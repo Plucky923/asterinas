@@ -3,9 +3,9 @@
 use self::options::SocketOption;
 pub use self::util::{
     options::LingerOption, send_recv_flags::SendRecvFlags, shutdown_cmd::SockShutdownCmd,
-    socket_addr::SocketAddr,
+    socket_addr::SocketAddr, MessageHeader,
 };
-use crate::{fs::file_handle::FileLike, prelude::*};
+use crate::{fs::file_handle::FileLike, prelude::*, util::IoVec};
 
 pub mod ip;
 pub mod options;
@@ -74,4 +74,10 @@ pub trait Socket: FileLike + Send + Sync {
     ) -> Result<usize> {
         return_errno_with_message!(Errno::EOPNOTSUPP, "recvfrom() is not supported");
     }
+
+    /// Send a message along with control message on a socket
+    fn sendmsg(&self, src: MessageHeader, flags: SendRecvFlags) -> Result<usize>;
+
+    /// Receive a message along with control message from a socket
+    fn recvmsg(&self, dst: Box<[IoVec]>, flags: SendRecvFlags) -> Result<(usize, MessageHeader)>;
 }

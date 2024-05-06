@@ -3,7 +3,10 @@
 use aster_frame::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 use super::{group::AtomicGid, user::AtomicUid, Gid, Uid};
-use crate::prelude::*;
+use crate::{
+    prelude::*,
+    process::credentials::linuxcapability::{AtomicCapability, Capability},
+};
 
 #[derive(Debug)]
 pub(super) struct Credentials_ {
@@ -25,13 +28,27 @@ pub(super) struct Credentials_ {
     /// Group id used for file system checks.
     fsgid: AtomicGid,
 
-    // A set of additional groups to which a process belongs.
+    /// A set of additional groups to which a process belongs.
     supplementary_gids: RwLock<BTreeSet<Gid>>,
+
+    /// The Linux capabilities.
+    /// This is not the capability (in static_cap.rs) on rust objects.
+
+    /// caps that children can inherit
+    inheritablecap: AtomicCapability,
+
+    /// The Permitted capability set is a list of capabilities that a process can potentially be granted.
+    /// It defines the maximum set of privileges that the process could possibly have.
+    /// Even if the process is not currently using these privileges, it has the potential ability to enable them.
+    permittedcap: AtomicCapability,
+
+    /// caps that we can actually use
+    effectivecap: AtomicCapability,
 }
 
 impl Credentials_ {
     /// Create a new credentials. ruid, euid, suid will be set as the same uid, and gid is the same.
-    pub fn new(uid: Uid, gid: Gid) -> Self {
+    pub fn new(uid: Uid, gid: Gid, cap: Capability) -> Self {
         let mut supplementary_gids = BTreeSet::new();
         supplementary_gids.insert(gid);
 
@@ -45,6 +62,9 @@ impl Credentials_ {
             sgid: AtomicGid::new(gid),
             fsgid: AtomicGid::new(gid),
             supplementary_gids: RwLock::new(supplementary_gids),
+            inheritablecap: AtomicCapability::new(cap),
+            permittedcap: AtomicCapability::new(cap),
+            effectivecap: AtomicCapability::new(cap),
         }
     }
 
@@ -371,6 +391,32 @@ impl Credentials_ {
     pub(super) fn groups_mut(&self) -> RwLockWriteGuard<BTreeSet<Gid>> {
         self.supplementary_gids.write()
     }
+
+    //  ******* Linux Capability methods *******
+
+    pub(super) fn inheritablecap(&self) -> Capability {
+        self.inheritablecap.get()
+    }
+
+    pub(super) fn permittedcap(&self) -> Capability {
+        self.permittedcap.get()
+    }
+
+    pub(super) fn effectivecap(&self) -> Capability {
+        self.effectivecap.get()
+    }
+
+    pub(super) fn set_inheritablecap(&self, inheritablecap: Capability) {
+        self.inheritablecap.set(inheritablecap);
+    }
+
+    pub(super) fn set_permittedcap(&self, permittedcap: Capability) {
+        self.permittedcap.set(permittedcap);
+    }
+
+    pub(super) fn set_effectivecap(&self, effectivecap: Capability) {
+        self.effectivecap.set(effectivecap);
+    }
 }
 
 impl Clone for Credentials_ {
@@ -385,6 +431,9 @@ impl Clone for Credentials_ {
             sgid: self.sgid.clone(),
             fsgid: self.fsgid.clone(),
             supplementary_gids: RwLock::new(self.supplementary_gids.read().clone()),
+            inheritablecap: self.inheritablecap.clone(),
+            permittedcap: self.permittedcap.clone(),
+            effectivecap: self.effectivecap.clone(),
         }
     }
 }

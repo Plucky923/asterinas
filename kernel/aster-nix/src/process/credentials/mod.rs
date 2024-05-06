@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
+pub mod c_types;
 mod credentials_;
 mod group;
+pub mod linuxcapability;
 mod static_cap;
 mod user;
 
@@ -20,7 +22,8 @@ use crate::prelude::*;
 /// - effective user ID and group ID;
 /// - saved-set user ID and saved-set group ID;
 /// - file system user ID and group ID (Linux-specific);
-/// - supplementary group IDs.
+/// - supplementary group IDs;
+/// - Linux capabilities.
 pub struct Credentials<R = FullOp>(Arc<Credentials_>, R);
 
 /// Gets read-only credentials of current thread.

@@ -4,7 +4,7 @@ use aster_frame::sync::{RwLockReadGuard, RwLockWriteGuard};
 use aster_rights::{Dup, Read, TRights, Write};
 use aster_rights_proc::require;
 
-use super::{credentials_::Credentials_, Credentials, Gid, Uid};
+use super::{credentials_::Credentials_, linuxcapability::Capability, Credentials, Gid, Uid};
 use crate::prelude::*;
 
 impl<R: TRights> Credentials<R> {
@@ -12,7 +12,8 @@ impl<R: TRights> Credentials<R> {
     pub fn new_root() -> Self {
         let uid = Uid::new_root();
         let gid = Gid::new_root();
-        let credentials_ = Arc::new(Credentials_::new(uid, gid));
+        let cap = Capability::new_root();
+        let credentials_ = Arc::new(Credentials_::new(uid, gid, cap));
         Self(credentials_, R::new())
     }
 
@@ -246,5 +247,55 @@ impl<R: TRights> Credentials<R> {
     #[require(R > Write)]
     pub fn groups_mut(&self) -> RwLockWriteGuard<BTreeSet<Gid>> {
         self.0.groups_mut()
+    }
+
+    // *********** Linux Capability methods **********
+
+    /// Gets the Linux caps that children can inherit.
+    ///
+    /// This method requies the `Read` right.
+    #[require(R > Read)]
+    pub fn inheritablecap(&self) -> Capability {
+        self.0.inheritablecap()
+    }
+
+    /// Gets the Linux caps that caps are permitted.
+    ///
+    /// This method requies the `Read` right.
+    #[require(R > Read)]
+    pub fn permittedcap(&self) -> Capability {
+        self.0.permittedcap()
+    }
+
+    /// Gets the Linux caps that actually use.
+    ///
+    /// This method requies the `Read` right.
+    #[require(R > Read)]
+    pub fn effectivecap(&self) -> Capability {
+        self.0.effectivecap()
+    }
+
+    /// Sets the Linux caps that children can inherit.
+    ///
+    /// This method requires the `Write` right.
+    #[require(R > Write)]
+    pub fn set_inheritablecap(&self, inheritablecap: Capability) {
+        self.0.set_inheritablecap(inheritablecap);
+    }
+
+    /// Sets the Linux caps that caps are permitted.
+    ///
+    /// This method requires the `Write` right.
+    #[require(R > Write)]
+    pub fn set_permittedcap(&self, permittedcap: Capability) {
+        self.0.set_permittedcap(permittedcap);
+    }
+
+    /// Sets the Linux caps that actually use.
+    ///
+    /// This method requires the `Write` right.
+    #[require(R > Write)]
+    pub fn set_effectivecap(&self, effectivecap: Capability) {
+        self.0.set_effectivecap(effectivecap);
     }
 }

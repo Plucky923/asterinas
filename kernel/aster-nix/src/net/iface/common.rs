@@ -168,7 +168,7 @@ impl IfaceCommon {
             self.next_poll_at_ms
                 .store(instant.total_millis() as u64, Ordering::Relaxed);
 
-            if new_instant < old_instant {
+            if old_instant == 0 || new_instant < old_instant {
                 self.polling_wait_queue.wake_all();
             }
         } else {

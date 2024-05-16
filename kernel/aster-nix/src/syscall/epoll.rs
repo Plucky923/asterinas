@@ -2,6 +2,8 @@
 
 use core::time::Duration;
 
+use aster_frame::vm::VmIo;
+
 use super::SyscallReturn;
 use crate::{
     events::IoEvents,
@@ -11,6 +13,7 @@ use crate::{
         utils::CreationFlags,
     },
     prelude::*,
+    process::posix_thread::PosixThreadExt,
     util::{read_val_from_user, write_val_to_user},
 };
 
@@ -89,12 +92,7 @@ pub fn sys_epoll_ctl(
     Ok(SyscallReturn::Return(0 as _))
 }
 
-pub fn sys_epoll_wait(
-    epfd: FileDesc,
-    events_addr: Vaddr,
-    max_events: i32,
-    timeout: i32,
-) -> Result<SyscallReturn> {
+fn do_epoll_wait(epfd: FileDesc, max_events: i32, timeout: i32) -> Result<Vec<EpollEvent>> {
     let max_events = {
         if max_events <= 0 {
             return_errno_with_message!(Errno::EINVAL, "max_events is not positive");
@@ -106,20 +104,31 @@ pub fn sys_epoll_wait(
     } else {
         None
     };
+
+    let current = current!();
+    let file_table = current.file_table().lock();
+    let epoll_file = file_table
+        .get_file(epfd)?
+        .downcast_ref::<EpollFile>()
+        .ok_or(Error::with_message(Errno::EINVAL, "not epoll file"))?;
+    let epoll_events = epoll_file.wait(max_events, timeout.as_ref())?;
+
+    Ok(epoll_events)
+}
+
+pub fn sys_epoll_wait(
+    epfd: FileDesc,
+    events_addr: Vaddr,
+    max_events: i32,
+    timeout: i32,
+) -> Result<SyscallReturn> {
     debug!(
         "epfd = {}, events_addr = 0x{:x}, max_events = {}, timeout = {:?}",
         epfd, events_addr, max_events, timeout
     );
 
-    let current = current!();
-    let file = {
-        let file_table = current.file_table().lock();
-        file_table.get_file(epfd)?.clone()
-    };
-    let epoll_file = file
-        .downcast_ref::<EpollFile>()
-        .ok_or(Error::with_message(Errno::EINVAL, "not epoll file"))?;
-    let epoll_events = epoll_file.wait(max_events, timeout.as_ref())?;
+    // Call do_epoll_wait to carry out the waiting process for events
+    let epoll_events = do_epoll_wait(epfd, max_events, timeout)?;
 
     // Write back
     let mut write_addr = events_addr;
@@ -132,17 +141,68 @@ pub fn sys_epoll_wait(
     Ok(SyscallReturn::Return(epoll_events.len() as _))
 }
 
+fn set_signal_mask(set_ptr: Vaddr) -> Result<u64> {
+    let current = current!();
+    let current_thread = current_thread!();
+    let posix_thread = current_thread.as_posix_thread().unwrap();
+    let root_vmar = current.root_vmar();
+    let mut sig_mask = posix_thread.sig_mask().lock();
+    let old_sig_mask_value = sig_mask.as_u64();
+
+    println!("old sig mask value: 0x{:x}", old_sig_mask_value);
+
+    if set_ptr != 0 {
+        let new_set = root_vmar.read_val::<u64>(set_ptr)?;
+        sig_mask.set(new_set);
+    }
+
+    println!("new set = {:x?}", &sig_mask);
+
+    Ok(old_sig_mask_value)
+}
+
+fn restore_signal_mask(sig_mask_val: u64) -> Result<()> {
+    let current_thread = current_thread!();
+    let posix_thread = current_thread.as_posix_thread().unwrap();
+    let mut sig_mask = posix_thread.sig_mask().lock();
+
+    println!("current set = {:x?}", &sig_mask);
+
+    sig_mask.set(sig_mask_val);
+
+    println!("now set = {:x?}", &sig_mask);
+
+    Ok(())
+}
+
 pub fn sys_epoll_pwait(
     epfd: FileDesc,
     events_addr: Vaddr,
     max_events: i32,
     timeout: i32,
-    sigmask: Vaddr, //TODO: handle sigmask
+    sigmask: Vaddr,
 ) -> Result<SyscallReturn> {
-    if sigmask != 0 {
-        warn!("epoll_pwait cannot handle signal mask, yet");
+    debug!(
+        "epfd = {}, events_addr = 0x{:x}, max_events = {}, timeout = {:?}, sigmask = 0x{:x}",
+        epfd, events_addr, max_events, timeout, sigmask
+    );
+
+    let old_sig_mask_value = set_signal_mask(sigmask)?;
+
+    // Call do_epoll_wait to carry out the waiting process for events
+    let ready_events = do_epoll_wait(epfd, max_events, timeout)?;
+
+    restore_signal_mask(old_sig_mask_value)?;
+
+    // Write back
+    let mut write_addr = events_addr;
+    for event in ready_events.iter() {
+        let c_event = c_epoll_event::from(event);
+        write_val_to_user(write_addr, &c_event)?;
+        write_addr += core::mem::size_of::<c_epoll_event>();
     }
-    sys_epoll_wait(epfd, events_addr, max_events, timeout)
+
+    Ok(SyscallReturn::Return(ready_events.len() as _))
 }
 
 #[derive(Debug, Clone, Copy, Pod)]

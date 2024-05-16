@@ -34,7 +34,7 @@ impl WaitQueue {
     /// `wake`-family method. This ordering is important to ensure that waiter
     /// threads do not lose any wakeup notifications.
     ///
-    /// By taking a condition closure, his wait-wakeup mechanism becomes
+    /// By taking a condition closure, this wait-wakeup mechanism becomes
     /// more efficient and robust.
     pub fn wait_until<F, R>(&self, mut cond: F) -> R
     where

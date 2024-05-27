@@ -13,12 +13,16 @@ use crate::{
         iface::IpEndpoint,
         poll_ifaces,
         socket::{
-            util::{send_recv_flags::SendRecvFlags, socket_addr::SocketAddr},
+            util::{
+                copy_packet_from_user, copy_packet_to_user, create_packet_buffer,
+                send_recv_flags::SendRecvFlags, socket_addr::SocketAddr, MessageHeader,
+            },
             Socket,
         },
     },
     prelude::*,
     process::signal::{Pollee, Poller},
+    util::IoVec,
 };
 
 mod bound;
@@ -326,6 +330,44 @@ impl Socket for DatagramSocket {
 
         // TODO: Block if the send buffer is full
         self.try_sendto(buf, &remote_endpoint, flags)
+    }
+
+    fn sendmsg(&self, msg_hdr: MessageHeader, flags: SendRecvFlags) -> Result<usize> {
+        let MessageHeader {
+            addr,
+            io_vecs,
+            control_message,
+        } = msg_hdr;
+
+        if control_message.is_some() {
+            // TODO: support sending control message
+            warn!("sending control message is not supported");
+        }
+
+        let packet = copy_packet_from_user(&io_vecs);
+
+        let sent_bytes = self.sendto(&packet, addr, flags)?;
+        poll_ifaces();
+
+        Ok(sent_bytes)
+    }
+
+    fn recvmsg(&self, dst: Box<[IoVec]>, flags: SendRecvFlags) -> Result<(usize, MessageHeader)> {
+        // FIXME: deal with flags
+
+        let mut packet_buffer = create_packet_buffer(&dst);
+
+        let (packet_len, peer_addr) = self.recvfrom(&mut packet_buffer, flags)?;
+
+        let copied_bytes = {
+            let packet = &packet_buffer[..packet_len];
+            copy_packet_to_user(&dst, packet)
+        };
+
+        // TODO: receive control message
+        let msg_hdr = MessageHeader::new(Some(peer_addr), dst, None);
+
+        Ok((copied_bytes, msg_hdr))
     }
 }
 

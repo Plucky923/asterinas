@@ -23,16 +23,19 @@ use crate::{
                 Error as SocketError, Linger, RecvBuf, ReuseAddr, ReusePort, SendBuf, SocketOption,
             },
             util::{
+                copy_packet_from_user, copy_packet_to_user, create_packet_buffer,
                 options::{SocketOptionSet, MIN_RECVBUF, MIN_SENDBUF},
                 send_recv_flags::SendRecvFlags,
                 shutdown_cmd::SockShutdownCmd,
                 socket_addr::SocketAddr,
+                MessageHeader,
             },
             Socket,
         },
     },
     prelude::*,
     process::signal::{Pollee, Poller},
+    util::IoVec,
 };
 
 mod connected;
@@ -61,6 +64,20 @@ enum State {
     Connected(ConnectedStream),
     // Final State 2
     Listen(ListenStream),
+}
+
+impl State {
+    fn connected(&self) -> Result<&ConnectedStream> {
+        match self {
+            State::Connected(connected_stream) => Ok(connected_stream),
+            State::Init(_) | State::Listen(_) => {
+                return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected")
+            }
+            State::Connecting(_) => {
+                return_errno_with_message!(Errno::EAGAIN, "the socket is connecting")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -250,15 +267,7 @@ impl StreamSocket {
     fn try_recvfrom(&self, buf: &mut [u8], flags: SendRecvFlags) -> Result<(usize, SocketAddr)> {
         let state = self.state.read();
 
-        let connected_stream = match state.as_ref() {
-            State::Connected(connected_stream) => connected_stream,
-            State::Init(_) | State::Listen(_) => {
-                return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected")
-            }
-            State::Connecting(_) => {
-                return_errno_with_message!(Errno::EAGAIN, "the socket is connecting")
-            }
-        };
+        let connected_stream = state.connected()?;
 
         let received = connected_stream.try_recvfrom(buf, flags).map(|recv_bytes| {
             connected_stream.update_io_events(&self.pollee);
@@ -669,6 +678,45 @@ impl Socket for StreamSocket {
         });
 
         Ok(())
+    }
+
+    fn sendmsg(&self, msg_hdr: MessageHeader, flags: SendRecvFlags) -> Result<usize> {
+        let MessageHeader {
+            addr,
+            io_vecs,
+            control_message,
+        } = msg_hdr;
+
+        if control_message.is_some() {
+            // TODO: support sending control message
+            warn!("sending control message is not supported");
+        }
+
+        let packet = copy_packet_from_user(&io_vecs);
+        let sent_bytes = self.sendto(&packet, addr, flags)?;
+        Ok(sent_bytes)
+    }
+
+    fn recvmsg(&self, dst: Box<[IoVec]>, flags: SendRecvFlags) -> Result<(usize, MessageHeader)> {
+        // FIXME: We may be able to avoid creating this temporary buffer
+        // if we send small buffers corresponding to a single `IoVec`.
+        // However, if we were to do so,
+        // we would not be able to reuse the current code.
+        let mut packet_buffer = create_packet_buffer(&dst);
+
+        let (recv_bytes, _) = self.recvfrom(&mut packet_buffer, flags)?;
+        let copied_bytes = {
+            let packet = &packet_buffer[..recv_bytes];
+            copy_packet_to_user(&dst, packet)
+        };
+
+        // TODO: support receiving control message
+
+        // According to <https://elixir.bootlin.com/linux/v6.0.9/source/net/ipv4/tcp.c#L2645>,
+        // peer address is ignored for connected socket, so we set peer addr as `None`.
+        let msg_hdr = MessageHeader::new(None, dst, None);
+
+        Ok((recv_bytes, msg_hdr))
     }
 }
 

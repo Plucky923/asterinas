@@ -16,26 +16,30 @@ use crate::{
     },
     net::socket::{
         unix::{addr::UnixSocketAddrBound, UnixSocketAddr},
-        util::{send_recv_flags::SendRecvFlags, socket_addr::SocketAddr},
+        util::{
+            copy_packet_from_user, copy_packet_to_user, create_packet_buffer,
+            send_recv_flags::SendRecvFlags, socket_addr::SocketAddr, MessageHeader,
+        },
         SockShutdownCmd, Socket,
     },
     prelude::*,
     process::signal::Poller,
+    util::IoVec,
 };
 
-pub struct UnixStreamSocket(RwLock<State>);
+pub struct UnixStreamSocket(RwMutex<State>);
 
 impl UnixStreamSocket {
     pub(super) fn new_init(init: Init) -> Self {
-        Self(RwLock::new(State::Init(Arc::new(init))))
+        Self(RwMutex::new(State::Init(Arc::new(init))))
     }
 
     pub(super) fn new_listen(listen: Listener) -> Self {
-        Self(RwLock::new(State::Listen(Arc::new(listen))))
+        Self(RwMutex::new(State::Listen(Arc::new(listen))))
     }
 
     pub(super) fn new_connected(connected: Connected) -> Self {
-        Self(RwLock::new(State::Connected(Arc::new(connected))))
+        Self(RwMutex::new(State::Connected(Arc::new(connected))))
     }
 }
 
@@ -273,6 +277,36 @@ impl Socket for UnixStreamSocket {
         };
 
         connected.write(buf)
+    }
+
+    fn sendmsg(&self, msg_hdr: MessageHeader, flags: SendRecvFlags) -> Result<usize> {
+        let MessageHeader {
+            addr,
+            io_vecs,
+            control_message,
+        } = msg_hdr;
+
+        let packet = copy_packet_from_user(&io_vecs);
+        let sent_len = self.sendto(&packet, addr, flags)?;
+
+        Ok(sent_len)
+    }
+
+    fn recvmsg(&self, dst: Box<[IoVec]>, flags: SendRecvFlags) -> Result<(usize, MessageHeader)> {
+        debug_assert!(flags.is_all_supported());
+
+        let mut packet_buffer = create_packet_buffer(&dst);
+        let (recv_len, _) = self.recvfrom(&mut packet_buffer, flags)?;
+
+        let copied_len = {
+            let packet = &packet_buffer[..recv_len];
+            copy_packet_to_user(&dst, packet)
+        };
+
+        // TODO: receive control message
+        let msg_hdr = MessageHeader::new(None, dst, None);
+
+        Ok((copied_len, msg_hdr))
     }
 }
 

@@ -5,10 +5,8 @@ use aster_frame::vm::Vaddr;
 use super::SyscallReturn;
 use crate::{
     fs::file_table::FileDesc,
-    log_syscall_entry,
     net::socket::SendRecvFlags,
     prelude::*,
-    syscall::SYS_RECVMSG,
     util::{
         net::{get_socket_from_fd, CUserMsgHdr},
         read_val_from_user,
@@ -16,7 +14,6 @@ use crate::{
 };
 
 pub fn sys_recvmsg(sockfd: FileDesc, user_msghdr_ptr: Vaddr, flags: i32) -> Result<SyscallReturn> {
-    log_syscall_entry!(SYS_RECVMSG);
 
     let c_user_msghdr: CUserMsgHdr = read_val_from_user(user_msghdr_ptr)?;
     let flags = SendRecvFlags::from_bits_truncate(flags);

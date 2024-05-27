@@ -2,7 +2,7 @@
 
 use super::SyscallReturn;
 use crate::{
-    fs::file_table::FileDesc, log_syscall_entry, prelude::*, syscall::SYS_WRITEV,
+    fs::file_table::FileDesc, prelude::*,
     util::copy_iovs_from_user,
 };
 

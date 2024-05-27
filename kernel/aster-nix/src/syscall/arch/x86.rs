@@ -9,6 +9,8 @@ use crate::syscall::{
     brk::sys_brk,
     capget::sys_capget,
     capset::sys_capset,
+    sendmsg::sys_sendmsg,
+    recvmsg::sys_recvmsg,
     chdir::{sys_chdir, sys_fchdir},
     chmod::{sys_chmod, sys_fchmod, sys_fchmodat},
     chown::{sys_chown, sys_fchown, sys_fchownat, sys_lchown},
@@ -149,6 +151,8 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_ACCEPT = 43            => sys_accept(args[..3]);
     SYS_SENDTO = 44            => sys_sendto(args[..6]);
     SYS_RECVFROM = 45          => sys_recvfrom(args[..6]);
+    SYS_SENDMSG = 46           => sys_sendmsg(args[..3]);
+    SYS_RECVMSG = 47           => sys_recvmsg(args[..3]);
     SYS_SHUTDOWN = 48          => sys_shutdown(args[..2]);
     SYS_BIND = 49              => sys_bind(args[..3]);
     SYS_LISTEN = 50            => sys_listen(args[..2]);

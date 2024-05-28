@@ -611,7 +611,7 @@ impl Dentry {
         let mountpoint = Self::new(mountpoint_mount_node.clone(), mountpoint_dentry.clone());
 
         let child_mount = mountpoint_mount_node.umount(&mountpoint)?;
-        mountpoint_dentry.clear_mountpoint();
+        // mountpoint_dentry.clear_mountpoint();
         Ok(child_mount)
     }
 

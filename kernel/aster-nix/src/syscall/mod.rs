@@ -61,6 +61,7 @@ mod listen;
 mod lseek;
 mod madvise;
 mod mkdir;
+mod mknod;
 mod mmap;
 mod mount;
 mod mprotect;

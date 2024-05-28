@@ -75,11 +75,18 @@ pub fn sys_fstatat(
     Ok(SyscallReturn::Return(0))
 }
 
-pub const S_IFMT: u32 = 0o170000;
-pub const S_IFCHR: u32 = 0o020000;
-pub const S_IFDIR: u32 = 0o040000;
-pub const S_IFREG: u32 = 0o100000;
-pub const S_IFLNK: u32 = 0o120000;
+bitflags! {
+    pub struct Mode: u16 {
+        const S_IFMT = 0o170000;
+        const S_IFSOCK = 0o140000;
+        const S_IFCHR = 0o020000;
+        const S_IFBLK = 0o060000;
+        const S_IFDIR = 0o040000;
+        const S_IFIFO = 0o010000;
+        const S_IFREG = 0o100000;
+        const S_IFLNK = 0o120000;
+    }
+}
 
 /// File Stat
 #[derive(Debug, Clone, Copy, Pod, Default)]

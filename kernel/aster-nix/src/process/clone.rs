@@ -414,7 +414,6 @@ fn clone_fs(
 }
 
 fn clone_ns(parent_ns: &Arc<Mutex<Namespaces>>, clone_flags: CloneFlags) -> Arc<Mutex<Namespaces>> {
-    println!("clone_ns");
     let parent_namespaces = parent_ns.lock();
 
     let new_mnt_ns = if clone_flags.contains(CloneFlags::CLONE_NEWNS) {

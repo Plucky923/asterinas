@@ -14,7 +14,6 @@ use crate::{
 };
 
 pub fn sys_recvmsg(sockfd: FileDesc, user_msghdr_ptr: Vaddr, flags: i32) -> Result<SyscallReturn> {
-
     let c_user_msghdr: CUserMsgHdr = read_val_from_user(user_msghdr_ptr)?;
     let flags = SendRecvFlags::from_bits_truncate(flags);
 

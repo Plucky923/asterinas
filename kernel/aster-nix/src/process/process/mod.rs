@@ -162,7 +162,7 @@ impl Process {
                 resource_limits: Mutex::new(resource_limits),
                 nice: Atomic::new(nice),
             }
-        }
+        })
     }
 
     /// init a user process and run the process

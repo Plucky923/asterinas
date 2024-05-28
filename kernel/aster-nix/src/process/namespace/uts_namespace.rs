@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: MPL-2.0
-
 use crate::prelude::*;
 
 pub struct UtsNamespace {
@@ -41,8 +39,8 @@ impl UtsNamespace {
     }
 
     pub fn copy_uts_ns(old_uts_ns: &Arc<UtsNamespace>) -> Arc<Self> {
-        let new_uts_name = old_uts_ns.name();
-        Self::new(new_uts_name.clone())
+        let new_uts_name = old_uts_ns.name.read().clone();
+        Self::new(new_uts_name)
     }
 
     pub fn sethostname(&self, new_hostname: CString) {

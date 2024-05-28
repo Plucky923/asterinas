@@ -31,6 +31,6 @@ impl MntNamespace {
         let new_mount_node =
             old_mount_node.copy_mount_node_tree(old_mount_node.root_dentry().clone());
         new_mount_node.process_move();
-        MntNamespace::new(new_mount_node)
+        Self::new(new_mount_node)
     }
 }

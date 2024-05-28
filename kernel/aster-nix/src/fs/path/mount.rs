@@ -145,7 +145,6 @@ impl MountNode {
         new_root_mount.clone()
     }
 
-
     /// Move process root and cwd directory to new mount node tree.
     pub fn process_move(&self) {
         let current = current!();

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::SyscallReturn;
-use crate::{
-    fs::file_table::FileDesc, prelude::*,
-    util::copy_iovs_from_user,
-};
+use crate::{fs::file_table::FileDesc, prelude::*, util::copy_iovs_from_user};
 
 pub fn sys_writev(fd: FileDesc, io_vec_ptr: Vaddr, io_vec_count: usize) -> Result<SyscallReturn> {
     let res = do_sys_writev(fd, io_vec_ptr, io_vec_count)?;

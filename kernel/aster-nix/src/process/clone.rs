@@ -297,6 +297,7 @@ fn clone_child_process(
             .process_vm(child_process_vm)
             .file_table(child_file_table)
             .fs(child_fs)
+            .namespaces(child_namespaces)
             .umask(child_umask)
             .sig_dispositions(child_sig_dispositions)
             .nice(child_nice);
@@ -413,6 +414,7 @@ fn clone_fs(
 }
 
 fn clone_ns(parent_ns: &Arc<Mutex<Namespaces>>, clone_flags: CloneFlags) -> Arc<Mutex<Namespaces>> {
+    println!("clone_ns");
     let parent_namespaces = parent_ns.lock();
 
     let new_mnt_ns = if clone_flags.contains(CloneFlags::CLONE_NEWNS) {

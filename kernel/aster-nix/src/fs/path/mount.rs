@@ -120,16 +120,14 @@ impl MountNode {
         let mut stack = vec![self.this()];
         let mut new_stack = vec![new_root_mount.clone()];
 
-        let mut dentry = new_root_mount.root_dentry.clone();
         while let Some(old_mount) = stack.pop() {
             let new_parent_mount = new_stack.pop().unwrap().clone();
             let old_children = old_mount.children.lock();
             for old_child_mount in old_children.values() {
                 let mountpoint_dentry = old_child_mount.mountpoint_dentry().unwrap();
-                if !dentry.is_subdir(mountpoint_dentry.clone()) {
+                if !mountpoint_dentry.is_subdir(old_mount.root_dentry.clone()) {
                     continue;
                 }
-                stack.push(old_child_mount.clone());
                 let new_child_mount =
                     old_child_mount.clone_mount_node(old_child_mount.root_dentry.clone());
                 let key = mountpoint_dentry.key();
@@ -140,11 +138,41 @@ impl MountNode {
                 new_child_mount.set_parent(new_parent_mount.clone());
                 new_child_mount
                     .set_mountpoint_dentry(old_child_mount.mountpoint_dentry().unwrap().clone());
+                stack.push(old_child_mount.clone());
                 new_stack.push(new_child_mount.clone());
-                dentry = new_child_mount.root_dentry.clone();
             }
         }
         new_root_mount.clone()
+    }
+
+
+    /// Move process root and cwd directory to new mount node tree.
+    pub fn process_move(&self) {
+        let current = current!();
+        let mut stack = vec![self.this().clone()];
+        let root = current.fs().read().root().clone();
+        let cwd = current.fs().read().cwd().clone();
+
+        while let Some(current_mount_node) = stack.pop() {
+            if Arc::ptr_eq(
+                current_mount_node.root_dentry(),
+                root.mount_node().root_dentry(),
+            ) {
+                root.move_root(current_mount_node.clone());
+            }
+
+            if Arc::ptr_eq(
+                current_mount_node.root_dentry(),
+                cwd.mount_node().root_dentry(),
+            ) {
+                cwd.move_cwd(current_mount_node.clone());
+            }
+
+            let children = current_mount_node.children.lock();
+            for child in children.values() {
+                stack.push(child.clone());
+            }
+        }
     }
 
     /// Detach the mount node from the parent mount node.

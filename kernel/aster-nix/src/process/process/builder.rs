@@ -6,6 +6,7 @@ use crate::{
     prelude::*,
     process::{
         posix_thread::{PosixThreadBuilder, PosixThreadExt},
+        process::Namespaces,
         process_vm::ProcessVm,
         rlimit::ResourceLimits,
         signal::sig_disposition::SigDispositions,
@@ -28,6 +29,7 @@ pub struct ProcessBuilder<'a> {
     process_vm: Option<ProcessVm>,
     file_table: Option<Arc<Mutex<FileTable>>>,
     fs: Option<Arc<RwMutex<FsResolver>>>,
+    namespaces: Option<Arc<Mutex<Namespaces>>>,
     umask: Option<Arc<RwLock<FileCreationMask>>>,
     resource_limits: Option<ResourceLimits>,
     sig_dispositions: Option<Arc<Mutex<SigDispositions>>>,
@@ -47,6 +49,7 @@ impl<'a> ProcessBuilder<'a> {
             process_vm: None,
             file_table: None,
             fs: None,
+            namespaces: None,
             umask: None,
             resource_limits: None,
             sig_dispositions: None,
@@ -72,6 +75,11 @@ impl<'a> ProcessBuilder<'a> {
 
     pub fn fs(&mut self, fs: Arc<RwMutex<FsResolver>>) -> &mut Self {
         self.fs = Some(fs);
+        self
+    }
+
+    pub fn namespaces(&mut self, namespaces: Arc<Mutex<Namespaces>>) -> &mut Self {
+        self.namespaces = Some(namespaces);
         self
     }
 
@@ -140,6 +148,7 @@ impl<'a> ProcessBuilder<'a> {
             process_vm,
             file_table,
             fs,
+            namespaces,
             umask,
             resource_limits,
             sig_dispositions,
@@ -155,6 +164,10 @@ impl<'a> ProcessBuilder<'a> {
 
         let fs = fs
             .or_else(|| Some(Arc::new(RwMutex::new(FsResolver::new()))))
+            .unwrap();
+
+        let namespaces = namespaces
+            .or_else(|| Some(Arc::new(Mutex::new(Namespaces::default()))))
             .unwrap();
 
         let umask = umask
@@ -181,6 +194,7 @@ impl<'a> ProcessBuilder<'a> {
                 process_vm,
                 file_table,
                 fs,
+                namespaces,
                 umask,
                 sig_dispositions,
                 resource_limits,

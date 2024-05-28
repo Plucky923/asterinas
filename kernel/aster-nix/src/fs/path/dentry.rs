@@ -664,6 +664,18 @@ impl Dentry {
     pub fn mount_node(&self) -> &Arc<MountNode> {
         &self.mount_node
     }
+
+    pub fn move_root(&self, mount_node: Arc<MountNode>) {
+        let current = current!();
+        let root_dentry = Self::new(mount_node.clone(), self.inner.clone());
+        current.fs().write().set_root(root_dentry.clone());
+    }
+
+    pub fn move_cwd(&self, mount_node: Arc<MountNode>) {
+        let current = current!();
+        let cwd_dentry = Self::new(mount_node.clone(), self.inner.clone());
+        current.fs().write().set_cwd(cwd_dentry.clone());
+    }
 }
 
 #[inherit_methods(from = "self.inner")]

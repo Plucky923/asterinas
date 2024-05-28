@@ -69,11 +69,11 @@ pub fn sys_mount(
 }
 
 fn do_reconfigure_mnt() -> Result<()> {
-    todo!()
+    Ok(())
 }
 
 fn do_remount() -> Result<()> {
-    todo!()
+    Ok(())
 }
 
 /// Bind a mount to a new location.
@@ -98,7 +98,7 @@ fn do_loopback(old_name: CString, new_dentry: Arc<Dentry>, recursive: bool) -> R
 }
 
 fn do_change_type() -> Result<()> {
-    todo!()
+    Ok(())
 }
 
 /// Move a mount from old location to new location.

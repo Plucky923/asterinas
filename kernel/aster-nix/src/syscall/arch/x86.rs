@@ -86,6 +86,7 @@ use crate::syscall::{
     setfsuid::sys_setfsuid,
     setgid::sys_setgid,
     setgroups::sys_setgroups,
+    sethostname::sys_sethostname,
     setpgid::sys_setpgid,
     setregid::sys_setregid,
     setresgid::sys_setresgid,
@@ -108,6 +109,7 @@ use crate::syscall::{
     umask::sys_umask,
     uname::sys_uname,
     unlink::{sys_unlink, sys_unlinkat},
+    unshare::sys_unshare,
     utimens::sys_utimensat,
     wait4::sys_wait4,
     waitid::sys_waitid,
@@ -222,6 +224,9 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_ARCH_PRCTL = 158       => sys_arch_prctl(args[..2], &mut context);
     SYS_CHROOT = 161           => sys_chroot(args[..1]);
     SYS_SYNC = 162             => sys_sync(args[..0]);
+    SYS_MOUNT = 165            => sys_mount(args[..5]);
+    SYS_UMOUNT = 166           => sys_umount(args[..2]);
+    SYS_SETHOSTNAME = 170      => sys_sethostname(args[..2]);
     SYS_GETTID = 186           => sys_gettid(args[..0]);
     SYS_TIME = 201             => sys_time(args[..1]);
     SYS_FUTEX = 202            => sys_futex(args[..6]);
@@ -245,6 +250,7 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_SYMLINKAT = 266        => sys_symlinkat(args[..3]);
     SYS_READLINKAT = 267       => sys_readlinkat(args[..4]);
     SYS_FCHMODAT = 268         => sys_fchmodat(args[..3]);
+    SYS_UNSHARE = 272          => sys_unshare(args[..1]);
     SYS_SET_ROBUST_LIST = 273  => sys_set_robust_list(args[..2]);
     SYS_UTIMENSAT = 280        => sys_utimensat(args[..4]);
     SYS_EPOLL_PWAIT = 281      => sys_epoll_pwait(args[..5]);

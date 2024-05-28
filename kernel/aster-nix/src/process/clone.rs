@@ -22,6 +22,7 @@ use crate::{
     current_thread,
     fs::{file_table::FileTable, fs_resolver::FsResolver, utils::FileCreationMask},
     prelude::*,
+    process::namespace::{mnt_namespace::MntNamespace, uts_namespace::UtsNamespace, Namespaces},
     thread::{allocate_tid, thread_table, Thread, Tid},
     util::write_val_to_user,
     vm::vmar::Vmar,
@@ -118,7 +119,9 @@ impl CloneFlags {
             | CloneFlags::CLONE_SETTLS
             | CloneFlags::CLONE_PARENT_SETTID
             | CloneFlags::CLONE_CHILD_SETTID
-            | CloneFlags::CLONE_CHILD_CLEARTID;
+            | CloneFlags::CLONE_CHILD_CLEARTID
+            | CloneFlags::CLONE_NEWNS
+            | CloneFlags::CLONE_NEWUTS;
         let unsupported_flags = *self - supported_flags;
         if !unsupported_flags.is_empty() {
             panic!("contains unsupported clone flags: {:?}", unsupported_flags);
@@ -242,6 +245,9 @@ fn clone_child_process(
 
     // clone fs
     let child_fs = clone_fs(current.fs(), clone_flags);
+
+    // clone namespaces
+    let child_namespaces = clone_ns(current.namespaces(), clone_flags);
 
     // clone umask
     let child_umask = {
@@ -406,6 +412,24 @@ fn clone_fs(
     }
 }
 
+fn clone_ns(parent_ns: &Arc<Mutex<Namespaces>>, clone_flags: CloneFlags) -> Arc<Mutex<Namespaces>> {
+    let parent_namespaces = parent_ns.lock();
+
+    let new_mnt_ns = if clone_flags.contains(CloneFlags::CLONE_NEWNS) {
+        MntNamespace::copy_mnt_ns(parent_namespaces.mnt_ns())
+    } else {
+        parent_namespaces.mnt_ns().clone()
+    };
+
+    let new_uts_ns = if clone_flags.contains(CloneFlags::CLONE_NEWUTS) {
+        UtsNamespace::copy_uts_ns(parent_namespaces.uts_ns())
+    } else {
+        parent_namespaces.uts_ns().clone()
+    };
+
+    Arc::new(Mutex::new(Namespaces::new(new_mnt_ns, new_uts_ns)))
+}
+
 fn clone_files(
     parent_file_table: &Arc<Mutex<FileTable>>,
     clone_flags: CloneFlags,
@@ -453,4 +477,13 @@ fn set_parent_and_group(parent: &Arc<Process>, child: &Arc<Process>) {
     *child_group_mut = Arc::downgrade(&process_group);
 
     process_table_mut.insert(child.pid(), child.clone());
+}
+
+pub fn do_unshare(unshare_flags: CloneFlags) -> Result<()> {
+    let current = current!();
+    unshare_flags.check_unsupported_flags()?;
+
+    let child_namespaces = clone_ns(current.namespaces(), unshare_flags);
+    current.switch_namespaces(child_namespaces);
+    Ok(())
 }

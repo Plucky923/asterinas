@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::{
+    namespace::Namespaces,
     posix_thread::PosixThreadExt,
     process_table,
     process_vm::{Heap, InitStackReader, ProcessVm},
@@ -79,6 +80,8 @@ pub struct Process {
     file_table: Arc<Mutex<FileTable>>,
     /// FsResolver
     fs: Arc<RwMutex<FsResolver>>,
+    /// Namespaces
+    namespaces: Arc<Mutex<Namespaces>>,
     /// umask
     umask: Arc<RwLock<FileCreationMask>>,
     /// resource limits
@@ -123,6 +126,7 @@ impl Process {
         process_vm: ProcessVm,
         file_table: Arc<Mutex<FileTable>>,
         fs: Arc<RwMutex<FsResolver>>,
+        namespaces: Arc<Mutex<Namespaces>>,
         umask: Arc<RwLock<FileCreationMask>>,
         sig_dispositions: Arc<Mutex<SigDispositions>>,
         resource_limits: ResourceLimits,
@@ -151,13 +155,14 @@ impl Process {
                 children: Mutex::new(BTreeMap::new()),
                 process_group: Mutex::new(Weak::new()),
                 file_table,
+                namespaces,
                 fs,
                 umask,
                 sig_dispositions,
                 resource_limits: Mutex::new(resource_limits),
                 nice: Atomic::new(nice),
             }
-        })
+        }
     }
 
     /// init a user process and run the process
@@ -560,6 +565,16 @@ impl Process {
 
     pub fn umask(&self) -> &Arc<RwLock<FileCreationMask>> {
         &self.umask
+    }
+    // ************** Namespaces ******************
+
+    pub fn namespaces(&self) -> &Arc<Mutex<Namespaces>> {
+        &self.namespaces
+    }
+
+    pub fn switch_namespaces(&self, namespaces: Arc<Mutex<Namespaces>>) {
+        let mut old_ns = self.namespaces.lock();
+        old_ns.set_namespaces(namespaces);
     }
 
     // ****************** Signal ******************

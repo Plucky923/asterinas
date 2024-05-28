@@ -1,46 +1,57 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use spin::Once;
-
 use self::iface::spawn_background_poll_thread;
 use crate::{
     net::iface::{Iface, IfaceLoopback, IfaceVirtio},
     prelude::*,
+    process::namespace::net_namespace::NetNamespace,
 };
 
-pub static IFACES: Once<Vec<Arc<dyn Iface>>> = Once::new();
+lazy_static! {
+    pub static ref IFACES: Mutex<Vec<Arc<dyn Iface>>> = Mutex::new(vec![]);
+    pub static ref INIT_NET: Mutex<Arc<Mutex<NetNamespace>>> = Mutex::new(NetNamespace::new());
+}
 
 pub mod iface;
 pub mod socket;
 
 pub fn init() {
-    IFACES.call_once(|| {
-        let iface_virtio = IfaceVirtio::new();
-        let iface_loopback = IfaceLoopback::new();
-        vec![iface_virtio, iface_loopback]
-    });
+    let iface_virtio = IfaceVirtio::new(&INIT_NET.lock());
+    let iface_loopback = IfaceLoopback::new(&INIT_NET.lock());
+    IFACES.lock().push(iface_virtio.clone());
+    IFACES.lock().push(iface_loopback.clone());
+    INIT_NET
+        .lock()
+        .lock()
+        .add_iface(&Arc::downgrade(&(iface_virtio as Arc<dyn Iface>)));
+    INIT_NET
+        .lock()
+        .lock()
+        .add_iface(&Arc::downgrade(&(iface_loopback as Arc<dyn Iface>)));
 
     for (name, _) in aster_network::all_devices() {
         aster_network::register_recv_callback(&name, || {
             // TODO: further check that the irq num is the same as iface's irq num
-            let iface_virtio = &IFACES.get().unwrap()[0];
+            let ifaces = IFACES.lock();
+            let iface_virtio = &ifaces.get(0).unwrap();
             iface_virtio.poll();
         })
     }
-    poll_ifaces();
+    for ifaces in IFACES.lock().iter() {
+        ifaces.poll();
+    }
 }
 
 /// Lazy init should be called after spawning init thread.
 pub fn lazy_init() {
-    for iface in IFACES.get().unwrap() {
+    for iface in IFACES.lock().iter() {
         spawn_background_poll_thread(iface.clone());
     }
 }
 
 /// Poll iface
 pub fn poll_ifaces() {
-    let ifaces = IFACES.get().unwrap();
-    for iface in ifaces.iter() {
-        iface.poll();
+    for iface in current!().namespaces().lock().net_ns().lock().ifaces() {
+        iface.upgrade().unwrap().poll();
     }
 }

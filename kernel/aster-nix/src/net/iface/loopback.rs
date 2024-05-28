@@ -7,7 +7,7 @@ use smoltcp::{
 };
 
 use super::{common::IfaceCommon, internal::IfaceInternal, Iface, IpAddress, Ipv4Address};
-use crate::prelude::*;
+use crate::{prelude::*, process::namespace::net_namespace::NetNamespace};
 
 pub const LOOPBACK_ADDRESS: IpAddress = {
     let ipv4_addr = Ipv4Address::new(127, 0, 0, 1);
@@ -22,7 +22,7 @@ pub struct IfaceLoopback {
 }
 
 impl IfaceLoopback {
-    pub fn new() -> Arc<Self> {
+    pub fn new(net_ns: &Arc<Mutex<NetNamespace>>) -> Arc<Self> {
         let mut loopback = Loopback::new(Medium::Ip);
         let interface = {
             let routes = Routes::new();
@@ -36,7 +36,7 @@ impl IfaceLoopback {
             interface
         };
         println!("Loopback ipaddr: {}", interface.ipv4_addr().unwrap());
-        let common = IfaceCommon::new(interface);
+        let common = IfaceCommon::new(interface, net_ns.clone());
         Arc::new_cyclic(|weak| Self {
             driver: Mutex::new(loopback),
             common,

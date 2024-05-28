@@ -22,7 +22,10 @@ use crate::{
     current_thread,
     fs::{file_table::FileTable, fs_resolver::FsResolver, utils::FileCreationMask},
     prelude::*,
-    process::namespace::{mnt_namespace::MntNamespace, uts_namespace::UtsNamespace, Namespaces},
+    process::namespace::{
+        mnt_namespace::MntNamespace, net_namespace::NetNamespace, uts_namespace::UtsNamespace,
+        Namespaces,
+    },
     thread::{allocate_tid, thread_table, Thread, Tid},
     util::write_val_to_user,
     vm::vmar::Vmar,
@@ -121,7 +124,8 @@ impl CloneFlags {
             | CloneFlags::CLONE_CHILD_SETTID
             | CloneFlags::CLONE_CHILD_CLEARTID
             | CloneFlags::CLONE_NEWNS
-            | CloneFlags::CLONE_NEWUTS;
+            | CloneFlags::CLONE_NEWUTS
+            | CloneFlags::CLONE_NEWNET;
         let unsupported_flags = *self - supported_flags;
         if !unsupported_flags.is_empty() {
             panic!("contains unsupported clone flags: {:?}", unsupported_flags);
@@ -428,7 +432,16 @@ fn clone_ns(parent_ns: &Arc<Mutex<Namespaces>>, clone_flags: CloneFlags) -> Arc<
         parent_namespaces.uts_ns().clone()
     };
 
-    Arc::new(Mutex::new(Namespaces::new(new_mnt_ns, new_uts_ns)))
+    let new_net_ns = if clone_flags.contains(CloneFlags::CLONE_NEWNET) {
+        let (new, _) = NetNamespace::new_with_loopback();
+        new
+    } else {
+        parent_namespaces.net_ns().clone()
+    };
+
+    Arc::new(Mutex::new(Namespaces::new(
+        new_mnt_ns, new_uts_ns, new_net_ns,
+    )))
 }
 
 fn clone_files(

@@ -65,25 +65,25 @@ impl FileTable {
             .map(|entry| entry.file.clone())
             .ok_or(Error::with_message(Errno::ENOENT, "No such file"))?;
 
-        // Get the lowest-numbered available fd equal to or greater than `new_fd`.
-        let get_min_free_fd = || -> usize {
-            let new_fd = new_fd as usize;
-            if self.table.get(new_fd).is_none() {
-                return new_fd;
-            }
-
-            for idx in new_fd + 1..self.table.slots_len() {
-                if self.table.get(idx).is_none() {
-                    return idx;
-                }
-            }
-            self.table.slots_len()
-        };
-
-        let min_free_fd = get_min_free_fd();
+        let min_free_fd = self.get_min_free_fd(new_fd);
         let entry = FileTableEntry::new(file, flags);
         self.table.put_at(min_free_fd, entry);
         Ok(min_free_fd as FileDesc)
+    }
+
+    // Get the lowest-numbered available fd equal to or greater than `new_fd`.
+    pub fn get_min_free_fd(&self, new_fd: FileDesc) -> usize {
+        let new_fd = new_fd as usize;
+        if self.table.get(new_fd).is_none() {
+            return new_fd;
+        }
+
+        for idx in new_fd + 1..self.table.slots_len() {
+            if self.table.get(idx).is_none() {
+                return idx;
+            }
+        }
+        self.table.slots_len()
     }
 
     pub fn insert(&mut self, item: Arc<dyn FileLike>, flags: FdFlags) -> FileDesc {
@@ -97,7 +97,7 @@ impl FileTable {
         item: Arc<dyn FileLike>,
         flags: FdFlags,
     ) -> Option<Arc<dyn FileLike>> {
-        let entry = FileTableEntry::new(item, FdFlags::empty());
+        let entry = FileTableEntry::new(item, flags);
         let entry = self.table.put_at(fd as usize, entry);
         if entry.is_some() {
             let events = FdEvents::Close(fd);

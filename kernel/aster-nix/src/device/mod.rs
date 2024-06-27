@@ -48,6 +48,10 @@ pub fn init() -> Result<()> {
     Ok(())
 }
 
+// TODO: Implement a more scalable solution for ID-to-device mapping.
+// Instead of hardcoding every device numbers in this function,
+// a registration mechanism should be used to allow each driver to
+// allocate device IDs either statically or dynamically.
 pub fn get_device(dev: usize) -> Result<Arc<dyn Device>> {
     if dev == 0 {
         return_errno_with_message!(Errno::EPERM, "whiteout device")

@@ -4,7 +4,7 @@ use super::SyscallReturn;
 use crate::{
     fs::{
         file_table::FileDesc,
-        fs_resolver::{FsPath, AT_FDCWD},
+        fs_resolver::{FsPath, LookupFlags, AT_FDCWD},
         utils::{InodeMode, InodeType},
     },
     prelude::*,
@@ -34,11 +34,11 @@ pub fn sys_symlinkat(
         if linkpath.is_empty() {
             return_errno_with_message!(Errno::ENOENT, "linkpath is empty");
         }
-        if linkpath.ends_with('/') {
-            return_errno_with_message!(Errno::EISDIR, "linkpath is dir");
-        }
         let fs_path = FsPath::new(dirfd, linkpath.as_ref())?;
-        current.fs().read().lookup_dir_and_base_name(&fs_path)?
+        current
+            .fs()
+            .read()
+            .path_create(&fs_path, LookupFlags::empty())?
     };
 
     let new_dentry = dir_dentry.new_fs_child(

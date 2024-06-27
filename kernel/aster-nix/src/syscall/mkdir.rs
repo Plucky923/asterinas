@@ -4,7 +4,7 @@ use super::SyscallReturn;
 use crate::{
     fs::{
         file_table::FileDesc,
-        fs_resolver::{FsPath, AT_FDCWD},
+        fs_resolver::{FsPath, LookupFlags, AT_FDCWD},
         utils::{InodeMode, InodeType},
     },
     prelude::*,
@@ -23,7 +23,10 @@ pub fn sys_mkdirat(dirfd: FileDesc, path_addr: Vaddr, mode: u16) -> Result<Sysca
             return_errno_with_message!(Errno::ENOENT, "path is empty");
         }
         let fs_path = FsPath::new(dirfd, path.as_ref())?;
-        current.fs().read().lookup_dir_and_base_name(&fs_path)?
+        current
+            .fs()
+            .read()
+            .path_create(&fs_path, LookupFlags::LOOKUP_DIRECTORY)?
     };
 
     let inode_mode = {

@@ -318,6 +318,29 @@ impl FsResolver {
 
         Ok((dir_dentry, base_name))
     }
+
+    /// The method used to create a new file using pathname.
+    ///
+    /// For example, mkdir, mknod, link, and symlink all need to create
+    /// new file and all need to perform unique processing on the last
+    /// component of the path name. path_create is used to provide a unified
+    /// method for pathname lookup and error handling.
+    pub fn path_create(
+        &self,
+        path: &FsPath,
+        lookup_flags: LookupFlags,
+    ) -> Result<(Arc<Dentry>, String)> {
+        let (dir_dentry, filename) = self.lookup_dir_and_base_name_inner(path, false)?;
+        if dir_dentry.lookup(filename.trim_end_matches('/')).is_ok() {
+            return_errno_with_message!(Errno::EEXIST, "file exists");
+        }
+
+        if !lookup_flags.contains(LookupFlags::LOOKUP_DIRECTORY) && filename.ends_with('/') {
+            return_errno_with_message!(Errno::ENOENT, "No such file or directory");
+        }
+
+        Ok((dir_dentry, filename))
+    }
 }
 
 pub const AT_FDCWD: FileDesc = -100;
@@ -410,4 +433,16 @@ pub fn split_path(path: &str) -> (&str, &str) {
     };
 
     (dir_path, file_name)
+}
+
+bitflags! {
+    pub struct LookupFlags: u32 {
+        // pathwalk mode
+        const LOOKUP_FOLLOW		= 0x0001;	// Follow links at the end.
+        const LOOKUP_DIRECTORY	= 0x0002;	// Require a directory.
+        const LOOKUP_AUTOMOUNT	= 0x0004;   // Force terminal automount.
+        const LOOKUP_EMPTY		= 0x4000;	// Accept empty path [user_... only].
+        const LOOKUP_DOWN		= 0x8000;	// Follow mounts in the starting point.
+        const LOOKUP_MOUNTPOINT	= 0x0080;	// Follow mounts in the end.
+    }
 }

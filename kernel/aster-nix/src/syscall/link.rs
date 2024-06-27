@@ -4,7 +4,7 @@ use super::SyscallReturn;
 use crate::{
     fs::{
         file_table::FileDesc,
-        fs_resolver::{FsPath, AT_FDCWD},
+        fs_resolver::{FsPath, LookupFlags, AT_FDCWD},
     },
     prelude::*,
     syscall::constants::MAX_FILENAME_LEN,
@@ -37,8 +37,8 @@ pub fn sys_linkat(
             return_errno_with_message!(Errno::ENOENT, "oldpath is empty");
         }
         let new_path = new_path.to_string_lossy();
-        if new_path.ends_with('/') || new_path.is_empty() {
-            return_errno_with_message!(Errno::ENOENT, "newpath is dir or is empty");
+        if new_path.is_empty() {
+            return_errno_with_message!(Errno::ENOENT, "newpath is empty");
         }
 
         let old_fs_path = FsPath::new(old_dirfd, old_path.as_ref())?;
@@ -49,7 +49,7 @@ pub fn sys_linkat(
         } else {
             fs.lookup_no_follow(&old_fs_path)?
         };
-        let (new_dir_dentry, new_name) = fs.lookup_dir_and_base_name(&new_fs_path)?;
+        let (new_dir_dentry, new_name) = fs.path_create(&new_fs_path, LookupFlags::empty())?;
         (old_dentry, new_dir_dentry, new_name)
     };
 

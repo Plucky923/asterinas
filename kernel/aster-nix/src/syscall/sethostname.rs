@@ -8,12 +8,10 @@ use crate::{
 };
 
 pub fn sys_sethostname(name: Vaddr, len: i32) -> Result<SyscallReturn> {
-    println!("sys_sethostname: name: {:?}, len: {:?}", name, len);
     if len < 0 || len as usize >= UTS_FIELD_LEN {
         return_errno_with_message!(Errno::EINVAL, "Invalid len");
     }
     let new_host_name = read_cstring_from_user(name, MAX_FILENAME_LEN)?;
-    println!("new_host_name: {:?}", new_host_name);
     current!()
         .namespaces()
         .lock()

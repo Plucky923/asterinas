@@ -9,7 +9,7 @@ use smoltcp::{
 };
 
 use super::{common::IfaceCommon, internal::IfaceInternal, Iface};
-use crate::prelude::*;
+use crate::{prelude::*, process::namespaces::net_namespace::NetNamespace};
 
 pub struct IfaceVirtio {
     driver: Arc<SpinLock<dyn AnyNetworkDevice>>,
@@ -19,7 +19,7 @@ pub struct IfaceVirtio {
 }
 
 impl IfaceVirtio {
-    pub fn new() -> Arc<Self> {
+    pub fn new(net_ns: &Arc<Mutex<NetNamespace>>) -> Arc<Self> {
         let virtio_net = aster_network::get_device(DEVICE_NAME).unwrap();
         let interface = {
             let mac_addr = virtio_net.lock().mac_addr();
@@ -38,7 +38,7 @@ impl IfaceVirtio {
             });
             interface
         };
-        let common = IfaceCommon::new(interface);
+        let common = IfaceCommon::new(interface, net_ns);
         let mut socket_set = common.sockets();
         let dhcp_handle = init_dhcp_client(&mut socket_set);
         drop(socket_set);

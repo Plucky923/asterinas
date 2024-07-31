@@ -9,37 +9,42 @@ use crate::{
 };
 
 pub fn get_iface_to_bind(ip_addr: &IpAddress) -> Option<Arc<dyn Iface>> {
-    let ifaces = IFACES.get().unwrap();
+    let current = current!();
+    let namespaces = current.namespaces().lock();
+    let net_ns = namespaces.net_ns().lock();
+    let mut ifaces = net_ns.ifaces();
     let IpAddress::Ipv4(ipv4_addr) = ip_addr;
     ifaces
-        .iter()
         .find(|iface| {
-            if let Some(iface_ipv4_addr) = iface.ipv4_addr() {
+            if let Some(iface_ipv4_addr) = iface.upgrade().unwrap().ipv4_addr() {
                 iface_ipv4_addr == *ipv4_addr
             } else {
                 false
             }
         })
-        .map(Clone::clone)
+        .map(|iface| iface.upgrade().unwrap())
 }
 
 /// Get a suitable iface to deal with sendto/connect request if the socket is not bound to an iface.
 /// If the remote address is the same as that of some iface, we will use the iface.
 /// Otherwise, we will use a default interface.
 fn get_ephemeral_iface(remote_ip_addr: &IpAddress) -> Arc<dyn Iface> {
-    let ifaces = IFACES.get().unwrap();
+    let current = current!();
+    let namespaces = current.namespaces().lock();
+    let net_ns = namespaces.net_ns().lock();
+    let mut ifaces = net_ns.ifaces();
     let IpAddress::Ipv4(remote_ipv4_addr) = remote_ip_addr;
-    if let Some(iface) = ifaces.iter().find(|iface| {
-        if let Some(iface_ipv4_addr) = iface.ipv4_addr() {
+    if let Some(iface) = ifaces.find(|iface| {
+        if let Some(iface_ipv4_addr) = iface.upgrade().unwrap().ipv4_addr() {
             iface_ipv4_addr == *remote_ipv4_addr
         } else {
             false
         }
     }) {
-        return iface.clone();
+        return iface.upgrade().unwrap();
     }
     // FIXME: use the virtio-net as the default interface
-    ifaces[0].clone()
+    IFACES.lock().get(0).unwrap().clone()
 }
 
 pub(super) fn bind_socket(

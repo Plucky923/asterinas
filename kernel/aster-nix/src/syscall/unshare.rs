@@ -9,6 +9,7 @@ use crate::{
 pub fn sys_unshare(unshare_flags: u64) -> Result<SyscallReturn> {
     let unshare_flags = CloneFlags::from(unshare_flags);
     debug!("flags = {:?}", unshare_flags);
+    println!("flags = {:?}", unshare_flags);
     unshare(unshare_flags)?;
     Ok(SyscallReturn::Return(0))
 }

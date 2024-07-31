@@ -13,6 +13,7 @@ use ostd::{
 
 use super::{
     credentials,
+    namespaces::net_namespace::NetNamespace,
     posix_thread::{PosixThread, PosixThreadBuilder, PosixThreadExt, ThreadName},
     process_table,
     process_vm::ProcessVm,
@@ -122,7 +123,9 @@ impl CloneFlags {
             | CloneFlags::CLONE_PARENT_SETTID
             | CloneFlags::CLONE_CHILD_SETTID
             | CloneFlags::CLONE_CHILD_CLEARTID
-            | CloneFlags::CLONE_NEWNS;
+            | CloneFlags::CLONE_NEWNS
+            | CloneFlags::CLONE_NEWUTS
+            | CloneFlags::CLONE_NEWNET;
         let unsupported_flags = *self - supported_flags;
         if !unsupported_flags.is_empty() {
             panic!("contains unsupported clone flags: {:?}", unsupported_flags);
@@ -438,7 +441,20 @@ fn clone_namespaces(
         parent_namespaces.mnt_ns().clone()
     };
 
-    Arc::new(Mutex::new(Namespaces::new(new_mnt_ns)))
+    let new_uts_ns = if clone_flags.contains(CloneFlags::CLONE_NEWUTS) {
+        parent_namespaces.uts_ns().copy_uts_ns()
+    } else {
+        parent_namespaces.uts_ns().clone()
+    };
+
+    let mut new_net_ns = parent_namespaces.net_ns().clone();
+    if clone_flags.contains(CloneFlags::CLONE_NEWNET) {
+        (new_net_ns, _) = NetNamespace::new_with_loopback();
+    }
+
+    Arc::new(Mutex::new(Namespaces::new(
+        new_mnt_ns, new_uts_ns, new_net_ns,
+    )))
 }
 
 fn clone_sighand(

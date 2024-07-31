@@ -17,7 +17,7 @@ use super::{
     util::BindPortConfig,
     AnyBoundSocket, Iface, Ipv4Address,
 };
-use crate::prelude::*;
+use crate::{prelude::*, process::namespaces::net_namespace::NetNamespace};
 
 pub struct IfaceCommon {
     interface: SpinLock<smoltcp::iface::Interface>,
@@ -29,10 +29,14 @@ pub struct IfaceCommon {
     closing_sockets: SpinLock<BTreeSet<KeyableArc<AnyBoundSocketInner>>>,
     /// The wait queue that background polling thread will sleep on
     polling_wait_queue: WaitQueue,
+    net_ns: Arc<Mutex<NetNamespace>>,
 }
 
 impl IfaceCommon {
-    pub(super) fn new(interface: smoltcp::iface::Interface) -> Self {
+    pub(super) fn new(
+        interface: smoltcp::iface::Interface,
+        net_ns: &Arc<Mutex<NetNamespace>>,
+    ) -> Self {
         let socket_set = SocketSet::new(Vec::new());
         let used_ports = BTreeMap::new();
         Self {
@@ -43,6 +47,7 @@ impl IfaceCommon {
             bound_sockets: RwLock::new(BTreeSet::new()),
             closing_sockets: SpinLock::new(BTreeSet::new()),
             polling_wait_queue: WaitQueue::new(),
+            net_ns: net_ns.clone(),
         }
     }
 

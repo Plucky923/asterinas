@@ -11,6 +11,7 @@
 #![feature(generic_const_exprs)]
 #![feature(iter_from_coroutine)]
 #![feature(let_chains)]
+#![feature(min_specialization)]
 #![feature(negative_impls)]
 #![feature(new_uninit)]
 #![feature(panic_info_message)]
@@ -46,7 +47,9 @@ pub mod user;
 pub use ostd_macros::main;
 pub use ostd_pod::Pod;
 
-pub use self::{cpu::cpu_local::CpuLocal, error::Error, prelude::Result};
+pub use self::{error::Error, prelude::Result};
+// [`CpuLocalCell`] is easy to be mis-used, so we don't expose it to the users.
+pub(crate) use crate::cpu::local::cpu_local_cell;
 
 /// Initializes OSTD.
 ///
@@ -57,10 +60,14 @@ pub use self::{cpu::cpu_local::CpuLocal, error::Error, prelude::Result};
 /// make inter-initialization-dependencies more clear and reduce usages of
 /// boot stage only global variables.
 pub fn init() {
-    arch::before_all_init();
+    arch::enable_cpu_features();
+    arch::serial::init();
+
+    #[cfg(feature = "cvm_guest")]
+    arch::check_tdx_init();
 
     // SAFETY: This function is called only once and only on the BSP.
-    unsafe { cpu::cpu_local::early_init_bsp_local_base() };
+    unsafe { cpu::local::early_init_bsp_local_base() };
 
     mm::heap_allocator::init();
 
@@ -70,16 +77,16 @@ pub fn init() {
     mm::page::allocator::init();
     mm::kspace::init_boot_page_table();
     mm::kspace::init_kernel_page_table(mm::init_page_meta());
-    // SAFETY: no CPU local objects have been accessed by this far. And
-    // we are on the BSP.
-    unsafe { cpu::cpu_local::init_on_bsp() };
     mm::misc_init();
 
     trap::init();
-    arch::after_all_init();
+    arch::init_on_bsp();
+
     bus::init();
 
     mm::kspace::activate_kernel_page_table();
+
+    arch::irq::enable_local();
 
     invoke_ffi_init_funcs();
 }

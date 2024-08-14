@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::SyscallReturn;
-use crate::{
-    prelude::*,
-    process::{credentials_mut, Gid},
-    util::read_val_from_user,
-};
+use crate::{prelude::*, process::Gid};
 
-pub fn sys_setgroups(size: usize, group_list_addr: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_setgroups(size: usize, group_list_addr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
     debug!("size = {}, group_list_addr = 0x{:x}", size, group_list_addr);
 
     // TODO: check perm: the calling process should have the CAP_SETGID capability
@@ -19,11 +15,11 @@ pub fn sys_setgroups(size: usize, group_list_addr: Vaddr) -> Result<SyscallRetur
     let mut new_groups = BTreeSet::new();
     for idx in 0..size {
         let addr = group_list_addr + idx * core::mem::size_of::<Gid>();
-        let gid = read_val_from_user(addr)?;
+        let gid = ctx.get_user_space().read_val(addr)?;
         new_groups.insert(gid);
     }
 
-    let credentials = credentials_mut();
+    let credentials = ctx.posix_thread.credentials_mut();
     *credentials.groups_mut() = new_groups;
 
     Ok(SyscallReturn::Return(0))

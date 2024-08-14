@@ -36,14 +36,21 @@ impl<M: PageMeta> Drop for ContPages<M> {
 impl<M: PageMeta> ContPages<M> {
     /// Create a new `ContPages` from unused pages.
     ///
+    /// The caller must provide a closure to initialize metadata for all the pages.
+    /// The closure receives the physical address of the page and returns the
+    /// metadata, which is similar to [`core::array::from_fn`].
+    ///
     /// # Panics
     ///
     /// The function panics if:
     ///  - the physical address is invalid or not aligned;
     ///  - any of the pages are already in use.
-    pub fn from_unused(range: Range<Paddr>) -> Self {
+    pub fn from_unused<F>(range: Range<Paddr>, mut metadata_fn: F) -> Self
+    where
+        F: FnMut(Paddr) -> M,
+    {
         for i in range.clone().step_by(PAGE_SIZE) {
-            let _ = ManuallyDrop::new(Page::<M>::from_unused(i));
+            let _ = ManuallyDrop::new(Page::<M>::from_unused(i, metadata_fn(i)));
         }
         Self {
             range,
@@ -54,6 +61,11 @@ impl<M: PageMeta> ContPages<M> {
     /// Get the start physical address of the contiguous pages.
     pub fn start_paddr(&self) -> Paddr {
         self.range.start
+    }
+
+    /// Get the end physical address of the contiguous pages.
+    pub fn end_paddr(&self) -> Paddr {
+        self.range.end
     }
 
     /// Get the length in bytes of the contiguous pages.

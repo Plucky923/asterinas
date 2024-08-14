@@ -6,7 +6,6 @@ use super::SyscallReturn;
 use crate::{
     prelude::*,
     process::{clone_child, signal::constants::SIGCHLD, CloneArgs, CloneFlags},
-    util::read_val_from_user,
 };
 
 // The order of arguments for clone differs in different architecture.
@@ -17,18 +16,20 @@ pub fn sys_clone(
     parent_tidptr: Vaddr,
     child_tidptr: Vaddr,
     tls: u64,
+    ctx: &Context,
     parent_context: &UserContext,
 ) -> Result<SyscallReturn> {
     let clone_flags = CloneFlags::from(clone_flags);
     debug!("flags = {:?}, child_stack_ptr = 0x{:x}, parent_tid_ptr = 0x{:x}, child tid ptr = 0x{:x}, tls = 0x{:x}", clone_flags, new_sp, parent_tidptr, child_tidptr, tls);
     let clone_args = CloneArgs::new(new_sp, 0, parent_tidptr, child_tidptr, tls, clone_flags);
-    let child_pid = clone_child(parent_context, clone_args).unwrap();
+    let child_pid = clone_child(ctx, parent_context, clone_args).unwrap();
     Ok(SyscallReturn::Return(child_pid as _))
 }
 
 pub fn sys_clone3(
     clong_args_addr: Vaddr,
     size: usize,
+    ctx: &Context,
     parent_context: &UserContext,
 ) -> Result<SyscallReturn> {
     trace!(
@@ -41,13 +42,13 @@ pub fn sys_clone3(
     }
 
     let clone_args = {
-        let args: Clone3Args = read_val_from_user(clong_args_addr)?;
+        let args: Clone3Args = ctx.get_user_space().read_val(clong_args_addr)?;
         trace!("clone3 args = {:x?}", args);
         CloneArgs::from(args)
     };
     debug!("clone args = {:x?}", clone_args);
 
-    let child_pid = clone_child(parent_context, clone_args)?;
+    let child_pid = clone_child(ctx, parent_context, clone_args)?;
     trace!("child pid = {}", child_pid);
     Ok(SyscallReturn::Return(child_pid as _))
 }

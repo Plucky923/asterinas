@@ -15,6 +15,7 @@ TESTS ?= \
 	dup_test \
 	epoll_test \
 	eventfd_test \
+	fcntl_test \
 	fsync_test \
 	getdents_test \
 	link_test \
@@ -27,6 +28,7 @@ TESTS ?= \
 	open_test \
 	pread64_test \
 	preadv2_test \
+	pselect_test \
 	pwrite64_test \
 	pwritev2_test \
 	pty_test \
@@ -47,6 +49,7 @@ TESTS ?= \
 	unshare_test \
 	vdso_clock_gettime_test \
 	write_test \
+	fallocate_test \
 	# The end of the list
 
 MKFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))

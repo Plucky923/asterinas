@@ -4,24 +4,15 @@ use crate::{fs::path::Dentry, net::socket::util::socket_addr::SocketAddr, prelud
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnixSocketAddr {
-    Path(String),
-    Abstract(String),
+    Unnamed,
+    Path(Arc<str>),
+    Abstract(Arc<[u8]>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) enum UnixSocketAddrBound {
-    Path(Arc<Dentry>),
-    Abstract(String),
-}
-
-impl PartialEq for UnixSocketAddrBound {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Abstract(l0), Self::Abstract(r0)) => l0 == r0,
-            (Self::Path(l0), Self::Path(r0)) => Arc::ptr_eq(l0.inode(), r0.inode()),
-            _ => false,
-        }
-    }
+    Path(Arc<str>, Arc<Dentry>),
+    Abstract(Arc<[u8]>),
 }
 
 impl TryFrom<SocketAddr> for UnixSocketAddr {
@@ -38,18 +29,23 @@ impl TryFrom<SocketAddr> for UnixSocketAddr {
 impl From<UnixSocketAddrBound> for UnixSocketAddr {
     fn from(value: UnixSocketAddrBound) -> Self {
         match value {
-            UnixSocketAddrBound::Path(dentry) => {
-                let abs_path = dentry.abs_path();
-                Self::Path(abs_path)
-            }
+            UnixSocketAddrBound::Path(path, _) => Self::Path(path),
             UnixSocketAddrBound::Abstract(name) => Self::Abstract(name),
         }
     }
 }
 
-impl From<UnixSocketAddrBound> for SocketAddr {
-    fn from(value: UnixSocketAddrBound) -> Self {
-        let unix_socket_addr = UnixSocketAddr::from(value);
-        SocketAddr::Unix(unix_socket_addr)
+impl From<Option<UnixSocketAddrBound>> for UnixSocketAddr {
+    fn from(value: Option<UnixSocketAddrBound>) -> Self {
+        match value {
+            Some(addr) => addr.into(),
+            None => Self::Unnamed,
+        }
+    }
+}
+
+impl<T: Into<UnixSocketAddr>> From<T> for SocketAddr {
+    fn from(value: T) -> Self {
+        SocketAddr::Unix(value.into())
     }
 }

@@ -15,7 +15,7 @@ use super::{
     any_socket::{AnyBoundSocketInner, AnyRawSocket, AnyUnboundSocket, SocketFamily},
     time::get_network_timestamp,
     util::BindPortConfig,
-    AnyBoundSocket, Iface, Ipv4Address,
+    AnyBoundSocket, Iface,
 };
 use crate::{prelude::*, process::namespaces::net_namespace::NetNamespace};
 

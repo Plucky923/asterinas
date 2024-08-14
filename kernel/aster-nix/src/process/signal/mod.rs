@@ -31,7 +31,6 @@ use crate::{
     prelude::*,
     process::{do_exit_group, TermStatus},
     thread::{status::ThreadStatus, Thread},
-    util::{write_bytes_to_user, write_val_to_user},
 };
 
 pub trait SignalContext {
@@ -49,7 +48,7 @@ pub fn handle_pending_signal(
     // We first deal with signal in current thread, then signal in current process.
     let posix_thread = current_thread.as_posix_thread().unwrap();
     let signal = {
-        let sig_mask = *posix_thread.sig_mask().lock();
+        let sig_mask = posix_thread.sig_mask().load(Ordering::Relaxed);
         if let Some(signal) = posix_thread.dequeue_signal(&sig_mask) {
             signal
         } else {
@@ -60,7 +59,8 @@ pub fn handle_pending_signal(
     let sig_num = signal.num();
     trace!("sig_num = {:?}, sig_name = {}", sig_num, sig_num.sig_name());
     let current = posix_thread.process();
-    let sig_action = current.sig_dispositions().lock().get(sig_num);
+    let mut sig_dispositions = current.sig_dispositions().lock();
+    let sig_action = sig_dispositions.get(sig_num);
     trace!("sig action: {:x?}", sig_action);
     match sig_action {
         SigAction::Ign => {
@@ -71,16 +71,30 @@ pub fn handle_pending_signal(
             flags,
             restorer_addr,
             mask,
-        } => handle_user_signal(
-            sig_num,
-            handler_addr,
-            flags,
-            restorer_addr,
-            mask,
-            context,
-            signal.to_info(),
-        )?,
+        } => {
+            if flags.contains(SigActionFlags::SA_RESETHAND) {
+                // In Linux, SA_RESETHAND corresponds to SA_ONESHOT,
+                // which means the user handler will be executed only once and then reset to the default.
+                // Refer to https://elixir.bootlin.com/linux/v6.0.9/source/kernel/signal.c#L2761.
+                sig_dispositions.set_default(sig_num);
+            }
+
+            drop(sig_dispositions);
+
+            handle_user_signal(
+                posix_thread,
+                sig_num,
+                handler_addr,
+                flags,
+                restorer_addr,
+                mask,
+                context,
+                signal.to_info(),
+            )?
+        }
         SigAction::Dfl => {
+            drop(sig_dispositions);
+
             let sig_default_action = SigDefaultAction::from_signum(sig_num);
             trace!("sig_default_action: {:?}", sig_default_action);
             match sig_default_action {
@@ -116,7 +130,9 @@ pub fn handle_pending_signal(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_user_signal(
+    posix_thread: &PosixThread,
     sig_num: SigNum,
     handler_addr: Vaddr,
     flags: SigActionFlags,
@@ -131,18 +147,19 @@ pub fn handle_user_signal(
     debug!("restorer_addr = 0x{:x}", restorer_addr);
     // FIXME: How to respect flags?
     if flags.contains_unsupported_flag() {
-        println!("flags = {:?}", flags);
-        panic!("Unsupported Signal flags");
+        warn!("Unsupported Signal flags: {:?}", flags);
     }
+
     if !flags.contains(SigActionFlags::SA_NODEFER) {
         // add current signal to mask
-        let current_mask = SigMask::from(sig_num);
-        mask.block(current_mask.as_u64());
+        mask += sig_num;
     }
-    let current_thread = current_thread!();
-    let posix_thread = current_thread.as_posix_thread().unwrap();
+
     // block signals in sigmask when running signal handler
-    posix_thread.sig_mask().lock().block(mask.as_u64());
+    let old_mask = posix_thread.sig_mask().load(Ordering::Relaxed);
+    posix_thread
+        .sig_mask()
+        .store(old_mask + mask, Ordering::Relaxed);
 
     // Set up signal stack.
     let mut stack_pointer = if let Some(sp) = use_alternate_signal_stack(posix_thread) {
@@ -155,15 +172,16 @@ pub fn handle_user_signal(
     // To avoid corrupting signal stack, we minus 128 first.
     stack_pointer -= 128;
 
+    let user_space = CurrentUserSpace::get();
     // 1. write siginfo_t
     stack_pointer -= mem::size_of::<siginfo_t>() as u64;
-    write_val_to_user(stack_pointer as _, &sig_info)?;
+    user_space.write_val(stack_pointer as _, &sig_info)?;
     let siginfo_addr = stack_pointer;
 
     // 2. write ucontext_t.
     stack_pointer = alloc_aligned_in_user_stack(stack_pointer, mem::size_of::<ucontext_t>(), 16)?;
     let mut ucontext = ucontext_t {
-        uc_sigmask: mask.as_u64(),
+        uc_sigmask: mask.into(),
         ..Default::default()
     };
     ucontext
@@ -178,7 +196,7 @@ pub fn handle_user_signal(
         ucontext.uc_link = 0;
     }
     // TODO: store fp regs in ucontext
-    write_val_to_user(stack_pointer as _, &ucontext)?;
+    user_space.write_val(stack_pointer as _, &ucontext)?;
     let ucontext_addr = stack_pointer;
     // Store the ucontext addr in sig context of current thread.
     *sig_context = Some(ucontext_addr as Vaddr);
@@ -199,7 +217,7 @@ pub fn handle_user_signal(
         ];
         stack_pointer -= TRAMPOLINE.len() as u64;
         let trampoline_rip = stack_pointer;
-        write_bytes_to_user(stack_pointer as Vaddr, &mut VmReader::from(TRAMPOLINE))?;
+        user_space.write_bytes(stack_pointer as Vaddr, &mut VmReader::from(TRAMPOLINE))?;
         stack_pointer = write_u64_to_user_stack(stack_pointer, trampoline_rip)?;
     }
 
@@ -243,7 +261,7 @@ fn use_alternate_signal_stack(posix_thread: &PosixThread) -> Option<usize> {
 
 fn write_u64_to_user_stack(rsp: u64, value: u64) -> Result<u64> {
     let rsp = rsp - 8;
-    write_val_to_user(rsp as Vaddr, &value)?;
+    CurrentUserSpace::get().write_val(rsp as Vaddr, &value)?;
     Ok(rsp)
 }
 

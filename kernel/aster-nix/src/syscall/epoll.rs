@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::time::Duration;
+use core::{sync::atomic::Ordering, time::Duration};
 
 use super::SyscallReturn;
 use crate::{
@@ -11,18 +11,17 @@ use crate::{
         utils::CreationFlags,
     },
     prelude::*,
-    process::posix_thread::PosixThreadExt,
-    util::{read_val_from_user, write_val_to_user},
+    process::signal::sig_mask::SigMask,
 };
 
-pub fn sys_epoll_create(size: i32) -> Result<SyscallReturn> {
+pub fn sys_epoll_create(size: i32, ctx: &Context) -> Result<SyscallReturn> {
     if size <= 0 {
         return_errno_with_message!(Errno::EINVAL, "size is not positive");
     }
-    sys_epoll_create1(0)
+    sys_epoll_create1(0, ctx)
 }
 
-pub fn sys_epoll_create1(flags: u32) -> Result<SyscallReturn> {
+pub fn sys_epoll_create1(flags: u32, ctx: &Context) -> Result<SyscallReturn> {
     debug!("flags = 0x{:x}", flags);
 
     let fd_flags = {
@@ -38,9 +37,8 @@ pub fn sys_epoll_create1(flags: u32) -> Result<SyscallReturn> {
         }
     };
 
-    let current = current!();
     let epoll_file: Arc<EpollFile> = EpollFile::new();
-    let mut file_table = current.file_table().lock();
+    let mut file_table = ctx.process.file_table().lock();
     let fd = file_table.insert(epoll_file, fd_flags);
     Ok(SyscallReturn::Return(fd as _))
 }
@@ -50,6 +48,7 @@ pub fn sys_epoll_ctl(
     op: i32,
     fd: FileDesc,
     event_addr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     debug!(
         "epfd = {}, op = {}, fd = {}, event_addr = 0x{:x}",
@@ -62,14 +61,14 @@ pub fn sys_epoll_ctl(
 
     let cmd = match op {
         EPOLL_CTL_ADD => {
-            let c_epoll_event = read_val_from_user::<c_epoll_event>(event_addr)?;
+            let c_epoll_event = ctx.get_user_space().read_val::<c_epoll_event>(event_addr)?;
             let event = EpollEvent::from(&c_epoll_event);
             let flags = EpollFlags::from_bits_truncate(c_epoll_event.events);
             EpollCtl::Add(fd, event, flags)
         }
         EPOLL_CTL_DEL => EpollCtl::Del(fd),
         EPOLL_CTL_MOD => {
-            let c_epoll_event = read_val_from_user::<c_epoll_event>(event_addr)?;
+            let c_epoll_event = ctx.get_user_space().read_val::<c_epoll_event>(event_addr)?;
             let event = EpollEvent::from(&c_epoll_event);
             let flags = EpollFlags::from_bits_truncate(c_epoll_event.events);
             EpollCtl::Mod(fd, event, flags)
@@ -77,9 +76,8 @@ pub fn sys_epoll_ctl(
         _ => return_errno_with_message!(Errno::EINVAL, "invalid op"),
     };
 
-    let current = current!();
     let file = {
-        let file_table = current.file_table().lock();
+        let file_table = ctx.process.file_table().lock();
         file_table.get_file(epfd)?.clone()
     };
     let epoll_file = file
@@ -90,7 +88,12 @@ pub fn sys_epoll_ctl(
     Ok(SyscallReturn::Return(0 as _))
 }
 
-fn do_epoll_wait(epfd: FileDesc, max_events: i32, timeout: i32) -> Result<Vec<EpollEvent>> {
+fn do_epoll_wait(
+    epfd: FileDesc,
+    max_events: i32,
+    timeout: i32,
+    ctx: &Context,
+) -> Result<Vec<EpollEvent>> {
     let max_events = {
         if max_events <= 0 {
             return_errno_with_message!(Errno::EINVAL, "max_events is not positive");
@@ -103,8 +106,7 @@ fn do_epoll_wait(epfd: FileDesc, max_events: i32, timeout: i32) -> Result<Vec<Ep
         None
     };
 
-    let current = current!();
-    let file_table = current.file_table().lock();
+    let file_table = ctx.process.file_table().lock();
     let epoll_file = file_table
         .get_file(epfd)?
         .downcast_ref::<EpollFile>()
@@ -129,51 +131,49 @@ pub fn sys_epoll_wait(
     events_addr: Vaddr,
     max_events: i32,
     timeout: i32,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     debug!(
         "epfd = {}, events_addr = 0x{:x}, max_events = {}, timeout = {:?}",
         epfd, events_addr, max_events, timeout
     );
 
-    let epoll_events = do_epoll_wait(epfd, max_events, timeout)?;
+    let epoll_events = do_epoll_wait(epfd, max_events, timeout, ctx)?;
 
     // Write back
     let mut write_addr = events_addr;
+    let user_space = ctx.get_user_space();
     for epoll_event in epoll_events.iter() {
         let c_epoll_event = c_epoll_event::from(epoll_event);
-        write_val_to_user(write_addr, &c_epoll_event)?;
+        user_space.write_val(write_addr, &c_epoll_event)?;
         write_addr += core::mem::size_of::<c_epoll_event>();
     }
 
     Ok(SyscallReturn::Return(epoll_events.len() as _))
 }
 
-fn set_signal_mask(set_ptr: Vaddr) -> Result<u64> {
-    let new_set: Option<u64> = if set_ptr != 0 {
-        Some(read_val_from_user::<u64>(set_ptr)?)
+fn set_signal_mask(set_ptr: Vaddr, ctx: &Context) -> Result<SigMask> {
+    let new_mask: Option<SigMask> = if set_ptr != 0 {
+        Some(ctx.get_user_space().read_val::<u64>(set_ptr)?.into())
     } else {
         None
     };
 
-    let current_thread = current_thread!();
-    let posix_thread = current_thread.as_posix_thread().unwrap();
-    let mut sig_mask = posix_thread.sig_mask().lock();
+    let old_sig_mask_value = ctx.posix_thread.sig_mask().load(Ordering::Relaxed);
 
-    let old_sig_mask_value = sig_mask.as_u64();
-
-    if let Some(new_set) = new_set {
-        sig_mask.set(new_set);
+    if let Some(new_mask) = new_mask {
+        ctx.posix_thread
+            .sig_mask()
+            .store(new_mask, Ordering::Relaxed);
     }
 
     Ok(old_sig_mask_value)
 }
 
-fn restore_signal_mask(sig_mask_val: u64) {
-    let current_thread = current_thread!();
-    let posix_thread = current_thread.as_posix_thread().unwrap();
-    let mut sig_mask = posix_thread.sig_mask().lock();
-
-    sig_mask.set(sig_mask_val);
+fn restore_signal_mask(sig_mask_val: SigMask, ctx: &Context) {
+    ctx.posix_thread
+        .sig_mask()
+        .store(sig_mask_val, Ordering::Relaxed);
 }
 
 pub fn sys_epoll_pwait(
@@ -183,6 +183,7 @@ pub fn sys_epoll_pwait(
     timeout: i32,
     sigmask: Vaddr,
     sigset_size: usize,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     debug!(
         "epfd = {}, events_addr = 0x{:x}, max_events = {}, timeout = {:?}, sigmask = 0x{:x}, sigset_size = {}",
@@ -193,25 +194,26 @@ pub fn sys_epoll_pwait(
         error!("sigset size is not equal to 8");
     }
 
-    let old_sig_mask_value = set_signal_mask(sigmask)?;
+    let old_sig_mask_value = set_signal_mask(sigmask, ctx)?;
 
-    let ready_events = match do_epoll_wait(epfd, max_events, timeout) {
+    let ready_events = match do_epoll_wait(epfd, max_events, timeout, ctx) {
         Ok(events) => {
-            restore_signal_mask(old_sig_mask_value);
+            restore_signal_mask(old_sig_mask_value, ctx);
             events
         }
         Err(e) => {
             // Restore the signal mask even if an error occurs
-            restore_signal_mask(old_sig_mask_value);
+            restore_signal_mask(old_sig_mask_value, ctx);
             return Err(e);
         }
     };
 
     // Write back
     let mut write_addr = events_addr;
+    let user_space = ctx.get_user_space();
     for event in ready_events.iter() {
         let c_event = c_epoll_event::from(event);
-        write_val_to_user(write_addr, &c_event)?;
+        user_space.write_val(write_addr, &c_event)?;
         write_addr += core::mem::size_of::<c_epoll_event>();
     }
 

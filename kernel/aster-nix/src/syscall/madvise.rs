@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::SyscallReturn;
-use crate::{prelude::*, util::read_bytes_from_user};
+use crate::prelude::*;
 
-pub fn sys_madvise(start: Vaddr, len: usize, behavior: i32) -> Result<SyscallReturn> {
+pub fn sys_madvise(
+    start: Vaddr,
+    len: usize,
+    behavior: i32,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
     let behavior = MadviseBehavior::try_from(behavior)?;
     debug!(
         "start = 0x{:x}, len = 0x{:x}, behavior = {:?}",
@@ -15,22 +20,26 @@ pub fn sys_madvise(start: Vaddr, len: usize, behavior: i32) -> Result<SyscallRet
         | MadviseBehavior::MADV_WILLNEED => {
             // perform a read at first
             let mut buffer = vec![0u8; len];
-            read_bytes_from_user(start, &mut VmWriter::from(buffer.as_mut_slice()))?;
+            ctx.get_user_space()
+                .read_bytes(start, &mut VmWriter::from(buffer.as_mut_slice()))?;
         }
-        MadviseBehavior::MADV_DONTNEED => madv_dontneed(start, len)?,
+        MadviseBehavior::MADV_DONTNEED => {
+            warn!("MADV_DONTNEED isn't implemented, do nothing for now.");
+        }
+        MadviseBehavior::MADV_FREE => madv_free(start, len, ctx)?,
         _ => todo!(),
     }
     Ok(SyscallReturn::Return(0))
 }
 
-fn madv_dontneed(start: Vaddr, len: usize) -> Result<()> {
+fn madv_free(start: Vaddr, len: usize, ctx: &Context) -> Result<()> {
     debug_assert!(start % PAGE_SIZE == 0);
     debug_assert!(len % PAGE_SIZE == 0);
-    let current = current!();
-    let root_vmar = current.root_vmar();
+
+    let root_vmar = ctx.process.root_vmar();
     let advised_range = start..start + len;
-    // `destroy()` interface may require adjustment and replacement afterwards.
     let _ = root_vmar.destroy(advised_range);
+
     Ok(())
 }
 

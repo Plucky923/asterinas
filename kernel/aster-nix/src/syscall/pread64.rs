@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::SyscallReturn;
-use crate::{fs::file_table::FileDesc, prelude::*, util::write_bytes_to_user};
+use crate::{fs::file_table::FileDesc, prelude::*};
 
 pub fn sys_pread64(
     fd: FileDesc,
     user_buf_ptr: Vaddr,
     user_buf_len: usize,
     offset: i64,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     debug!(
         "fd = {}, buf = 0x{:x}, user_buf_len = 0x{:x}, offset = 0x{:x}",
@@ -18,8 +19,7 @@ pub fn sys_pread64(
         return_errno_with_message!(Errno::EINVAL, "offset cannot be negative");
     }
     let file = {
-        let current = current!();
-        let filetable = current.file_table().lock();
+        let filetable = ctx.process.file_table().lock();
         filetable.get_file(fd)?.clone()
     };
     // TODO: Check (f.file->f_mode & FMODE_PREAD); We don't have f_mode in our FileLike trait
@@ -33,7 +33,8 @@ pub fn sys_pread64(
     let read_len = {
         let mut buffer = vec![0u8; user_buf_len];
         let read_len = file.read_at(offset as usize, &mut buffer)?;
-        write_bytes_to_user(user_buf_ptr, &mut VmReader::from(buffer.as_slice()))?;
+        ctx.get_user_space()
+            .write_bytes(user_buf_ptr, &mut VmReader::from(buffer.as_slice()))?;
         read_len
     };
 

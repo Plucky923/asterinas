@@ -4,10 +4,7 @@ use super::SyscallReturn;
 use crate::{
     fs::file_table::FileDesc,
     prelude::*,
-    util::{
-        net::{get_socket_from_fd, new_raw_socket_option, CSocketOptionLevel},
-        read_val_from_user, write_val_to_user,
-    },
+    util::net::{get_socket_from_fd, new_raw_socket_option, CSocketOptionLevel},
 };
 
 pub fn sys_getsockopt(
@@ -16,12 +13,15 @@ pub fn sys_getsockopt(
     optname: i32,
     optval: Vaddr,
     optlen_addr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     let level = CSocketOptionLevel::try_from(level)?;
     if optval == 0 || optlen_addr == 0 {
         return_errno_with_message!(Errno::EINVAL, "optval or optlen_addr is null pointer");
     }
-    let optlen: u32 = read_val_from_user(optlen_addr)?;
+    let user_space = ctx.get_user_space();
+
+    let optlen: u32 = user_space.read_val(optlen_addr)?;
     debug!("level = {level:?}, sockfd = {sockfd}, optname = {optname:?}, optlen = {optlen}");
 
     let socket = get_socket_from_fd(sockfd)?;
@@ -32,13 +32,9 @@ pub fn sys_getsockopt(
 
     socket.get_option(raw_option.as_sock_option_mut())?;
 
-    let write_len = {
-        let current = current!();
-        let vmar = current.root_vmar();
-        raw_option.write_to_user(vmar, optval, optlen)?
-    };
+    let write_len = raw_option.write_to_user(optval, optlen)?;
 
-    write_val_to_user(optlen_addr, &(write_len as u32))?;
+    user_space.write_val(optlen_addr, &(write_len as u32))?;
 
     Ok(SyscallReturn::Return(0))
 }

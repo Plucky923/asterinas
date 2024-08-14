@@ -101,6 +101,16 @@ pub(super) struct Vmar_ {
     parent: Weak<Vmar_>,
 }
 
+impl Drop for Vmar_ {
+    fn drop(&mut self) {
+        let mut cursor = self
+            .vm_space
+            .cursor_mut(&(self.base..self.base + self.size))
+            .unwrap();
+        cursor.unmap(self.size);
+    }
+}
+
 struct VmarInner {
     /// Whether the vmar is destroyed
     is_destroyed: bool,
@@ -123,8 +133,13 @@ impl VmarInner {
     }
 }
 
-const ROOT_VMAR_LOWEST_ADDR: Vaddr = 0x001_0000; // 64 KiB is the Linux configurable default
+pub const ROOT_VMAR_LOWEST_ADDR: Vaddr = 0x001_0000; // 64 KiB is the Linux configurable default
 const ROOT_VMAR_CAP_ADDR: Vaddr = MAX_USERSPACE_VADDR;
+
+/// Returns whether the input `vaddr` is a legal user space virtual address.
+pub fn is_userspace_vaddr(vaddr: Vaddr) -> bool {
+    (ROOT_VMAR_LOWEST_ADDR..ROOT_VMAR_CAP_ADDR).contains(&vaddr)
+}
 
 impl Interval<usize> for Arc<Vmar_> {
     fn range(&self) -> Range<usize> {
@@ -280,39 +295,18 @@ impl Vmar_ {
         if !self.is_root_vmar() {
             return_errno_with_message!(Errno::EACCES, "The vmar is not root vmar");
         }
-        self.vm_space.clear();
+        let mut cursor = self
+            .vm_space
+            .cursor_mut(&(self.base..self.base + self.size))
+            .unwrap();
+        cursor.unmap(self.size);
+        drop(cursor);
         let mut inner = self.inner.lock();
         inner.child_vmar_s.clear();
         inner.vm_mappings.clear();
         inner.free_regions.clear();
         let root_region = FreeRegion::new(ROOT_VMAR_LOWEST_ADDR..ROOT_VMAR_CAP_ADDR);
         inner.free_regions.insert(root_region.start(), root_region);
-        Ok(())
-    }
-
-    pub fn destroy_all(&self) -> Result<()> {
-        let mut inner = self.inner.lock();
-        inner.is_destroyed = true;
-        let mut free_regions = BTreeMap::new();
-        for (child_vmar_base, child_vmar) in &inner.child_vmar_s {
-            child_vmar.destroy_all()?;
-            let free_region = FreeRegion::new(child_vmar.range());
-            free_regions.insert(free_region.start(), free_region);
-        }
-        inner.child_vmar_s.clear();
-        inner.free_regions.append(&mut free_regions);
-
-        for vm_mapping in inner.vm_mappings.values() {
-            vm_mapping.unmap(&vm_mapping.range(), true)?;
-            let free_region = FreeRegion::new(vm_mapping.range());
-            free_regions.insert(free_region.start(), free_region);
-        }
-        inner.vm_mappings.clear();
-        inner.free_regions.append(&mut free_regions);
-
-        drop(inner);
-        self.merge_continuous_regions();
-        self.vm_space.clear();
         Ok(())
     }
 
@@ -324,7 +318,6 @@ impl Vmar_ {
         for child_vmar_ in inner.child_vmar_s.find(&range) {
             let child_vmar_range = child_vmar_.range();
             debug_assert!(is_intersected(&child_vmar_range, &range));
-            child_vmar_.destroy_all()?;
             let free_region = FreeRegion::new(child_vmar_range);
             free_regions.insert(free_region.start(), free_region);
         }
@@ -333,8 +326,8 @@ impl Vmar_ {
             .child_vmar_s
             .retain(|_, child_vmar_| !child_vmar_.is_destroyed());
 
-        let mut mappings_to_remove = BTreeSet::new();
-        let mut mappings_to_append = BTreeMap::new();
+        let mut mappings_to_remove = LinkedList::new();
+        let mut mappings_to_append = LinkedList::new();
 
         for vm_mapping in inner.vm_mappings.find(&range) {
             let vm_mapping_range = vm_mapping.range();
@@ -676,9 +669,9 @@ impl Vmar_ {
 
     fn trim_existing_mappings(&self, trim_range: Range<usize>) -> Result<()> {
         let mut inner = self.inner.lock();
-        let mut mappings_to_remove = BTreeSet::new();
-        let mut mappings_to_append = BTreeMap::new();
-        for vm_mapping in inner.vm_mappings.values() {
+        let mut mappings_to_remove = LinkedList::new();
+        let mut mappings_to_append = LinkedList::new();
+        for vm_mapping in inner.vm_mappings.find(&trim_range) {
             vm_mapping.trim_mapping(
                 &trim_range,
                 &mut mappings_to_remove,

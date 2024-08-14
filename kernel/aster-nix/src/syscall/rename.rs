@@ -9,7 +9,6 @@ use crate::{
     },
     prelude::*,
     syscall::constants::MAX_FILENAME_LEN,
-    util::read_cstring_from_user,
 };
 
 pub fn sys_renameat(
@@ -17,16 +16,17 @@ pub fn sys_renameat(
     old_path_addr: Vaddr,
     new_dirfd: FileDesc,
     new_path_addr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let old_path = read_cstring_from_user(old_path_addr, MAX_FILENAME_LEN)?;
-    let new_path = read_cstring_from_user(new_path_addr, MAX_FILENAME_LEN)?;
+    let user_space = ctx.get_user_space();
+    let old_path = user_space.read_cstring(old_path_addr, MAX_FILENAME_LEN)?;
+    let new_path = user_space.read_cstring(new_path_addr, MAX_FILENAME_LEN)?;
     debug!(
         "old_dirfd = {}, old_path = {:?}, new_dirfd = {}, new_path = {:?}",
         old_dirfd, old_path, new_dirfd, new_path
     );
 
-    let current = current!();
-    let fs = current.fs().read();
+    let fs = ctx.process.fs().read();
 
     let (old_dir_dentry, old_name) = {
         let old_path = old_path.to_string_lossy();
@@ -69,6 +69,10 @@ pub fn sys_renameat(
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_rename(old_path_addr: Vaddr, new_path_addr: Vaddr) -> Result<SyscallReturn> {
-    self::sys_renameat(AT_FDCWD, old_path_addr, AT_FDCWD, new_path_addr)
+pub fn sys_rename(
+    old_path_addr: Vaddr,
+    new_path_addr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    self::sys_renameat(AT_FDCWD, old_path_addr, AT_FDCWD, new_path_addr, ctx)
 }

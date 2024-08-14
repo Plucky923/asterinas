@@ -22,6 +22,7 @@ buddy_system_allocator = "0.9.0"
 bitflags = "1.3"
 bitvec = { version = "1.0", default-features = false, features = ["alloc"] }
 cfg-if = "1.0"
+const-assert = "1.0"
 gimli = { version = "0.28", default-features = false, features = ["read-core"] }
 id-alloc = { path = "libs/id-alloc", version = "0.1.0" }
 inherit-methods-macro = { git = "https://github.com/asterinas/inherit-methods-macro", rev = "98f7e3e", version = "0.1.0" }
@@ -39,7 +40,6 @@ owo-colors = { version = "3", optional = true }
 ostd-pod = { git = "https://github.com/asterinas/ostd-pod", rev = "c4644be", version = "0.1.1" }
 spin = "0.9.4"
 static_assertions = "1.1.0"
-tdx-guest = { version = "0.1.5", optional = true }
 trapframe = "0.10.0"
 unwinding = { version = "0.2.2", default-features = false, features = ["fde-gnu-eh-frame-hdr", "hide-trace", "panic", "personality", "unwinder"] }
 volatile = { version = "0.4.5", features = ["unstable"] }
@@ -57,8 +57,10 @@ iced-x86 = { version = "1.21.0", default-features = false, features = [
     "decoder",
     "gas",
 ], optional = true }
+tdx-guest = { version = "0.1.7", optional = true }
 
 [features]
-default = ["intel_tdx", "log_color"]
+default = ["cvm_guest", "log_color"]
 log_color = ["dep:owo-colors"]
-intel_tdx = ["dep:tdx-guest", "dep:iced-x86"]
+# The guest OS support for Confidential VMs (CVMs), e.g., Intel TDX
+cvm_guest = ["dep:tdx-guest", "dep:iced-x86"]

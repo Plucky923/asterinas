@@ -8,22 +8,26 @@ use crate::{
         utils::PATH_MAX,
     },
     prelude::*,
-    util::read_cstring_from_user,
 };
 
-pub fn sys_faccessat(dirfd: FileDesc, path_ptr: Vaddr, mode: u16) -> Result<SyscallReturn> {
+pub fn sys_faccessat(
+    dirfd: FileDesc,
+    path_ptr: Vaddr,
+    mode: u16,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
     debug!(
         "faccessat: dirfd = {}, path_ptr = {:#x}, mode = {:o}",
         dirfd, path_ptr, mode
     );
 
-    do_faccessat(dirfd, path_ptr, mode, 0)
+    do_faccessat(dirfd, path_ptr, mode, 0, ctx)
 }
 
-pub fn sys_access(path_ptr: Vaddr, mode: u16) -> Result<SyscallReturn> {
+pub fn sys_access(path_ptr: Vaddr, mode: u16, ctx: &Context) -> Result<SyscallReturn> {
     debug!("access: path_ptr = {:#x}, mode = {:o}", path_ptr, mode);
 
-    do_faccessat(AT_FDCWD, path_ptr, mode, 0)
+    do_faccessat(AT_FDCWD, path_ptr, mode, 0, ctx)
 }
 
 bitflags! {
@@ -49,23 +53,23 @@ pub fn do_faccessat(
     path_ptr: Vaddr,
     mode: u16,
     flags: i32,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     let mode = AccessMode::from_bits(mode)
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "Invalid mode"))?;
     let flags = FaccessatFlags::from_bits(flags)
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "Invalid flags"))?;
 
-    let path = read_cstring_from_user(path_ptr, PATH_MAX)?;
+    let path = ctx.get_user_space().read_cstring(path_ptr, PATH_MAX)?;
     debug!(
         "dirfd = {}, path = {:?}, mode = {:o}, flags = {:?}",
         dirfd, path, mode, flags
     );
 
-    let current = current!();
     let dentry = {
         let path = path.to_string_lossy();
         let fs_path = FsPath::new(dirfd, path.as_ref())?;
-        let fs = current.fs().read();
+        let fs = ctx.process.fs().read();
         if flags.contains(FaccessatFlags::AT_SYMLINK_NOFOLLOW) {
             fs.lookup_no_follow(&fs_path)?
         } else {

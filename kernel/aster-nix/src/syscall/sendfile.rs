@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::SyscallReturn;
-use crate::{
-    fs::file_table::FileDesc,
-    prelude::*,
-    util::{read_val_from_user, write_val_to_user},
-};
+use crate::{fs::file_table::FileDesc, prelude::*};
 
 pub fn sys_sendfile(
     out_fd: FileDesc,
     in_fd: FileDesc,
     offset_ptr: Vaddr,
     count: isize,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     trace!("raw offset ptr = 0x{:x}", offset_ptr);
 
     let offset = if offset_ptr == 0 {
         None
     } else {
-        let offset: isize = read_val_from_user(offset_ptr)?;
+        let offset: isize = ctx.get_user_space().read_val(offset_ptr)?;
         if offset < 0 {
             return_errno_with_message!(Errno::EINVAL, "offset cannot be negative");
         }
@@ -37,8 +34,7 @@ pub fn sys_sendfile(
     };
 
     let (out_file, in_file) = {
-        let current = current!();
-        let file_table = current.file_table().lock();
+        let file_table = ctx.process.file_table().lock();
         let out_file = file_table.get_file(out_fd)?.clone();
         // FIXME: the in_file must support mmap-like operations (i.e., it cannot be a socket).
         let in_file = file_table.get_file(in_fd)?.clone();
@@ -113,7 +109,8 @@ pub fn sys_sendfile(
     }
 
     if let Some(offset) = offset {
-        write_val_to_user(offset_ptr, &(offset as isize))?;
+        ctx.get_user_space()
+            .write_val(offset_ptr, &(offset as isize))?;
     }
 
     Ok(SyscallReturn::Return(total_len as _))

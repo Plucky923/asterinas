@@ -9,22 +9,22 @@ use crate::{
     },
     prelude::*,
     syscall::constants::MAX_FILENAME_LEN,
-    util::read_cstring_from_user,
 };
 
 pub fn sys_symlinkat(
     target_addr: Vaddr,
     dirfd: FileDesc,
     linkpath_addr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let target = read_cstring_from_user(target_addr, MAX_FILENAME_LEN)?;
-    let linkpath = read_cstring_from_user(linkpath_addr, MAX_FILENAME_LEN)?;
+    let user_space = ctx.get_user_space();
+    let target = user_space.read_cstring(target_addr, MAX_FILENAME_LEN)?;
+    let linkpath = user_space.read_cstring(linkpath_addr, MAX_FILENAME_LEN)?;
     debug!(
         "target = {:?}, dirfd = {}, linkpath = {:?}",
         target, dirfd, linkpath
     );
 
-    let current = current!();
     let target = target.to_string_lossy();
     if target.is_empty() {
         return_errno_with_message!(Errno::ENOENT, "target is empty");
@@ -35,7 +35,7 @@ pub fn sys_symlinkat(
             return_errno_with_message!(Errno::ENOENT, "linkpath is empty");
         }
         let fs_path = FsPath::new(dirfd, linkpath.as_ref())?;
-        current
+        ctx.process
             .fs()
             .read()
             .lookup_dir_and_new_basename(&fs_path, false)?
@@ -50,6 +50,10 @@ pub fn sys_symlinkat(
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_symlink(target_addr: Vaddr, linkpath_addr: Vaddr) -> Result<SyscallReturn> {
-    self::sys_symlinkat(target_addr, AT_FDCWD, linkpath_addr)
+pub fn sys_symlink(
+    target_addr: Vaddr,
+    linkpath_addr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    self::sys_symlinkat(target_addr, AT_FDCWD, linkpath_addr, ctx)
 }

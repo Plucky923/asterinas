@@ -6,7 +6,6 @@ use super::SyscallReturn;
 use crate::{
     prelude::*,
     time::{itimerspec_t, timer::Timeout, timespec_t, TIMER_ABSTIME},
-    util::{read_val_from_user, write_val_to_user},
 };
 
 pub fn sys_timer_settime(
@@ -14,17 +13,18 @@ pub fn sys_timer_settime(
     flags: i32,
     new_itimerspec_addr: Vaddr,
     old_itimerspec_addr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     if new_itimerspec_addr == 0 {
         return_errno_with_message!(Errno::EINVAL, "invalid pointer to new value");
     }
 
-    let new_itimerspec = read_val_from_user::<itimerspec_t>(new_itimerspec_addr)?;
-    let interval = Duration::from(new_itimerspec.it_interval);
-    let expire_time = Duration::from(new_itimerspec.it_value);
+    let user_space = ctx.get_user_space();
+    let new_itimerspec = user_space.read_val::<itimerspec_t>(new_itimerspec_addr)?;
+    let interval = Duration::try_from(new_itimerspec.it_interval)?;
+    let expire_time = Duration::try_from(new_itimerspec.it_value)?;
 
-    let current_process = current!();
-    let Some(timer) = current_process.timer_manager().find_posix_timer(timer_id) else {
+    let Some(timer) = ctx.process.timer_manager().find_posix_timer(timer_id) else {
         return_errno_with_message!(Errno::EINVAL, "invalid timer ID");
     };
 
@@ -35,7 +35,7 @@ pub fn sys_timer_settime(
             it_interval: old_interval,
             it_value: remain,
         };
-        write_val_to_user(old_itimerspec_addr, &old_itimerspec)?;
+        user_space.write_val(old_itimerspec_addr, &old_itimerspec)?;
     }
 
     timer.set_interval(interval);
@@ -56,12 +56,15 @@ pub fn sys_timer_settime(
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_timer_gettime(timer_id: usize, itimerspec_addr: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_timer_gettime(
+    timer_id: usize,
+    itimerspec_addr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
     if itimerspec_addr == 0 {
         return_errno_with_message!(Errno::EINVAL, "invalid pointer to return value");
     }
-    let current_process = current!();
-    let Some(timer) = current_process.timer_manager().find_posix_timer(timer_id) else {
+    let Some(timer) = ctx.process.timer_manager().find_posix_timer(timer_id) else {
         return_errno_with_message!(Errno::EINVAL, "invalid timer ID");
     };
 
@@ -71,7 +74,8 @@ pub fn sys_timer_gettime(timer_id: usize, itimerspec_addr: Vaddr) -> Result<Sysc
         it_interval: interval,
         it_value: remain,
     };
-    write_val_to_user(itimerspec_addr, &itimerspec)?;
+    ctx.get_user_space()
+        .write_val(itimerspec_addr, &itimerspec)?;
 
     Ok(SyscallReturn::Return(0))
 }

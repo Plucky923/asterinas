@@ -11,7 +11,7 @@ use super::{
     listener::{unregister_backlog, Listener},
 };
 use crate::{
-    events::IoEvents,
+    events::{IoEvents, Observer},
     fs::{
         file_handle::FileLike,
         fs_resolver::FsPath,
@@ -74,7 +74,7 @@ impl UnixStreamSocket {
     fn bound_addr(&self) -> Option<UnixSocketAddrBound> {
         let state = self.state.read();
         match &*state {
-            State::Init(init) => init.addr(),
+            State::Init(init) => init.addr().cloned(),
             State::Listen(listen) => Some(listen.addr().clone()),
             State::Connected(connected) => connected.addr().cloned(),
         }
@@ -166,14 +166,39 @@ impl FileLike for UnixStreamSocket {
         self.set_nonblocking(new_flags.contains(StatusFlags::O_NONBLOCK));
         Ok(())
     }
+
+    fn register_observer(
+        &self,
+        observer: Weak<dyn Observer<IoEvents>>,
+        mask: IoEvents,
+    ) -> Result<()> {
+        let inner = self.state.write();
+        match &*inner {
+            State::Init(init) => init.register_observer(observer, mask),
+            State::Listen(listen) => listen.register_observer(observer, mask),
+            State::Connected(connected) => connected.register_observer(observer, mask),
+        }
+    }
+
+    fn unregister_observer(
+        &self,
+        observer: &Weak<dyn Observer<IoEvents>>,
+    ) -> Option<Weak<dyn Observer<IoEvents>>> {
+        let inner = self.state.write();
+        match &*inner {
+            State::Init(init) => init.unregister_observer(observer),
+            State::Listen(listen) => listen.unregister_observer(observer),
+            State::Connected(connected) => connected.unregister_observer(observer),
+        }
+    }
 }
 
 impl Socket for UnixStreamSocket {
     fn bind(&self, socket_addr: SocketAddr) -> Result<()> {
         let addr = UnixSocketAddr::try_from(socket_addr)?;
 
-        match &*self.state.read() {
-            State::Init(init) => init.bind(&addr),
+        match &mut *self.state.write() {
+            State::Init(init) => init.bind(addr),
             _ => return_errno_with_message!(
                 Errno::EINVAL,
                 "cannot bind a listening or connected socket"
@@ -186,19 +211,31 @@ impl Socket for UnixStreamSocket {
         let remote_addr = {
             let unix_socket_addr = UnixSocketAddr::try_from(socket_addr)?;
             match unix_socket_addr {
+                UnixSocketAddr::Unnamed => todo!(),
                 UnixSocketAddr::Abstract(abstract_name) => {
                     UnixSocketAddrBound::Abstract(abstract_name)
                 }
                 UnixSocketAddr::Path(path) => {
                     let dentry = lookup_socket_file(&path)?;
-                    UnixSocketAddrBound::Path(dentry)
+                    UnixSocketAddrBound::Path(path, dentry)
                 }
             }
         };
 
+        // Note that the Linux kernel implementation locks the remote socket and checks to see if
+        // it is listening first. This is different from our implementation, which locks the local
+        // socket and checks the state of the local socket first.
+        //
+        // The difference may result in different error codes, but it's doubtful that this will
+        // ever lead to real problems.
+        //
+        // See also <https://elixir.bootlin.com/linux/v6.10.4/source/net/unix/af_unix.c#L1527>.
+
         let connected = match &*self.state.read() {
             State::Init(init) => init.connect(&remote_addr)?,
-            State::Listen(_) => return_errno_with_message!(Errno::EINVAL, "the socket is listened"),
+            State::Listen(_) => {
+                return_errno_with_message!(Errno::EINVAL, "the socket is listening")
+            }
             State::Connected(_) => {
                 return_errno_with_message!(Errno::EISCONN, "the socket is connected")
             }
@@ -247,16 +284,12 @@ impl Socket for UnixStreamSocket {
 
     fn addr(&self) -> Result<SocketAddr> {
         let addr = match &*self.state.read() {
-            State::Init(init) => init.addr(),
+            State::Init(init) => init.addr().cloned(),
             State::Listen(listen) => Some(listen.addr().clone()),
             State::Connected(connected) => connected.addr().cloned(),
         };
 
-        addr.map(Into::<SocketAddr>::into)
-            .ok_or(Error::with_message(
-                Errno::EINVAL,
-                "the socket does not bind to addr",
-            ))
+        Ok(addr.into())
     }
 
     fn peer_addr(&self) -> Result<SocketAddr> {
@@ -265,10 +298,7 @@ impl Socket for UnixStreamSocket {
             _ => return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected"),
         };
 
-        match peer_addr {
-            None => Ok(SocketAddr::Unix(UnixSocketAddr::Path(String::new()))),
-            Some(peer_addr) => Ok(SocketAddr::from(peer_addr)),
-        }
+        Ok(peer_addr.into())
     }
 
     fn sendmsg(

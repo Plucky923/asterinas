@@ -3,21 +3,27 @@
 use alloc::sync::Arc;
 use core::ops::Deref;
 
-#[cfg(feature = "intel_tdx")]
-use ::tdx_guest::tdx_is_enabled;
+use cfg_if::cfg_if;
 
 use super::{check_and_insert_dma_mapping, remove_dma_mapping, DmaError, HasDaddr};
-#[cfg(feature = "intel_tdx")]
-use crate::arch::tdx_guest;
 use crate::{
-    arch::{iommu, mm::tlb_flush_addr_range},
+    arch::iommu,
     mm::{
         dma::{dma_type, Daddr, DmaType},
+        io::VmIoOnce,
         kspace::{paddr_to_vaddr, KERNEL_PAGE_TABLE},
         page_prop::CachePolicy,
-        HasPaddr, Paddr, Segment, VmIo, VmReader, VmWriter, PAGE_SIZE,
+        HasPaddr, Paddr, PodOnce, Segment, VmIo, VmReader, VmWriter, PAGE_SIZE,
     },
+    prelude::*,
 };
+
+cfg_if! {
+    if #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))] {
+        use ::tdx_guest::tdx_is_enabled;
+        use crate::arch::tdx_guest;
+    }
+}
 
 /// A coherent (or consistent) DMA mapping,
 /// which guarantees that the device and the CPU can
@@ -47,7 +53,10 @@ impl DmaCoherent {
     ///
     /// The method fails if any part of the given `vm_segment`
     /// already belongs to a DMA mapping.
-    pub fn map(vm_segment: Segment, is_cache_coherent: bool) -> Result<Self, DmaError> {
+    pub fn map(
+        vm_segment: Segment,
+        is_cache_coherent: bool,
+    ) -> core::result::Result<Self, DmaError> {
         let frame_count = vm_segment.nframes();
         let start_paddr = vm_segment.start_paddr();
         if !check_and_insert_dma_mapping(start_paddr, frame_count) {
@@ -62,14 +71,13 @@ impl DmaCoherent {
             // SAFETY: the physical mappings is only used by DMA so protecting it is safe.
             unsafe {
                 page_table
-                    .protect(&va_range, |p| p.cache = CachePolicy::Uncacheable)
+                    .protect_flush_tlb(&va_range, |p| p.cache = CachePolicy::Uncacheable)
                     .unwrap();
             }
-            tlb_flush_addr_range(&va_range);
         }
         let start_daddr = match dma_type() {
             DmaType::Direct => {
-                #[cfg(feature = "intel_tdx")]
+                #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
                 // SAFETY:
                 // This is safe because we are ensuring that the physical address range specified by `start_paddr` and `frame_count` is valid before these operations.
                 // The `check_and_insert_dma_mapping` function checks if the physical address range is already mapped.
@@ -124,7 +132,7 @@ impl Drop for DmaCoherentInner {
         start_paddr.checked_add(frame_count * PAGE_SIZE).unwrap();
         match dma_type() {
             DmaType::Direct => {
-                #[cfg(feature = "intel_tdx")]
+                #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
                 // SAFETY:
                 // This is safe because we are ensuring that the physical address range specified by `start_paddr` and `frame_count` is valid before these operations.
                 // The `start_paddr()` ensures the `start_paddr` is page-aligned.
@@ -150,22 +158,35 @@ impl Drop for DmaCoherentInner {
             // SAFETY: the physical mappings is only used by DMA so protecting it is safe.
             unsafe {
                 page_table
-                    .protect(&va_range, |p| p.cache = CachePolicy::Writeback)
+                    .protect_flush_tlb(&va_range, |p| p.cache = CachePolicy::Writeback)
                     .unwrap();
             }
-            tlb_flush_addr_range(&va_range);
         }
         remove_dma_mapping(start_paddr, frame_count);
     }
 }
 
 impl VmIo for DmaCoherent {
-    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> crate::prelude::Result<()> {
+    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
         self.inner.vm_segment.read_bytes(offset, buf)
     }
 
-    fn write_bytes(&self, offset: usize, buf: &[u8]) -> crate::prelude::Result<()> {
+    fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<()> {
         self.inner.vm_segment.write_bytes(offset, buf)
+    }
+}
+
+impl VmIoOnce for DmaCoherent {
+    fn read_once<T: PodOnce>(&self, offset: usize) -> Result<T> {
+        self.inner.vm_segment.reader().skip(offset).read_once()
+    }
+
+    fn write_once<T: PodOnce>(&self, offset: usize, new_val: &T) -> Result<()> {
+        self.inner
+            .vm_segment
+            .writer()
+            .skip(offset)
+            .write_once(new_val)
     }
 }
 
@@ -192,7 +213,7 @@ mod test {
     use alloc::vec;
 
     use super::*;
-    use crate::{mm::FrameAllocOptions, prelude::*};
+    use crate::mm::FrameAllocOptions;
 
     #[ktest]
     fn map_with_coherent_device() {

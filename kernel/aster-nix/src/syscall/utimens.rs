@@ -11,7 +11,6 @@ use crate::{
     },
     prelude::*,
     time::{clocks::RealTimeCoarseClock, timespec_t, timeval_t},
-    util::{read_cstring_from_user, read_val_from_user},
 };
 
 /// The 'sys_utimensat' system call sets the access and modification times of a file.
@@ -24,13 +23,14 @@ pub fn sys_utimensat(
     pathname_ptr: Vaddr,
     timespecs_ptr: Vaddr,
     flags: u32,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     debug!(
         "utimensat: dirfd: {}, pathname_ptr: {:#x}, timespecs_ptr: {:#x}, flags: {:#x}",
         dirfd, pathname_ptr, timespecs_ptr, flags
     );
     let times = if timespecs_ptr != 0 {
-        let (autime, mutime) = read_time_from_user::<timespec_t>(timespecs_ptr)?;
+        let (autime, mutime) = read_time_from_user::<timespec_t>(timespecs_ptr, ctx)?;
         if autime.is_utime_omit() && mutime.is_utime_omit() {
             return Ok(SyscallReturn::Return(0));
         }
@@ -41,7 +41,7 @@ pub fn sys_utimensat(
     } else {
         None
     };
-    do_utimes(dirfd, pathname_ptr, times, flags)
+    do_utimes(dirfd, pathname_ptr, times, flags, ctx)
 }
 
 /// The 'sys_futimesat' system call sets the access and modification times of a file.
@@ -51,33 +51,34 @@ pub fn sys_futimesat(
     dirfd: FileDesc,
     pathname_ptr: Vaddr,
     timeval_ptr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     debug!(
         "futimesat: dirfd: {}, pathname_ptr: {:#x}, timeval_ptr: {:#x}",
         dirfd, pathname_ptr, timeval_ptr
     );
-    do_futimesat(dirfd, pathname_ptr, timeval_ptr)
+    do_futimesat(dirfd, pathname_ptr, timeval_ptr, ctx)
 }
 
 /// The 'sys_utimes' system call sets the access and modification times of a file.
 /// It receives time values in the form of timeval structures like 'sys_futimesat',
 /// but it uses the current working directory as the base directory.
-pub fn sys_utimes(pathname_ptr: Vaddr, timeval_ptr: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_utimes(pathname_ptr: Vaddr, timeval_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
     debug!(
         "utimes: pathname_ptr: {:#x}, timeval_ptr: {:#x}",
         pathname_ptr, timeval_ptr
     );
-    do_futimesat(AT_FDCWD, pathname_ptr, timeval_ptr)
+    do_futimesat(AT_FDCWD, pathname_ptr, timeval_ptr, ctx)
 }
 
 /// The 'sys_utime' system call is similar to 'sys_utimes' but uses the older 'utimbuf' structure to specify times.
-pub fn sys_utime(pathname_ptr: Vaddr, utimbuf_ptr: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_utime(pathname_ptr: Vaddr, utimbuf_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
     debug!(
         "utime: pathname_ptr: {:#x}, utimbuf_ptr: {:#x}",
         pathname_ptr, utimbuf_ptr
     );
     let times = if utimbuf_ptr != 0 {
-        let utimbuf = read_val_from_user::<Utimbuf>(utimbuf_ptr)?;
+        let utimbuf = ctx.get_user_space().read_val::<Utimbuf>(utimbuf_ptr)?;
         let atime = timespec_t {
             sec: utimbuf.actime,
             nsec: 0,
@@ -90,7 +91,7 @@ pub fn sys_utime(pathname_ptr: Vaddr, utimbuf_ptr: Vaddr) -> Result<SyscallRetur
     } else {
         None
     };
-    do_utimes(AT_FDCWD, pathname_ptr, times, 0)
+    do_utimes(AT_FDCWD, pathname_ptr, times, 0, ctx)
 }
 
 // Structure to hold access and modification times
@@ -120,14 +121,14 @@ fn vfs_utimes(dentry: &Arc<Dentry>, times: Option<TimeSpecPair>) -> Result<Sysca
             } else if times.atime.is_utime_now() {
                 now
             } else {
-                Duration::from(times.atime)
+                Duration::try_from(times.atime)?
             };
             let mtime = if times.mtime.is_utime_omit() {
                 dentry.mtime()
             } else if times.mtime.is_utime_now() {
                 now
             } else {
-                Duration::from(times.mtime)
+                Duration::try_from(times.mtime)?
             };
             (atime, mtime, now)
         }
@@ -151,6 +152,7 @@ fn do_utimes(
     pathname_ptr: Vaddr,
     times: Option<TimeSpecPair>,
     flags: u32,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     let flags = UtimensFlags::from_bits(flags)
         .ok_or(Error::with_message(Errno::EINVAL, "invalid flags"))?;
@@ -158,14 +160,15 @@ fn do_utimes(
     let pathname = if pathname_ptr == 0 {
         String::new()
     } else {
-        let cstring = read_cstring_from_user(pathname_ptr, MAX_FILENAME_LEN)?;
+        let cstring = ctx
+            .get_user_space()
+            .read_cstring(pathname_ptr, MAX_FILENAME_LEN)?;
         cstring.to_string_lossy().into_owned()
     };
-    let current = current!();
     let dentry = {
         // Determine the file system path and the corresponding entry
         let fs_path = FsPath::new(dirfd, pathname.as_ref())?;
-        let fs = current.fs().read();
+        let fs = ctx.process.fs().read();
         if flags.contains(UtimensFlags::AT_SYMLINK_NOFOLLOW) {
             fs.lookup_no_follow(&fs_path)?
         } else {
@@ -178,9 +181,14 @@ fn do_utimes(
 
 // Sets the access and modification times for a file,
 // specified by a pathname relative to the directory file descriptor `dirfd`.
-fn do_futimesat(dirfd: FileDesc, pathname_ptr: Vaddr, timeval_ptr: Vaddr) -> Result<SyscallReturn> {
+fn do_futimesat(
+    dirfd: FileDesc,
+    pathname_ptr: Vaddr,
+    timeval_ptr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
     let times = if timeval_ptr != 0 {
-        let (autime, mutime) = read_time_from_user::<timeval_t>(timeval_ptr)?;
+        let (autime, mutime) = read_time_from_user::<timeval_t>(timeval_ptr, ctx)?;
         if autime.usec >= 1000000 || autime.usec < 0 || mutime.usec >= 1000000 || mutime.usec < 0 {
             return_errno_with_message!(Errno::EINVAL, "Invalid time");
         }
@@ -192,14 +200,15 @@ fn do_futimesat(dirfd: FileDesc, pathname_ptr: Vaddr, timeval_ptr: Vaddr) -> Res
     } else {
         None
     };
-    do_utimes(dirfd, pathname_ptr, times, 0)
+    do_utimes(dirfd, pathname_ptr, times, 0, ctx)
 }
 
-fn read_time_from_user<T: Pod>(time_ptr: Vaddr) -> Result<(T, T)> {
+fn read_time_from_user<T: Pod>(time_ptr: Vaddr, ctx: &Context) -> Result<(T, T)> {
     let mut time_addr = time_ptr;
-    let autime = read_val_from_user::<T>(time_addr)?;
+    let user_space = ctx.get_user_space();
+    let autime = user_space.read_val::<T>(time_addr)?;
     time_addr += core::mem::size_of::<T>();
-    let mutime = read_val_from_user::<T>(time_addr)?;
+    let mutime = user_space.read_val::<T>(time_addr)?;
     Ok((autime, mutime))
 }
 

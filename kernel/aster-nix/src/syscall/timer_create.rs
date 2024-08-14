@@ -25,13 +25,13 @@ use crate::{
         clockid_t,
         clocks::{BootTimeClock, MonotonicClock, RealTimeClock},
     },
-    util::{read_val_from_user, write_val_to_user},
 };
 
 pub fn sys_timer_create(
     clockid: clockid_t,
     sigevent_addr: Vaddr,
     timer_id_addr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     if timer_id_addr == 0 {
         return_errno_with_message!(
@@ -51,7 +51,7 @@ pub fn sys_timer_create(
             })
         // Determine the timeout action through `sigevent`.
         } else {
-            let sig_event = read_val_from_user::<sigevent_t>(sigevent_addr)?;
+            let sig_event = ctx.get_user_space().read_val::<sigevent_t>(sigevent_addr)?;
             let sigev_notify = SigNotify::try_from(sig_event.sigev_notify)?;
             let signo = sig_event.sigev_signo;
             match sigev_notify {
@@ -111,13 +111,7 @@ pub fn sys_timer_create(
         let clock_id = ClockId::try_from(clockid)?;
         match clock_id {
             ClockId::CLOCK_PROCESS_CPUTIME_ID => process_timer_manager.create_prof_timer(func),
-            ClockId::CLOCK_THREAD_CPUTIME_ID => {
-                let current_thread = current_thread!();
-                current_thread
-                    .as_posix_thread()
-                    .unwrap()
-                    .create_prof_timer(func)
-            }
+            ClockId::CLOCK_THREAD_CPUTIME_ID => ctx.posix_thread.create_prof_timer(func),
             ClockId::CLOCK_REALTIME => RealTimeClock::timer_manager().create_timer(func),
             ClockId::CLOCK_MONOTONIC => MonotonicClock::timer_manager().create_timer(func),
             ClockId::CLOCK_BOOTTIME => BootTimeClock::timer_manager().create_timer(func),
@@ -152,11 +146,11 @@ pub fn sys_timer_create(
     };
 
     let timer_id = process_timer_manager.add_posix_timer(timer);
-    write_val_to_user(timer_id_addr, &timer_id)?;
+    ctx.get_user_space().write_val(timer_id_addr, &timer_id)?;
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_timer_delete(timer_id: usize) -> Result<SyscallReturn> {
+pub fn sys_timer_delete(timer_id: usize, _ctx: &Context) -> Result<SyscallReturn> {
     let current_process = current!();
     let Some(timer) = current_process.timer_manager().remove_posix_timer(timer_id) else {
         return_errno_with_message!(Errno::EINVAL, "invalid timer ID");

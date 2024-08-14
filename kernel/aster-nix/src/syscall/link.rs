@@ -8,7 +8,6 @@ use crate::{
     },
     prelude::*,
     syscall::constants::MAX_FILENAME_LEN,
-    util::read_cstring_from_user,
 };
 
 pub fn sys_linkat(
@@ -17,9 +16,12 @@ pub fn sys_linkat(
     new_dirfd: FileDesc,
     new_path_addr: Vaddr,
     flags: u32,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let old_path = read_cstring_from_user(old_path_addr, MAX_FILENAME_LEN)?;
-    let new_path = read_cstring_from_user(new_path_addr, MAX_FILENAME_LEN)?;
+    let user_space = ctx.get_user_space();
+
+    let old_path = user_space.read_cstring(old_path_addr, MAX_FILENAME_LEN)?;
+    let new_path = user_space.read_cstring(new_path_addr, MAX_FILENAME_LEN)?;
     let flags =
         LinkFlags::from_bits(flags).ok_or(Error::with_message(Errno::EINVAL, "invalid flags"))?;
     debug!(
@@ -27,7 +29,6 @@ pub fn sys_linkat(
         old_dirfd, old_path, new_dirfd, new_path, flags
     );
 
-    let current = current!();
     let (old_dentry, new_dir_dentry, new_name) = {
         let old_path = old_path.to_string_lossy();
         if old_path.ends_with('/') {
@@ -43,7 +44,7 @@ pub fn sys_linkat(
 
         let old_fs_path = FsPath::new(old_dirfd, old_path.as_ref())?;
         let new_fs_path = FsPath::new(new_dirfd, new_path.as_ref())?;
-        let fs = current.fs().read();
+        let fs = ctx.process.fs().read();
         let old_dentry = if flags.contains(LinkFlags::AT_SYMLINK_FOLLOW) {
             fs.lookup(&old_fs_path)?
         } else {
@@ -57,8 +58,12 @@ pub fn sys_linkat(
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_link(old_path_addr: Vaddr, new_path_addr: Vaddr) -> Result<SyscallReturn> {
-    self::sys_linkat(AT_FDCWD, old_path_addr, AT_FDCWD, new_path_addr, 0)
+pub fn sys_link(
+    old_path_addr: Vaddr,
+    new_path_addr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    self::sys_linkat(AT_FDCWD, old_path_addr, AT_FDCWD, new_path_addr, 0, ctx)
 }
 
 bitflags::bitflags! {

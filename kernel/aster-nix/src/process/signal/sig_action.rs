@@ -28,7 +28,7 @@ impl TryFrom<sigaction_t> for SigAction {
             SIG_IGN => SigAction::Ign,
             _ => {
                 let flags = SigActionFlags::from_bits_truncate(input.flags);
-                let mask = SigMask::from(input.mask);
+                let mask = input.mask.into();
                 SigAction::User {
                     handler_addr: input.handler_ptr,
                     flags,
@@ -65,7 +65,7 @@ impl SigAction {
                 handler_ptr: *handler_addr,
                 flags: flags.as_u32(),
                 restorer_ptr: *restorer_addr,
-                mask: mask.as_u64(),
+                mask: (*mask).into(),
             },
         }
     }
@@ -103,11 +103,7 @@ impl SigActionFlags {
     }
 
     pub fn contains_unsupported_flag(&self) -> bool {
-        self.intersects(
-            SigActionFlags::SA_NOCLDSTOP
-                | SigActionFlags::SA_NOCLDWAIT
-                | SigActionFlags::SA_RESETHAND,
-        )
+        self.intersects(SigActionFlags::SA_NOCLDSTOP | SigActionFlags::SA_NOCLDWAIT)
     }
 }
 

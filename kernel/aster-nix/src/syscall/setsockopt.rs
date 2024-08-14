@@ -13,6 +13,7 @@ pub fn sys_setsockopt(
     optname: i32,
     optval: Vaddr,
     optlen: u32,
+    _ctx: &Context,
 ) -> Result<SyscallReturn> {
     let level = CSocketOptionLevel::try_from(level)?;
     if optval == 0 {
@@ -29,9 +30,7 @@ pub fn sys_setsockopt(
     let raw_option = {
         let mut option = new_raw_socket_option(level, optname)?;
 
-        let current = current!();
-        let vmar = current.root_vmar();
-        option.read_from_user(vmar, optval, optlen)?;
+        option.read_from_user(optval, optlen)?;
 
         option
     };

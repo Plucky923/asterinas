@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-
 use core::time::Duration;
 
 use super::{
     poll::{do_poll, PollFd},
     SyscallReturn,
 };
-use crate::{
-    events::IoEvents,
-    fs::file_table::FileDesc,
-    prelude::*,
-    time::timeval_t,
-    util::{read_val_from_user, write_val_to_user},
-};
+use crate::{events::IoEvents, fs::file_table::FileDesc, prelude::*, time::timeval_t};
 
 pub fn sys_select(
     nfds: FileDesc,
@@ -22,16 +14,43 @@ pub fn sys_select(
     writefds_addr: Vaddr,
     exceptfds_addr: Vaddr,
     timeval_addr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    let timeout = if timeval_addr == 0 {
+        None
+    } else {
+        let timeval = ctx.get_user_space().read_val::<timeval_t>(timeval_addr)?;
+        Some(Duration::from(timeval))
+    };
+
+    do_sys_select(
+        nfds,
+        readfds_addr,
+        writefds_addr,
+        exceptfds_addr,
+        timeout,
+        ctx,
+    )
+}
+
+pub fn do_sys_select(
+    nfds: FileDesc,
+    readfds_addr: Vaddr,
+    writefds_addr: Vaddr,
+    exceptfds_addr: Vaddr,
+    timeout: Option<Duration>,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     if nfds < 0 || nfds as usize > FD_SETSIZE {
         return_errno_with_message!(Errno::EINVAL, "nfds is negative or exceeds the FD_SETSIZE");
     }
 
+    let user_space = ctx.get_user_space();
     let get_fdset = |fdset_addr: Vaddr| -> Result<Option<FdSet>> {
         let fdset = if fdset_addr == 0 {
             None
         } else {
-            let fdset = read_val_from_user::<FdSet>(fdset_addr)?;
+            let fdset = user_space.read_val::<FdSet>(fdset_addr)?;
             Some(fdset)
         };
         Ok(fdset)
@@ -39,13 +58,6 @@ pub fn sys_select(
     let mut readfds = get_fdset(readfds_addr)?;
     let mut writefds = get_fdset(writefds_addr)?;
     let mut exceptfds = get_fdset(exceptfds_addr)?;
-
-    let timeout = if timeval_addr == 0 {
-        None
-    } else {
-        let timeval = read_val_from_user::<timeval_t>(timeval_addr)?;
-        Some(Duration::from(timeval))
-    };
 
     debug!(
         "nfds = {}, readfds = {:?}, writefds = {:?}, exceptfds = {:?}, timeout = {:?}",
@@ -58,6 +70,7 @@ pub fn sys_select(
         writefds.as_mut(),
         exceptfds.as_mut(),
         timeout,
+        ctx,
     )?;
 
     // FIXME: The Linux select() and pselect6() system call
@@ -68,7 +81,7 @@ pub fn sys_select(
     let set_fdset = |fdset_addr: Vaddr, fdset: Option<FdSet>| -> Result<()> {
         if let Some(fdset) = fdset {
             debug_assert!(fdset_addr != 0);
-            write_val_to_user(fdset_addr, &fdset)?;
+            user_space.write_val(fdset_addr, &fdset)?;
         }
         Ok(())
     };
@@ -85,6 +98,7 @@ fn do_select(
     mut writefds: Option<&mut FdSet>,
     mut exceptfds: Option<&mut FdSet>,
     timeout: Option<Duration>,
+    ctx: &Context,
 ) -> Result<usize> {
     // Convert the FdSet to an array of PollFd
     let poll_fds = {
@@ -119,7 +133,7 @@ fn do_select(
     }
 
     // Do the poll syscall that is equivalent to the select syscall
-    let num_revents = do_poll(&poll_fds, timeout)?;
+    let num_revents = do_poll(&poll_fds, timeout, ctx)?;
     if num_revents == 0 {
         return Ok(0);
     }
@@ -198,6 +212,7 @@ impl FdSet {
     }
 
     /// Equivalent to FD_CLR.
+    #[allow(unused)]
     pub fn unset(&mut self, fd: FileDesc) -> Result<()> {
         let fd = fd as usize;
         if fd >= FD_SETSIZE {

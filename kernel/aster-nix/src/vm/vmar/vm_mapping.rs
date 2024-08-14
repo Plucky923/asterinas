@@ -5,9 +5,7 @@
 
 use core::ops::Range;
 
-use ostd::mm::{
-    vm_space::VmQueryResult, CachePolicy, Frame, PageFlags, PageProperty, VmIo, VmSpace,
-};
+use ostd::mm::{vm_space::VmItem, CachePolicy, Frame, PageFlags, PageProperty, VmIo, VmSpace};
 
 use super::{interval::Interval, is_intersected, Vmar, Vmar_};
 use crate::{
@@ -221,12 +219,12 @@ impl VmMapping {
                 drop(cursor);
 
                 match map_info {
-                    VmQueryResult::Mapped { va, prop, .. } => {
+                    VmItem::Mapped { va, prop, .. } => {
                         if !prop.flags.contains(PageFlags::W) {
                             self.handle_page_fault(va, false, true)?;
                         }
                     }
-                    VmQueryResult::NotMapped { va, .. } => {
+                    VmItem::NotMapped { va, .. } => {
                         self.handle_page_fault(va, true, true)?;
                     }
                 }
@@ -409,8 +407,8 @@ impl VmMapping {
     pub fn trim_mapping(
         self: &Arc<Self>,
         trim_range: &Range<usize>,
-        mappings_to_remove: &mut BTreeSet<Vaddr>,
-        mappings_to_append: &mut BTreeMap<Vaddr, Arc<VmMapping>>,
+        mappings_to_remove: &mut LinkedList<Vaddr>,
+        mappings_to_append: &mut LinkedList<(Vaddr, Arc<VmMapping>)>,
     ) -> Result<()> {
         let map_to_addr = self.map_to_addr();
         let map_size = self.map_size();
@@ -421,15 +419,15 @@ impl VmMapping {
         if trim_range.start <= map_to_addr && trim_range.end >= map_to_addr + map_size {
             // Fast path: the whole mapping was trimed.
             self.unmap(trim_range, true)?;
-            mappings_to_remove.insert(map_to_addr);
+            mappings_to_remove.push_back(map_to_addr);
             return Ok(());
         }
         if trim_range.start <= range.start {
-            mappings_to_remove.insert(map_to_addr);
+            mappings_to_remove.push_back(map_to_addr);
             if trim_range.end <= range.end {
                 // Overlap vm_mapping from left.
                 let new_map_addr = self.trim_left(trim_range.end)?;
-                mappings_to_append.insert(new_map_addr, self.clone());
+                mappings_to_append.push_back((new_map_addr, self.clone()));
             } else {
                 // The mapping was totally destroyed.
             }
@@ -438,7 +436,7 @@ impl VmMapping {
                 // The trim range was totally inside the old mapping.
                 let another_mapping = Arc::new(self.try_clone()?);
                 let another_map_to_addr = another_mapping.trim_left(trim_range.end)?;
-                mappings_to_append.insert(another_map_to_addr, another_mapping);
+                mappings_to_append.push_back((another_map_to_addr, another_mapping));
             } else {
                 // Overlap vm_mapping from right.
             }
@@ -540,7 +538,7 @@ impl VmMappingInner {
         debug_assert!(range.start % PAGE_SIZE == 0);
         debug_assert!(range.end % PAGE_SIZE == 0);
         let mut cursor = vm_space.cursor_mut(&range).unwrap();
-        cursor.protect(range.len(), |p| p.flags = perms.into(), true)?;
+        cursor.protect(range.len(), |p| p.flags = perms.into());
         Ok(())
     }
 

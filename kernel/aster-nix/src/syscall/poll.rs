@@ -3,20 +3,15 @@
 use core::{cell::Cell, time::Duration};
 
 use super::SyscallReturn;
-use crate::{
-    events::IoEvents,
-    fs::file_table::FileDesc,
-    prelude::*,
-    process::signal::Poller,
-    util::{read_val_from_user, write_val_to_user},
-};
+use crate::{events::IoEvents, fs::file_table::FileDesc, prelude::*, process::signal::Poller};
 
-pub fn sys_poll(fds: Vaddr, nfds: u64, timeout: i32) -> Result<SyscallReturn> {
+pub fn sys_poll(fds: Vaddr, nfds: u64, timeout: i32, ctx: &Context) -> Result<SyscallReturn> {
+    let user_space = ctx.get_user_space();
     let poll_fds = {
         let mut read_addr = fds;
         let mut poll_fds = Vec::with_capacity(nfds as _);
         for _ in 0..nfds {
-            let c_poll_fd = read_val_from_user::<c_pollfd>(read_addr)?;
+            let c_poll_fd = user_space.read_val::<c_pollfd>(read_addr)?;
             let poll_fd = PollFd::from(c_poll_fd);
             // Always clear the revents fields first
             poll_fd.revents().set(IoEvents::empty());
@@ -36,13 +31,13 @@ pub fn sys_poll(fds: Vaddr, nfds: u64, timeout: i32) -> Result<SyscallReturn> {
         poll_fds, nfds, timeout
     );
 
-    let num_revents = do_poll(&poll_fds, timeout)?;
+    let num_revents = do_poll(&poll_fds, timeout, ctx)?;
 
     // Write back
     let mut write_addr = fds;
     for pollfd in poll_fds {
         let c_poll_fd = c_pollfd::from(pollfd);
-        write_val_to_user(write_addr, &c_poll_fd)?;
+        user_space.write_val(write_addr, &c_poll_fd)?;
         // FIXME: do we need to respect align of c_pollfd here?
         write_addr += core::mem::size_of::<c_pollfd>();
     }
@@ -50,7 +45,7 @@ pub fn sys_poll(fds: Vaddr, nfds: u64, timeout: i32) -> Result<SyscallReturn> {
     Ok(SyscallReturn::Return(num_revents as _))
 }
 
-pub fn do_poll(poll_fds: &[PollFd], timeout: Option<Duration>) -> Result<usize> {
+pub fn do_poll(poll_fds: &[PollFd], timeout: Option<Duration>, ctx: &Context) -> Result<usize> {
     // The main loop of polling
     let mut poller = Poller::new();
     loop {
@@ -64,9 +59,8 @@ pub fn do_poll(poll_fds: &[PollFd], timeout: Option<Duration>) -> Result<usize> 
             };
 
             // Poll the file
-            let current = current!();
             let file = {
-                let file_table = current.file_table().lock();
+                let file_table = ctx.process.file_table().lock();
                 file_table.get_file(fd)?.clone()
             };
             let need_poller = if num_revents == 0 {

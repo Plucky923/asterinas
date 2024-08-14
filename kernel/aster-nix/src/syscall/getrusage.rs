@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(non_camel_case_types)]
-
 use int_to_c_enum::TryFromInt;
 
 use super::SyscallReturn;
-use crate::{
-    prelude::*, process::posix_thread::PosixThreadExt, time::timeval_t, util::write_val_to_user,
-};
+use crate::{prelude::*, time::timeval_t};
 
 #[derive(Debug, Copy, Clone, TryFromInt, PartialEq)]
 #[repr(i32)]
@@ -18,7 +14,7 @@ enum RusageTarget {
     Thread = 1,
 }
 
-pub fn sys_getrusage(target: i32, rusage_addr: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_getrusage(target: i32, rusage_addr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
     let rusage_target = RusageTarget::try_from(target)?;
 
     debug!(
@@ -29,7 +25,7 @@ pub fn sys_getrusage(target: i32, rusage_addr: Vaddr) -> Result<SyscallReturn> {
     if rusage_addr != 0 {
         let rusage = match rusage_target {
             RusageTarget::ForSelf => {
-                let process = current!();
+                let process = ctx.process;
                 rusage_t {
                     ru_utime: process.prof_clock().user_clock().read_time().into(),
                     ru_stime: process.prof_clock().kernel_clock().read_time().into(),
@@ -37,8 +33,7 @@ pub fn sys_getrusage(target: i32, rusage_addr: Vaddr) -> Result<SyscallReturn> {
                 }
             }
             RusageTarget::Thread => {
-                let thread = current_thread!();
-                let posix_thread = thread.as_posix_thread().unwrap();
+                let posix_thread = ctx.posix_thread;
                 rusage_t {
                     ru_utime: posix_thread.prof_clock().user_clock().read_time().into(),
                     ru_stime: posix_thread.prof_clock().kernel_clock().read_time().into(),
@@ -53,7 +48,7 @@ pub fn sys_getrusage(target: i32, rusage_addr: Vaddr) -> Result<SyscallReturn> {
             }
         };
 
-        write_val_to_user(rusage_addr, &rusage)?;
+        ctx.get_user_space().write_val(rusage_addr, &rusage)?;
     }
 
     Ok(SyscallReturn::Return(0))
@@ -90,7 +85,7 @@ pub struct rusage_t {
     pub ru_msgrcv: u64,
     /// signals received
     pub ru_nsignals: u64,
-    /// voluntary context switches
+    /// voluntary ctx switches
     pub ru_nvcsw: u64,
     /// involuntary
     pub ru_nivcsw: u64,

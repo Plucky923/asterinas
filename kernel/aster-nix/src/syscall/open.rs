@@ -9,7 +9,6 @@ use crate::{
     },
     prelude::*,
     syscall::constants::MAX_FILENAME_LEN,
-    util::read_cstring_from_user,
 };
 
 pub fn sys_openat(
@@ -17,14 +16,17 @@ pub fn sys_openat(
     path_addr: Vaddr,
     flags: u32,
     mode: u16,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let path = read_cstring_from_user(path_addr, MAX_FILENAME_LEN)?;
+    let path = ctx
+        .get_user_space()
+        .read_cstring(path_addr, MAX_FILENAME_LEN)?;
     debug!(
         "dirfd = {}, path = {:?}, flags = {}, mode = {}",
         dirfd, path, flags, mode
     );
 
-    let current = current!();
+    let current = ctx.process;
     let file_handle = {
         let path = path.to_string_lossy();
         let fs_path = FsPath::new(dirfd, path.as_ref())?;
@@ -45,12 +47,12 @@ pub fn sys_openat(
     Ok(SyscallReturn::Return(fd as _))
 }
 
-pub fn sys_open(path_addr: Vaddr, flags: u32, mode: u16) -> Result<SyscallReturn> {
-    self::sys_openat(AT_FDCWD, path_addr, flags, mode)
+pub fn sys_open(path_addr: Vaddr, flags: u32, mode: u16, ctx: &Context) -> Result<SyscallReturn> {
+    self::sys_openat(AT_FDCWD, path_addr, flags, mode, ctx)
 }
 
-pub fn sys_creat(path_addr: Vaddr, mode: u16) -> Result<SyscallReturn> {
+pub fn sys_creat(path_addr: Vaddr, mode: u16, ctx: &Context) -> Result<SyscallReturn> {
     let flags =
         AccessMode::O_WRONLY as u32 | CreationFlags::O_CREAT.bits() | CreationFlags::O_TRUNC.bits();
-    self::sys_openat(AT_FDCWD, path_addr, flags, mode)
+    self::sys_openat(AT_FDCWD, path_addr, flags, mode, ctx)
 }

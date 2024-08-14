@@ -9,10 +9,9 @@ use crate::{
     },
     prelude::*,
     process::{Gid, Uid},
-    util::read_cstring_from_user,
 };
 
-pub fn sys_fchown(fd: FileDesc, uid: i32, gid: i32) -> Result<SyscallReturn> {
+pub fn sys_fchown(fd: FileDesc, uid: i32, gid: i32, ctx: &Context) -> Result<SyscallReturn> {
     debug!("fd = {}, uid = {}, gid = {}", fd, uid, gid);
 
     let uid = to_optional_id(uid, Uid::new)?;
@@ -21,8 +20,7 @@ pub fn sys_fchown(fd: FileDesc, uid: i32, gid: i32) -> Result<SyscallReturn> {
         return Ok(SyscallReturn::Return(0));
     }
 
-    let current = current!();
-    let file_table = current.file_table().lock();
+    let file_table = ctx.process.file_table().lock();
     let file = file_table.get_file(fd)?;
     if let Some(uid) = uid {
         file.set_owner(uid)?;
@@ -33,17 +31,18 @@ pub fn sys_fchown(fd: FileDesc, uid: i32, gid: i32) -> Result<SyscallReturn> {
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_chown(path_ptr: Vaddr, uid: i32, gid: i32) -> Result<SyscallReturn> {
-    self::sys_fchownat(AT_FDCWD, path_ptr, uid, gid, 0)
+pub fn sys_chown(path_ptr: Vaddr, uid: i32, gid: i32, ctx: &Context) -> Result<SyscallReturn> {
+    self::sys_fchownat(AT_FDCWD, path_ptr, uid, gid, 0, ctx)
 }
 
-pub fn sys_lchown(path_ptr: Vaddr, uid: i32, gid: i32) -> Result<SyscallReturn> {
+pub fn sys_lchown(path_ptr: Vaddr, uid: i32, gid: i32, ctx: &Context) -> Result<SyscallReturn> {
     self::sys_fchownat(
         AT_FDCWD,
         path_ptr,
         uid,
         gid,
         ChownFlags::AT_SYMLINK_NOFOLLOW.bits(),
+        ctx,
     )
 }
 
@@ -53,8 +52,9 @@ pub fn sys_fchownat(
     uid: i32,
     gid: i32,
     flags: u32,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let path = read_cstring_from_user(path_ptr, PATH_MAX)?;
+    let path = ctx.get_user_space().read_cstring(path_ptr, PATH_MAX)?;
     let flags = ChownFlags::from_bits(flags)
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid flags"))?;
     debug!(
@@ -66,7 +66,7 @@ pub fn sys_fchownat(
         if !flags.contains(ChownFlags::AT_EMPTY_PATH) {
             return_errno_with_message!(Errno::ENOENT, "path is empty");
         }
-        return self::sys_fchown(dirfd, uid, gid);
+        return self::sys_fchown(dirfd, uid, gid, ctx);
     }
 
     let uid = to_optional_id(uid, Uid::new)?;
@@ -75,11 +75,10 @@ pub fn sys_fchownat(
         return Ok(SyscallReturn::Return(0));
     }
 
-    let current = current!();
     let dentry = {
         let path = path.to_string_lossy();
         let fs_path = FsPath::new(dirfd, path.as_ref())?;
-        let fs = current.fs().read();
+        let fs = ctx.process.fs().read();
         if flags.contains(ChownFlags::AT_SYMLINK_NOFOLLOW) {
             fs.lookup_no_follow(&fs_path)?
         } else {

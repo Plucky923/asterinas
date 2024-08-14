@@ -10,7 +10,6 @@ use crate::{
     },
     prelude::*,
     syscall::{constants::MAX_FILENAME_LEN, stat::FileType},
-    util::read_cstring_from_user,
 };
 
 pub fn sys_mknodat(
@@ -18,9 +17,12 @@ pub fn sys_mknodat(
     path_addr: Vaddr,
     mode: u16,
     dev: usize,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let path = read_cstring_from_user(path_addr, MAX_FILENAME_LEN)?;
-    let current = current!();
+    let path = ctx
+        .get_user_space()
+        .read_cstring(path_addr, MAX_FILENAME_LEN)?;
+    let current = ctx.process;
     let inode_mode = {
         let mask_mode = mode & !current.umask().read().get();
         InodeMode::from_bits_truncate(mask_mode)
@@ -60,6 +62,6 @@ pub fn sys_mknodat(
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_mknod(path_addr: Vaddr, mode: u16, dev: usize) -> Result<SyscallReturn> {
-    self::sys_mknodat(AT_FDCWD, path_addr, mode, dev)
+pub fn sys_mknod(path_addr: Vaddr, mode: u16, dev: usize, ctx: &Context) -> Result<SyscallReturn> {
+    self::sys_mknodat(AT_FDCWD, path_addr, mode, dev, ctx)
 }

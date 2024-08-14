@@ -8,10 +8,9 @@ use crate::{
         utils::{Channel, CreationFlags, StatusFlags},
     },
     prelude::*,
-    util::write_val_to_user,
 };
 
-pub fn sys_pipe2(fds: Vaddr, flags: u32) -> Result<SyscallReturn> {
+pub fn sys_pipe2(fds: Vaddr, flags: u32, ctx: &Context) -> Result<SyscallReturn> {
     debug!("flags: {:?}", flags);
 
     let (pipe_reader, pipe_writer) = {
@@ -31,8 +30,7 @@ pub fn sys_pipe2(fds: Vaddr, flags: u32) -> Result<SyscallReturn> {
         FdFlags::empty()
     };
 
-    let current = current!();
-    let mut file_table = current.file_table().lock();
+    let mut file_table = ctx.process.file_table().lock();
 
     let pipe_fds = PipeFds {
         reader_fd: file_table.insert(pipe_reader, fd_flags),
@@ -40,7 +38,7 @@ pub fn sys_pipe2(fds: Vaddr, flags: u32) -> Result<SyscallReturn> {
     };
     debug!("pipe_fds: {:?}", pipe_fds);
 
-    if let Err(err) = write_val_to_user(fds, &pipe_fds) {
+    if let Err(err) = ctx.get_user_space().write_val(fds, &pipe_fds) {
         file_table.close_file(pipe_fds.reader_fd).unwrap();
         file_table.close_file(pipe_fds.writer_fd).unwrap();
         return Err(err);
@@ -49,8 +47,8 @@ pub fn sys_pipe2(fds: Vaddr, flags: u32) -> Result<SyscallReturn> {
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_pipe(fds: Vaddr) -> Result<SyscallReturn> {
-    self::sys_pipe2(fds, 0)
+pub fn sys_pipe(fds: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
+    self::sys_pipe2(fds, 0, ctx)
 }
 
 #[derive(Debug, Clone, Copy, Pod)]
@@ -60,4 +58,4 @@ struct PipeFds {
     writer_fd: FileDesc,
 }
 
-const PIPE_BUF_SIZE: usize = 1024 * 1024;
+const PIPE_BUF_SIZE: usize = 65536;

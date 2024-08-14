@@ -3,7 +3,7 @@ on:
   # In case of manual trigger, use workflow_dispatch
   workflow_dispatch:
   schedule:
-    # Schedule to run on every day at 20:00 UTC (04:00 CST)
+    # Schedule to run on every day at 20:00 UTC (04:00 Beijing Time)
     - cron: '0 20 * * *'
 
 jobs:
@@ -23,22 +23,24 @@ jobs:
           - lmbench-mem-frd
           - lmbench-mem-fwr
           - lmbench-mem-fcp
-          # Network-related benchmarks
+          # IPC-related benchmarks
           - lmbench-unix-latency
+          - lmbench-unix-bandwidth
+          - lmbench-pipe-latency
+          - lmbench-pipe-bandwidth
           # Syscall-related benchmarks
           - lmbench-getpid
           - lmbench-fstat
           - lmbench-open
           - lmbench-stat
-          # TODO: The following benchmarks are disabled now for some reasons.
-          #
-          # In Linux, lack of /dev/null device
-          # - lmbench-write
-          # In Linux, lack of /dev/zero device
-          # - lmbench-read
-          #
+          - lmbench-write
+          - lmbench-read
           # Signal-related benchmarks
           - lmbench-signal
+          - lmbench-signal-install
+          # File-related benchmarks
+          - lmbench-file-rd-bandwidth
+          - lmbench-select-file
       fail-fast: false
     timeout-minutes: 60
     container: 
@@ -69,17 +71,28 @@ jobs:
           make install_osdk
           bash test/benchmark/bench_linux_and_aster.sh ${{ matrix.benchmark }}
 
-    - name: Prepare threshold values
+    - name: Set up benchmark configuration
       run: |
-        echo "Configuring thresholds..."
         ALERT_THRESHOLD=$(jq -r '.alert_threshold' test/benchmark/${{ matrix.benchmark }}/config.json)
         echo "ALERT_THRESHOLD=$ALERT_THRESHOLD" >> $GITHUB_ENV
+        
+        ALERT_TOOL=$(jq -r '.alert_tool' test/benchmark/${{ matrix.benchmark }}/config.json)
+        if [ "${ALERT_TOOL}" = "null" ]; then
+          ALERT_TOOL="customSmallerIsBetter"
+        fi
+        echo "ALERT_TOOL=$ALERT_TOOL" >> $GITHUB_ENV
+        
+        DESCRIPTION=$(jq -r '.description' test/benchmark/${{ matrix.benchmark }}/config.json)
+        if [ -z "$DESCRIPTION" ]; then
+          DESCRIPTION=""
+        fi
+        echo "DESCRIPTION=$DESCRIPTION" >> $GITHUB_ENV
 
     - name: Store benchmark results
-      uses: asterinas/github-action-benchmark@v1
+      uses: asterinas/github-action-benchmark@v2
       with:
         name: ${{ matrix.benchmark }} Benchmark
-        tool: 'customSmallerIsBetter'
+        tool: ${{ env.ALERT_TOOL }}
         output-file-path: result_${{ matrix.benchmark }}.json
         benchmark-data-dir-path: '' 
         github-token: ${{ secrets.BENCHMARK_SECRET }}
@@ -88,3 +101,4 @@ jobs:
         alert-threshold: ${{ env.ALERT_THRESHOLD }} 
         comment-on-alert: true
         fail-on-alert: true
+        chart-description: ${{ env.DESCRIPTION }}

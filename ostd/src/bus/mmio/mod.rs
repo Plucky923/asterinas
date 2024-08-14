@@ -10,17 +10,21 @@ pub mod common_device;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-#[cfg(feature = "intel_tdx")]
-use ::tdx_guest::tdx_is_enabled;
+use cfg_if::cfg_if;
 use log::debug;
 
 use self::bus::MmioBus;
-#[cfg(feature = "intel_tdx")]
-use crate::arch::tdx_guest;
 use crate::{
     arch::kernel::IO_APIC, bus::mmio::common_device::MmioCommonDevice, mm::paddr_to_vaddr,
     sync::SpinLock, trap::IrqLine,
 };
+
+cfg_if! {
+    if #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))] {
+        use ::tdx_guest::tdx_is_enabled;
+        use crate::arch::tdx_guest;
+    }
+}
 
 const VIRTIO_MMIO_MAGIC: u32 = 0x74726976;
 
@@ -29,7 +33,7 @@ pub static MMIO_BUS: SpinLock<MmioBus> = SpinLock::new(MmioBus::new());
 static IRQS: SpinLock<Vec<IrqLine>> = SpinLock::new(Vec::new());
 
 pub(crate) fn init() {
-    #[cfg(feature = "intel_tdx")]
+    #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
     // SAFETY:
     // This is safe because we are ensuring that the address range 0xFEB0_0000 to 0xFEB0_4000 is valid before this operation.
     // The address range is page-aligned and falls within the MMIO range, which is a requirement for the `unprotect_gpa_range` function.
@@ -59,8 +63,8 @@ fn iter_range(range: Range<usize>) {
     while current > range.start {
         current -= 0x100;
         // SAFETY: It only read the value and judge if the magic value fit 0x74726976
-        let value = unsafe { *(paddr_to_vaddr(current) as *const u32) };
-        if value == VIRTIO_MMIO_MAGIC {
+        let magic = unsafe { core::ptr::read_volatile(paddr_to_vaddr(current) as *const u32) };
+        if magic == VIRTIO_MMIO_MAGIC {
             // SAFETY: It only read the device id
             let device_id = unsafe { *(paddr_to_vaddr(current + 8) as *const u32) };
             device_count += 1;

@@ -7,12 +7,12 @@ use crate::{
     prelude::*,
     process::signal::Pauser,
     time::{clockid_t, timespec_t, TIMER_ABSTIME},
-    util::{read_val_from_user, write_val_to_user},
 };
 
 pub fn sys_nanosleep(
     request_timespec_addr: Vaddr,
     remain_timespec_addr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     let clockid = ClockId::CLOCK_MONOTONIC;
 
@@ -21,6 +21,7 @@ pub fn sys_nanosleep(
         false,
         request_timespec_addr,
         remain_timespec_addr,
+        ctx,
     )
 }
 
@@ -29,6 +30,7 @@ pub fn sys_clock_nanosleep(
     flags: i32,
     request_timespec_addr: Vaddr,
     remain_timespec_addr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     let is_abs_time = if flags == 0 {
         false
@@ -43,6 +45,7 @@ pub fn sys_clock_nanosleep(
         is_abs_time,
         request_timespec_addr,
         remain_timespec_addr,
+        ctx,
     )
 }
 
@@ -51,10 +54,13 @@ fn do_clock_nanosleep(
     is_abs_time: bool,
     request_timespec_addr: Vaddr,
     remain_timespec_addr: Vaddr,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     let request_time = {
-        let timespec = read_val_from_user::<timespec_t>(request_timespec_addr)?;
-        Duration::from(timespec)
+        let timespec = ctx
+            .get_user_space()
+            .read_val::<timespec_t>(request_timespec_addr)?;
+        Duration::try_from(timespec)?
     };
 
     debug!(
@@ -62,7 +68,7 @@ fn do_clock_nanosleep(
         clockid, is_abs_time, request_time, remain_timespec_addr
     );
 
-    let start_time = read_clock(clockid)?;
+    let start_time = read_clock(clockid, ctx)?;
     let timeout = if is_abs_time {
         if request_time < start_time {
             return Ok(SyscallReturn::Return(0));
@@ -81,7 +87,7 @@ fn do_clock_nanosleep(
     match res {
         Err(e) if e.error() == Errno::ETIME => Ok(SyscallReturn::Return(0)),
         Err(e) if e.error() == Errno::EINTR => {
-            let end_time = read_clock(clockid)?;
+            let end_time = read_clock(clockid, ctx)?;
 
             if end_time >= start_time + timeout {
                 return Ok(SyscallReturn::Return(0));
@@ -90,7 +96,8 @@ fn do_clock_nanosleep(
             if remain_timespec_addr != 0 && !is_abs_time {
                 let remaining_duration = (start_time + timeout) - end_time;
                 let remaining_timespec = timespec_t::from(remaining_duration);
-                write_val_to_user(remain_timespec_addr, &remaining_timespec)?;
+                ctx.get_user_space()
+                    .write_val(remain_timespec_addr, &remaining_timespec)?;
             }
 
             return_errno_with_message!(Errno::EINTR, "sleep was interrupted");

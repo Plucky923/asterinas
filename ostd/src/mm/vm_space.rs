@@ -17,16 +17,16 @@ use super::{
     io::UserSpace,
     kspace::KERNEL_PAGE_TABLE,
     page_table::{PageTable, UserMode},
-    PageProperty, VmReader, VmWriter,
+    PageFlags, PageProperty, VmReader, VmWriter,
 };
 use crate::{
     arch::mm::{
-        current_page_table_paddr, tlb_flush_addr_range, tlb_flush_all_excluding_global,
-        PageTableEntry, PagingConsts,
+        current_page_table_paddr, tlb_flush_addr, tlb_flush_addr_range, PageTableEntry,
+        PagingConsts,
     },
     cpu::CpuExceptionInfo,
     mm::{
-        page_table::{self, PageTableQueryResult as PtQr},
+        page_table::{self, PageTableItem},
         Frame, MAX_USERSPACE_VADDR,
     },
     prelude::*,
@@ -48,6 +48,7 @@ use crate::{
 /// A `VmSpace` can also attach a page fault handler, which will be invoked to
 /// handle page faults generated from user space.
 #[allow(clippy::type_complexity)]
+#[derive(Debug)]
 pub struct VmSpace {
     pt: PageTable<UserMode>,
     page_fault_handler: Once<fn(&VmSpace, &CpuExceptionInfo) -> core::result::Result<(), ()>>,
@@ -122,22 +123,24 @@ impl VmSpace {
         self.page_fault_handler.call_once(|| func);
     }
 
-    /// Clears all mappings
-    pub fn clear(&self) {
-        // SAFETY: unmapping user space is safe, and we don't care unmapping
-        // invalid ranges.
-        unsafe {
-            self.pt.unmap(&(0..MAX_USERSPACE_VADDR)).unwrap();
-        }
-        tlb_flush_all_excluding_global();
-    }
-
     /// Forks a new VM space with copy-on-write semantics.
     ///
     /// Both the parent and the newly forked VM space will be marked as
     /// read-only. And both the VM space will take handles to the same
     /// physical memory pages.
     pub fn fork_copy_on_write(&self) -> Self {
+        // Protect the parent VM space as read-only.
+        let end = MAX_USERSPACE_VADDR;
+        let mut cursor = self.pt.cursor_mut(&(0..end)).unwrap();
+        let mut op = |prop: &mut PageProperty| {
+            prop.flags -= PageFlags::W;
+        };
+
+        // SAFETY: It is safe to protect memory in the userspace.
+        while let Some(range) = unsafe { cursor.protect_next(end - cursor.virt_addr(), &mut op) } {
+            tlb_flush_addr(range.start);
+        }
+
         let page_fault_handler = {
             let new_handler = Once::new();
             if let Some(handler) = self.page_fault_handler.get() {
@@ -145,12 +148,11 @@ impl VmSpace {
             }
             new_handler
         };
-        let new_space = Self {
-            pt: self.pt.fork_copy_on_write(),
+
+        Self {
+            pt: self.pt.clone_with(cursor),
             page_fault_handler,
-        };
-        tlb_flush_all_excluding_global();
-        new_space
+        }
     }
 
     /// Creates a reader to read data from the user space of the current task.
@@ -210,7 +212,7 @@ impl Default for VmSpace {
 pub struct Cursor<'a>(page_table::Cursor<'a, UserMode, PageTableEntry, PagingConsts>);
 
 impl Iterator for Cursor<'_> {
-    type Item = VmQueryResult;
+    type Item = VmItem;
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = self.query();
@@ -225,8 +227,8 @@ impl Cursor<'_> {
     /// Query about the current slot.
     ///
     /// This function won't bring the cursor to the next slot.
-    pub fn query(&mut self) -> Result<VmQueryResult> {
-        Ok(self.0.query().map(|ptqr| ptqr.try_into().unwrap())?)
+    pub fn query(&mut self) -> Result<VmItem> {
+        Ok(self.0.query().map(|item| item.try_into().unwrap())?)
     }
 
     /// Jump to the virtual address.
@@ -252,8 +254,8 @@ impl CursorMut<'_> {
     /// This is the same as [`Cursor::query`].
     ///
     /// This function won't bring the cursor to the next slot.
-    pub fn query(&mut self) -> Result<VmQueryResult> {
-        Ok(self.0.query().map(|ptqr| ptqr.try_into().unwrap())?)
+    pub fn query(&mut self) -> Result<VmItem> {
+        Ok(self.0.query().map(|item| item.try_into().unwrap())?)
     }
 
     /// Jump to the virtual address.
@@ -288,20 +290,34 @@ impl CursorMut<'_> {
     /// This method will bring the cursor forward by `len` bytes in the virtual
     /// address space after the modification.
     ///
+    /// Already-absent mappings encountered by the cursor will be skipped. It
+    /// is valid to unmap a range that is not mapped.
+    ///
     /// # Panics
     ///
     /// This method will panic if `len` is not page-aligned.
     pub fn unmap(&mut self, len: usize) {
         assert!(len % super::PAGE_SIZE == 0);
-        let start_va = self.virt_addr();
-        let end_va = start_va + len;
+        let end_va = self.virt_addr() + len;
 
-        // SAFETY: It is safe to un-map memory in the userspace.
-        unsafe {
-            self.0.unmap(len);
+        loop {
+            // SAFETY: It is safe to un-map memory in the userspace.
+            let result = unsafe { self.0.take_next(end_va - self.virt_addr()) };
+            match result {
+                PageTableItem::Mapped { va, page, .. } => {
+                    // TODO: Ask other processors to flush the TLB before we
+                    // release the page back to the allocator.
+                    tlb_flush_addr(va);
+                    drop(page);
+                }
+                PageTableItem::NotMapped { .. } => {
+                    break;
+                }
+                PageTableItem::MappedUntracked { .. } => {
+                    panic!("found untracked memory mapped into `VmSpace`");
+                }
+            }
         }
-
-        tlb_flush_addr_range(&(start_va..end_va));
     }
 
     /// Change the mapping property starting from the current slot.
@@ -314,28 +330,20 @@ impl CursorMut<'_> {
     /// # Panics
     ///
     /// This method will panic if `len` is not page-aligned.
-    pub fn protect(
-        &mut self,
-        len: usize,
-        op: impl FnMut(&mut PageProperty),
-        allow_protect_absent: bool,
-    ) -> Result<()> {
+    pub fn protect(&mut self, len: usize, mut op: impl FnMut(&mut PageProperty)) {
         assert!(len % super::PAGE_SIZE == 0);
-        let start_va = self.virt_addr();
-        let end_va = start_va + len;
+        let end = self.0.virt_addr() + len;
 
         // SAFETY: It is safe to protect memory in the userspace.
-        let result = unsafe { self.0.protect(len, op, allow_protect_absent) };
-
-        tlb_flush_addr_range(&(start_va..end_va));
-
-        Ok(result?)
+        while let Some(range) = unsafe { self.0.protect_next(end - self.0.virt_addr(), &mut op) } {
+            tlb_flush_addr(range.start);
+        }
     }
 }
 
 /// The result of a query over the VM space.
 #[derive(Debug)]
-pub enum VmQueryResult {
+pub enum VmItem {
     /// The current slot is not mapped.
     NotMapped {
         /// The virtual address of the slot.
@@ -354,20 +362,22 @@ pub enum VmQueryResult {
     },
 }
 
-impl TryFrom<PtQr> for VmQueryResult {
+impl TryFrom<PageTableItem> for VmItem {
     type Error = &'static str;
 
-    fn try_from(ptqr: PtQr) -> core::result::Result<Self, Self::Error> {
-        match ptqr {
-            PtQr::NotMapped { va, len } => Ok(VmQueryResult::NotMapped { va, len }),
-            PtQr::Mapped { va, page, prop } => Ok(VmQueryResult::Mapped {
+    fn try_from(item: PageTableItem) -> core::result::Result<Self, Self::Error> {
+        match item {
+            PageTableItem::NotMapped { va, len } => Ok(VmItem::NotMapped { va, len }),
+            PageTableItem::Mapped { va, page, prop } => Ok(VmItem::Mapped {
                 va,
                 frame: page
                     .try_into()
                     .map_err(|_| "found typed memory mapped into `VmSpace`")?,
                 prop,
             }),
-            PtQr::MappedUntracked { .. } => Err("found untracked memory mapped into `VmSpace`"),
+            PageTableItem::MappedUntracked { .. } => {
+                Err("found untracked memory mapped into `VmSpace`")
+            }
         }
     }
 }

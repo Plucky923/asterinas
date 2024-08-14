@@ -1,37 +1,37 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-
 use super::SyscallReturn;
 use crate::{
     prelude::*,
-    process::{
-        posix_thread::PosixThreadExt,
-        signal::{SigStack, SigStackFlags},
-    },
-    util::{read_val_from_user, write_val_to_user},
+    process::signal::{SigStack, SigStackFlags},
 };
 
-pub fn sys_sigaltstack(sig_stack_addr: Vaddr, old_sig_stack_addr: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_sigaltstack(
+    sig_stack_addr: Vaddr,
+    old_sig_stack_addr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
     debug!(
         "sig_stack_addr = 0x{:x}, old_sig_stack_addr: 0x{:x}",
         sig_stack_addr, old_sig_stack_addr
     );
 
     let old_stack = {
-        let current_thread = current_thread!();
-        let posix_thread = current_thread.as_posix_thread().unwrap();
-        let sig_stack = posix_thread.sig_stack().lock();
+        let sig_stack = ctx.posix_thread.sig_stack().lock();
         sig_stack.clone()
     };
 
-    get_old_stack(old_sig_stack_addr, old_stack.as_ref())?;
-    set_new_stack(sig_stack_addr, old_stack.as_ref())?;
+    get_old_stack(old_sig_stack_addr, old_stack.as_ref(), ctx)?;
+    set_new_stack(sig_stack_addr, old_stack.as_ref(), ctx)?;
 
     Ok(SyscallReturn::Return(0))
 }
 
-fn get_old_stack(old_sig_stack_addr: Vaddr, old_stack: Option<&SigStack>) -> Result<()> {
+fn get_old_stack(
+    old_sig_stack_addr: Vaddr,
+    old_stack: Option<&SigStack>,
+    ctx: &Context,
+) -> Result<()> {
     if old_sig_stack_addr == 0 {
         return Ok(());
     }
@@ -43,10 +43,10 @@ fn get_old_stack(old_sig_stack_addr: Vaddr, old_stack: Option<&SigStack>) -> Res
     debug!("old stack = {:?}", old_stack);
 
     let stack = stack_t::from(old_stack.clone());
-    write_val_to_user(old_sig_stack_addr, &stack)
+    ctx.get_user_space().write_val(old_sig_stack_addr, &stack)
 }
 
-fn set_new_stack(sig_stack_addr: Vaddr, old_stack: Option<&SigStack>) -> Result<()> {
+fn set_new_stack(sig_stack_addr: Vaddr, old_stack: Option<&SigStack>, ctx: &Context) -> Result<()> {
     if sig_stack_addr == 0 {
         return Ok(());
     }
@@ -58,15 +58,13 @@ fn set_new_stack(sig_stack_addr: Vaddr, old_stack: Option<&SigStack>) -> Result<
     }
 
     let new_stack = {
-        let stack = read_val_from_user::<stack_t>(sig_stack_addr)?;
+        let stack = ctx.get_user_space().read_val::<stack_t>(sig_stack_addr)?;
         SigStack::try_from(stack)?
     };
 
     debug!("new_stack = {:?}", new_stack);
 
-    let current_thread = current_thread!();
-    let posix_thread = current_thread.as_posix_thread().unwrap();
-    *posix_thread.sig_stack().lock() = Some(new_stack);
+    *ctx.posix_thread.sig_stack().lock() = Some(new_stack);
 
     Ok(())
 }
@@ -112,5 +110,6 @@ impl From<SigStack> for stack_t {
     }
 }
 
+#[allow(unused)]
 const SIGSTKSZ: usize = 8192;
 const MINSTKSZ: usize = 2048;

@@ -163,18 +163,14 @@ fn get_manifest_path<'a>(cargo_metadata: &'a serde_json::Value, crate_name: &str
 fn get_src_path<'a>(cargo_metadata: &'a serde_json::Value, crate_name: &str) -> &'a str {
     let metadata = get_package_metadata(cargo_metadata, crate_name);
     let targets = metadata.get("targets").unwrap().as_array().unwrap();
+    assert!(
+        targets.len() == 1,
+        "there must be one and only one target generated"
+    );
 
-    for target in targets {
-        let name = target.get("name").unwrap().as_str().unwrap();
-        if name != crate_name {
-            continue;
-        }
-
-        let src_path = target.get("src_path").unwrap();
-        return src_path.as_str().unwrap();
-    }
-
-    panic!("the crate name does not match with any target");
+    let target = &targets[0];
+    let src_path = target.get("src_path").unwrap();
+    return src_path.as_str().unwrap();
 }
 
 fn get_workspace_root(cargo_metadata: &serde_json::Value) -> &str {

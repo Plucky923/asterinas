@@ -117,7 +117,7 @@ const_assert_eq!(size_of::<MetaSlot>(), 16);
 /// If a page type needs specific drop behavior, it should specify
 /// when implementing this trait. When we drop the last handle to
 /// this page, the `on_drop` method will be called.
-pub trait PageMeta: Default + Sync + private::Sealed + Sized {
+pub trait PageMeta: Sync + private::Sealed + Sized {
     const USAGE: PageUsage;
 
     fn on_drop(page: &mut Page<Self>);
@@ -175,16 +175,9 @@ pub struct FrameMeta {
 
 impl Sealed for FrameMeta {}
 
-#[derive(Debug, Default)]
-#[repr(C)]
-pub struct PageTablePageMetaInner {
-    pub level: PagingLevel,
-    pub nr_children: u16,
-}
-
 /// The metadata of any kinds of page table pages.
 /// Make sure the the generic parameters don't effect the memory layout.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[repr(C)]
 pub struct PageTablePageMeta<
     E: PageTableEntryTrait = PageTableEntry,
@@ -192,9 +185,26 @@ pub struct PageTablePageMeta<
 > where
     [(); C::NR_LEVELS as usize]:,
 {
+    pub level: PagingLevel,
+    /// The lock for the page table page.
     pub lock: AtomicU8,
-    pub inner: UnsafeCell<PageTablePageMetaInner>,
+    /// The number of valid PTEs. It is mutable if the lock is held.
+    pub nr_children: UnsafeCell<u16>,
     _phantom: core::marker::PhantomData<(E, C)>,
+}
+
+impl<E: PageTableEntryTrait, C: PagingConstsTrait> PageTablePageMeta<E, C>
+where
+    [(); C::NR_LEVELS as usize]:,
+{
+    pub fn new_locked(level: PagingLevel) -> Self {
+        Self {
+            level,
+            lock: AtomicU8::new(1),
+            nr_children: UnsafeCell::new(0),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<E: PageTableEntryTrait, C: PagingConstsTrait> Sealed for PageTablePageMeta<E, C> where
@@ -275,7 +285,7 @@ pub(crate) fn init() -> Vec<Page<MetaPageMeta>> {
     // Now the metadata pages are mapped, we can initialize the metadata.
     meta_pages
         .into_iter()
-        .map(Page::<MetaPageMeta>::from_unused)
+        .map(|paddr| Page::<MetaPageMeta>::from_unused(paddr, MetaPageMeta::default()))
         .collect()
 }
 

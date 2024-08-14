@@ -2,26 +2,24 @@
 
 //! Panic support.
 
-use alloc::{boxed::Box, string::ToString};
 use core::ffi::c_void;
-
-use log::error;
 
 use crate::{
     arch::qemu::{exit_qemu, QemuExitCode},
-    early_print, early_println,
+    cpu_local_cell, early_print, early_println,
 };
 
 extern crate cfg_if;
 extern crate gimli;
 use gimli::Register;
-use unwinding::{
-    abi::{
-        UnwindContext, UnwindReasonCode, _Unwind_Backtrace, _Unwind_FindEnclosingFunction,
-        _Unwind_GetGR, _Unwind_GetIP,
-    },
-    panic::begin_panic,
+use unwinding::abi::{
+    UnwindContext, UnwindReasonCode, _Unwind_Backtrace, _Unwind_FindEnclosingFunction,
+    _Unwind_GetGR, _Unwind_GetIP,
 };
+
+cpu_local_cell! {
+    static IN_PANIC: bool = false;
+}
 
 /// The panic handler must be defined in the binary crate or in the crate that the binary
 /// crate explicity declares by `extern crate`. We cannot let the base crate depend on OSTD
@@ -29,19 +27,35 @@ use unwinding::{
 /// panic handler in the binary crate.
 #[export_name = "__aster_panic_handler"]
 pub fn panic_handler(info: &core::panic::PanicInfo) -> ! {
-    let throw_info = ostd_test::PanicInfo {
-        message: info.message().to_string(),
-        file: info.location().unwrap().file().to_string(),
-        line: info.location().unwrap().line() as usize,
-        col: info.location().unwrap().column() as usize,
-    };
-    // Throw an exception and expecting it to be caught.
-    begin_panic(Box::new(throw_info.clone()));
-    // If the exception is not caught (e.g. by ktest) and resumed,
-    // then print the information and abort.
-    error!("Uncaught panic!");
+    let _irq_guard = crate::trap::disable_local();
+
+    if IN_PANIC.load() {
+        early_println!("{}", info);
+        early_println!("The panic handler panicked when processing the above panic. Aborting.");
+        abort();
+    }
+
+    // If in ktest, we would like to catch the panics and resume the test.
+    #[cfg(ktest)]
+    {
+        use alloc::{boxed::Box, string::ToString};
+
+        use unwinding::panic::begin_panic;
+
+        let throw_info = ostd_test::PanicInfo {
+            message: info.message().to_string(),
+            file: info.location().unwrap().file().to_string(),
+            line: info.location().unwrap().line() as usize,
+            col: info.location().unwrap().column() as usize,
+            resolve_panic: || {
+                IN_PANIC.store(false);
+            },
+        };
+        // Throw an exception and expecting it to be caught.
+        begin_panic(Box::new(throw_info.clone()));
+    }
     early_println!("{}", info);
-    early_println!("printing stack trace:");
+    early_println!("Printing stack trace:");
     print_stack_trace();
     abort();
 }

@@ -36,7 +36,7 @@ use crate::{
         paddr_to_vaddr,
         page::{
             self,
-            meta::{PageMeta, PageTablePageMeta, PageTablePageMetaInner, PageUsage},
+            meta::{PageMeta, PageTablePageMeta, PageUsage},
             DynPage, Page,
         },
         page_prop::PageProperty,
@@ -128,11 +128,11 @@ where
 
         let last_activated_paddr = current_page_table_paddr();
 
-        activate_page_table(self.raw, CachePolicy::Writeback);
-
         if last_activated_paddr == self.raw {
             return;
         }
+
+        activate_page_table(self.raw, CachePolicy::Writeback);
 
         // Increment the reference count of the current page table.
         self.inc_ref_count();
@@ -231,14 +231,8 @@ where
     /// set the lock bit for performance as it is exclusive and unlocking is an
     /// extra unnecessary expensive operation.
     pub(super) fn alloc(level: PagingLevel) -> Self {
-        let page = page::allocator::alloc_single::<PageTablePageMeta<E, C>>().unwrap();
-
-        // The lock is initialized as held.
-        page.meta().lock.store(1, Ordering::Relaxed);
-
-        // SAFETY: here the page exclusively owned by the newly created handle.
-        let inner = unsafe { &mut *page.meta().inner.get() };
-        inner.level = level;
+        let meta = PageTablePageMeta::new_locked(level);
+        let page = page::allocator::alloc_single::<PageTablePageMeta<E, C>>(meta).unwrap();
 
         // Zero out the page table node.
         let ptr = paddr_to_vaddr(page.paddr()) as *mut u8;
@@ -318,6 +312,31 @@ where
         }
     }
 
+    /// Remove the child at the given index and return it.
+    pub(super) fn take_child(&mut self, idx: usize, in_tracked_range: bool) -> Child<E, C> {
+        debug_assert!(idx < nr_subpage_per_huge::<C>());
+
+        let pte = self.read_pte(idx);
+        if !pte.is_present() {
+            Child::None
+        } else {
+            let paddr = pte.paddr();
+            let is_last = pte.is_last(self.level());
+            *self.nr_children_mut() -= 1;
+            self.write_pte(idx, E::new_absent());
+            if !is_last {
+                Child::PageTable(RawPageTableNode {
+                    raw: paddr,
+                    _phantom: PhantomData,
+                })
+            } else if in_tracked_range {
+                Child::Page(unsafe { DynPage::from_raw(paddr) })
+            } else {
+                Child::Untracked(paddr)
+            }
+        }
+    }
+
     /// Makes a copy of the page table node.
     ///
     /// This function allows you to control about the way to copy the children.
@@ -369,13 +388,6 @@ where
         }
 
         new_pt
-    }
-
-    /// Removes a child if the child at the given index is present.
-    pub(super) fn unset_child(&mut self, idx: usize, in_tracked_range: bool) {
-        debug_assert!(idx < nr_subpage_per_huge::<C>());
-
-        self.overwrite_pte(idx, None, in_tracked_range);
     }
 
     /// Sets a child page table at a given index.
@@ -468,8 +480,27 @@ where
         unsafe { self.as_ptr().add(idx).read() }
     }
 
-    fn start_paddr(&self) -> Paddr {
-        self.page.paddr()
+    /// Writes a page table entry at a given index.
+    ///
+    /// This operation will leak the old child if the PTE is present.
+    fn write_pte(&mut self, idx: usize, pte: E) {
+        // It should be ensured by the cursor.
+        debug_assert!(idx < nr_subpage_per_huge::<C>());
+
+        // SAFETY: the index is within the bound and PTE is plain-old-data.
+        unsafe { (self.as_ptr() as *mut E).add(idx).write(pte) };
+    }
+
+    /// The number of valid PTEs.
+    pub(super) fn nr_children(&self) -> u16 {
+        // SAFETY: The lock is held so there is no mutable reference to it.
+        // It would be safe to read.
+        unsafe { *self.meta().nr_children.get() }
+    }
+
+    fn nr_children_mut(&mut self) -> &mut u16 {
+        // SAFETY: The lock is held so we have an exclusive access.
+        unsafe { &mut *self.meta().nr_children.get() }
     }
 
     /// Replaces a page table entry at a given index.
@@ -483,14 +514,7 @@ where
         let existing_pte = self.read_pte(idx);
 
         if existing_pte.is_present() {
-            // SAFETY: The index is within the bound and the address is aligned.
-            // The validity of the PTE is checked within this module.
-            // The safetiness also holds in the following branch.
-            unsafe {
-                (self.as_ptr() as *mut E)
-                    .add(idx)
-                    .write(pte.unwrap_or(E::new_absent()))
-            };
+            self.write_pte(idx, pte.unwrap_or(E::new_absent()));
 
             // Drop the child. We must set the PTE before dropping the child.
             // Just restore the handle and drop the handle.
@@ -510,13 +534,13 @@ where
 
             // Update the child count.
             if pte.is_none() {
-                self.meta_mut().nr_children -= 1;
+                *self.nr_children_mut() -= 1;
             }
         } else if let Some(e) = pte {
             // SAFETY: This is safe as described in the above branch.
             unsafe { (self.as_ptr() as *mut E).add(idx).write(e) };
 
-            self.meta_mut().nr_children += 1;
+            *self.nr_children_mut() += 1;
         }
     }
 
@@ -524,16 +548,12 @@ where
         paddr_to_vaddr(self.start_paddr()) as *const E
     }
 
-    fn meta(&self) -> &PageTablePageMetaInner {
-        // SAFETY: We have exclusively locked the page, so we can derive an immutable reference
-        // from an immutable reference to the lock guard.
-        unsafe { &*self.page.meta().inner.get() }
+    fn start_paddr(&self) -> Paddr {
+        self.page.paddr()
     }
 
-    fn meta_mut(&mut self) -> &mut PageTablePageMetaInner {
-        // SAFETY: We have exclusively locked the page, so we can derive a mutable reference from a
-        // mutable reference to the lock guard.
-        unsafe { &mut *self.page.meta().inner.get() }
+    fn meta(&self) -> &PageTablePageMeta<E, C> {
+        self.page.meta()
     }
 }
 
@@ -555,9 +575,7 @@ where
 
     fn on_drop(page: &mut Page<Self>) {
         let paddr = page.paddr();
-
-        let inner = unsafe { &mut *page.meta().inner.get() };
-        let level = inner.level;
+        let level = page.meta().level;
 
         // Drop the children.
         for i in 0..nr_subpage_per_huge::<C>() {

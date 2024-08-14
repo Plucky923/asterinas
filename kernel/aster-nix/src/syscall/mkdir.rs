@@ -9,14 +9,20 @@ use crate::{
     },
     prelude::*,
     syscall::constants::MAX_FILENAME_LEN,
-    util::read_cstring_from_user,
 };
 
-pub fn sys_mkdirat(dirfd: FileDesc, path_addr: Vaddr, mode: u16) -> Result<SyscallReturn> {
-    let path = read_cstring_from_user(path_addr, MAX_FILENAME_LEN)?;
+pub fn sys_mkdirat(
+    dirfd: FileDesc,
+    path_addr: Vaddr,
+    mode: u16,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    let path = ctx
+        .get_user_space()
+        .read_cstring(path_addr, MAX_FILENAME_LEN)?;
     debug!("dirfd = {}, path = {:?}, mode = {}", dirfd, path, mode);
 
-    let current = current!();
+    let current = ctx.process;
     let (dir_dentry, name) = {
         let path = path.to_string_lossy();
         if path.is_empty() {
@@ -37,6 +43,6 @@ pub fn sys_mkdirat(dirfd: FileDesc, path_addr: Vaddr, mode: u16) -> Result<Sysca
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_mkdir(path_addr: Vaddr, mode: u16) -> Result<SyscallReturn> {
-    self::sys_mkdirat(AT_FDCWD, path_addr, mode)
+pub fn sys_mkdir(path_addr: Vaddr, mode: u16, ctx: &Context) -> Result<SyscallReturn> {
+    self::sys_mkdirat(AT_FDCWD, path_addr, mode, ctx)
 }

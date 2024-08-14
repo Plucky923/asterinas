@@ -9,10 +9,12 @@ BUILD_SYSCALL_TEST ?= 0
 ENABLE_KVM ?= 1
 GDB_TCP_PORT ?= 1234
 INTEL_TDX ?= 0
+MEM ?= 8G
 RELEASE ?= 0
 RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
 SCHEME ?= ""
+SMP ?= 1
 # End of global options.
 
 # The Makefile provides a way to run arbitrary tests in the kernel
@@ -56,7 +58,6 @@ ifeq ($(INTEL_TDX), 1)
 BOOT_METHOD = grub-qcow2
 BOOT_PROTOCOL = linux-efi-handover64
 CARGO_OSDK_ARGS += --scheme tdx
-CARGO_OSDK_ARGS += --features intel_tdx
 endif
 
 ifneq ($(SCHEME), "")
@@ -70,6 +71,7 @@ endif
 ifeq ($(BOOT_PROTOCOL), linux-efi-handover64)
 CARGO_OSDK_ARGS += --grub-mkrescue=/usr/bin/grub-mkrescue
 CARGO_OSDK_ARGS += --grub-boot-protocol="linux"
+CARGO_OSDK_ARGS += --encoding gzip
 else ifeq ($(BOOT_PROTOCOL), linux-legacy32)
 CARGO_OSDK_ARGS += --linux-x86-legacy-boot
 CARGO_OSDK_ARGS += --grub-boot-protocol="linux"

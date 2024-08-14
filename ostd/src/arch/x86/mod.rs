@@ -14,10 +14,21 @@ pub(crate) mod pci;
 pub mod qemu;
 pub mod serial;
 pub mod task;
-#[cfg(feature = "intel_tdx")]
-pub(crate) mod tdx_guest;
 pub mod timer;
 pub mod trap;
+
+use cfg_if::cfg_if;
+
+cfg_if! {
+    if #[cfg(feature = "cvm_guest")] {
+        pub(crate) mod tdx_guest;
+
+        use {
+            crate::early_println,
+            ::tdx_guest::{init_tdx, tdcall::InitError, tdx_is_enabled},
+        };
+    }
+}
 
 use core::{
     arch::x86_64::{_rdrand64_step, _rdtsc},
@@ -26,16 +37,9 @@ use core::{
 
 use kernel::apic::ioapic;
 use log::{info, warn};
-#[cfg(feature = "intel_tdx")]
-use {
-    crate::early_println,
-    ::tdx_guest::{init_tdx, tdcall::InitError, tdx_is_enabled},
-};
 
-pub(crate) fn before_all_init() {
-    enable_common_cpu_features();
-    serial::init();
-    #[cfg(feature = "intel_tdx")]
+#[cfg(feature = "cvm_guest")]
+pub(crate) fn check_tdx_init() {
     match init_tdx() {
         Ok(td_info) => {
             early_println!(
@@ -55,9 +59,13 @@ pub(crate) fn before_all_init() {
     }
 }
 
-pub(crate) fn after_all_init() {
+pub(crate) fn init_on_bsp() {
     irq::init();
     kernel::acpi::init();
+
+    // SAFETY: it is only called once and ACPI has been initialized.
+    unsafe { crate::cpu::init() };
+
     match kernel::apic::init() {
         Ok(_) => {
             ioapic::init();
@@ -68,19 +76,31 @@ pub(crate) fn after_all_init() {
         }
     }
     serial::callback_init();
+
+    // SAFETY: no CPU local objects have been accessed by this far. And
+    // we are on the BSP.
+    unsafe { crate::cpu::local::init_on_bsp() };
+
+    crate::boot::smp::boot_all_aps();
+
     timer::init();
-    #[cfg(feature = "intel_tdx")]
-    if !tdx_is_enabled() {
-        match iommu::init() {
-            Ok(_) => {}
-            Err(err) => warn!("IOMMU initialization error:{:?}", err),
+
+    cfg_if! {
+        if #[cfg(feature = "cvm_guest")] {
+            if !tdx_is_enabled() {
+                match iommu::init() {
+                    Ok(_) => {}
+                    Err(err) => warn!("IOMMU initialization error:{:?}", err),
+                }
+            }
+        } else {
+            match iommu::init() {
+                Ok(_) => {}
+                Err(err) => warn!("IOMMU initialization error:{:?}", err),
+            }
         }
     }
-    #[cfg(not(feature = "intel_tdx"))]
-    match iommu::init() {
-        Ok(_) => {}
-        Err(err) => warn!("IOMMU initialization error:{:?}", err),
-    }
+
     // Some driver like serial may use PIC
     kernel::pic::init();
 }
@@ -88,9 +108,9 @@ pub(crate) fn after_all_init() {
 pub(crate) fn interrupts_ack(irq_number: usize) {
     if !cpu::CpuException::is_cpu_exception(irq_number as u16) {
         kernel::pic::ack();
-        if let Some(apic) = kernel::apic::APIC_INSTANCE.get() {
-            apic.lock_irq_disabled().eoi();
-        }
+        kernel::apic::borrow(|apic| {
+            apic.eoi();
+        });
     }
 }
 
@@ -138,7 +158,7 @@ fn has_avx512() -> bool {
     cpuid_result.ebx & (1 << 16) != 0
 }
 
-fn enable_common_cpu_features() {
+pub(crate) fn enable_cpu_features() {
     use x86_64::registers::{control::Cr4Flags, model_specific::EferFlags, xcontrol::XCr0Flags};
     let mut cr4 = x86_64::registers::control::Cr4::read();
     cr4 |= Cr4Flags::FSGSBASE

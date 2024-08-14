@@ -12,7 +12,7 @@ use crate::{
     util::net::{CSocketAddrFamily, Protocol, SockFlags, SockType, SOCK_TYPE_MASK},
 };
 
-pub fn sys_socket(domain: i32, type_: i32, protocol: i32) -> Result<SyscallReturn> {
+pub fn sys_socket(domain: i32, type_: i32, protocol: i32, ctx: &Context) -> Result<SyscallReturn> {
     let domain = CSocketAddrFamily::try_from(domain)?;
     let sock_type = SockType::try_from(type_ & SOCK_TYPE_MASK)?;
     let sock_flags = SockFlags::from_bits_truncate(type_ & !SOCK_TYPE_MASK);
@@ -23,7 +23,8 @@ pub fn sys_socket(domain: i32, type_: i32, protocol: i32) -> Result<SyscallRetur
     );
     let nonblocking = sock_flags.contains(SockFlags::SOCK_NONBLOCK);
     let file_like = match (domain, sock_type, protocol) {
-        (CSocketAddrFamily::AF_UNIX, SockType::SOCK_STREAM, _) => {
+        // FIXME: SOCK_SEQPACKET is added to run fcntl_test, not supported yet.
+        (CSocketAddrFamily::AF_UNIX, SockType::SOCK_STREAM | SockType::SOCK_SEQPACKET, _) => {
             UnixStreamSocket::new(nonblocking) as Arc<dyn FileLike>
         }
         (
@@ -42,8 +43,7 @@ pub fn sys_socket(domain: i32, type_: i32, protocol: i32) -> Result<SyscallRetur
         _ => return_errno_with_message!(Errno::EAFNOSUPPORT, "unsupported domain"),
     };
     let fd = {
-        let current = current!();
-        let mut file_table = current.file_table().lock();
+        let mut file_table = ctx.process.file_table().lock();
         let fd_flags = if sock_flags.contains(SockFlags::SOCK_CLOEXEC) {
             FdFlags::CLOEXEC
         } else {

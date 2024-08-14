@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::SyscallReturn;
-use crate::{prelude::*, util::write_val_to_user};
+use crate::prelude::*;
 
 pub fn sys_uname(old_uname_addr: Vaddr) -> Result<SyscallReturn> {
     debug!("old uname addr = 0x{:x}", old_uname_addr);

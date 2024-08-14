@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(unused_variables)]
-
-use ostd::mm::VmIo;
+use core::sync::atomic::Ordering;
 
 use super::SyscallReturn;
 use crate::{
     prelude::*,
-    process::{
-        posix_thread::PosixThreadExt,
-        signal::{
-            constants::{SIGKILL, SIGSTOP},
-            sig_mask::SigMask,
-        },
+    process::signal::{
+        constants::{SIGKILL, SIGSTOP},
+        sig_mask::SigMask,
     },
 };
 
@@ -21,6 +16,7 @@ pub fn sys_rt_sigprocmask(
     set_ptr: Vaddr,
     oldset_ptr: Vaddr,
     sigset_size: usize,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
     let mask_op = MaskOp::try_from(how).unwrap();
     debug!(
@@ -30,7 +26,7 @@ pub fn sys_rt_sigprocmask(
     if sigset_size != 8 {
         error!("sigset size is not equal to 8");
     }
-    do_rt_sigprocmask(mask_op, set_ptr, oldset_ptr, sigset_size).unwrap();
+    do_rt_sigprocmask(mask_op, set_ptr, oldset_ptr, ctx).unwrap();
     Ok(SyscallReturn::Return(0))
 }
 
@@ -38,34 +34,33 @@ fn do_rt_sigprocmask(
     mask_op: MaskOp,
     set_ptr: Vaddr,
     oldset_ptr: Vaddr,
-    sigset_size: usize,
+    ctx: &Context,
 ) -> Result<()> {
-    let current = current!();
-    let current_thread = current_thread!();
-    let posix_thread = current_thread.as_posix_thread().unwrap();
-    let root_vmar = current.root_vmar();
-    let mut sig_mask = posix_thread.sig_mask().lock();
-    let old_sig_mask_value = sig_mask.as_u64();
+    let old_sig_mask_value = ctx.posix_thread.sig_mask().load(Ordering::Relaxed);
     debug!("old sig mask value: 0x{:x}", old_sig_mask_value);
     if oldset_ptr != 0 {
-        root_vmar.write_val(oldset_ptr, &old_sig_mask_value)?;
+        ctx.get_user_space()
+            .write_val(oldset_ptr, &old_sig_mask_value)?;
     }
+
+    let sig_mask_ref = ctx.posix_thread.sig_mask();
     if set_ptr != 0 {
-        let new_set = root_vmar.read_val::<u64>(set_ptr)?;
+        let mut read_mask = ctx.get_user_space().read_val::<SigMask>(set_ptr)?;
         match mask_op {
             MaskOp::Block => {
-                let mut new_sig_mask = SigMask::from(new_set);
                 // According to man pages, "it is not possible to block SIGKILL or SIGSTOP.
                 // Attempts to do so are silently ignored."
-                new_sig_mask.remove_signal(SIGKILL);
-                new_sig_mask.remove_signal(SIGSTOP);
-                sig_mask.block(new_sig_mask.as_u64());
+                read_mask -= SIGKILL;
+                read_mask -= SIGSTOP;
+                sig_mask_ref.store(old_sig_mask_value + read_mask, Ordering::Relaxed);
             }
-            MaskOp::Unblock => sig_mask.unblock(new_set),
-            MaskOp::SetMask => sig_mask.set(new_set),
+            MaskOp::Unblock => {
+                sig_mask_ref.store(old_sig_mask_value - read_mask, Ordering::Relaxed)
+            }
+            MaskOp::SetMask => sig_mask_ref.store(read_mask, Ordering::Relaxed),
         }
     }
-    debug!("new set = {:x?}", &sig_mask);
+    debug!("new set = {:x?}", sig_mask_ref.load(Ordering::Relaxed));
 
     Ok(())
 }

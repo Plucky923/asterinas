@@ -7,28 +7,26 @@ use crate::{
         utils::{IoctlCmd, StatusFlags},
     },
     prelude::*,
-    util::read_val_from_user,
 };
 
-pub fn sys_ioctl(fd: FileDesc, cmd: u32, arg: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_ioctl(fd: FileDesc, cmd: u32, arg: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
     let ioctl_cmd = IoctlCmd::try_from(cmd)?;
     debug!(
         "fd = {}, ioctl_cmd = {:?}, arg = 0x{:x}",
         fd, ioctl_cmd, arg
     );
-    let current = current!();
-    let file_table = current.file_table().lock();
+    let file_table = ctx.process.file_table().lock();
     let file = file_table.get_file(fd)?;
     let res = match ioctl_cmd {
         IoctlCmd::FIONBIO => {
-            let is_nonblocking = read_val_from_user::<i32>(arg)? != 0;
+            let is_nonblocking = ctx.get_user_space().read_val::<i32>(arg)? != 0;
             let mut flags = file.status_flags();
             flags.set(StatusFlags::O_NONBLOCK, is_nonblocking);
             file.set_status_flags(flags)?;
             0
         }
         IoctlCmd::FIOASYNC => {
-            let is_async = read_val_from_user::<i32>(arg)? != 0;
+            let is_async = ctx.get_user_space().read_val::<i32>(arg)? != 0;
             let mut flags = file.status_flags();
 
             // Set `O_ASYNC` flags will send `SIGIO` signal to a process when

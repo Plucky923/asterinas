@@ -14,6 +14,7 @@
 #![feature(iter_repeat_n)]
 #![feature(let_chains)]
 #![feature(linked_list_remove)]
+#![feature(negative_impls)]
 #![feature(register_tool)]
 // FIXME: This feature is used to support vm capbility now as a work around.
 // Since this is an incomplete feature, use this feature is unsafe.
@@ -47,6 +48,7 @@ extern crate getset;
 
 pub mod arch;
 pub mod console;
+pub mod context;
 pub mod cpu;
 pub mod device;
 pub mod driver;
@@ -87,9 +89,6 @@ fn init_thread() {
     // Work queue should be initialized before interrupt is enabled,
     // in case any irq handler uses work queue as bottom half
     thread::work_queue::init();
-    // FIXME: Remove this if we move the step of mounting
-    // the filesystems to be done within the init process.
-    ostd::trap::enable_local();
     net::lazy_init();
     fs::lazy_init();
     // driver::pci::virtio::block::block_device_test();

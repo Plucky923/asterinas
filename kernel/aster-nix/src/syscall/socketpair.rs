@@ -5,13 +5,16 @@ use crate::{
     fs::file_table::{FdFlags, FileDesc},
     net::socket::unix::UnixStreamSocket,
     prelude::*,
-    util::{
-        net::{CSocketAddrFamily, Protocol, SockFlags, SockType, SOCK_TYPE_MASK},
-        write_val_to_user,
-    },
+    util::net::{CSocketAddrFamily, Protocol, SockFlags, SockType, SOCK_TYPE_MASK},
 };
 
-pub fn sys_socketpair(domain: i32, type_: i32, protocol: i32, sv: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_socketpair(
+    domain: i32,
+    type_: i32,
+    protocol: i32,
+    sv: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
     let domain = CSocketAddrFamily::try_from(domain)?;
     let sock_type = SockType::try_from(type_ & SOCK_TYPE_MASK)?;
     let sock_flags = SockFlags::from_bits_truncate(type_ & !SOCK_TYPE_MASK);
@@ -34,8 +37,7 @@ pub fn sys_socketpair(domain: i32, type_: i32, protocol: i32, sv: Vaddr) -> Resu
     };
 
     let socket_fds = {
-        let current = current!();
-        let mut file_table = current.file_table().lock();
+        let mut file_table = ctx.process.file_table().lock();
         let fd_flags = if sock_flags.contains(SockFlags::SOCK_CLOEXEC) {
             FdFlags::CLOEXEC
         } else {
@@ -46,7 +48,7 @@ pub fn sys_socketpair(domain: i32, type_: i32, protocol: i32, sv: Vaddr) -> Resu
         SocketFds(fd_a, fd_b)
     };
 
-    write_val_to_user(sv, &socket_fds)?;
+    ctx.get_user_space().write_val(sv, &socket_fds)?;
     Ok(SyscallReturn::Return(0))
 }
 

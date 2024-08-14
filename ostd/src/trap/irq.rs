@@ -9,7 +9,6 @@ use trapframe::TrapFrame;
 use crate::{
     arch::irq::{self, IrqCallbackHandle, IRQ_ALLOCATOR},
     prelude::*,
-    task::{disable_preempt, DisablePreemptGuard},
     Error,
 };
 
@@ -135,7 +134,6 @@ pub fn disable_local() -> DisabledLocalIrqGuard {
 #[must_use]
 pub struct DisabledLocalIrqGuard {
     was_enabled: bool,
-    preempt_guard: DisablePreemptGuard,
 }
 
 impl !Send for DisabledLocalIrqGuard {}
@@ -146,11 +144,7 @@ impl DisabledLocalIrqGuard {
         if was_enabled {
             irq::disable_local();
         }
-        let preempt_guard = disable_preempt();
-        Self {
-            was_enabled,
-            preempt_guard,
-        }
+        Self { was_enabled }
     }
 
     /// Transfers the saved IRQ status of this guard to a new guard.
@@ -158,10 +152,7 @@ impl DisabledLocalIrqGuard {
     pub fn transfer_to(&mut self) -> Self {
         let was_enabled = self.was_enabled;
         self.was_enabled = false;
-        Self {
-            was_enabled,
-            preempt_guard: disable_preempt(),
-        }
+        Self { was_enabled }
     }
 }
 
@@ -170,20 +161,5 @@ impl Drop for DisabledLocalIrqGuard {
         if self.was_enabled {
             irq::enable_local();
         }
-    }
-}
-
-/// Enables all IRQs on the current CPU.
-///
-/// FIXME: The reason we need to add this API is that currently IRQs
-/// are enabled when the CPU enters the user space for the first time,
-/// which is too late. During the OS initialization phase,
-/// we need to get the block device working and mount the filesystems,
-/// thus requiring the IRQs should be enabled as early as possible.
-///
-/// FIXME: this method may be unsound.
-pub fn enable_local() {
-    if !crate::arch::irq::is_local_enabled() {
-        crate::arch::irq::enable_local();
     }
 }

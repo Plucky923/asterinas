@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-
 use super::SyscallReturn;
 use crate::{
     fs::{
@@ -12,30 +10,29 @@ use crate::{
     prelude::*,
     syscall::constants::MAX_FILENAME_LEN,
     time::timespec_t,
-    util::{read_cstring_from_user, write_val_to_user},
 };
 
-pub fn sys_fstat(fd: FileDesc, stat_buf_ptr: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_fstat(fd: FileDesc, stat_buf_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
     debug!("fd = {}, stat_buf_addr = 0x{:x}", fd, stat_buf_ptr);
 
-    let current = current!();
-    let file_table = current.file_table().lock();
+    let file_table = ctx.process.file_table().lock();
     let file = file_table.get_file(fd)?;
     let stat = Stat::from(file.metadata());
-    write_val_to_user(stat_buf_ptr, &stat)?;
+    ctx.get_user_space().write_val(stat_buf_ptr, &stat)?;
     Ok(SyscallReturn::Return(0))
 }
 
-pub fn sys_stat(filename_ptr: Vaddr, stat_buf_ptr: Vaddr) -> Result<SyscallReturn> {
-    self::sys_fstatat(AT_FDCWD, filename_ptr, stat_buf_ptr, 0)
+pub fn sys_stat(filename_ptr: Vaddr, stat_buf_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
+    self::sys_fstatat(AT_FDCWD, filename_ptr, stat_buf_ptr, 0, ctx)
 }
 
-pub fn sys_lstat(filename_ptr: Vaddr, stat_buf_ptr: Vaddr) -> Result<SyscallReturn> {
+pub fn sys_lstat(filename_ptr: Vaddr, stat_buf_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
     self::sys_fstatat(
         AT_FDCWD,
         filename_ptr,
         stat_buf_ptr,
         StatFlags::AT_SYMLINK_NOFOLLOW.bits(),
+        ctx,
     )
 }
 
@@ -44,8 +41,10 @@ pub fn sys_fstatat(
     filename_ptr: Vaddr,
     stat_buf_ptr: Vaddr,
     flags: u32,
+    ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let filename = read_cstring_from_user(filename_ptr, MAX_FILENAME_LEN)?;
+    let user_space = ctx.get_user_space();
+    let filename = user_space.read_cstring(filename_ptr, MAX_FILENAME_LEN)?;
     let flags =
         StatFlags::from_bits(flags).ok_or(Error::with_message(Errno::EINVAL, "invalid flags"))?;
     debug!(
@@ -58,14 +57,13 @@ pub fn sys_fstatat(
             return_errno_with_message!(Errno::ENOENT, "path is empty");
         }
         // In this case, the behavior of fstatat() is similar to that of fstat().
-        return self::sys_fstat(dirfd, stat_buf_ptr);
+        return self::sys_fstat(dirfd, stat_buf_ptr, ctx);
     }
 
-    let current = current!();
     let dentry = {
         let filename = filename.to_string_lossy();
         let fs_path = FsPath::new(dirfd, filename.as_ref())?;
-        let fs = current.fs().read();
+        let fs = ctx.process.fs().read();
         if flags.contains(StatFlags::AT_SYMLINK_NOFOLLOW) {
             fs.lookup_no_follow(&fs_path)?
         } else {
@@ -73,7 +71,7 @@ pub fn sys_fstatat(
         }
     };
     let stat = Stat::from(dentry.metadata());
-    write_val_to_user(stat_buf_ptr, &stat)?;
+    user_space.write_val(stat_buf_ptr, &stat)?;
     Ok(SyscallReturn::Return(0))
 }
 

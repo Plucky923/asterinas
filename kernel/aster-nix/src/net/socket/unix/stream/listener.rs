@@ -4,12 +4,9 @@ use keyable_arc::KeyableWeak;
 
 use super::{connected::Connected, endpoint::Endpoint, UnixStreamSocket};
 use crate::{
-    events::IoEvents,
+    events::{IoEvents, Observer},
     fs::{file_handle::FileLike, path::Dentry, utils::Inode},
-    net::socket::{
-        unix::addr::{UnixSocketAddr, UnixSocketAddrBound},
-        SocketAddr,
-    },
+    net::socket::{unix::addr::UnixSocketAddrBound, SocketAddr},
     prelude::*,
     process::signal::{Pollee, Poller},
 };
@@ -36,10 +33,7 @@ impl Listener {
             Connected::new(local_endpoint)
         };
 
-        let peer_addr = match connected.peer_addr() {
-            None => SocketAddr::Unix(UnixSocketAddr::Path(String::new())),
-            Some(addr) => SocketAddr::from(addr.clone()),
-        };
+        let peer_addr = connected.peer_addr().cloned().into();
 
         let socket = UnixStreamSocket::new_connected(connected, false);
 
@@ -50,6 +44,25 @@ impl Listener {
         let addr = self.addr();
         let backlog = BACKLOG_TABLE.get_backlog(addr).unwrap();
         backlog.poll(mask, poller)
+    }
+
+    pub(super) fn register_observer(
+        &self,
+        observer: Weak<dyn Observer<IoEvents>>,
+        mask: IoEvents,
+    ) -> Result<()> {
+        let addr = self.addr();
+        let backlog = BACKLOG_TABLE.get_backlog(addr)?;
+        backlog.register_observer(observer, mask)
+    }
+
+    pub(super) fn unregister_observer(
+        &self,
+        observer: &Weak<dyn Observer<IoEvents>>,
+    ) -> Option<Weak<dyn Observer<IoEvents>>> {
+        let addr = self.addr();
+        let backlog = BACKLOG_TABLE.get_backlog(addr).ok()?;
+        backlog.unregister_observer(observer)
     }
 }
 
@@ -69,7 +82,7 @@ impl BacklogTable {
 
     fn add_backlog(&self, addr: &UnixSocketAddrBound, backlog: usize) -> Result<()> {
         let inode = {
-            let UnixSocketAddrBound::Path(dentry) = addr else {
+            let UnixSocketAddrBound::Path(_, dentry) = addr else {
                 todo!()
             };
             create_keyable_inode(dentry)
@@ -86,7 +99,7 @@ impl BacklogTable {
 
     fn get_backlog(&self, addr: &UnixSocketAddrBound) -> Result<Arc<Backlog>> {
         let inode = {
-            let UnixSocketAddrBound::Path(dentry) = addr else {
+            let UnixSocketAddrBound::Path(_, dentry) = addr else {
                 todo!()
             };
             create_keyable_inode(dentry)
@@ -121,7 +134,7 @@ impl BacklogTable {
     }
 
     fn remove_backlog(&self, addr: &UnixSocketAddrBound) {
-        let UnixSocketAddrBound::Path(dentry) = addr else {
+        let UnixSocketAddrBound::Path(_, dentry) = addr else {
             todo!()
         };
 
@@ -168,6 +181,22 @@ impl Backlog {
         // Lock to avoid any events may change pollee state when we poll
         let _lock = self.incoming_endpoints.lock();
         self.pollee.poll(mask, poller)
+    }
+
+    fn register_observer(
+        &self,
+        observer: Weak<dyn Observer<IoEvents>>,
+        mask: IoEvents,
+    ) -> Result<()> {
+        self.pollee.register_observer(observer, mask);
+        Ok(())
+    }
+
+    fn unregister_observer(
+        &self,
+        observer: &Weak<dyn Observer<IoEvents>>,
+    ) -> Option<Weak<dyn Observer<IoEvents>>> {
+        self.pollee.unregister_observer(observer)
     }
 }
 

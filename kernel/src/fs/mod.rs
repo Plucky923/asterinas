@@ -17,6 +17,7 @@ pub mod ramfs;
 pub mod rootfs;
 pub mod thread_info;
 pub mod utils;
+pub mod notify;
 
 use aster_block::BlockDevice;
 use aster_virtio::device::block::device::BlockDevice as VirtIoBlockDevice;

@@ -2,7 +2,10 @@
 
 use super::SyscallReturn;
 use crate::{
-    fs::file_table::{get_file_fast, FileDesc},
+    fs::{
+        file_table::{get_file_fast, FileDesc},
+        notify::fsnotify_access,
+    },
     prelude::*,
 };
 
@@ -36,6 +39,5 @@ pub fn sys_read(
         Errno::EINTR => Error::new(Errno::ERESTARTSYS),
         _ => err,
     })?;
-
     Ok(SyscallReturn::Return(read_len as _))
 }

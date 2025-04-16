@@ -29,6 +29,7 @@ TEST_APPS := \
 	hello_pie \
 	hello_world \
 	itimer \
+	inotify \
 	mmap \
 	mongoose \
 	network \

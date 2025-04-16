@@ -15,6 +15,7 @@ use ostd::sync::RwMutexWriteGuard;
 use super::{is_dot, is_dot_or_dotdot, is_dotdot};
 use crate::{
     fs::{
+        notify::{FsnotifyGroup, FsnotifyMark},
         path::mount::MountNode,
         utils::{
             FileSystem, Inode, InodeMode, InodeType, Metadata, MknodType, Permission, XattrName,
@@ -41,6 +42,8 @@ pub struct Dentry_ {
     children: RwMutex<DentryChildren>,
     flags: AtomicU32,
     this: Weak<Dentry_>,
+    fsnotify_mask: u32,
+    fsnotify_marks: RwLock<Vec<Arc<Mutex<dyn FsnotifyMark>>>>,
 }
 
 impl Dentry_ {
@@ -63,6 +66,8 @@ impl Dentry_ {
             children: RwMutex::new(DentryChildren::new()),
             flags: AtomicU32::new(DentryFlags::empty().bits()),
             this: weak_self.clone(),
+            fsnotify_mask: 0,
+            fsnotify_marks: RwLock::new(Vec::new()),
         })
     }
 
@@ -113,6 +118,10 @@ impl Dentry_ {
     fn flags(&self) -> DentryFlags {
         let flags = self.flags.load(Ordering::Relaxed);
         DentryFlags::from_bits(flags).unwrap()
+    }
+
+    pub fn fsnotify_mask(&self) -> u32 {
+        self.fsnotify_mask
     }
 
     /// Checks if this dentry is a descendant (child, grandchild, or
@@ -333,6 +342,28 @@ impl Dentry_ {
             }
         }
         Ok(())
+    }
+
+    pub fn add_fsnotify_mark(&self, mark: Arc<Mutex<dyn FsnotifyMark>>, add_flags: u32) {
+        self.fsnotify_marks.write().push(mark);
+    }
+
+    pub fn send_fsnotify(&self, mask: u32) {
+        let marks = self.fsnotify_marks.read();
+        for mark in marks.iter() {
+            let mut mark = mark.lock();
+            mark.send_fsnotify(mask);
+        }
+    }
+
+    pub fn update_fsnotify_mask(&self, mask: u32) {
+        // TODO: implement fsnotify_recalc_mask
+    }
+
+    pub fn remove_fsnotify_mark(&self, mark: &Arc<Mutex<dyn FsnotifyMark>>) {
+        self.fsnotify_marks
+            .write()
+            .retain(|m| !Arc::ptr_eq(m, mark));
     }
 }
 
@@ -755,6 +786,39 @@ impl Dentry {
     /// Gets the mount node of current `Dentry`.
     pub fn mount_node(&self) -> &Arc<MountNode> {
         &self.mount_node
+    }
+
+    pub fn add_fsnotify_mark(&self, mark: Arc<Mutex<dyn FsnotifyMark>>, add_flags: u32) {
+        self.inner.add_fsnotify_mark(mark, add_flags);
+    }
+
+    pub fn remove_fsnotify_mark(&self, mark: &Arc<Mutex<dyn FsnotifyMark>>) {
+        self.inner.remove_fsnotify_mark(mark);
+    }
+
+    pub fn find_fsnotify_mark(
+        &self,
+        fsnotify_group: &Arc<Mutex<FsnotifyGroup>>,
+    ) -> Option<Arc<Mutex<dyn FsnotifyMark>>> {
+        self.inner
+            .fsnotify_marks
+            .read()
+            .iter()
+            .find(|mark| Arc::ptr_eq(&mark.lock().fsnotify_group(), &fsnotify_group))
+            .cloned()
+    }
+
+    pub fn update_fsnotify_mask(&self, old_mask: u32, new_mask: u32) {
+        let dropped = old_mask & !new_mask;
+        let do_dentry = new_mask & !self.inner.fsnotify_mask();
+
+        if dropped | do_dentry != 0 {
+            self.inner.update_fsnotify_mask(new_mask);
+        }
+    }
+
+    pub fn send_fsnotify(&self, mask: u32) {
+        self.inner.send_fsnotify(mask);
     }
 }
 

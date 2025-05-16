@@ -2,12 +2,11 @@
 
 #![expect(dead_code)]
 use hashbrown::HashMap;
+use ostd::boot::boot_info;
 
 use crate::{
     fs::{
-        path::dentry::{Dentry, DentryKey, Dentry_},
-        thread_info::ThreadFsInfo,
-        utils::{FileSystem, InodeType},
+        path::dentry::{Dentry, DentryKey, Dentry_}, rootfs::init_container_rootfs, thread_info::ThreadFsInfo, utils::{FileSystem, InodeType}
     },
     prelude::*,
 };
@@ -229,8 +228,12 @@ impl MountNode {
     /// Clone the mount node tree and move the process
     /// root and cwd to the new mount node tree.
     pub(super) fn clone_mount_node_tree_and_move(&self, fs: &Arc<ThreadFsInfo>) -> Arc<Self> {
-        let new_mount_node = self.clone_mount_node_tree(self.root_dentry(), true);
-        new_mount_node.move_process_root_and_cwd(fs);
+        let new_mount_node = init_container_rootfs(boot_info().initramfs.expect("No initramfs found!")).unwrap();
+        let cwd = fs.resolver().read().cwd().clone();
+        let root = fs.resolver().read().root().clone();
+        let new_dentry = Dentry::new_fs_root(new_mount_node.clone());
+        fs.resolver().write().set_root(new_dentry.clone());
+        fs.resolver().write().set_cwd(new_dentry.clone());
         new_mount_node
     }
 

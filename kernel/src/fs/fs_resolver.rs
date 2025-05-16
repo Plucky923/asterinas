@@ -7,7 +7,7 @@ use ostd::task::Task;
 use super::{
     file_table::{get_file_fast, FileDesc},
     inode_handle::InodeHandle,
-    path::Dentry,
+    path::{Dentry, MountNode},
     rootfs::root_mount,
     utils::{AccessMode, CreationFlags, InodeMode, InodeType, StatusFlags, PATH_MAX, SYMLINKS_MAX},
 };
@@ -29,6 +29,13 @@ impl FsResolver {
         Self {
             root: Dentry::new_fs_root(root_mount().clone()),
             cwd: Dentry::new_fs_root(root_mount().clone()),
+        }
+    }
+
+    pub fn new_container(root_mount: Arc<MountNode>) -> Self {
+        Self {
+            root: Dentry::new_fs_root(root_mount.clone()),
+            cwd: Dentry::new_fs_root(root_mount.clone()),
         }
     }
 

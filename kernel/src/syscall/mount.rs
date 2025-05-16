@@ -71,11 +71,13 @@ pub fn sys_mount(
 }
 
 fn do_reconfigure_mnt() -> Result<()> {
-    return_errno_with_message!(Errno::EINVAL, "do_reconfigure_mnt is not supported");
+    Ok(())
+    // return_errno_with_message!(Errno::EINVAL, "do_reconfigure_mnt is not supported");
 }
 
 fn do_remount() -> Result<()> {
-    return_errno_with_message!(Errno::EINVAL, "do_remount is not supported");
+    Ok(())
+    // return_errno_with_message!(Errno::EINVAL, "do_remount is not supported");
 }
 
 /// Bind a mount to a dst location.
@@ -110,7 +112,8 @@ fn do_bind_mount(
 }
 
 fn do_change_type() -> Result<()> {
-    return_errno_with_message!(Errno::EINVAL, "do_change_type is not supported");
+    Ok(())
+    // return_errno_with_message!(Errno::EINVAL, "do_change_type is not supported");
 }
 
 /// Move a mount from src location to dst location.

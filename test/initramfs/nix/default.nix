@@ -1,7 +1,9 @@
 { target ? "x86_64", enableBenchmarkTest ? false, enableConformanceTest ? false
 , enableRegressionTest ? false, conformanceTestSuite ? "ltp"
 , conformanceTestWorkDir ? "/tmp", regressionTestPlatform ? "asterinas"
-, dnsServer ? "none", smp ? 1, initramfsCompressed ? true, }:
+, dnsServer ? "none", smp ? 1, initramfsCompressed ? true
+, framevmObjPath ? ""
+, framevmInstallPath ? "/framevm/framevm.o" }:
 let
   crossSystem.config = if target == "x86_64" then
     "x86_64-unknown-linux-gnu"
@@ -39,6 +41,8 @@ in rec {
     conformance = if enableConformanceTest then conformance else null;
     regression = if enableRegressionTest then regression else null;
     dnsServer = dnsServer;
+    framevmObjPath = framevmObjPath;
+    framevmInstallPath = framevmInstallPath;
   };
   initramfs-image = pkgs.callPackage ./initramfs-image.nix {
     inherit initramfs;

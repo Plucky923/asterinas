@@ -33,6 +33,7 @@ members = [
     "kernel/comps/systree",
     "kernel/comps/logger",
     "kernel/comps/mlsdisk",
+    "kernel/comps/framevm",
     "kernel/comps/time",
     "kernel/comps/virtio",
     "kernel/comps/pci",

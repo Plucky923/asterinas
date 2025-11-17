@@ -4,6 +4,8 @@ use linux_bzimage_builder::PayloadEncoding;
 
 use super::{Boot, BootScheme, Grub, GrubScheme, Qemu, QemuScheme, inherit_optional};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{cli::CommonArgs, config::Arch};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,7 +14,7 @@ pub enum ActionChoice {
     Test,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildScheme {
     pub profile: Option<String>,
     #[serde(default)]
@@ -28,6 +30,20 @@ pub struct BuildScheme {
     pub encoding: Option<PayloadEncoding>,
     #[serde(default)]
     pub rustflags: String,
+}
+
+impl Default for BuildScheme {
+    fn default() -> Self {
+        Self {
+            profile: None,
+            features: Vec::new(),
+            no_default_features: false,
+            linux_x86_legacy_boot: false,
+            strip_elf: false,
+            encoding: None,
+            rustflags: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,8 +108,15 @@ impl Build {
     }
 
     pub fn append_rustflags(&mut self, rustflags: &str) {
-        self.rustflags += " ";
-        self.rustflags += rustflags;
+        if rustflags.trim().is_empty() {
+            return;
+        }
+        if self.rustflags.trim().is_empty() {
+            self.rustflags = rustflags.trim().to_string();
+        } else {
+            self.rustflags.push(' ');
+            self.rustflags.push_str(rustflags.trim());
+        }
     }
 }
 
@@ -117,7 +140,15 @@ impl BuildScheme {
         if self.encoding.is_none() {
             self.encoding.clone_from(&parent.encoding);
         }
-        self.rustflags = parent.rustflags.clone() + " " + &self.rustflags;
+        let parent_flags = parent.rustflags.trim();
+        let own_flags = self.rustflags.trim();
+        self.rustflags = match (parent_flags.is_empty(), own_flags.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => parent_flags.to_string(),
+            (true, false) => own_flags.to_string(),
+            (false, false) if parent_flags == own_flags => parent_flags.to_string(),
+            (false, false) => format!("{} {}", parent_flags, own_flags),
+        };
     }
 
     pub fn finalize(self) -> Build {

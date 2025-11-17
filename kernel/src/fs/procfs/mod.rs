@@ -9,6 +9,7 @@ use template::{lookup_child_from_table, populate_children_from_table};
 use self::{
     cmdline::CmdLineFileOps,
     cpuinfo::CpuInfoFileOps,
+    framevm::FrameVmFileOps,
     loadavg::LoadAvgFileOps,
     meminfo::MemInfoFileOps,
     pid::PidDirOps,
@@ -39,6 +40,7 @@ use crate::{
 mod cmdline;
 mod cpuinfo;
 mod filesystems;
+mod framevm;
 mod loadavg;
 mod meminfo;
 mod pid;
@@ -159,6 +161,7 @@ impl RootDirOps {
         ("filesystems", FileSystemsFileOps::new_inode),
         ("loadavg", LoadAvgFileOps::new_inode),
         ("meminfo", MemInfoFileOps::new_inode),
+        ("framevm", FrameVmFileOps::new_inode),
         ("self", SelfSymOps::new_inode),
         ("stat", StatFileOps::new_inode),
         ("sys", SysDirOps::new_inode),

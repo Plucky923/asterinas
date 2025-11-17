@@ -213,6 +213,7 @@ unsafe extern "sysv64" fn __linux_boot(params_ptr: *const BootParams) -> ! {
         bootloader_name: parse_bootloader_name(params),
         kernel_cmdline: parse_kernel_commandline(params).unwrap_or(""),
         initramfs: parse_initramfs(params),
+        symbols: None,
         acpi_arg: parse_acpi_arg(params),
         framebuffer_arg: parse_framebuffer_info(params),
         memory_regions: parse_memory_regions(params),

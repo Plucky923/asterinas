@@ -381,6 +381,7 @@ unsafe extern "sysv64" fn __multiboot_entry(boot_magic: u32, boot_params: u64) -
         bootloader_name: parse_bootloader_name(mb1_info).unwrap_or("Unknown Multiboot Loader"),
         kernel_cmdline: parse_kernel_commandline(mb1_info).unwrap_or(""),
         initramfs: parse_initramfs(mb1_info),
+        symbols: None,
         acpi_arg: parse_acpi_arg(mb1_info),
         framebuffer_arg: parse_framebuffer_info(mb1_info),
         memory_regions: parse_memory_regions(mb1_info),

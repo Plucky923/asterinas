@@ -15,9 +15,13 @@ use crate::{
     },
     task::disable_preempt,
     util::range_alloc::RangeAllocator,
+    early_println, mm::{
+        PAGE_SIZE, Paddr, Vaddr, frame::{Frame, meta::AnyFrameMeta}, kspace::{KernelPtConfig, MODULE_RANGE, MappedItem}, page_prop::PageProperty, page_table::largest_pages
+    }, task::disable_preempt, util::range_alloc::RangeAllocator
 };
 
 static KVIRT_AREA_ALLOCATOR: RangeAllocator = RangeAllocator::new(VMALLOC_VADDR_RANGE);
+static MODULE_KVIRT_AREA_ALLOCATOR: RangeAllocator = RangeAllocator::new(MODULE_RANGE);
 
 /// Kernel virtual area.
 ///
@@ -118,6 +122,52 @@ impl KVirtArea {
             // SAFETY: The constructor of the `KVirtArea` has already ensured
             // that this mapping does not affect kernel's memory safety.
             unsafe { cursor.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) }
+                .expect("Failed to map frame in a new `KVirtArea`");
+        }
+        early_println!("MODULE_RANGE: {:#x?}", MODULE_RANGE);
+
+        Self { range }
+    }
+
+    pub fn map_module_frames<T: AnyFrameMeta>(
+        area_size: usize,
+        map_offset: usize,
+        frames: impl Iterator<Item = Frame<T>>,
+        prop: PageProperty,
+    ) -> Self {
+        assert!(area_size % PAGE_SIZE == 0);
+        assert!(map_offset % PAGE_SIZE == 0);
+
+        let range = MODULE_KVIRT_AREA_ALLOCATOR.alloc(area_size).unwrap();
+        
+        // 验证分配的地址范围完全在 MODULE_RANGE 内
+        assert!(
+            range.start >= MODULE_RANGE.start,
+            "Allocated range start 0x{:x} is before MODULE_RANGE start 0x{:x}",
+            range.start,
+            MODULE_RANGE.start
+        );
+        assert!(
+            range.end <= MODULE_RANGE.end,
+            "Allocated range end 0x{:x} is after MODULE_RANGE end 0x{:x}",
+            range.end,
+            MODULE_RANGE.end
+        );
+        
+        let cursor_range = range.start + map_offset..range.end;
+        early_println!("cursor_range: {:#x?}", cursor_range);
+        early_println!("range: {:#x?}", range);
+        early_println!("MODULE_RANGE: {:#x?}", MODULE_RANGE);
+        let page_table = KERNEL_PAGE_TABLE.get().unwrap();
+        let preempt_guard = disable_preempt();
+        let mut cursor = page_table
+            .cursor_mut(&preempt_guard, &cursor_range)
+            .unwrap();
+
+        for frame in frames.into_iter() {
+            // SAFETY: The constructor of the `KVirtArea` has already ensured
+            // that this mapping does not affect kernel's memory safety.
+            unsafe { cursor.map(MappedItem::Tracked(frame.into(), prop)) }
                 .expect("Failed to map frame in a new `KVirtArea`");
         }
 

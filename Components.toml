@@ -1,5 +1,9 @@
 # template
 [components]
+nix = { name = "aster-nix" }
+virtio = { name = "aster-virtio" }
+framevisor = { name = "aster-framevisor" }
+input = { name = "aster-input" }
 block = { name = "aster-block" }
 cmdline = { name = "aster-cmdline" }
 console = { name = "aster-console" }

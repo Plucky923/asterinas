@@ -37,6 +37,7 @@ members = [
     "kernel/comps/pci",
     "kernel/comps/softirq",
     "kernel/comps/systree",
+    "kernel/comps/framevm",
     "kernel/comps/time",
     "kernel/comps/uart",
     "kernel/comps/virtio",

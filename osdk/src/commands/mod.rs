@@ -33,14 +33,16 @@ pub fn execute_forwarded_command(subcommand: &str, args: &Vec<String>, cfg_ktest
     cargo.args(args);
 
     let env_rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-    let rustflags = env_rustflags + " --check-cfg cfg(ktest)";
-    let rustflags = if cfg_ktest {
-        rustflags + " --cfg ktest"
-    } else {
-        rustflags
-    };
+    let mut rustflags = Vec::new();
+    if !env_rustflags.trim().is_empty() {
+        rustflags.push(env_rustflags.trim().to_string());
+    }
+    rustflags.push("--check-cfg cfg(ktest)".to_string());
+    if cfg_ktest {
+        rustflags.push("--cfg ktest".to_string());
+    }
 
-    cargo.env("RUSTFLAGS", rustflags);
+    cargo.env("RUSTFLAGS", rustflags.join(" "));
 
     // When generating documentation via `cargo doc`, the `--check-cfg cfg(ktest)` flag
     // must be specified in both `RUSTFLAGS` and `RUSTDOCFLAGS`.

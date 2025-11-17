@@ -26,7 +26,8 @@ extern "cdecl" fn main_legacy32(boot_params_ptr: *mut BootParams) -> ! {
     unsafe { alloc::init(boot_params) };
 
     crate::println!("[setup] Loading the payload as an ELF file");
-    crate::loader::load_elf(crate::x86::payload());
+    let total_symbols = crate::loader::load_elf(crate::x86::payload());
+    crate::println!("[setup] Symbols found in ELF file: {}", total_symbols);
 
     crate::println!(
         "[setup] Entering the Asterinas entry point at {:p}",

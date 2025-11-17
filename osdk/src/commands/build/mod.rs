@@ -6,6 +6,7 @@ mod qcow2;
 
 use std::{
     ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     process,
     time::SystemTime,
@@ -24,6 +25,7 @@ use crate::{
     },
     cli::BuildArgs,
     config::{
+        scheme::{ActionChoice, BootMethod, BootProtocol},
         Config,
         scheme::{ActionChoice, BootMethod},
     },
@@ -32,6 +34,8 @@ use crate::{
     util::{
         CrateInfo, DirGuard, get_cargo_metadata, get_current_crates, get_kernel_crate,
         get_target_directory,
+        get_cargo_metadata, get_current_crates, get_kernel_crate, get_target_directory, new_command_checked_exists,
+        CrateInfo, DirGuard,
     },
 };
 
@@ -132,9 +136,9 @@ pub fn do_cached_build(
     action: ActionChoice,
     rustflags: &[&str],
 ) -> Bundle {
-    let (build, boot) = match action {
-        ActionChoice::Run => (&config.run.build, &config.run.boot),
-        ActionChoice::Test => (&config.test.build, &config.test.boot),
+    let (build, boot, grub_cfg) = match action {
+        ActionChoice::Run => (&config.run.build, &config.run.boot, &config.run.grub),
+        ActionChoice::Test => (&config.test.build, &config.test.boot, &config.test.grub),
     };
 
     let mut rustflags = rustflags.to_vec();
@@ -167,10 +171,22 @@ pub fn do_cached_build(
     match boot.method {
         BootMethod::GrubRescueIso | BootMethod::GrubQcow2 => {
             info!("Building boot device image");
+            let initramfs_path = boot.initramfs.as_ref().map(|path| path.as_path());
+            let binary_module_path = if matches!(grub_cfg.boot_protocol, BootProtocol::Multiboot2) {
+                generate_kernel_symbols_module(&aster_elf)
+            } else {
+                None
+            };
             let bootdev_image = grub::create_bootdev_image(
                 &osdk_output_directory,
                 &aster_elf,
-                boot.initramfs.as_ref(),
+                initramfs_path,
+                {
+                    if let Some(path) = &binary_module_path {
+                        info!("Embedding kernel symbols module: {:?}", path);
+                    }
+                    binary_module_path.as_deref()
+                },
                 config,
                 action,
             );
@@ -189,6 +205,59 @@ pub fn do_cached_build(
     }
 
     bundle
+}
+
+fn generate_kernel_symbols_module(aster_elf: &AsterBin) -> Option<PathBuf> {
+    let mut symbols_path = aster_elf.path().to_path_buf();
+    symbols_path.set_extension("sym");
+
+    let symbols_outdated = match fs::metadata(&symbols_path) {
+        Ok(metadata) => match metadata.modified() {
+            Ok(modified) => modified < *aster_elf.modified_time(),
+            Err(_) => true,
+        },
+        Err(_) => true,
+    };
+
+    if symbols_outdated {
+        println!(
+            "[osdk] Generating kernel symbols file at {:?} via rust-objcopy",
+            symbols_path
+        );
+        let mut cmd = new_command_checked_exists("rust-objcopy");
+        cmd.arg("--only-keep-debug").arg(aster_elf.path()).arg(&symbols_path);
+        match cmd.status() {
+            Ok(status) if status.success() => {
+                if let Ok(size) = fs::metadata(&symbols_path).and_then(|m| Ok(m.len())) {
+                    info!(
+                        "Kernel symbols file generated ({} bytes)",
+                        size
+                    );
+                }
+            }
+            Ok(status) => {
+                warn!(
+                    "rust-objcopy exited with status {:?}; skipping kernel symbols module",
+                    status.code()
+                );
+                return None;
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to run rust-objcopy for kernel symbols: {}",
+                    err
+                );
+                return None;
+            }
+        }
+    } else {
+        println!(
+            "[osdk] Reusing existing kernel symbols file at {:?}",
+            symbols_path
+        );
+    }
+
+    Some(symbols_path)
 }
 
 fn build_kernel_elf(
@@ -252,7 +321,7 @@ fn build_kernel_elf(
     );
 
     command.env("RUSTFLAGS", rustflags.join(" "));
-    command.arg("build");
+    command.arg("rustc");
     command.arg("--features").arg(features.join(" "));
     if no_default_features {
         command.arg("--no-default-features");
@@ -266,6 +335,11 @@ fn build_kernel_elf(
     for override_config in override_configs {
         command.arg("--config").arg(override_config);
     }
+
+    // Use `cargo rustc` so the final crate keeps unused symbols without
+    // rebuilding the standard library with link-dead-code.
+    command.arg("--");
+    command.arg("-Clink-dead-code");
 
     const CFLAGS: &str = "CFLAGS_x86_64-unknown-none";
     let mut env_cflags = std::env::var(CFLAGS).unwrap_or_default();

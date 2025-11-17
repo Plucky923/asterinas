@@ -1,7 +1,8 @@
 { target ? "x86_64", enableBasicTest ? false, basicTestPlatform ? "asterinas"
 , enableBenchmark ? false, enableSyscallTest ? false, syscallTestSuite ? "ltp"
 , syscallTestWorkDir ? "/tmp", dnsServer ? "none", smp ? 1
-, initramfsCompressed ? true, }:
+, initramfsCompressed ? true, framevmObjPath ? ""
+, framevmInstallPath ? "/framevm/framevm.o" }:
 let
   crossSystem.config = if target == "x86_64" then
     "x86_64-unknown-linux-gnu"
@@ -37,6 +38,8 @@ in rec {
     benchmark = if enableBenchmark then benchmark else null;
     syscall = if enableSyscallTest then syscall else null;
     dnsServer = dnsServer;
+    framevmObjPath = framevmObjPath;
+    framevmInstallPath = framevmInstallPath;
   };
   initramfs-image = pkgs.callPackage ./initramfs-image.nix {
     inherit initramfs;

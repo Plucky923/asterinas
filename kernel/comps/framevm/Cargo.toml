@@ -1,0 +1,14 @@
+[package]
+name = "aster-framevm"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "framevm"
+path = "src/main.rs"
+
+[dependencies]
+ostd = { path = "../../../ostd" }
+
+[lints]
+workspace = true

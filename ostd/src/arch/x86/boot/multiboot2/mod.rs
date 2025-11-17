@@ -2,7 +2,7 @@
 
 use core::arch::global_asm;
 
-use multiboot2::{BootInformation, BootInformationHeader, MemoryAreaType};
+use multiboot2::{BootInformation, BootInformationHeader, MemoryAreaType, ModuleTag};
 
 use crate::{
     boot::{
@@ -38,7 +38,14 @@ unsafe fn make_str_vaddr_static(str: &str) -> &'static str {
 }
 
 fn parse_initramfs(mb2_info: &BootInformation) -> Option<&'static [u8]> {
-    let module_tag = mb2_info.module_tags().next()?;
+    let module_tag = mb2_info
+        .module_tags()
+        .find(|module| is_initramfs_module(module) && !is_kernel_binary_module(module))
+        .or_else(|| {
+            mb2_info
+                .module_tags()
+                .find(|module| !is_kernel_binary_module(module))
+        })?;
 
     let initramfs_ptr = paddr_to_vaddr(module_tag.start_address() as usize);
     let initramfs_len = module_tag.module_size() as usize;
@@ -47,6 +54,48 @@ fn parse_initramfs(mb2_info: &BootInformation) -> Option<&'static [u8]> {
         unsafe { core::slice::from_raw_parts(initramfs_ptr as *const u8, initramfs_len) };
 
     Some(initramfs)
+}
+
+const MODULE_ARG_TYPE_INITRAMFS: &str = "type=initramfs";
+const MODULE_ARG_TYPE_KERNEL_BIN: &str = "type=kernel-bin";
+const MODULE_ARG_NAME_PREFIX: &str = "name=";
+
+fn module_contains_arg(module: &ModuleTag, arg: &str) -> bool {
+    module
+        .cmdline()
+        .is_ok_and(|cmd| cmd.split_whitespace().any(|token| token == arg))
+}
+
+fn is_kernel_binary_module(module: &ModuleTag) -> bool {
+    module_contains_arg(module, MODULE_ARG_TYPE_KERNEL_BIN)
+}
+
+fn is_initramfs_module(module: &ModuleTag) -> bool {
+    module_contains_arg(module, MODULE_ARG_TYPE_INITRAMFS)
+}
+
+fn module_name(module: &ModuleTag) -> Option<&str> {
+    module.cmdline().ok().and_then(|cmd| {
+        cmd.split_whitespace()
+            .find_map(|token| token.strip_prefix(MODULE_ARG_NAME_PREFIX))
+    })
+}
+
+fn parse_symbols(mb2_info: &BootInformation) -> Option<&'static [u8]> {
+    let module_tag = mb2_info
+        .module_tags()
+        .find(|module| is_kernel_binary_module(module))?;
+
+    let symbols_ptr = paddr_to_vaddr(module_tag.start_address() as usize);
+    let symbols_len = module_tag.module_size() as usize;
+    // SAFETY: The symbols are safe to read because of the contract with the loader.
+    let symbols = unsafe { core::slice::from_raw_parts(symbols_ptr as *const u8, symbols_len) };
+    crate::early_println!(
+        "[ostd] Kernel symbols module found: addr=0x{:x}, len={}",
+        symbols_ptr,
+        symbols_len
+    );
+    Some(symbols)
 }
 
 fn parse_acpi_arg(mb2_info: &BootInformation) -> BootloaderAcpiArg {
@@ -85,7 +134,10 @@ impl From<MemoryAreaType> for MemoryRegionType {
     }
 }
 
-fn parse_memory_regions(mb2_info: &BootInformation) -> MemoryRegionArray {
+fn parse_memory_regions(
+    mb2_info: &BootInformation,
+    symbols: Option<&'static [u8]>,
+) -> MemoryRegionArray {
     let mut regions = MemoryRegionArray::new();
 
     // Add the regions returned by Grub.
@@ -115,6 +167,10 @@ fn parse_memory_regions(mb2_info: &BootInformation) -> MemoryRegionArray {
     // Add the initramfs region.
     if let Some(initramfs) = parse_initramfs(mb2_info) {
         regions.push(MemoryRegion::module(initramfs)).unwrap();
+    }
+
+    if let Some(symbols) = symbols {
+        regions.push(MemoryRegion::module(symbols)).unwrap();
     }
 
     // Add the AP boot code region that will be copied into by the BSP.
@@ -152,13 +208,29 @@ unsafe extern "sysv64" fn __multiboot2_entry(boot_magic: u32, boot_params: u64) 
 
     use crate::boot::{EARLY_INFO, EarlyBootInfo, call_ostd_main};
 
+    let module_iter = mb2_info.module_tags();
+    for module_tag in module_iter {
+        let name = module_name(module_tag);
+        crate::early_println!(
+            "[ostd] Multiboot2 Module Found! name={:?}, cmdline='{}', start=0x{:x}, end=0x{:x}",
+            name,
+            module_tag.cmdline().unwrap_or("<invalid utf8>"),
+            module_tag.start_address(),
+            module_tag.end_address(),
+        );
+        crate::early_println!("[ostd] Module {:?}", module_tag);
+    }
+
+    let symbols = parse_symbols(&mb2_info);
+
     EARLY_INFO.call_once(|| EarlyBootInfo {
         bootloader_name: parse_bootloader_name(&mb2_info).unwrap_or("Unknown Multiboot2 Loader"),
         kernel_cmdline: parse_kernel_commandline(&mb2_info).unwrap_or(""),
         initramfs: parse_initramfs(&mb2_info),
+        symbols,
         acpi_arg: parse_acpi_arg(&mb2_info),
         framebuffer_arg: parse_framebuffer_info(&mb2_info),
-        memory_regions: parse_memory_regions(&mb2_info),
+        memory_regions: parse_memory_regions(&mb2_info, symbols),
     });
 
     call_ostd_main();

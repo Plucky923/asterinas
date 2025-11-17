@@ -1,0 +1,11 @@
+[package]
+name = "aster-framevisor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ostd = { path = "../../../ostd" }
+component = { path = "../../libs/comp-sys/component" }
+
+[lints]
+workspace = true

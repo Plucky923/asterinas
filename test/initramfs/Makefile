@@ -11,6 +11,9 @@ ENABLE_BASIC_TEST ?= false
 # - linux: Define only `__linux__`. Tests may fail in Asterinas.
 BASIC_TEST_PLATFORM ?= asterinas
 DNS_SERVER ?= none
+# FrameVM payload settings
+FRAMEVM_OBJ_PATH ?=
+FRAMEVM_INSTALL_PATH ?= /framevm/framevm.o
 # Set Nix's cached tarballs to be live for a longer period of time (30 days) to avoid network traffics.
 # Nix's default value is rather small (1 hour or 3600 seconds).
 NIXPKGS_CACHE_TTL := 2592000 # In seconds
@@ -28,6 +31,7 @@ INITRAMFS_COMPRESSED := true
 endif
 EXT2_IMAGE := $(BUILD_DIR)/ext2.img
 EXFAT_IMAGE := $(BUILD_DIR)/exfat.img
+NIX_FRAMEVM_ARGS := --argstr framevmObjPath "$(FRAMEVM_OBJ_PATH)" --argstr framevmInstallPath "$(FRAMEVM_INSTALL_PATH)"
 
 # Include benchmark, if BENCHMARK is set.
 ifeq ($(BENCHMARK), none)
@@ -75,6 +79,7 @@ $(INITRAMFS_IMAGE): $(INITRAMFS)
 		--arg initramfsCompressed $(INITRAMFS_COMPRESSED) \
 		--arg smp $(SMP) \
 		--out-link $@ \
+		$(NIX_FRAMEVM_ARGS) \
 		nix -A initramfs-image
 
 .PHONY: $(INITRAMFS)
@@ -91,6 +96,7 @@ $(INITRAMFS):
 		--argstr dnsServer ${DNS_SERVER} \
 		--arg smp $(SMP) \
 		--out-link $@ \
+		$(NIX_FRAMEVM_ARGS) \
 		nix -A initramfs
 
 # Prebuild x86_64 packages

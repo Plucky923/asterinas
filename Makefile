@@ -32,6 +32,14 @@ ENABLE_BASIC_TEST ?= false
 CONSOLE ?= hvc0
 # End of global build options.
 
+# FrameVM-specific options.
+BUILD_FRAMEVM_OBJ ?= 1
+FRAMEVM_OBJ_OUTPUT ?= build/framevm/framevm.o
+FRAMEVM_TARGET ?= x86_64-unknown-none
+FRAMEVM_INITRAMFS_INCLUDE ?= 1
+FRAMEVM_INITRAMFS_PATH ?= /framevm/framevm.o
+# End of FrameVM options.
+
 # GDB debugging and profiling options.
 GDB_TCP_PORT ?= 1234
 GDB_PROFILE_FORMAT ?= flame-graph
@@ -198,6 +206,36 @@ endif
 CARGO_OSDK_BUILD_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 CARGO_OSDK_TEST_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 
+# FrameVM profile/target directories for locating the emitted object file.
+FRAMEVM_PROFILE_DIR := debug
+FRAMEVM_CARGO_PROFILE :=
+ifeq ($(RELEASE_LTO), 1)
+FRAMEVM_CARGO_PROFILE := --profile release-lto
+FRAMEVM_PROFILE_DIR := release-lto
+else ifeq ($(RELEASE), 1)
+FRAMEVM_CARGO_PROFILE := --release
+FRAMEVM_PROFILE_DIR := release
+endif
+FRAMEVM_DEPS_DIR := target/$(FRAMEVM_TARGET)/$(FRAMEVM_PROFILE_DIR)/deps
+
+FRAMEVM_FEATURE_ARGS :=
+ifdef FEATURES
+FRAMEVM_FEATURE_ARGS += --features="$(FEATURES)"
+endif
+ifeq ($(NO_DEFAULT_FEATURES), 1)
+FRAMEVM_FEATURE_ARGS += --no-default-features
+endif
+
+INITRAMFS_EXTRA_DEPS :=
+INITRAMFS_EXTRA_ARGS :=
+ifeq ($(BUILD_FRAMEVM_OBJ), 1)
+ifeq ($(FRAMEVM_INITRAMFS_INCLUDE), 1)
+INITRAMFS_EXTRA_DEPS += framevm_obj
+INITRAMFS_EXTRA_ARGS += FRAMEVM_OBJ_PATH=$(abspath $(FRAMEVM_OBJ_OUTPUT))
+INITRAMFS_EXTRA_ARGS += FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
+endif
+endif
+
 # Pass make variables to all subdirectory makes
 export
 
@@ -294,8 +332,8 @@ check_vdso:
 	fi
 
 .PHONY: initramfs
-initramfs: check_vdso
-	@$(MAKE) --no-print-directory -C test/initramfs
+initramfs: check_vdso $(INITRAMFS_EXTRA_DEPS)
+	@$(MAKE) --no-print-directory -C test/initramfs $(INITRAMFS_EXTRA_ARGS)
 
 # Build the kernel with an initramfs
 .PHONY: kernel
@@ -502,3 +540,16 @@ clean:
 	@$(MAKE) --no-print-directory -C test/initramfs clean
 	@echo "Uninstalling OSDK"
 	@rm -f $(CARGO_OSDK)
+
+.PHONY: framevm_obj
+framevm_obj:
+	@echo "[make] Building FrameVM object for dynamic loading"
+	@cargo rustc -p aster-framevm --target $(FRAMEVM_TARGET) $(FRAMEVM_CARGO_PROFILE) $(FRAMEVM_FEATURE_ARGS) -- -C link-arg=--unresolved-symbols=ignore-all -C relocation-model=static -Zplt=no --emit=obj
+	@mkdir -p $(dir $(FRAMEVM_OBJ_OUTPUT))
+	@FRAMEVM_SRC=$$(find $(FRAMEVM_DEPS_DIR) -maxdepth 1 -type f -name 'framevm-*' ! -name '*.d' | sort | tail -n 1); \
+	if [ -z "$$FRAMEVM_SRC" ]; then \
+		echo "Error: FrameVM object not found under $(FRAMEVM_DEPS_DIR)"; \
+		exit 1; \
+	fi; \
+	cp $$FRAMEVM_SRC $(FRAMEVM_OBJ_OUTPUT); \
+	echo "FrameVM object copied to $(FRAMEVM_OBJ_OUTPUT)"

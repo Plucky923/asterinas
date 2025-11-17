@@ -199,6 +199,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-framevisor"
+version = "0.1.0"
+dependencies = [
+ "component",
+ "ostd",
+]
+
+[[package]]
+name = "aster-framevm"
+version = "0.1.0"
+dependencies = [
+ "ostd",
+]
+
+[[package]]
 name = "aster-i8042"
 version = "0.1.0"
 dependencies = [
@@ -277,6 +292,7 @@ dependencies = [
  "aster-cmdline",
  "aster-console",
  "aster-framebuffer",
+ "aster-framevisor",
  "aster-i8042",
  "aster-input",
  "aster-logger",
@@ -1463,6 +1479,7 @@ dependencies = [
  "ostd-pod",
  "ostd-test",
  "riscv",
+ "rustc-demangle",
  "sbi-rt",
  "smallvec",
  "spin",
@@ -1471,6 +1488,7 @@ dependencies = [
  "volatile 0.6.1",
  "x86",
  "x86_64",
+ "xmas-elf",
 ]
 
 [[package]]
@@ -1767,6 +1785,12 @@ name = "rle-decode-fast"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
+
+[[package]]
+name = "rustc-demangle"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56f7d92ca342cea22a06f2121d944b4fd82af56988c270852495420f961d4ace"
 
 [[package]]
 name = "rustc_version"

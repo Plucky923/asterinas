@@ -12,6 +12,7 @@ aster-block = { path = "comps/block" }
 aster-network = { path = "comps/network" }
 aster-cmdline = { path = "comps/cmdline" }
 aster-console = { path = "comps/console" }
+aster-framevisor = { path = "comps/framevisor" }
 aster-framebuffer = { path = "comps/framebuffer" }
 aster-softirq = { path = "comps/softirq" }
 aster-logger = { path = "comps/logger" }

@@ -37,6 +37,8 @@ volatile = "0.6.1"
 bitvec = { version = "1.0", default-features = false, features = ["alloc"] }
 
 minicov = { version = "0.3", optional = true }
+xmas-elf = "0.10.0"
+rustc-demangle = "0.1.26"
 
 # The targets are chosen to prevent the generated machine code from using any
 # vector or floating-point registers.

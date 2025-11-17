@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+mod framevm;
 mod full;
 mod null;
 mod pty;
@@ -74,6 +75,9 @@ pub fn init_in_first_process(ctx: &Context) -> Result<()> {
 
     shm::init_in_first_process(&fs_resolver, ctx)?;
 
+    let framevm = Arc::new(framevm::FrameVMDevice);
+    add_node(framevm, "framevm", &fs_resolver)?;
+
     Ok(())
 }
 
@@ -91,6 +95,7 @@ pub fn get_device(devid: DeviceId) -> Result<Arc<dyn Device>> {
         (5, 0) => Ok(Arc::new(tty::TtyDevice)),
         (1, 8) => Ok(Arc::new(random::Random)),
         (1, 9) => Ok(Arc::new(urandom::Urandom)),
+        (99, 99) => Ok(Arc::new(framevm::FrameVMDevice)),
         _ => return_errno_with_message!(Errno::EINVAL, "the device ID is invalid or unsupported"),
     }
 }

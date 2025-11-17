@@ -30,6 +30,8 @@ pub struct BootInfo {
     pub kernel_cmdline: String,
     /// The initial ramfs raw bytes.
     pub initramfs: Option<&'static [u8]>,
+    /// The kernel symbol table raw bytes.
+    pub symbols: Option<&'static [u8]>,
     /// The framebuffer arguments.
     pub framebuffer_arg: Option<BootloaderFramebufferArg>,
     /// The memory regions provided by the bootloader.
@@ -89,6 +91,7 @@ pub(crate) struct EarlyBootInfo {
     pub(crate) bootloader_name: &'static str,
     pub(crate) kernel_cmdline: &'static str,
     pub(crate) initramfs: Option<&'static [u8]>,
+    pub(crate) symbols: Option<&'static [u8]>,
     pub(crate) acpi_arg: BootloaderAcpiArg,
     pub(crate) framebuffer_arg: Option<BootloaderFramebufferArg>,
     pub(crate) memory_regions: MemoryRegionArray,
@@ -108,6 +111,7 @@ pub(crate) fn init_after_heap() {
         bootloader_name: boot_time_info.bootloader_name.to_string(),
         kernel_cmdline: boot_time_info.kernel_cmdline.to_string(),
         initramfs: boot_time_info.initramfs,
+        symbols: boot_time_info.symbols,
         framebuffer_arg: boot_time_info.framebuffer_arg,
         memory_regions: boot_time_info.memory_regions.to_vec(),
     });

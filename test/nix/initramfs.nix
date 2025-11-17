@@ -1,5 +1,6 @@
 { lib, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox, apps
-, benchmark, syscall, dnsServer, pkgs }:
+, benchmark, syscall, dnsServer, pkgs, framevmObjPath ? ""
+, framevmInstallPath ? "/framevm/framevm.o" }:
 let
   etc = lib.fileset.toSource {
     root = ./../src/etc;
@@ -10,6 +11,11 @@ let
     path = "/lib/x86_64-linux-gnu";
   };
   resolv_conf = pkgs.callPackage ./resolv_conf.nix { dnsServer = dnsServer; };
+  framevmObj =
+    if framevmObjPath == "" then null else builtins.path {
+      name = "framevm-object";
+      path = framevmObjPath;
+    };
   all_pkgs = [ busybox etc resolv_conf ]
     ++ lib.optionals (apps != null) [ apps.package ]
     ++ lib.optionals (benchmark != null) [ benchmark.package ]
@@ -50,6 +56,10 @@ in stdenvNoCC.mkDerivation {
         cp -L ${gvisor_libs}/libc.so.6 $out/lib/x86_64-linux-gnu/libc.so.6
         cp -L ${gvisor_libs}/libm.so.6 $out/lib/x86_64-linux-gnu/libm.so.6
       fi
+    ''}
+
+    ${lib.optionalString (framevmObj != null) ''
+      install -Dm644 ${framevmObj} $out${framevmInstallPath}
     ''}
 
     # Use `writeClosure` to retrieve all dependencies of the specified packages.

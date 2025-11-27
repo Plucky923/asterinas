@@ -87,11 +87,7 @@ impl<'a> FrameVmInfo<'a> {
         let sections_metadata = load_section_data(&elf_file, &section_memory)?;
         let symbol_table = get_symbol_table(&elf_file)?;
         simply_symbol(symbol_table, &elf_file, &sections_metadata)?;
-        relocate_sections(
-            &elf_file,
-            &sections_metadata,
-            default_external_symbol_resolver,
-        )?;
+        relocate_sections(&elf_file, &sections_metadata)?;
 
         // 查找并记录入口点地址 (_start)
         let entry_point = find_entry_point(&elf_file, &sections_metadata)?;
@@ -590,447 +586,7 @@ fn find_entry_point(
     Ok(None)
 }
 
-/// 外部符号解析器类型
-/// 参数：符号名称
-/// 返回：符号地址，如果找不到返回 None
-pub type ExternalSymbolResolver = fn(&str) -> Option<usize>;
-
-/// 默认的外部符号解析器
-/// 尝试从内核符号表中查找符号
-/// 先 demangle 符号名称，然后在符号表中查找
-fn default_external_symbol_resolver(name: &str) -> Option<usize> {
-    // 使用 symbols 模块的按名称查找函数
-    // 该函数会自动处理 demangle 和匹配
-    let result = symbols::symbol_addr_by_name(name);
-
-    if result.is_some() {
-        // 成功找到符号，打印调试信息
-        early_println!(
-            "[Loader] Symbol '{}' resolved to 0x{:x}",
-            name,
-            result.unwrap()
-        );
-    } else {
-        // 添加调试信息
-        use rustc_demangle::demangle;
-        let demangled = demangle(name);
-        early_println!(
-            "[Loader] Symbol lookup failed: mangled='{}', demangled='{}', table_size={}",
-            name,
-            demangled,
-            symbols::symbols_len()
-        );
-    }
-
-    result
-}
-
-/// 解析符号地址
-/// 如果符号在当前文件中定义，返回其加载后的地址
-/// 如果符号是外部符号，尝试通过 resolver 解析
-fn resolve_symbol_address(
-    symbol: &Entry64,
-    _symbol_index: usize,
-    symbol_name: &str,
-    _elf_file: &ElfFile,
-    sections_metadata: &SectionsMetadata,
-    external_resolver: ExternalSymbolResolver,
-) -> Option<usize> {
-    let section_index = symbol.shndx();
-
-    // SHN_UNDEF (0) 表示未定义的外部符号
-    if section_index == 0 {
-        // 尝试通过外部解析器解析
-        return external_resolver(symbol_name);
-    }
-
-    // SHN_ABS (65521) 表示绝对地址，不需要重定位
-    if section_index == 65521 {
-        return Some(symbol.value() as usize);
-    }
-
-    // 从已加载的section中查找符号地址
-    if let Some(loaded_section) = sections_metadata
-        .loaded_sections
-        .get(&(section_index as usize))
-    {
-        // 符号地址 = section基地址 + 符号在section中的偏移
-        let symbol_addr = loaded_section.base_addr + symbol.value() as usize;
-        return Some(symbol_addr);
-    }
-
-    None
-}
-
-/// 执行单个重定位
-/// 返回 Ok(true) 表示指令已被转换（如 call 转换为间接调用），应该跳过验证
-/// 返回 Ok(false) 表示正常处理，需要验证
-fn apply_relocation(
-    reloc_offset: u64,
-    reloc_type: u32,
-    symbol_addr: usize,
-    addend: i64,
-    target_section_base: usize,
-    elf_file: &ElfFile,
-) -> Result<bool> {
-    // 计算重定位目标地址（在内存中的实际地址）
-    let reloc_addr = target_section_base + reloc_offset as usize;
-
-    // 根据重定位类型计算新值
-    let new_value = match reloc_type {
-        // R_X86_64_64: 64位绝对地址
-        1 => (symbol_addr as i64 + addend) as u64,
-        // R_X86_64_PC32 或 R_X86_64_PLT32: 32位PC相对地址
-        4 => {
-            // PC相对地址 = 符号地址 + addend - (当前指令地址 + 4)
-            // 当前指令地址是 reloc_addr，+4 是因为指令长度
-            let pc = reloc_addr + 4;
-            let diff = (symbol_addr as i64 + addend) - (pc as i64);
-            // 检查是否超出32位有符号范围
-            if diff < i32::MIN as i64 || diff > i32::MAX as i64 {
-                // 超出范围，尝试转换为间接调用
-                early_println!(
-                    "[Loader] Warning: R_X86_64_PC32 relocation out of range (diff={}), converting to indirect call",
-                    diff
-                );
-                early_println!(
-                    "[Loader]   symbol_addr=0x{:x}, pc=0x{:x}, reloc_addr=0x{:x}",
-                    symbol_addr,
-                    pc,
-                    reloc_addr
-                );
-
-                // 读取当前指令，检查指令类型
-                // R_X86_64_PC32 重定位可以用于多种指令：
-                // - call rel32 (E8) - 重定位偏移指向操作码后的32位偏移
-                // - jmp rel32 (E9) - 重定位偏移指向操作码后的32位偏移
-                // - lea reg, [rip+rel32] (48 8D ...) - 重定位偏移指向指令内部的disp32字段
-                // - mov reg, [rip+rel32] (48 8B ...) - 重定位偏移指向指令内部的disp32字段
-                // 注意：重定位偏移可能指向指令的操作数字段，而不是操作码！
-                unsafe {
-                    // 读取重定位地址周围32字节以便分析
-                    let mut context_bytes = [0u8; 32];
-                    let context_start = if reloc_addr >= 16 { reloc_addr - 16 } else { 0 };
-                    for i in 0..32 {
-                        if let Some(addr) = context_start.checked_add(i) {
-                            if addr < reloc_addr + 16 {
-                                context_bytes[i] = core::ptr::read_volatile(addr as *const u8);
-                            }
-                        }
-                    }
-
-                    // 打印上下文字节（简化版本）
-                    early_println!(
-                        "[Loader]   Bytes around reloc_addr 0x{:x} (offset 0x{:x}):",
-                        reloc_addr,
-                        reloc_offset
-                    );
-                    let start_idx = if reloc_addr >= context_start + 16 {
-                        16
-                    } else {
-                        (reloc_addr - context_start) as usize
-                    };
-                    let end_idx = (start_idx + 16).min(32);
-                    for i in start_idx..end_idx {
-                        let addr = context_start + i;
-                        if addr == reloc_addr {
-                            early_println!(
-                                "[Loader]     0x{:x}: [{:02x}] <-- reloc_addr",
-                                addr,
-                                context_bytes[i]
-                            );
-                        } else {
-                            early_println!("[Loader]     0x{:x}: [{:02x}]", addr, context_bytes[i]);
-                        }
-                    }
-
-                    // 尝试向前查找指令开始（最多向前16字节）
-                    let mut found_instr_start = None;
-                    for back_offset in 1..=16 {
-                        let check_addr = reloc_addr.checked_sub(back_offset);
-                        if let Some(addr) = check_addr {
-                            let byte = core::ptr::read_volatile(addr as *const u8);
-                            // 检查是否是 call (E8) 或 jmp (E9)
-                            if byte == 0xE8 || byte == 0xE9 {
-                                found_instr_start = Some((addr, byte));
-                                early_println!(
-                                    "[Loader]   Found instruction start at 0x{:x}: 0x{:02x} (offset -{})",
-                                    addr,
-                                    byte,
-                                    back_offset
-                                );
-                                break;
-                            }
-                            // 检查是否是 lea/mov [rip+rel32] 的前缀
-                            if byte == 0x48 {
-                                let next_byte = core::ptr::read_volatile((addr + 1) as *const u8);
-                                if (next_byte & 0xF8) == 0x8D || (next_byte & 0xF8) == 0x8B {
-                                    found_instr_start = Some((addr, byte));
-                                    early_println!(
-                                        "[Loader]   Found instruction start at 0x{:x}: 0x{:02x} 0x{:02x} (offset -{})",
-                                        addr,
-                                        byte,
-                                        next_byte,
-                                        back_offset
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // 尝试从重定位地址向前查找指令开始
-                    // 对于 call/jmp，重定位偏移应该指向操作码后的32位偏移（即偏移+1）
-                    // 对于 lea/mov，重定位偏移指向指令内部的disp32字段
-                    let instr_ptr = reloc_addr as *const u8;
-                    let mut instr_bytes = [0u8; 16];
-                    for i in 0..16 {
-                        instr_bytes[i] = core::ptr::read_volatile(instr_ptr.add(i));
-                    }
-
-                    // 对于 call/jmp 指令，转换为间接调用/跳转时，应该直接使用符号地址
-                    // addend 是用于 PC 相对地址计算的，不适用于绝对地址
-                    let target_addr = symbol_addr as u64;
-
-                    // 根据找到的指令开始位置处理
-                    if let Some((instr_start, instr_byte)) = found_instr_start {
-                        // 检查是否是 call rel32 (E8)
-                        if instr_byte == 0xE8 {
-                            // call rel32 指令，转换为间接调用
-                            // 原指令：E8 [32位相对偏移] (5字节)
-                            // 新指令：48 B8 [64位绝对地址] FF D0 (mov rax, addr64; call rax) (12字节)
-                            // 注意：使用符号地址，不使用 addend（addend 只用于 PC 相对地址计算）
-                            let mov_rax_bytes = [0x48u8, 0xB8];
-                            let call_rax_bytes = [0xFFu8, 0xD0];
-                            unsafe {
-                                let mut writer =
-                                    VmWriter::from_kernel_space(instr_start as *mut u8, 12);
-                                let written1 =
-                                    writer.write(&mut VmReader::from(&mov_rax_bytes[..])); // mov rax, imm64 (2字节)
-                                if written1 != 2 {
-                                    return Err(crate::Error::InvalidArgs);
-                                }
-                                writer.write_val(&target_addr)?; // 64位地址 (8字节)
-                                let written2 =
-                                    writer.write(&mut VmReader::from(&call_rax_bytes[..])); // call rax (2字节)
-                                if written2 != 2 {
-                                    return Err(crate::Error::InvalidArgs);
-                                }
-                            }
-                            early_println!(
-                                "[Loader]   Converted call to indirect call: mov rax, 0x{:x}; call rax (symbol_addr=0x{:x}, addend={})",
-                                target_addr,
-                                symbol_addr,
-                                addend
-                            );
-                            early_println!(
-                                "[Loader]   Warning: Patched 12 bytes (original 5-byte call), may affect following 7 bytes"
-                            );
-                            return Ok(true); // 已转换，跳过验证
-                        }
-                        // 检查是否是 jmp rel32 (E9)
-                        else if instr_byte == 0xE9 {
-                            // jmp rel32 指令，转换为间接跳转
-                            // 原指令：E9 [32位相对偏移] (5字节)
-                            // 新指令：48 B8 [64位绝对地址] FF E0 (mov rax, addr64; jmp rax) (12字节)
-                            // 注意：使用符号地址，不使用 addend
-                            let mov_rax_bytes = [0x48u8, 0xB8];
-                            let jmp_rax_bytes = [0xFFu8, 0xE0];
-                            unsafe {
-                                let mut writer =
-                                    VmWriter::from_kernel_space(instr_start as *mut u8, 12);
-                                let written1 =
-                                    writer.write(&mut VmReader::from(&mov_rax_bytes[..])); // mov rax, imm64 (2字节)
-                                if written1 != 2 {
-                                    return Err(crate::Error::InvalidArgs);
-                                }
-                                writer.write_val(&target_addr)?; // 64位地址 (8字节)
-                                let written2 =
-                                    writer.write(&mut VmReader::from(&jmp_rax_bytes[..])); // jmp rax (2字节)
-                                if written2 != 2 {
-                                    return Err(crate::Error::InvalidArgs);
-                                }
-                            }
-                            early_println!(
-                                "[Loader]   Converted jmp to indirect jmp: mov rax, 0x{:x}; jmp rax (symbol_addr=0x{:x}, addend={})",
-                                target_addr,
-                                symbol_addr,
-                                addend
-                            );
-                            early_println!(
-                                "[Loader]   Warning: Patched 12 bytes (original 5-byte jmp), may affect following 7 bytes"
-                            );
-                            return Ok(true); // 已转换，跳过验证
-                        }
-                    }
-
-                    // 如果没有找到指令开始，尝试直接检查重定位地址处的指令
-                    let instr_byte = instr_bytes[0];
-                    // 检查是否是 lea reg, [rip+rel32] (48 8D ...) 或 mov reg, [rip+rel32] (48 8B ...)
-                    // 这些指令的重定位偏移指向指令内部的32位偏移字段，不是指令开始
-                    if instr_bytes[0] == 0x48 && (instr_bytes[1] & 0xF8) == 0x8D {
-                        // lea reg, [rip+rel32] - 指令格式：48 8D [modrm] [sib] [disp32]
-                        // 重定位偏移指向 disp32 字段（通常是第3-6字节）
-                        // 对于这种情况，我们需要将 lea 转换为 mov reg, imm64
-                        // 但这需要知道目标寄存器，比较复杂
-                        early_println!(
-                            "[Loader]   Detected lea instruction, but conversion is complex (needs register info)"
-                        );
-                        early_println!(
-                            "[Loader]   Error: R_X86_64_PC32 relocation out of range for lea instruction"
-                        );
-                        return Err(crate::Error::InvalidArgs);
-                    } else if instr_bytes[0] == 0x48 && (instr_bytes[1] & 0xF8) == 0x8B {
-                        // mov reg, [rip+rel32] - 类似处理
-                        early_println!(
-                            "[Loader]   Detected mov [rip+rel32] instruction, but conversion is complex"
-                        );
-                        early_println!(
-                            "[Loader]   Error: R_X86_64_PC32 relocation out of range for mov instruction"
-                        );
-                        return Err(crate::Error::InvalidArgs);
-                    } else {
-                        // 未知指令类型
-                        early_println!(
-                            "[Loader] Error: R_X86_64_PC32 relocation out of range and unsupported instruction type (0x{:02x} {:02x} {:02x} {:02x})",
-                            instr_bytes[0],
-                            instr_bytes[1],
-                            instr_bytes[2],
-                            instr_bytes[3]
-                        );
-                        early_println!(
-                            "[Loader]   Note: R_X86_64_PC32 is typically used for call/jmp/lea/mov instructions"
-                        );
-                        return Err(crate::Error::InvalidArgs);
-                    }
-                }
-            }
-            // 先转换为有符号i32，再转换为u32，这样可以保留符号位
-            (diff as i32 as u32) as u64
-        }
-        // R_X86_64_32: 32位绝对地址
-        // 注意：如果符号地址超出 32 位范围，这会导致地址截断
-        // 对于 VMALLOC 范围内的地址，应该使用 R_X86_64_64 或 R_X86_64_PC32
-        10 => {
-            let value = symbol_addr as i64 + addend;
-            // 检查是否超出32位无符号范围
-            if value < 0 || value > u32::MAX as i64 {
-                early_println!(
-                    "[Loader] Error: R_X86_64_32 relocation out of range: value={}, symbol_addr=0x{:x}, addend=0x{:x}",
-                    value,
-                    symbol_addr,
-                    addend
-                );
-                return Err(crate::Error::InvalidArgs);
-            }
-            value as u32 as u64
-        }
-        // R_X86_64_RELATIVE: 相对重定位（用于共享库）
-        8 => {
-            // 对于可重定位文件，这通常不应该出现
-            // 但如果有，就是 addend + 基地址
-            (target_section_base as i64 + addend) as u64
-        }
-        // R_X86_64_GOTPCREL: GOT PC 相对重定位
-        // 用于访问全局偏移表（GOT）中的条目
-        // 由于我们没有实现 GOT，将其转换为直接 PC 相对访问（类似于 R_X86_64_PC32）
-        9 => {
-            // GOTPCREL 的计算公式是：GOT[符号] - PC + addend
-            // 由于没有 GOT，我们直接使用符号地址：符号地址 - PC + addend
-            let pc = reloc_addr + 4;
-            let diff = (symbol_addr as i64 + addend) - (pc as i64);
-            // 检查是否超出32位有符号范围
-            if diff < i32::MIN as i64 || diff > i32::MAX as i64 {
-                early_println!(
-                    "[Loader] Warning: R_X86_64_GOTPCREL relocation out of range (diff={}), converting to indirect access",
-                    diff
-                );
-                early_println!(
-                    "[Loader]   symbol_addr=0x{:x}, pc=0x{:x}, reloc_addr=0x{:x}",
-                    symbol_addr,
-                    pc,
-                    reloc_addr
-                );
-
-                // 读取指令，检查是否是 mov reg, [rip+got_offset]
-                unsafe {
-                    let instr_ptr = reloc_addr as *const u8;
-                    let mut instr_bytes = [0u8; 16];
-                    for i in 0..16 {
-                        instr_bytes[i] = core::ptr::read_volatile(instr_ptr.add(i));
-                    }
-
-                    // 检查是否是 mov reg, [rip+rel32] (48 8B ...)
-                    if instr_bytes[0] == 0x48 && (instr_bytes[1] & 0xF8) == 0x8B {
-                        // mov reg, [rip+rel32] - 转换为 mov reg, [符号地址]
-                        // 但这需要知道目标寄存器，比较复杂
-                        // 更简单的方法：转换为 mov reg, imm64; mov reg, [reg]
-                        // 或者：lea reg, [rip+0]; mov [reg], symbol_addr; mov reg, [reg]
-                        // 实际上，最简单的方法是：将 mov reg, [rip+rel32] 转换为 mov reg, imm64（直接加载符号地址）
-                        // 但这改变了指令语义（从加载值变为加载地址）
-
-                        // 更实用的方法：转换为 movabs reg, symbol_addr; mov reg, [reg]
-                        // 但这需要知道目标寄存器
-
-                        early_println!("[Loader]   Detected mov [rip+got_offset] instruction");
-                        early_println!(
-                            "[Loader]   Error: R_X86_64_GOTPCREL relocation out of range, conversion requires register info"
-                        );
-                        return Err(crate::Error::InvalidArgs);
-                    } else {
-                        early_println!(
-                            "[Loader]   Error: R_X86_64_GOTPCREL relocation out of range, unsupported instruction (0x{:02x} {:02x} {:02x} {:02x})",
-                            instr_bytes[0],
-                            instr_bytes[1],
-                            instr_bytes[2],
-                            instr_bytes[3]
-                        );
-                        return Err(crate::Error::InvalidArgs);
-                    }
-                }
-            }
-            // 先转换为有符号i32，再转换为u32，这样可以保留符号位
-            (diff as i32 as u32) as u64
-        }
-        _ => {
-            early_println!(
-                "[Loader] Warning: Unsupported relocation type {} at offset 0x{:x}",
-                reloc_type,
-                reloc_offset
-            );
-            return Err(crate::Error::InvalidArgs);
-        }
-    };
-
-    // 写入新值到内存
-    unsafe {
-        match reloc_type {
-            1 | 8 => {
-                // 64位值
-                let val: u64 = new_value;
-                let mut writer = VmWriter::from_kernel_space(reloc_addr as *mut u8, 8);
-                writer.write_val(&val)?;
-            }
-            4 | 9 | 10 => {
-                // 32位值（PC32, GOTPCREL, 32位绝对地址）
-                let val: u32 = new_value as u32;
-                let mut writer = VmWriter::from_kernel_space(reloc_addr as *mut u8, 4);
-                writer.write_val(&val)?;
-            }
-            _ => {
-                return Err(crate::Error::InvalidArgs);
-            }
-        }
-    }
-
-    Ok(false) // 正常处理，需要验证
-}
-
-fn relocate_sections(
-    elf_file: &ElfFile,
-    sections_metadata: &SectionsMetadata,
-    external_resolver: ExternalSymbolResolver,
-) -> Result<()> {
+fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadata) -> Result<()> {
     let symbol_table = get_symbol_table(elf_file)?;
     early_println!("[Loader] Starting relocation...");
 
@@ -1057,7 +613,9 @@ fn relocate_sections(
             continue;
         }
 
-        let name = target_section.get_name(elf_file).map_err(|_| crate::Error::InvalidArgs)?;
+        let name = target_section
+            .get_name(elf_file)
+            .map_err(|_| crate::Error::InvalidArgs)?;
         match reloc_section.get_data(elf_file) {
             Ok(SectionData::Rela64(rela)) => {
                 early_println!(
@@ -1065,7 +623,13 @@ fn relocate_sections(
                     rela.len(),
                     name
                 );
-                apply_relocate_add(rela, &target_section, elf_file)?;
+                apply_relocate_add(
+                    rela,
+                    info as usize,
+                    elf_file,
+                    &sections_metadata,
+                    symbol_table,
+                )?;
             }
             Ok(SectionData::Rel64(rel)) => {
                 early_println!(
@@ -1084,17 +648,231 @@ fn relocate_sections(
     Ok(())
 }
 
+/// 应用 RELA 重定位
+/// 参考 Linux 内核的 __write_relocate_add 函数实现
 fn apply_relocate_add(
     rel: &[Rela<u64>],
-    target_section: &SectionHeader,
+    target_section_index: usize,
     elf_file: &ElfFile,
+    sections_metadata: &SectionsMetadata,
+    symbol_table: &[Entry64],
 ) -> Result<()> {
-    for reloc in rel {
+    // 获取目标 section 的基地址
+    let target_section_base = sections_metadata
+        .loaded_sections
+        .get(&target_section_index)
+        .ok_or(crate::Error::InvalidArgs)?
+        .base_addr;
+
+    early_println!(
+        "[Loader] Applying {} relocations to section {} (base: 0x{:x})",
+        rel.len(),
+        target_section_index,
+        target_section_base
+    );
+
+    // 遍历每个重定位条目
+    for (i, reloc) in rel.iter().enumerate() {
         let symbol_idx = reloc.get_symbol_table_index() as usize;
         let offset = reloc.get_offset();
-        let typ = reloc.get_type();
+        let reloc_type = reloc.get_type();
         let addend = reloc.get_addend() as i64;
-        early_println!("reloc: symbol_idx={}, offset={}, typ={}, addend={}", symbol_idx, offset, typ, addend);
+
+        // 计算要修改的目标地址
+        let loc = target_section_base + offset as usize;
+
+        // 获取符号
+        let symbol = symbol_table
+            .get(symbol_idx)
+            .ok_or(crate::Error::InvalidArgs)?;
+
+        let symbol_name = symbol.get_name(elf_file).unwrap_or("");
+        
+        // 计算符号的实际地址：根据符号所在的段和偏移量
+        let symbol_addr = {
+            let shndx = symbol.shndx();
+            if shndx == SHN_UNDEF {
+                // 未定义的符号，尝试从外部符号表查找
+                symbol_addr_by_name(symbol_name).unwrap_or(0) as u64
+            } else if let Some(section) = sections_metadata.loaded_sections.get(&(shndx as usize)) {
+                // 符号在已加载的段中：段基地址 + 符号偏移
+                (section.base_addr + symbol.value() as usize) as u64
+            } else {
+                // 符号不在已加载的段中，使用原始值
+                symbol.value() as u64
+            }
+        };
+        
+        // 基础值 = 符号地址 + addend
+        let mut val = symbol_addr;
+        // addend 是有符号的，需要正确处理
+        if addend >= 0 {
+            val = val.wrapping_add(addend as u64);
+        } else {
+            val = val.wrapping_sub((-addend) as u64);
+        }
+
+        early_println!(
+            "[Loader] Reloc[{}]: type={}, symbol='{}' (0x{:x}), addend=0x{:x}, loc=0x{:x}, val=0x{:x}",
+            i,
+            reloc_type,
+            symbol_name,
+            symbol_addr,
+            addend,
+            loc,
+            val
+        );
+
+        // 根据重定位类型处理
+        let size = match reloc_type {
+            // R_X86_64_NONE (0): 无需任何操作
+            0 => {
+                continue;
+            }
+            // R_X86_64_64 (1): 64 位绝对地址（如 movabs $imm64, %rax）
+            1 => 8,
+            // R_X86_64_32 (10): 32 位绝对地址（无符号）
+            10 => {
+                // 检查截断后是否丢失高位
+                let val_u32 = val as u32;
+                if val != val_u32 as u64 {
+                    early_println!(
+                        "[Loader] Error: overflow in relocation type {} val 0x{:x}",
+                        reloc_type,
+                        val
+                    );
+                    early_println!("[Loader] Module likely not compiled with -mcmodel=kernel");
+                    return Err(crate::Error::InvalidArgs);
+                }
+                4
+            }
+            // R_X86_64_32S (11): 32 位绝对地址（有符号）
+            11 => {
+                // 有符号截断检查
+                let val_i32 = val as i32;
+                if val as i64 != val_i32 as i64 {
+                    early_println!(
+                        "[Loader] Error: overflow in relocation type {} val 0x{:x}",
+                        reloc_type,
+                        val
+                    );
+                    early_println!("[Loader] Module likely not compiled with -mcmodel=kernel");
+                    return Err(crate::Error::InvalidArgs);
+                }
+                4
+            }
+            // R_X86_64_PC32 (2): 32 位 PC 相对（如 callq、jmp）
+            // R_X86_64_PLT32 (4): PLT 入口也是 32 位 PC 相对
+            2 | 4 => {
+                // PC 相对地址 = 符号地址 + addend - (当前指令地址)
+                // S + A - P
+                // C 代码: val -= (u64)loc;
+                val = val.wrapping_sub(loc as u64);
+                4
+            }
+            // R_X86_64_PC64 (5): 64 位 PC 相对（极少使用）
+            24 => {
+                val = val.wrapping_sub(loc as u64);
+                8
+            }
+
+            _ => {
+                early_println!(
+                    "[Loader] Error: Unsupported relocation type: {}, symbol '{}'",
+                    reloc_type,
+                    symbol_name
+                );
+                continue;
+            }
+        };
+
+        // 安全检查：目标位置必须原本是 0
+        unsafe {
+            let mut existing_bytes = [0u8; 8];
+            let mut reader = VmReader::from_kernel_space(loc as *const u8, size);
+            let read_len = reader.read(&mut VmWriter::from(&mut existing_bytes[..size]));
+            if read_len != size {
+                early_println!(
+                    "[Loader] Error: Failed to read existing value at 0x{:x}",
+                    loc
+                );
+                return Err(crate::Error::InvalidArgs);
+            }
+
+            // 检查是否为零
+            let is_zero = match size {
+                4 => {
+                    let existing_val = u32::from_le_bytes([
+                        existing_bytes[0],
+                        existing_bytes[1],
+                        existing_bytes[2],
+                        existing_bytes[3],
+                    ]);
+                    existing_val == 0
+                }
+                8 => {
+                    let existing_val = u64::from_le_bytes([
+                        existing_bytes[0],
+                        existing_bytes[1],
+                        existing_bytes[2],
+                        existing_bytes[3],
+                        existing_bytes[4],
+                        existing_bytes[5],
+                        existing_bytes[6],
+                        existing_bytes[7],
+                    ]);
+                    existing_val == 0
+                }
+                _ => false,
+            };
+
+            if !is_zero {
+                early_println!(
+                    "[Loader] Error: Invalid relocation target, existing value is nonzero for type {}, loc 0x{:x}, val 0x{:x}",
+                    reloc_type,
+                    loc,
+                    val
+                );
+                return Err(crate::Error::InvalidArgs);
+            }
+
+            // 写入新值
+            let mut writer = VmWriter::from_kernel_space(loc as *mut u8, size);
+            match size {
+                4 => {
+                    // 对于 32 位值，根据重定位类型决定是有符号还是无符号
+                    match reloc_type {
+                        // R_X86_64_32: 无符号 32 位
+                        10 => {
+                            let val_u32 = val as u32;
+                            writer.write_val(&val_u32)?;
+                        }
+                        // R_X86_64_32S, R_X86_64_PC32, R_X86_64_PLT32: 有符号 32 位
+                        _ => {
+                            // 将 u64 转换为有符号 i32，然后写入（会自动进行符号扩展）
+                            let val_i32 = val as i32;
+                            writer.write_val(&val_i32)?;
+                        }
+                    }
+                }
+                8 => {
+                    // 64 位值直接写入
+                    writer.write_val(&val)?;
+                }
+                _ => {
+                    return Err(crate::Error::InvalidArgs);
+                }
+            }
+
+            early_println!(
+                "[Loader] Reloc[{}] applied: type={}, wrote {} bytes (0x{:x}) to 0x{:x}",
+                i,
+                reloc_type,
+                size,
+                val,
+                loc
+            );
+        }
     }
 
     Ok(())

@@ -438,7 +438,9 @@ clean:
 .PHONY: framevm_obj
 framevm_obj:
 	@echo "[make] Building FrameVM object for dynamic loading"
-	@cargo rustc -p aster-framevm --target $(FRAMEVM_TARGET) $(FRAMEVM_CARGO_PROFILE) $(FRAMEVM_FEATURE_ARGS) -- --emit=obj
+	@env RUSTFLAGS="-C relocation-model=static -C code-model=kernel -C relro-level=off" \
+	CFLAGS_x86_64-unknown-none="-fno-pic" \
+	cargo rustc -p aster-framevm --target $(FRAMEVM_TARGET) $(FRAMEVM_CARGO_PROFILE) $(FRAMEVM_FEATURE_ARGS) -- --emit=obj
 	@mkdir -p $(dir $(FRAMEVM_OBJ_OUTPUT))
 	@FRAMEVM_SRC=$$(find $(FRAMEVM_DEPS_DIR) -maxdepth 1 -type f -name 'framevm-*' ! -name '*.d' | sort | tail -n 1); \
 	if [ -z "$$FRAMEVM_SRC" ]; then \

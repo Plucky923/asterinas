@@ -18,6 +18,16 @@ use crate::{
     early_println, mm::{
         PAGE_SIZE, Paddr, Vaddr, frame::{Frame, meta::AnyFrameMeta}, kspace::{KernelPtConfig, MODULE_RANGE, MappedItem}, page_prop::PageProperty, page_table::largest_pages
     }, task::disable_preempt, util::range_alloc::RangeAllocator
+    early_println,
+    mm::{
+        frame::{meta::AnyFrameMeta, Frame},
+        kspace::{KernelPtConfig, MappedItem, MODULE_RANGE},
+        page_prop::PageProperty,
+        page_table::largest_pages,
+        Paddr, Vaddr, PAGE_SIZE,
+    },
+    task::disable_preempt,
+    util::range_alloc::RangeAllocator,
 };
 
 static KVIRT_AREA_ALLOCATOR: RangeAllocator = RangeAllocator::new(VMALLOC_VADDR_RANGE);
@@ -139,7 +149,7 @@ impl KVirtArea {
         assert!(map_offset % PAGE_SIZE == 0);
 
         let range = MODULE_KVIRT_AREA_ALLOCATOR.alloc(area_size).unwrap();
-        
+
         // 验证分配的地址范围完全在 MODULE_RANGE 内
         assert!(
             range.start >= MODULE_RANGE.start,
@@ -153,7 +163,7 @@ impl KVirtArea {
             range.end,
             MODULE_RANGE.end
         );
-        
+
         let cursor_range = range.start + map_offset..range.end;
         early_println!("cursor_range: {:#x?}", cursor_range);
         early_println!("range: {:#x?}", range);

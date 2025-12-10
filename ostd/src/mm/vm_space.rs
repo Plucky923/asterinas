@@ -14,6 +14,8 @@ use super::{AnyUFrameMeta, PagingLevel, page_table::PageTableConfig};
 use crate::{
     Error,
     arch::mm::{PageTableEntry, PagingConsts, current_page_table_paddr},
+    arch::mm::{current_page_table_paddr, PageTableEntry, PagingConsts},
+    console::early_print,
     cpu::{AtomicCpuSet, CpuSet, PinCurrentCpu},
     cpu_local_cell,
     io::IoMem,

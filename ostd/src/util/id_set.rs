@@ -30,7 +30,7 @@ use core::{
 use bitvec::{order::Lsb0, view::BitView};
 use smallvec::SmallVec;
 
-use crate::const_assert;
+use crate::{const_assert, early_println};
 
 /// A trait to abstract an ID type.
 ///
@@ -188,6 +188,8 @@ impl<I: Id> IdSet<I> {
 
     /// Adds an ID to the set.
     pub fn add(&mut self, id: I) {
+        early_println!("IdSet add: {:?}", id);
+        early_println!("self.bits: {:?}", self.bits);
         let part_idx = part_idx(id);
         let bit_idx = bit_idx(id);
         if part_idx >= self.bits.len() {

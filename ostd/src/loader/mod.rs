@@ -6,8 +6,8 @@ use xmas_elf::{
     header::Type,
     program::ProgramHeader,
     sections::{
-        Rel, Rela, SectionData, SectionHeader, ShType, SHF_ALLOC, SHF_EXECINSTR,
-        SHF_WRITE, SHN_UNDEF,
+        Rel, Rela, SectionData, SectionHeader, ShType, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
+        SHN_UNDEF,
     },
     symbol_table::{Entry, Entry64},
     ElfFile,
@@ -75,7 +75,7 @@ impl<'a> FrameVmInfo<'a> {
             if !line_buffer.is_empty() {
                 early_println!("{}", line_buffer);
             }
-            
+
             // 尝试解析前几条指令
             early_println!("[Loader] Attempting to disassemble first few instructions:");
             let mut hex_buffer = alloc::string::String::new();
@@ -94,10 +94,9 @@ impl<'a> FrameVmInfo<'a> {
         // 打印入口点函数的反汇编信息（前几条指令）
         early_println!("[Loader] Entry point function starts at 0x{:x}", start);
         early_println!("[Loader] About to call entry point...");
-        early_println!("[Loader] If RIP goes to 0xfffffffffdfff801, check if there's a jump/call instruction that calculates wrong target");
 
-        let entry: fn() -> () = unsafe { core::mem::transmute(start) };
-        entry();
+        let entry: extern "Rust" fn() = unsafe { core::mem::transmute(start) };
+        unsafe { entry() };
         early_println!("framevm end");
         Ok(())
     }
@@ -596,17 +595,17 @@ fn reader_equals_slice(reader: &mut VmReader<'_, Infallible>, data: &[u8]) -> bo
     reader.remain() == 0
 }
 
-/// 查找入口点地址 (_start 符号)
+/// 查找入口点地址 (__ostd_main 符号)
 fn find_entry_point(
     elf_file: &ElfFile,
     sections_metadata: &SectionsMetadata,
 ) -> Result<Option<usize>> {
     let symbol_table = get_symbol_table(elf_file)?;
 
-    // 查找 _start 符号
+    // 查找 __framevm_main 符号
     for symbol in symbol_table.iter() {
         let name = symbol.get_name(elf_file).unwrap_or("");
-        if name == "_start" {
+        if name == "__framevm_main" {
             // 解析符号地址
             let section_index = symbol.shndx();
             if section_index == 0 {
@@ -660,7 +659,7 @@ fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadata) -
         match reloc_section.get_data(elf_file) {
             Ok(SectionData::Rela64(rela)) => {
                 early_println!(
-                    "[Loader] Processing {} relocations for section '{}'",
+                    "[Loader] Processing {} RELA relocations for section '{}'",
                     rela.len(),
                     name
                 );
@@ -674,7 +673,7 @@ fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadata) -
             }
             Ok(SectionData::Rel64(rel)) => {
                 early_println!(
-                    "[Loader] Processing {} relocations for section '{}'",
+                    "[Loader] Processing {} REL relocations for section '{}'",
                     rel.len(),
                     name
                 );
@@ -824,14 +823,14 @@ fn apply_relocate_add(
                 // 验证 32 位有符号范围：必须在 ±2GB 范围内
                 let val_i32 = val as i32;
                 let val_i64 = val as i64;
-                
+
                 // 计算实际跳转目标地址（用于调试）
                 // 对于 call 指令（e8 XX XX XX XX），指令长度是 5 字节
                 // 执行时 PC = loc + 5，跳转目标 = PC + offset = loc + 5 + offset
                 let instruction_length = 5; // call 指令通常是 5 字节
                 let execution_pc = loc + instruction_length;
                 let jump_target = (execution_pc as i64).wrapping_add(val_i32 as i64) as u64;
-                
+
                 early_println!(
                     "[Loader] PC32/PLT32 relocation calculation: symbol=0x{:x}, addend={}, loc=0x{:x}, val_before=0x{:x}, val_after=0x{:x} ({}), execution_pc=0x{:x}, jump_target=0x{:x}",
                     symbol_addr,
@@ -843,7 +842,7 @@ fn apply_relocate_add(
                     execution_pc,
                     jump_target
                 );
-                
+
                 // 检查是否有符号扩展问题（值超出 32 位有符号范围）
                 if val_i64 != val_i32 as i64 {
                     early_println!(

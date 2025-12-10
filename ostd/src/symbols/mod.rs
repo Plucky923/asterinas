@@ -19,8 +19,6 @@ pub fn symbols_table_init() {
     } else {
         early_print!("[ostd] No symbols were provided by the bootloader.");
     }
-
-    traverse_symbols();
 }
 
 /// A single entry within the kernel symbol table.
@@ -109,24 +107,21 @@ fn parse_symbols_file_from_binary(symbols: &[u8]) {
                         || demangled_lower.contains("framevisor")
                         || demangled_lower.contains("aster_framevisor")
                     {
-                        framevisor_count += 1;
-                        // Debug: print first few framevisor symbols
-                        if framevisor_count <= 5 {
-                            early_println!(
-                                "[ostd] Found framevisor symbol: {} (raw: {})",
-                                demangled,
-                                name
-                            );
-                        }
-                        table.insert(
-                            address,
-                            SymbolEntry {
-                                name: demangled,
-                                addr: address,
-                                size,
-                            },
+                        early_println!(
+                            "[ostd] Found framevisor symbol: {} (raw: {})",
+                            demangled,
+                            name
                         );
                     }
+
+                    table.insert(
+                        address,
+                        SymbolEntry {
+                            name: demangled,
+                            addr: address,
+                            size,
+                        },
+                    );
                 }
             }
         }
@@ -175,7 +170,6 @@ fn strip_hash_suffix(name: &str) -> &str {
 /// This function searches for a symbol by its name. It will:
 /// 1. Try to match the exact name (mangled or demangled)
 /// 2. Try to demangle the input name and match against demangled names (ignoring hash suffixes)
-/// 3. For names starting with `ostd::`, also try mapping to `aster_framevisor::` and resolving again.
 ///
 /// Returns the symbol address if found, None otherwise.
 pub fn symbol_addr_by_name(name: &str) -> Option<usize> {
@@ -192,40 +186,25 @@ pub fn symbol_addr_by_name(name: &str) -> Option<usize> {
     let demangled = demangle(name).to_string();
     let demangled_no_hash = strip_hash_suffix(&demangled);
 
+    early_println!("[ostd] Looking up symbol by name: input='{}', demangled='{}'", name, demangled_no_hash);
+
     // 2.1 Build candidate names:
     //   - the original demangled_no_hash
-    //   - if it starts with "ostd::", also try replacing the prefix with "aster_framevisor::"
-    //   - if it contains "ostd::" inside（例如 core::ptr::drop_in_place<ostd::...>），
-    //     也尝试把内部的 "ostd::" 替换为 "aster_framevisor::"
-    //
-    // This allows resolving symbols that were compiled against a dependency
-    // aliased as `ostd` but actually come from the `aster_framevisor` crate.
     let mut candidates: Vec<String> = Vec::new();
     candidates.push(demangled_no_hash.to_string());
 
-    if let Some(rest) = demangled_no_hash.strip_prefix("ostd::") {
-        candidates.push(format!("aster_framevisor::{}", rest));
-    }
-
-    // 例如：core::ptr::drop_in_place<ostd::mm::vm_space::VmSpace>
-    // 我们希望把内部的 `ostd::` 替换成 `aster_framevisor::`，
-    // 映射到 core::ptr::drop_in_place<aster_framevisor::mm::vm_space::VmSpace>
-    if demangled_no_hash.contains("ostd::") {
-        let replaced = demangled_no_hash.replacen("ostd::", "aster_framevisor::", 1);
-        if replaced != demangled_no_hash {
-            candidates.push(replaced);
-        }
-    }
-
+    let tmp_addr: usize = 0;
     // 2.2 Try to match each candidate against the demangled symbol names in the table.
     for cand in &candidates {
         for (_addr, entry) in table.iter() {
             let entry_no_hash = strip_hash_suffix(&entry.name);
             if entry_no_hash == cand {
-                return Some(entry.addr);
+                early_println!("[ostd] Matched symbol '{}' to entry '{}'", cand, entry.name);
+                let tmp_addr = entry.addr;
             }
         }
     }
+    return Some(tmp_addr);
 
     // 3. Fallback: also try matching the raw input name against stored names (including mangled).
     for (_addr, entry) in table.iter() {
@@ -245,12 +224,4 @@ pub fn symbols_len() -> usize {
 /// Logs every loaded symbol to the early console for diagnostics.
 pub fn traverse_symbols() {
     let table = symbol_table().lock();
-    for (addr, entry) in table.iter() {
-        early_print!(
-            "[ostd] Symbol: addr=0x{:x}, size={}, name={}",
-            addr,
-            entry.size,
-            entry.name
-        );
-    }
 }

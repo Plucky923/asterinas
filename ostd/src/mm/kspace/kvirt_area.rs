@@ -14,6 +14,7 @@ use crate::{
         page_prop::PageProperty,
         page_table::largest_pages,
     },
+
 };
 
 mod allocator {
@@ -168,6 +169,7 @@ impl KVirtArea {
         let range = allocator::module_kvirt_area_allocator(&irq_guard)
             .alloc(area_size)
             .unwrap();
+
 
         assert!(
             range.start >= MODULE_RANGE.start,

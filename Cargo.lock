@@ -140,9 +140,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-framevisor"
+version = "0.1.0"
+dependencies = [
+ "aster-framevisor-macros",
+ "component",
+ "ostd",
+]
+
+[[package]]
+name = "aster-framevisor-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.101",
+]
+
+[[package]]
 name = "aster-framevm"
 version = "0.1.0"
 dependencies = [
+ "align_ext",
+ "aster-framevisor",
  "ostd",
 ]
 

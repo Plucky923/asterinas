@@ -64,6 +64,9 @@ else
 build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE)
 endif
 
+.PHONY: framevm_initramfs
+framevm_initramfs: $(INITRAMFS_IMAGE)
+
 .PHONY: $(INITRAMFS_IMAGE)
 $(INITRAMFS_IMAGE): $(INITRAMFS)
 	@nix-build \

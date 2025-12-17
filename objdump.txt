@@ -1,0 +1,375 @@
+
+build/framevm/framevm.o:     file format elf64-x86-64
+
+
+Disassembly of section .text._RINvNtCsh6ugFidcq7g_4core3mem4dropINtNtB4_6result6ResultNtNtNtCs3UvJIZ7j0i5_16aster_framevisor2mm8vm_space9CursorMutNtNtCsiwCasD5lcxl_4ostd5error5ErrorEECsbRqWTd2Q6EU_7framevm:
+
+0000000000000000 <core::mem::drop::<core::result::Result<aster_framevisor::mm::vm_space::CursorMut, ostd::error::Error>>>:
+   0:	50                   	push   %rax
+   1:	e8 00 00 00 00       	call   6 <core::mem::drop::<core::result::Result<aster_framevisor::mm::vm_space::CursorMut, ostd::error::Error>>+0x6>	2: R_X86_64_PLT32	.text._RINvNtCsh6ugFidcq7g_4core3ptr13drop_in_placeINtNtB4_6result6ResultNtNtNtCs3UvJIZ7j0i5_16aster_framevisor2mm8vm_space9CursorMutNtNtCsiwCasD5lcxl_4ostd5error5ErrorEECsbRqWTd2Q6EU_7framevm-0x4
+   6:	58                   	pop    %rax
+   7:	c3                   	ret
+
+Disassembly of section .text._RINvNtCsh6ugFidcq7g_4core3ptr13drop_in_placeINtNtB4_6result6ResultNtNtNtCs3UvJIZ7j0i5_16aster_framevisor2mm8vm_space9CursorMutNtNtCsiwCasD5lcxl_4ostd5error5ErrorEECsbRqWTd2Q6EU_7framevm:
+
+0000000000000000 <core::ptr::drop_in_place::<core::result::Result<aster_framevisor::mm::vm_space::CursorMut, ostd::error::Error>>>:
+   0:	48 83 ec 18          	sub    $0x18,%rsp
+   4:	48 89 7c 24 08       	mov    %rdi,0x8(%rsp)
+   9:	48 89 7c 24 10       	mov    %rdi,0x10(%rsp)
+   e:	31 c0                	xor    %eax,%eax
+  10:	b9 01 00 00 00       	mov    $0x1,%ecx
+  15:	48 83 3f 02          	cmpq   $0x2,(%rdi)
+  19:	48 0f 44 c1          	cmove  %rcx,%rax
+  1d:	48 83 f8 00          	cmp    $0x0,%rax
+  21:	75 0a                	jne    2d <core::ptr::drop_in_place::<core::result::Result<aster_framevisor::mm::vm_space::CursorMut, ostd::error::Error>>+0x2d>
+  23:	48 8b 7c 24 08       	mov    0x8(%rsp),%rdi
+  28:	e8 00 00 00 00       	call   2d <core::ptr::drop_in_place::<core::result::Result<aster_framevisor::mm::vm_space::CursorMut, ostd::error::Error>>+0x2d>	29: R_X86_64_PLT32	core::ptr::drop_in_place::<aster_framevisor::mm::vm_space::CursorMut>-0x4
+  2d:	48 83 c4 18          	add    $0x18,%rsp
+  31:	c3                   	ret
+
+Disassembly of section .text._RNvCs2BPxN8jEfYS_7___rustc17rust_begin_unwind:
+
+0000000000000000 <__rustc::rust_begin_unwind>:
+   0:	50                   	push   %rax
+   1:	48 89 3c 24          	mov    %rdi,(%rsp)
+   5:	eb fe                	jmp    5 <__rustc::rust_begin_unwind+0x5>
+
+Disassembly of section .text._RNvCsbRqWTd2Q6EU_7framevm15create_vm_space:
+
+0000000000000000 <framevm::create_vm_space>:
+   0:	48 81 ec 58 04 00 00 	sub    $0x458,%rsp
+   7:	48 89 74 24 08       	mov    %rsi,0x8(%rsp)
+   c:	48 89 f8             	mov    %rdi,%rax
+   f:	48 8b 7c 24 08       	mov    0x8(%rsp),%rdi
+  14:	48 89 84 24 50 02 00 00 	mov    %rax,0x250(%rsp)
+  1c:	48 89 bc 24 58 02 00 00 	mov    %rdi,0x258(%rsp)
+  24:	be 00 10 00 00       	mov    $0x1000,%esi
+  29:	e8 00 00 00 00       	call   2e <framevm::create_vm_space+0x2e>	2a: R_X86_64_PLT32	.text._RNvXs2_CscfbY36SjpG_9align_extjNtB5_8AlignExt8align_upCsbRqWTd2Q6EU_7framevm-0x4
+  2e:	48 89 44 24 10       	mov    %rax,0x10(%rsp)
+  33:	48 89 84 24 68 02 00 00 	mov    %rax,0x268(%rsp)
+  3b:	e8 00 00 00 00       	call   40 <framevm::create_vm_space+0x40>	3c: R_X86_64_PLT32	<aster_framevisor::mm::frame::allocator::FrameAllocOptions>::new-0x4
+  40:	48 8b 54 24 10       	mov    0x10(%rsp),%rdx
+  45:	24 01                	and    $0x1,%al
+  47:	88 44 24 4e          	mov    %al,0x4e(%rsp)
+  4b:	48 c1 ea 0c          	shr    $0xc,%rdx
+  4f:	48 8d 7c 24 30       	lea    0x30(%rsp),%rdi
+  54:	48 8d 74 24 4e       	lea    0x4e(%rsp),%rsi
+  59:	e8 00 00 00 00       	call   5e <framevm::create_vm_space+0x5e>	5a: R_X86_64_PLT32	<aster_framevisor::mm::frame::allocator::FrameAllocOptions>::alloc_segment-0x4
+  5e:	8a 44 24 30          	mov    0x30(%rsp),%al
+  62:	a8 01                	test   $0x1,%al
+  64:	75 02                	jne    68 <framevm::create_vm_space+0x68>
+  66:	eb 32                	jmp    9a <framevm::create_vm_space+0x9a>
+  68:	8a 44 24 31          	mov    0x31(%rsp),%al
+  6c:	88 84 24 47 04 00 00 	mov    %al,0x447(%rsp)
+  73:	48 c7 c7 00 00 00 00 	mov    $0x0,%rdi	76: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.7
+  7a:	48 c7 c1 00 00 00 00 	mov    $0x0,%rcx	7d: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.8
+  81:	49 c7 c0 00 00 00 00 	mov    $0x0,%r8	84: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.1
+  88:	be 2b 00 00 00       	mov    $0x2b,%esi
+  8d:	48 8d 94 24 47 04 00 00 	lea    0x447(%rsp),%rdx
+  95:	e8 00 00 00 00       	call   9a <framevm::create_vm_space+0x9a>	96: R_X86_64_PLT32	core::result::unwrap_failed-0x4
+  9a:	48 8b 4c 24 38       	mov    0x38(%rsp),%rcx
+  9f:	48 8b 44 24 40       	mov    0x40(%rsp),%rax
+  a4:	48 89 8c 24 48 04 00 00 	mov    %rcx,0x448(%rsp)
+  ac:	48 89 84 24 50 04 00 00 	mov    %rax,0x450(%rsp)
+  b4:	48 89 8c 24 70 02 00 00 	mov    %rcx,0x270(%rsp)
+  bc:	48 89 84 24 78 02 00 00 	mov    %rax,0x278(%rsp)
+  c4:	48 89 4c 24 20       	mov    %rcx,0x20(%rsp)
+  c9:	48 89 44 24 28       	mov    %rax,0x28(%rsp)
+  ce:	e8 00 00 00 00       	call   d3 <framevm::create_vm_space+0xd3>	cf: R_X86_64_PLT32	<aster_framevisor::mm::vm_space::VmSpace>::new-0x4
+  d3:	48 89 44 24 18       	mov    %rax,0x18(%rsp)
+  d8:	e8 00 00 00 00       	call   dd <framevm::create_vm_space+0xdd>	d9: R_X86_64_PLT32	aster_framevisor::task::preempt::guard::disable_preempt-0x4
+  dd:	e8 00 00 00 00       	call   e2 <framevm::create_vm_space+0xe2>	de: R_X86_64_PLT32	aster_framevisor::hello_world-0x4
+  e2:	48 8b 44 24 10       	mov    0x10(%rsp),%rax
+  e7:	48 05 00 00 40 00    	add    $0x400000,%rax
+  ed:	48 89 04 24          	mov    %rax,(%rsp)
+  f1:	48 3d 00 00 40 00    	cmp    $0x400000,%rax
+  f7:	0f 82 c9 00 00 00    	jb     1c6 <framevm::create_vm_space+0x1c6>
+  fd:	48 8b 04 24          	mov    (%rsp),%rax
+ 101:	48 c7 84 24 10 02 00 00 00 00 40 00 	movq   $0x400000,0x210(%rsp)
+ 10d:	48 89 84 24 18 02 00 00 	mov    %rax,0x218(%rsp)
+ 115:	48 8d 7c 24 50       	lea    0x50(%rsp),%rdi
+ 11a:	48 8d 74 24 18       	lea    0x18(%rsp),%rsi
+ 11f:	48 8d 54 24 4f       	lea    0x4f(%rsp),%rdx
+ 124:	48 8d 8c 24 10 02 00 00 	lea    0x210(%rsp),%rcx
+ 12c:	e8 00 00 00 00       	call   131 <framevm::create_vm_space+0x131>	12d: R_X86_64_PLT32	<aster_framevisor::mm::vm_space::VmSpace>::cursor_mut::<aster_framevisor::task::preempt::guard::DisabledPreemptGuard>-0x4
+ 131:	48 c7 c6 00 00 00 00 	mov    $0x0,%rsi	134: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.3
+ 138:	48 8d bc 24 20 02 00 00 	lea    0x220(%rsp),%rdi
+ 140:	ba 23 00 00 00       	mov    $0x23,%edx
+ 145:	e8 00 00 00 00       	call   14a <framevm::create_vm_space+0x14a>	146: R_X86_64_PLT32	<str as alloc::string::ToString>::to_string-0x4
+ 14a:	48 8d bc 24 20 02 00 00 	lea    0x220(%rsp),%rdi
+ 152:	e8 00 00 00 00       	call   157 <framevm::create_vm_space+0x157>	153: R_X86_64_PLT32	aster_framevisor::print-0x4
+ 157:	48 8d bc 24 80 02 00 00 	lea    0x280(%rsp),%rdi
+ 15f:	48 8d 74 24 50       	lea    0x50(%rsp),%rsi
+ 164:	ba c0 01 00 00       	mov    $0x1c0,%edx
+ 169:	48 8b 05 00 00 00 00 	mov    0x0(%rip),%rax        # 170 <framevm::create_vm_space+0x170>	16c: R_X86_64_GOTPCREL	memcpy-0x4
+ 170:	ff d0                	call   *%rax
+ 172:	48 8d bc 24 80 02 00 00 	lea    0x280(%rsp),%rdi
+ 17a:	e8 00 00 00 00       	call   17f <framevm::create_vm_space+0x17f>	17b: R_X86_64_PLT32	.text._RINvNtCsh6ugFidcq7g_4core3mem4dropINtNtB4_6result6ResultNtNtNtCs3UvJIZ7j0i5_16aster_framevisor2mm8vm_space9CursorMutNtNtCsiwCasD5lcxl_4ostd5error5ErrorEECsbRqWTd2Q6EU_7framevm-0x4
+ 17f:	48 c7 c6 00 00 00 00 	mov    $0x0,%rsi	182: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.4
+ 186:	48 8d bc 24 38 02 00 00 	lea    0x238(%rsp),%rdi
+ 18e:	ba 25 00 00 00       	mov    $0x25,%edx
+ 193:	e8 00 00 00 00       	call   198 <framevm::create_vm_space+0x198>	194: R_X86_64_PLT32	<str as alloc::string::ToString>::to_string-0x4
+ 198:	48 8d bc 24 38 02 00 00 	lea    0x238(%rsp),%rdi
+ 1a0:	e8 00 00 00 00       	call   1a5 <framevm::create_vm_space+0x1a5>	1a1: R_X86_64_PLT32	aster_framevisor::print-0x4
+ 1a5:	48 8d 7c 24 4f       	lea    0x4f(%rsp),%rdi
+ 1aa:	e8 00 00 00 00       	call   1af <framevm::create_vm_space+0x1af>	1ab: R_X86_64_PLT32	core::ptr::drop_in_place::<aster_framevisor::task::preempt::guard::DisabledPreemptGuard>-0x4
+ 1af:	48 8d 7c 24 20       	lea    0x20(%rsp),%rdi
+ 1b4:	e8 00 00 00 00       	call   1b9 <framevm::create_vm_space+0x1b9>	1b5: R_X86_64_PLT32	core::ptr::drop_in_place::<aster_framevisor::mm::frame::segment::Segment<()>>-0x4
+ 1b9:	48 8b 44 24 18       	mov    0x18(%rsp),%rax
+ 1be:	48 81 c4 58 04 00 00 	add    $0x458,%rsp
+ 1c5:	c3                   	ret
+ 1c6:	48 c7 c7 00 00 00 00 	mov    $0x0,%rdi	1c9: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.2
+ 1cd:	e8 00 00 00 00       	call   1d2 <framevm::create_vm_space+0x1d2>	1ce: R_X86_64_PLT32	core::panicking::panic_const::panic_const_add_overflow-0x4
+
+Disassembly of section .text._RNvCsbRqWTd2Q6EU_7framevm16create_user_task:
+
+0000000000000000 <framevm::create_user_task>:
+   0:	50                   	push   %rax
+   1:	48 89 3c 24          	mov    %rdi,(%rsp)
+   5:	48 89 e7             	mov    %rsp,%rdi
+   8:	e8 00 00 00 00       	call   d <framevm::create_user_task+0xd>	9: R_X86_64_PLT32	core::ptr::drop_in_place::<alloc::sync::Arc<aster_framevisor::mm::vm_space::VmSpace>>-0x4
+   d:	58                   	pop    %rax
+   e:	c3                   	ret
+
+Disassembly of section .text._RNvCsbRqWTd2Q6EU_7framevm4main:
+
+0000000000000000 <framevm::main>:
+   0:	48 83 ec 48          	sub    $0x48,%rsp
+   4:	48 c7 44 24 28 00 00 00 00 	movq   $0x0,0x28(%rsp)	9: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.5
+   d:	e8 00 00 00 00       	call   12 <framevm::main+0x12>	e: R_X86_64_PLT32	aster_framevisor::hello_world-0x4
+  12:	48 c7 c6 00 00 00 00 	mov    $0x0,%rsi	15: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.6
+  19:	48 8d 7c 24 08       	lea    0x8(%rsp),%rdi
+  1e:	ba 1e 00 00 00       	mov    $0x1e,%edx
+  23:	e8 00 00 00 00       	call   28 <framevm::main+0x28>	24: R_X86_64_PLT32	.text._RNvXsH_NtCsiHeutlt6frq_5alloc6stringNtB5_6StringINtNtCsh6ugFidcq7g_4core7convert4FromReE4fromCsbRqWTd2Q6EU_7framevm-0x4
+  28:	e8 00 00 00 00       	call   2d <framevm::main+0x2d>	29: R_X86_64_PLT32	aster_framevisor::hello_world-0x4
+  2d:	48 8b 44 24 08       	mov    0x8(%rsp),%rax
+  32:	48 89 44 24 30       	mov    %rax,0x30(%rsp)
+  37:	48 8b 44 24 10       	mov    0x10(%rsp),%rax
+  3c:	48 89 44 24 38       	mov    %rax,0x38(%rsp)
+  41:	48 8b 44 24 18       	mov    0x18(%rsp),%rax
+  46:	48 89 44 24 40       	mov    %rax,0x40(%rsp)
+  4b:	48 8d 7c 24 30       	lea    0x30(%rsp),%rdi
+  50:	e8 00 00 00 00       	call   55 <framevm::main+0x55>	51: R_X86_64_PLT32	aster_framevisor::print-0x4
+  55:	e8 00 00 00 00       	call   5a <framevm::main+0x5a>	56: R_X86_64_PLT32	aster_framevisor::hello_world-0x4
+  5a:	48 c7 c7 00 00 00 00 	mov    $0x0,%rdi	5d: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.5
+  61:	be 00 23 00 00       	mov    $0x2300,%esi
+  66:	e8 00 00 00 00       	call   6b <framevm::main+0x6b>	67: R_X86_64_PLT32	.text._RNvCsbRqWTd2Q6EU_7framevm15create_vm_space-0x4
+  6b:	48 89 c7             	mov    %rax,%rdi
+  6e:	e8 00 00 00 00       	call   73 <framevm::main+0x73>	6f: R_X86_64_PLT32	<alloc::sync::Arc<aster_framevisor::mm::vm_space::VmSpace>>::new-0x4
+  73:	48 89 44 24 20       	mov    %rax,0x20(%rsp)
+  78:	48 8d 7c 24 20       	lea    0x20(%rsp),%rdi
+  7d:	e8 00 00 00 00       	call   82 <framevm::main+0x82>	7e: R_X86_64_PLT32	<aster_framevisor::mm::vm_space::VmSpace>::activate-0x4
+  82:	48 8b 7c 24 20       	mov    0x20(%rsp),%rdi
+  87:	e8 00 00 00 00       	call   8c <framevm::main+0x8c>	88: R_X86_64_PLT32	.text._RNvCsbRqWTd2Q6EU_7framevm16create_user_task-0x4
+  8c:	e8 00 00 00 00       	call   91 <framevm::main+0x91>	8d: R_X86_64_PLT32	aster_framevisor::hello_world-0x4
+  91:	48 83 c4 48          	add    $0x48,%rsp
+  95:	c3                   	ret
+
+Disassembly of section .text._RNvMNtCsiHeutlt6frq_5alloc6stringNtB2_6String19from_utf8_uncheckedCsbRqWTd2Q6EU_7framevm:
+
+0000000000000000 <<alloc::string::String>::from_utf8_unchecked>:
+   0:	48 89 f8             	mov    %rdi,%rax
+   3:	48 8b 0e             	mov    (%rsi),%rcx
+   6:	48 89 0f             	mov    %rcx,(%rdi)
+   9:	48 8b 4e 08          	mov    0x8(%rsi),%rcx
+   d:	48 89 4f 08          	mov    %rcx,0x8(%rdi)
+  11:	48 8b 4e 10          	mov    0x10(%rsi),%rcx
+  15:	48 89 4f 10          	mov    %rcx,0x10(%rdi)
+  19:	c3                   	ret
+
+Disassembly of section .text._RNvMs9_NtCsh6ugFidcq7g_4core3numj11checked_addCsbRqWTd2Q6EU_7framevm:
+
+0000000000000000 <<usize>::checked_add>:
+   0:	48 83 ec 38          	sub    $0x38,%rsp
+   4:	48 89 34 24          	mov    %rsi,(%rsp)
+   8:	48 89 f8             	mov    %rdi,%rax
+   b:	48 89 44 24 08       	mov    %rax,0x8(%rsp)
+  10:	48 89 44 24 20       	mov    %rax,0x20(%rsp)
+  15:	48 89 74 24 28       	mov    %rsi,0x28(%rsp)
+  1a:	48 89 c7             	mov    %rax,%rdi
+  1d:	48 01 f7             	add    %rsi,%rdi
+  20:	48 39 c7             	cmp    %rax,%rdi
+  23:	0f 92 c0             	setb   %al
+  26:	88 c1                	mov    %al,%cl
+  28:	80 e1 01             	and    $0x1,%cl
+  2b:	88 4c 24 37          	mov    %cl,0x37(%rsp)
+  2f:	a8 01                	test   $0x1,%al
+  31:	75 07                	jne    3a <<usize>::checked_add+0x3a>
+  33:	c6 44 24 36 00       	movb   $0x0,0x36(%rsp)
+  38:	eb 05                	jmp    3f <<usize>::checked_add+0x3f>
+  3a:	c6 44 24 36 01       	movb   $0x1,0x36(%rsp)
+  3f:	f6 44 24 36 01       	testb  $0x1,0x36(%rsp)
+  44:	75 1c                	jne    62 <<usize>::checked_add+0x62>
+  46:	48 8b 0c 24          	mov    (%rsp),%rcx
+  4a:	48 8b 44 24 08       	mov    0x8(%rsp),%rax
+  4f:	48 01 c8             	add    %rcx,%rax
+  52:	48 89 44 24 18       	mov    %rax,0x18(%rsp)
+  57:	48 c7 44 24 10 01 00 00 00 	movq   $0x1,0x10(%rsp)
+  60:	eb 09                	jmp    6b <<usize>::checked_add+0x6b>
+  62:	48 c7 44 24 10 00 00 00 00 	movq   $0x0,0x10(%rsp)
+  6b:	48 8b 44 24 10       	mov    0x10(%rsp),%rax
+  70:	48 8b 54 24 18       	mov    0x18(%rsp),%rdx
+  75:	48 83 c4 38          	add    $0x38,%rsp
+  79:	c3                   	ret
+
+Disassembly of section .text._RNvNtCsh6ugFidcq7g_4core10intrinsics9cold_pathCsbRqWTd2Q6EU_7framevm:
+
+0000000000000000 <core::intrinsics::cold_path>:
+   0:	c3                   	ret
+
+Disassembly of section .text._RNvXs2_CscfbY36SjpG_9align_extjNtB5_8AlignExt8align_upCsbRqWTd2Q6EU_7framevm:
+
+0000000000000000 <<usize as align_ext::AlignExt>::align_up>:
+   0:	48 83 ec 68          	sub    $0x68,%rsp
+   4:	48 89 f1             	mov    %rsi,%rcx
+   7:	48 89 4c 24 18       	mov    %rcx,0x18(%rsp)
+   c:	48 89 7c 24 20       	mov    %rdi,0x20(%rsp)
+  11:	48 89 7c 24 28       	mov    %rdi,0x28(%rsp)
+  16:	48 89 4c 24 30       	mov    %rcx,0x30(%rsp)
+  1b:	48 89 4c 24 50       	mov    %rcx,0x50(%rsp)
+  20:	48 89 4c 24 58       	mov    %rcx,0x58(%rsp)
+  25:	48 89 c8             	mov    %rcx,%rax
+  28:	48 d1 e8             	shr    $1,%rax
+  2b:	48 ba 55 55 55 55 55 55 55 55 	movabs $0x5555555555555555,%rdx
+  35:	48 21 d0             	and    %rdx,%rax
+  38:	48 29 c1             	sub    %rax,%rcx
+  3b:	48 ba 33 33 33 33 33 33 33 33 	movabs $0x3333333333333333,%rdx
+  45:	48 89 c8             	mov    %rcx,%rax
+  48:	48 21 d0             	and    %rdx,%rax
+  4b:	48 c1 e9 02          	shr    $0x2,%rcx
+  4f:	48 21 d1             	and    %rdx,%rcx
+  52:	48 01 c8             	add    %rcx,%rax
+  55:	48 89 c1             	mov    %rax,%rcx
+  58:	48 c1 e9 04          	shr    $0x4,%rcx
+  5c:	48 01 c8             	add    %rcx,%rax
+  5f:	48 b9 0f 0f 0f 0f 0f 0f 0f 0f 	movabs $0xf0f0f0f0f0f0f0f,%rcx
+  69:	48 21 c8             	and    %rcx,%rax
+  6c:	48 b9 01 01 01 01 01 01 01 01 	movabs $0x101010101010101,%rcx
+  76:	48 0f af c1          	imul   %rcx,%rax
+  7a:	48 c1 e8 38          	shr    $0x38,%rax
+  7e:	89 44 24 64          	mov    %eax,0x64(%rsp)
+  82:	83 7c 24 64 01       	cmpl   $0x1,0x64(%rsp)
+  87:	74 18                	je     a1 <<usize as align_ext::AlignExt>::align_up+0xa1>
+  89:	48 c7 c7 00 00 00 00 	mov    $0x0,%rdi	8c: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.9
+  90:	48 c7 c2 00 00 00 00 	mov    $0x0,%rdx	93: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.11
+  97:	be 37 00 00 00       	mov    $0x37,%esi
+  9c:	e8 00 00 00 00       	call   a1 <<usize as align_ext::AlignExt>::align_up+0xa1>	9d: R_X86_64_PLT32	core::panicking::panic-0x4
+  a1:	48 8b 44 24 18       	mov    0x18(%rsp),%rax
+  a6:	48 83 f8 02          	cmp    $0x2,%rax
+  aa:	72 dd                	jb     89 <<usize as align_ext::AlignExt>::align_up+0x89>
+  ac:	48 8b 44 24 18       	mov    0x18(%rsp),%rax
+  b1:	48 89 c1             	mov    %rax,%rcx
+  b4:	48 83 e9 01          	sub    $0x1,%rcx
+  b8:	48 89 4c 24 10       	mov    %rcx,0x10(%rsp)
+  bd:	48 83 f8 01          	cmp    $0x1,%rax
+  c1:	72 57                	jb     11a <<usize as align_ext::AlignExt>::align_up+0x11a>
+  c3:	48 8b 74 24 10       	mov    0x10(%rsp),%rsi
+  c8:	48 8b 7c 24 20       	mov    0x20(%rsp),%rdi
+  cd:	e8 00 00 00 00       	call   d2 <<usize as align_ext::AlignExt>::align_up+0xd2>	ce: R_X86_64_PLT32	.text._RNvMs9_NtCsh6ugFidcq7g_4core3numj11checked_addCsbRqWTd2Q6EU_7framevm-0x4
+  d2:	48 89 44 24 38       	mov    %rax,0x38(%rsp)
+  d7:	48 89 54 24 40       	mov    %rdx,0x40(%rsp)
+  dc:	48 f7 44 24 38 01 00 00 00 	testq  $0x1,0x38(%rsp)
+  e5:	75 0c                	jne    f3 <<usize as align_ext::AlignExt>::align_up+0xf3>
+  e7:	48 c7 c7 00 00 00 00 	mov    $0x0,%rdi	ea: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.11
+  ee:	e8 00 00 00 00       	call   f3 <<usize as align_ext::AlignExt>::align_up+0xf3>	ef: R_X86_64_PLT32	core::option::unwrap_failed-0x4
+  f3:	48 8b 44 24 18       	mov    0x18(%rsp),%rax
+  f8:	48 8b 4c 24 40       	mov    0x40(%rsp),%rcx
+  fd:	48 89 0c 24          	mov    %rcx,(%rsp)
+ 101:	48 89 4c 24 48       	mov    %rcx,0x48(%rsp)
+ 106:	48 89 c1             	mov    %rax,%rcx
+ 109:	48 83 e9 01          	sub    $0x1,%rcx
+ 10d:	48 89 4c 24 08       	mov    %rcx,0x8(%rsp)
+ 112:	48 83 f8 01          	cmp    $0x1,%rax
+ 116:	72 23                	jb     13b <<usize as align_ext::AlignExt>::align_up+0x13b>
+ 118:	eb 0c                	jmp    126 <<usize as align_ext::AlignExt>::align_up+0x126>
+ 11a:	48 c7 c7 00 00 00 00 	mov    $0x0,%rdi	11d: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.11
+ 121:	e8 00 00 00 00       	call   126 <<usize as align_ext::AlignExt>::align_up+0x126>	122: R_X86_64_PLT32	core::panicking::panic_const::panic_const_sub_overflow-0x4
+ 126:	48 8b 04 24          	mov    (%rsp),%rax
+ 12a:	48 8b 4c 24 08       	mov    0x8(%rsp),%rcx
+ 12f:	48 83 f1 ff          	xor    $0xffffffffffffffff,%rcx
+ 133:	48 21 c8             	and    %rcx,%rax
+ 136:	48 83 c4 68          	add    $0x68,%rsp
+ 13a:	c3                   	ret
+ 13b:	48 c7 c7 00 00 00 00 	mov    $0x0,%rdi	13e: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.11
+ 142:	e8 00 00 00 00       	call   147 <<usize as align_ext::AlignExt>::align_up+0x147>	143: R_X86_64_PLT32	core::panicking::panic_const::panic_const_sub_overflow-0x4
+
+Disassembly of section .text._RNvXs2_NtCsiHeutlt6frq_5alloc3streNtNtB7_6borrow7ToOwned8to_ownedCsbRqWTd2Q6EU_7framevm:
+
+0000000000000000 <<str as alloc::borrow::ToOwned>::to_owned>:
+   0:	48 83 ec 48          	sub    $0x48,%rsp
+   4:	48 89 3c 24          	mov    %rdi,(%rsp)
+   8:	48 89 7c 24 08       	mov    %rdi,0x8(%rsp)
+   d:	48 89 74 24 28       	mov    %rsi,0x28(%rsp)
+  12:	48 89 54 24 30       	mov    %rdx,0x30(%rsp)
+  17:	48 89 74 24 38       	mov    %rsi,0x38(%rsp)
+  1c:	48 89 54 24 40       	mov    %rdx,0x40(%rsp)
+  21:	48 8d 7c 24 10       	lea    0x10(%rsp),%rdi
+  26:	e8 00 00 00 00       	call   2b <<str as alloc::borrow::ToOwned>::to_owned+0x2b>	27: R_X86_64_PLT32	<[u8] as alloc::borrow::ToOwned>::to_owned-0x4
+  2b:	48 8b 3c 24          	mov    (%rsp),%rdi
+  2f:	48 8d 74 24 10       	lea    0x10(%rsp),%rsi
+  34:	e8 00 00 00 00       	call   39 <<str as alloc::borrow::ToOwned>::to_owned+0x39>	35: R_X86_64_PLT32	.text._RNvMNtCsiHeutlt6frq_5alloc6stringNtB2_6String19from_utf8_uncheckedCsbRqWTd2Q6EU_7framevm-0x4
+  39:	48 8b 44 24 08       	mov    0x8(%rsp),%rax
+  3e:	48 83 c4 48          	add    $0x48,%rsp
+  42:	c3                   	ret
+
+Disassembly of section .text._RNvXs5_NtCs3UvJIZ7j0i5_16aster_framevisor5errorNtB5_5ErrorNtNtCsh6ugFidcq7g_4core3fmt5Debug3fmtCsbRqWTd2Q6EU_7framevm:
+
+0000000000000000 <<aster_framevisor::error::Error as core::fmt::Debug>::fmt>:
+   0:	48 83 ec 38          	sub    $0x38,%rsp
+   4:	48 89 74 24 08       	mov    %rsi,0x8(%rsp)
+   9:	48 89 7c 24 28       	mov    %rdi,0x28(%rsp)
+   e:	48 89 74 24 30       	mov    %rsi,0x30(%rsp)
+  13:	0f b6 07             	movzbl (%rdi),%eax
+  16:	48 89 44 24 10       	mov    %rax,0x10(%rsp)
+  1b:	48 8b 44 24 10       	mov    0x10(%rsp),%rax
+  20:	48 8b 04 c5 00 00 00 00 	mov    0x0(,%rax,8),%rax	24: R_X86_64_32S	.rodata._RNvXs5_NtCs3UvJIZ7j0i5_16aster_framevisor5errorNtB5_5ErrorNtNtCsh6ugFidcq7g_4core3fmt5Debug3fmtCsbRqWTd2Q6EU_7framevm
+  28:	ff e0                	jmp    *%rax
+  2a:	0f 0b                	ud2
+  2c:	48 c7 44 24 18 00 00 00 00 	movq   $0x0,0x18(%rsp)	31: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.12
+  35:	48 c7 44 24 20 0b 00 00 00 	movq   $0xb,0x20(%rsp)
+  3e:	eb 76                	jmp    b6 <<aster_framevisor::error::Error as core::fmt::Debug>::fmt+0xb6>
+  40:	48 c7 44 24 18 00 00 00 00 	movq   $0x0,0x18(%rsp)	45: R_X86_64_32S	.rodata.cst8
+  49:	48 c7 44 24 20 08 00 00 00 	movq   $0x8,0x20(%rsp)
+  52:	eb 62                	jmp    b6 <<aster_framevisor::error::Error as core::fmt::Debug>::fmt+0xb6>
+  54:	48 c7 44 24 18 00 00 00 00 	movq   $0x0,0x18(%rsp)	59: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.14
+  5d:	48 c7 44 24 20 09 00 00 00 	movq   $0x9,0x20(%rsp)
+  66:	eb 4e                	jmp    b6 <<aster_framevisor::error::Error as core::fmt::Debug>::fmt+0xb6>
+  68:	48 c7 44 24 18 00 00 00 00 	movq   $0x0,0x18(%rsp)	6d: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.15
+  71:	48 c7 44 24 20 0c 00 00 00 	movq   $0xc,0x20(%rsp)
+  7a:	eb 3a                	jmp    b6 <<aster_framevisor::error::Error as core::fmt::Debug>::fmt+0xb6>
+  7c:	48 c7 44 24 18 00 00 00 00 	movq   $0x0,0x18(%rsp)	81: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.16
+  85:	48 c7 44 24 20 07 00 00 00 	movq   $0x7,0x20(%rsp)
+  8e:	eb 26                	jmp    b6 <<aster_framevisor::error::Error as core::fmt::Debug>::fmt+0xb6>
+  90:	48 c7 44 24 18 00 00 00 00 	movq   $0x0,0x18(%rsp)	95: R_X86_64_32S	.rodata..Lanon.49898492c49071ecdc96c0b77a94d45c.17
+  99:	48 c7 44 24 20 12 00 00 00 	movq   $0x12,0x20(%rsp)
+  a2:	eb 12                	jmp    b6 <<aster_framevisor::error::Error as core::fmt::Debug>::fmt+0xb6>
+  a4:	48 c7 44 24 18 00 00 00 00 	movq   $0x0,0x18(%rsp)	a9: R_X86_64_32S	.rodata.cst8+0x8
+  ad:	48 c7 44 24 20 08 00 00 00 	movq   $0x8,0x20(%rsp)
+  b6:	48 8b 7c 24 08       	mov    0x8(%rsp),%rdi
+  bb:	48 8b 74 24 18       	mov    0x18(%rsp),%rsi
+  c0:	48 8b 54 24 20       	mov    0x20(%rsp),%rdx
+  c5:	e8 00 00 00 00       	call   ca <<aster_framevisor::error::Error as core::fmt::Debug>::fmt+0xca>	c6: R_X86_64_PLT32	<core::fmt::Formatter>::write_str-0x4
+  ca:	24 01                	and    $0x1,%al
+  cc:	48 83 c4 38          	add    $0x38,%rsp
+  d0:	c3                   	ret
+
+Disassembly of section .text._RNvXsH_NtCsiHeutlt6frq_5alloc6stringNtB5_6StringINtNtCsh6ugFidcq7g_4core7convert4FromReE4fromCsbRqWTd2Q6EU_7framevm:
+
+0000000000000000 <<alloc::string::String as core::convert::From<&str>>::from>:
+   0:	48 83 ec 18          	sub    $0x18,%rsp
+   4:	48 89 f8             	mov    %rdi,%rax
+   7:	48 89 04 24          	mov    %rax,(%rsp)
+   b:	48 89 74 24 08       	mov    %rsi,0x8(%rsp)
+  10:	48 89 54 24 10       	mov    %rdx,0x10(%rsp)
+  15:	e8 00 00 00 00       	call   1a <<alloc::string::String as core::convert::From<&str>>::from+0x1a>	16: R_X86_64_PLT32	.text._RNvXs2_NtCsiHeutlt6frq_5alloc3streNtNtB7_6borrow7ToOwned8to_ownedCsbRqWTd2Q6EU_7framevm-0x4
+  1a:	48 8b 04 24          	mov    (%rsp),%rax
+  1e:	48 83 c4 18          	add    $0x18,%rsp
+  22:	c3                   	ret
+
+Disassembly of section .text.__framevm_main:
+
+0000000000000000 <__framevm_main>:
+   0:	50                   	push   %rax
+   1:	e8 00 00 00 00       	call   6 <__framevm_main+0x6>	2: R_X86_64_PLT32	.text._RNvCsbRqWTd2Q6EU_7framevm4main-0x4
+   6:	58                   	pop    %rax
+   7:	c3                   	ret

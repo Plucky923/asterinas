@@ -5,11 +5,12 @@ use ostd::{
     early_println,
     mm::{vm_space::CursorMut as OstdCursorMut, VmSpace as OstdVmSpace},
     task::atomic_mode::AsAtomicModeGuard as OstdAsAtomicModeGuard,
+    Error,
 };
 
 use crate::{
     mm::{frame::untyped::UFrame, page_prop::PageProperty, Vaddr},
-    task::atomic_mode::AsAtomicModeGuard,
+    task::{atomic_mode::AsAtomicModeGuard, disable_preempt},
     Result,
 };
 
@@ -34,9 +35,14 @@ impl VmSpace {
         guard: &'a G,
         va: &Range<Vaddr>,
     ) -> Result<CursorMut<'a>> {
-        let inner = self.vmspace().cursor_mut(guard.inner(), va)?;
+        early_println!("[framevisor] Creating mutable cursor for VM space...");
+        let inner = self.vmspace().cursor_mut(guard.get_inner(), va);
 
-        Ok(CursorMut::new_with_inner(inner))
+        if let Ok(cursor) = inner {
+            return Ok(CursorMut::new_with_inner(cursor));
+        }
+
+        return Err(Error::InvalidArgs);
     }
 
     pub fn activate(self: &Arc<Self>) {
@@ -58,8 +64,17 @@ impl<'a> CursorMut<'a> {
     }
 }
 
+impl Drop for CursorMut<'_> {
+    fn drop(&mut self) {
+        early_println!("[framevisor] Dropping VM space cursor...");
+    }
+}
+
 pub fn init_vm_space() {
     let vm_space = Arc::new(VmSpace::new());
+    let preempt_guard = disable_preempt();
+    let cursor_mut = vm_space.cursor_mut(&preempt_guard, &(0..4096)).unwrap();
+    drop(cursor_mut);
     vm_space.activate();
     early_println!("[framevisor] Initializing VM space...");
 }

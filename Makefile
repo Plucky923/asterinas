@@ -230,9 +230,9 @@ INITRAMFS_EXTRA_DEPS :=
 INITRAMFS_EXTRA_ARGS :=
 ifeq ($(BUILD_FRAMEVM_OBJ), 1)
 ifeq ($(FRAMEVM_INITRAMFS_INCLUDE), 1)
-INITRAMFS_EXTRA_DEPS += framevm_obj
-INITRAMFS_EXTRA_ARGS += FRAMEVM_OBJ_PATH=$(abspath $(FRAMEVM_OBJ_OUTPUT))
-INITRAMFS_EXTRA_ARGS += FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
+# INITRAMFS_EXTRA_DEPS += framevm_obj
+# INITRAMFS_EXTRA_ARGS += FRAMEVM_OBJ_PATH=$(abspath $(FRAMEVM_OBJ_OUTPUT))
+# INITRAMFS_EXTRA_ARGS += FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
 endif
 endif
 
@@ -413,7 +413,7 @@ endif
 
 .PHONY: gdb_server
 gdb_server: initramfs $(CARGO_OSDK)
-	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --gdb-server wait-client,vscode,addr=:$(GDB_TCP_PORT)
+	@cd kernel && cargo osdk run --no-build $(CARGO_OSDK_BUILD_ARGS) --gdb-server wait-client,vscode,addr=:$(GDB_TCP_PORT)
 
 .PHONY: gdb_client
 gdb_client: initramfs $(CARGO_OSDK)
@@ -540,16 +540,57 @@ clean:
 	@$(MAKE) --no-print-directory -C test/initramfs clean
 	@echo "Uninstalling OSDK"
 	@rm -f $(CARGO_OSDK)
+	@rm -rf build/
+
+.PHONY: framevm_sdk
+framevm_sdk:
+	@echo "[make] Copying build dependencies"
+	@rm -rf build/deps
+	@cargo run --manifest-path framevm_tools/copy_build_deps/Cargo.toml -- \
+		-i target/$(OSDK_TARGET_ARCH)-unknown-none/$(FRAMEVM_PROFILE_DIR)/deps \
+		--input-host target/debug/deps \
+		--output-deps build/deps
 
 .PHONY: framevm_obj
-framevm_obj:
+framevm_obj: framevm_sdk
 	@echo "[make] Building FrameVM object for dynamic loading"
-	@cargo rustc -p aster-framevm --target $(FRAMEVM_TARGET) $(FRAMEVM_CARGO_PROFILE) $(FRAMEVM_FEATURE_ARGS) -- -C relocation-model=static -Zplt=no --emit=obj
+	@rm -rf target/$(FRAMEVM_TARGET)/$(FRAMEVM_PROFILE_DIR)/.fingerprint
+	@cargo run --manifest-path framevm_tools/framevm_cargo/Cargo.toml -- \
+		--input build/deps \
+		--output build/framevm \
+		--target $(FRAMEVM_TARGET) \
+		--profile "$(FRAMEVM_CARGO_PROFILE)" \
+		--features "$(FRAMEVM_FEATURE_ARGS)"
 	@mkdir -p $(dir $(FRAMEVM_OBJ_OUTPUT))
-	@FRAMEVM_SRC=$$(find $(FRAMEVM_DEPS_DIR) -maxdepth 1 -type f -name 'framevm-*' ! -name '*.d' | sort | tail -n 1); \
-	if [ -z "$$FRAMEVM_SRC" ]; then \
-		echo "Error: FrameVM object not found under $(FRAMEVM_DEPS_DIR)"; \
+	@if [ -f build/framevm/framevm.o ]; then \
+		if ! [ "build/framevm/framevm.o" -ef "$(FRAMEVM_OBJ_OUTPUT)" ]; then \
+			cp build/framevm/framevm.o $(FRAMEVM_OBJ_OUTPUT); \
+		fi; \
+		echo "FrameVM object copied to $(FRAMEVM_OBJ_OUTPUT)"; \
+	else \
+		echo "Error: FrameVM object not found at build/framevm/framevm.o"; \
 		exit 1; \
-	fi; \
-	cp $$FRAMEVM_SRC $(FRAMEVM_OBJ_OUTPUT); \
-	echo "FrameVM object copied to $(FRAMEVM_OBJ_OUTPUT)"
+	fi
+
+.PHONY: fv_init_ramfs
+fv_init_ramfs: framevm_obj
+	@echo "[make] Building FrameVM initramfs"
+	@$(MAKE) --no-print-directory -C test framevm_initramfs \
+		FRAMEVM_OBJ_PATH=$(abspath $(FRAMEVM_OBJ_OUTPUT)) \
+		FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
+
+.PHONY: framevm
+framevm: 
+	@make clean 
+	@make kernel
+	@make fv_init_ramfs
+	@echo "[make] FrameVM build completed"
+	@echo "[make] Manually regenerating ISO with new initramfs..."
+    
+	# 1. Copy the new initramfs to the OSDK iso_root
+	@cp test/build/initramfs.cpio.gz target/osdk/iso_root/boot/initramfs.cpio.gz
+    
+	# 2. Regenerate the ISO using the updated iso_root
+	@grub-mkrescue -o target/osdk/aster-nix/aster-nix-osdk-bin.iso target/osdk/iso_root 2> /dev/null
+	@echo "[make] ISO successfully updated at target/osdk/aster-nix/aster-nix-osdk-bin.iso"
+	@cd kernel && cargo osdk run --no-build $(CARGO_OSDK_BUILD_ARGS)

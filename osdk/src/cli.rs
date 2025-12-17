@@ -42,7 +42,7 @@ pub fn main() {
         OsdkSubcommand::Run(run_args) => {
             execute_run_command(
                 &load_config(&run_args.common_args),
-                run_args.gdb_server.as_deref(),
+                run_args,
             );
         }
         OsdkSubcommand::Debug(debug_args) => {
@@ -201,6 +201,11 @@ pub struct RunArgs {
         default_missing_value = ""
     )]
     pub gdb_server: Option<String>,
+    #[arg(
+        long = "no-build",
+        help = "Skip the build process and run the existing binary directly"
+    )]
+    pub no_build: bool,
     #[command(flatten)]
     pub common_args: CommonArgs,
 }

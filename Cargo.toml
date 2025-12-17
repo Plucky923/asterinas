@@ -38,6 +38,7 @@ members = [
     "kernel/comps/softirq",
     "kernel/comps/systree",
     "kernel/comps/framevm",
+    "kernel/comps/framevisor",
     "kernel/comps/time",
     "kernel/comps/uart",
     "kernel/comps/virtio",
@@ -54,6 +55,7 @@ members = [
     "kernel/libs/typeflags",
     "kernel/libs/typeflags-util",
     "kernel/libs/xarray",
+    "tools/sctrace", "framevm_tools/copy_build_deps", "framevm_tools/framevm_cargo",
 ]
 exclude = [
     "kernel/libs/comp-sys/cargo-component",

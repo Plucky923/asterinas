@@ -1,0 +1,11 @@
+[package]
+name = "copy_build_deps"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+getopts = "0.2"
+
+
+[lints]
+workspace = true

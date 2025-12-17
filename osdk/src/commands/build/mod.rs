@@ -27,15 +27,12 @@ use crate::{
     config::{
         scheme::{ActionChoice, BootMethod, BootProtocol},
         Config,
-        scheme::{ActionChoice, BootMethod},
     },
     error::Errno,
     error_msg,
     util::{
         CrateInfo, DirGuard, get_cargo_metadata, get_current_crates, get_kernel_crate,
-        get_target_directory,
-        get_cargo_metadata, get_current_crates, get_kernel_crate, get_target_directory, new_command_checked_exists,
-        CrateInfo, DirGuard,
+        get_target_directory, new_command_checked_exists,
     },
 };
 
@@ -105,7 +102,7 @@ fn get_reusable_existing_bundle(
     config: &Config,
     action: ActionChoice,
 ) -> Option<Bundle> {
-    let existing_bundle = Bundle::load(&bundle_path);
+    let existing_bundle = Bundle::load(&bundle_path, true);
     let Some(existing_bundle) = existing_bundle else {
         info!(
             "Building a new bundle: No cached bundle found or validation of the existing bundle failed"
@@ -277,6 +274,11 @@ fn build_kernel_elf(
     rustflags.extend(vec![
         &rustc_linker_script_arg,
         "-C relocation-model=static",
+        "-C code-model=kernel",
+        "-Z direct-access-external-data=yes",
+        "-Z relax-elf-relocations=no",
+        "-Zplt=yes",
+        "-C link-arg=-no-pie",
         "-C relro-level=off",
         // Even if we disabled unwinding on panic, we need to specify this to show backtraces.
         "-C force-unwind-tables=yes",
@@ -343,7 +345,11 @@ fn build_kernel_elf(
 
     const CFLAGS: &str = "CFLAGS_x86_64-unknown-none";
     let mut env_cflags = std::env::var(CFLAGS).unwrap_or_default();
-    env_cflags += " -fPIC";
+    if !env_cflags.is_empty() {
+        env_cflags.push(' ');
+    }
+    // 需要禁用
+    env_cflags += "-fno-PIE -fno-pic -fno-plt";
 
     if features.contains(&"coverage".to_string()) {
         // This is a workaround for minicov <https://github.com/Amanieu/minicov/issues/29>,
@@ -353,6 +359,7 @@ fn build_kernel_elf(
 
     command.env(CFLAGS, env_cflags);
 
+    println!("[osdk] Executing cargo command: {:?}", command);
     info!("Building kernel ELF using command: {:#?}", command);
     info!("Building directory: {:?}", std::env::current_dir().unwrap());
 

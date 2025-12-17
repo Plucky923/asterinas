@@ -87,6 +87,10 @@ impl AsterBin {
         &self.version
     }
 
+    pub fn typ(&self) -> &AsterBinType {
+        &self.typ
+    }
+
     pub fn stripped(&self) -> bool {
         self.stripped
     }

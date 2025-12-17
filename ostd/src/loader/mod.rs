@@ -3,28 +3,28 @@ use core::cmp;
 
 use rustc_demangle::demangle;
 use xmas_elf::{
+    ElfFile,
     header::Type,
     program::ProgramHeader,
     sections::{
-        Rel, Rela, SectionData, SectionHeader, ShType, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
-        SHN_UNDEF,
+        Rel, Rela, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_UNDEF, SectionData, SectionHeader,
+        ShType,
     },
     symbol_table::{Entry, Entry64},
-    ElfFile,
 };
 
 use crate::{
+    Result,
     alloc::string::ToString,
     early_println,
     mm::{
+        PAGE_SIZE,
         frame::allocator::FrameAllocOptions,
         io::{Infallible, VmReader, VmWriter},
         kspace::kvirt_area::KVirtArea,
         page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
-        PAGE_SIZE,
     },
     symbols::symbol_addr_by_name,
-    Result,
 };
 
 pub struct FrameVmInfo<'a> {
@@ -222,9 +222,9 @@ fn select_section_bucket(sh_type: u64) -> SectionMemoryType {
 fn caculate_section_size(elf_file: &ElfFile) -> (usize, usize, usize) {
     early_println!("[Loader] Analyzing sections...");
 
-    let mut exec_bytes = 0;
-    let mut ro_bytes = 0;
-    let mut rw_bytes = 0;
+    let mut exec_cursor = 0;
+    let mut ro_cursor = 0;
+    let mut rw_cursor = 0;
 
     for (i, sh) in elf_file.section_iter().enumerate() {
         let Ok(name) = sh.get_name(elf_file) else {
@@ -254,39 +254,37 @@ fn caculate_section_size(elf_file: &ElfFile) -> (usize, usize, usize) {
             continue;
         }
 
-        // 计算对齐后的大小
         let align = cmp::max(sh.align() as usize, 1);
-        let aligned_size = if align > 0 {
-            (size + align - 1) / align * align
-        } else {
-            size
-        };
 
         // 判断需要分配什么样的内存
         let bucket = select_section_bucket(flags);
         match bucket {
             SectionMemoryType::Text => {
-                exec_bytes += aligned_size;
+                exec_cursor = align_up(exec_cursor, align);
+                exec_cursor += size;
             }
             SectionMemoryType::RoData => {
-                ro_bytes += aligned_size;
+                ro_cursor = align_up(ro_cursor, align);
+                ro_cursor += size;
             }
             SectionMemoryType::RwData => {
-                rw_bytes += aligned_size;
+                rw_cursor = align_up(rw_cursor, align);
+                rw_cursor += size;
             }
         }
         early_println!(
-            "section memory type: {:?} aligned size: 0x{:x}",
+            "section memory type: {:?} size: 0x{:x} align: 0x{:x}",
             bucket,
-            aligned_size
+            size,
+            align
         );
     }
 
-    early_println!("[Loader] Executable bytes: 0x{:x}", exec_bytes);
-    early_println!("[Loader] Read-only bytes: 0x{:x}", ro_bytes);
-    early_println!("[Loader] Read-write bytes: 0x{:x}", rw_bytes);
+    early_println!("[Loader] Executable bytes: 0x{:x}", exec_cursor);
+    early_println!("[Loader] Read-only bytes: 0x{:x}", ro_cursor);
+    early_println!("[Loader] Read-write bytes: 0x{:x}", rw_cursor);
 
-    (exec_bytes, ro_bytes, rw_bytes)
+    (exec_cursor, ro_cursor, rw_cursor)
 }
 
 /// 存储已分配的内存区域
@@ -872,7 +870,7 @@ fn apply_relocate_add(
                     reloc_type,
                     symbol_name
                 );
-                continue;
+                return Err(crate::Error::InvalidArgs);
             }
         };
 

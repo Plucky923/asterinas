@@ -168,10 +168,10 @@ fn install_setup_with_arch(
     let rustflags = [
         "-Cdebuginfo=2",
         "-Ccode-model=kernel",
-        "-Crelocation-model=pie",
+        "-Crelocation-model=static",
         "-Clink-dead-code",
         "-Zplt=yes",
-        "-Zrelax-elf-relocations=yes",
+        "-Zrelax-elf-relocations=no",
         "-Crelro-level=full",
         "-Ctarget-feature=+crt-static",
     ];

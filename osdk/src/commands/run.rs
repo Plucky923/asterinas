@@ -10,13 +10,16 @@ use super::{
 };
 use crate::{
     config::{Config, scheme::ActionChoice},
+    cli::RunArgs,
     error::Errno,
     error_msg,
+    bundle::Bundle,
     util::{get_kernel_crate, get_target_directory},
     warn_msg,
 };
+use std::path::Path;
 
-pub fn execute_run_command(config: &Config, gdb_server_args: Option<&str>) {
+pub fn execute_run_command(config: &Config, args: &RunArgs) {
     let cargo_target_directory = get_target_directory();
     let osdk_output_directory = cargo_target_directory.join(DEFAULT_TARGET_RELPATH);
 
@@ -24,24 +27,75 @@ pub fn execute_run_command(config: &Config, gdb_server_args: Option<&str>) {
 
     let mut config = config.clone();
 
-    let _vsc_launch_file = if let Some(gdb_server_str) = gdb_server_args {
+    let _vsc_launch_file = if let Some(gdb_server_str) = args.gdb_server.as_deref() {
         adapt_for_gdb_server(&mut config, gdb_server_str)
     } else {
         None
     };
 
     let default_bundle_directory = osdk_output_directory.join(&target_info.name);
-    let bundle = create_base_and_cached_build(
-        target_info,
-        default_bundle_directory,
-        &osdk_output_directory,
-        &cargo_target_directory,
-        &config,
-        ActionChoice::Run,
-        &[],
-    );
+    let bundle = if args.no_build {
+        load_existing_bundle_for_run(&default_bundle_directory, &mut config)
+    } else {
+        create_base_and_cached_build(
+            target_info,
+            default_bundle_directory,
+            &osdk_output_directory,
+            &cargo_target_directory,
+            &config,
+            ActionChoice::Run,
+            &[],
+        )
+    };
 
     bundle.run(&config, ActionChoice::Run);
+}
+
+fn load_existing_bundle_for_run(bundle_dir: &Path, config: &mut Config) -> Bundle {
+    // Use non-strict loading here to allow minor mtime/size drifts of files that still exist.
+    let mut bundle = match Bundle::load(bundle_dir, false) {
+        Some(b) => b,
+        None => {
+            error_msg!(
+                "No valid existing bundle found at {:?}. Please run without --no-build first.",
+                bundle_dir
+            );
+            std::process::exit(Errno::RunBundle as _);
+        }
+    };
+
+    // Ensure critical artifacts still exist on disk before claiming success.
+    if let Some(vm_image) = bundle.vm_image_path() {
+        if !vm_image.exists() {
+            error_msg!(
+                "Existing bundle is missing VM image at {:?}. Please rebuild without --no-build.",
+                vm_image
+            );
+            std::process::exit(Errno::RunBundle as _);
+        }
+    }
+    if let Some(aster_bin) = bundle.aster_bin_path() {
+        if !aster_bin.exists() {
+            error_msg!(
+                "Existing bundle is missing kernel binary at {:?}. Please rebuild without --no-build.",
+                aster_bin
+            );
+            std::process::exit(Errno::RunBundle as _);
+        }
+    }
+
+    match bundle.can_run_with_config(config, ActionChoice::Run) {
+        Ok(()) => bundle,
+        Err(e) => {
+            warn_msg!("Existing bundle incompatible ({}), refreshing bundle metadata to match current config...", e);
+            bundle.update_config(config, ActionChoice::Run);
+            if let Err(e2) = bundle.can_run_with_config(config, ActionChoice::Run) {
+                error_msg!("Failed to refresh existing bundle: {}", e2);
+                std::process::exit(Errno::RunBundle as _);
+            }
+            bundle
+        }
+    }
 }
 
 fn adapt_for_gdb_server(config: &mut Config, gdb_server_str: &str) -> Option<VscLaunchConfig> {

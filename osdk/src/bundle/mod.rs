@@ -6,6 +6,7 @@ pub mod vm_image;
 
 use bin::AsterBin;
 use file::{BundleFile, Initramfs};
+use serde::{Deserialize, Serialize};
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
@@ -27,7 +28,7 @@ use crate::{
         scheme::{ActionChoice, BootMethod},
     },
     error::Errno,
-    error_msg,
+    error_msg, warn_msg,
     util::{DirGuard, new_command_checked_exists},
 };
 
@@ -86,27 +87,54 @@ impl Bundle {
 
     // Load the bundle from the file system. If the bundle does not exist or have inconsistencies,
     // it will return `None`.
-    pub fn load(path: impl AsRef<Path>) -> Option<Self> {
+    pub fn load(path: impl AsRef<Path>, strict: bool) -> Option<Self> {
         let manifest_file_path = path.as_ref().join("bundle.toml");
-        let manifest_file_content = std::fs::read_to_string(manifest_file_path).ok()?;
-        let manifest: BundleManifest = toml::from_str(&manifest_file_content).ok()?;
+        let manifest_file_content = match std::fs::read_to_string(&manifest_file_path) {
+            Ok(content) => content,
+            Err(e) => {
+                warn_msg!("Failed to read bundle manifest at {:?}: {}", manifest_file_path, e);
+                return None;
+            }
+        };
+        let manifest: BundleManifest = match toml::from_str(&manifest_file_content) {
+            Ok(m) => m,
+            Err(e) => {
+                warn_msg!("Failed to parse bundle manifest: {}", e);
+                return None;
+            }
+        };
 
         let _dir_guard = DirGuard::change_dir(&path);
 
-        if let Some(aster_bin) = &manifest.aster_bin
-            && !aster_bin.validate()
-        {
-            return None;
+        if let Some(aster_bin) = &manifest.aster_bin {
+            if !aster_bin.validate() {
+                if strict {
+                    warn_msg!("Aster binary validation failed");
+                    return None;
+                } else {
+                    warn_msg!("Aster binary validation failed, but proceeding in non-strict mode");
+                }
+            }
         }
-        if let Some(vm_image) = &manifest.vm_image
-            && !vm_image.validate()
-        {
-            return None;
+        if let Some(vm_image) = &manifest.vm_image {
+            if !vm_image.validate() {
+                if strict {
+                    warn_msg!("VM image validation failed");
+                    return None;
+                } else {
+                    warn_msg!("VM image validation failed, but proceeding in non-strict mode");
+                }
+            }
         }
-        if let Some(initramfs) = &manifest.initramfs
-            && !initramfs.validate()
-        {
-            return None;
+        if let Some(initramfs) = &manifest.initramfs {
+            if !initramfs.validate() {
+                if strict {
+                    warn_msg!("Initramfs validation failed");
+                    return None;
+                } else {
+                    warn_msg!("Initramfs validation failed, but proceeding in non-strict mode");
+                }
+            }
         }
 
         Some(Self {
@@ -197,8 +225,21 @@ impl Bundle {
         match self.can_run_with_config(config, action) {
             Ok(()) => {}
             Err(msg) => {
-                error_msg!("{}", msg);
-                std::process::exit(Errno::RunBundle as _);
+                warn_msg!("Bundle mismatch ignored in run: {}", msg);
+                warn_msg!("Updating bundle.toml to match current run configuration...");
+                let manifest_path = self.path.join("bundle.toml");
+                if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+                    if let Ok(mut manifest) = toml::from_str::<BundleManifest>(&content) {
+                        manifest.config = config.clone();
+                        if let Ok(new_content) = toml::to_string_pretty(&manifest) {
+                            if let Err(e) = std::fs::write(&manifest_path, new_content) {
+                                warn_msg!("Failed to update bundle.toml: {}", e);
+                            } else {
+                                warn_msg!("Successfully updated bundle.toml");
+                            }
+                        }
+                    }
+                }
             }
         }
         let action = match action {
@@ -334,6 +375,17 @@ impl Bundle {
         }
     }
 
+    pub fn vm_image_path(&self) -> Option<PathBuf> {
+        self.manifest.vm_image.as_ref().map(|vm| self.path.join(vm.path()))
+    }
+
+    pub fn aster_bin_path(&self) -> Option<PathBuf> {
+        self.manifest
+            .aster_bin
+            .as_ref()
+            .map(|bin| self.path.join(bin.path()))
+    }
+
     /// Move the vm_image into the bundle.
     pub fn consume_vm_image(&mut self, vm_image: AsterVmImage) {
         if self.manifest.vm_image.is_some() {
@@ -350,6 +402,74 @@ impl Bundle {
         }
         self.manifest.aster_bin = Some(aster_bin.copy_to(&self.path));
         self.write_manifest_to_fs();
+    }
+
+    pub fn update_config(&mut self, config: &mut Config, action: ActionChoice) {
+        // Ensure relative paths inside the bundle validate correctly
+        let _guard = DirGuard::change_dir(&self.path);
+
+        self.manifest.action = action;
+
+        // Work on the selected action configs
+        let config_action = match action {
+            ActionChoice::Run => &mut config.run,
+            ActionChoice::Test => &mut config.test,
+        };
+
+        // Handle initramfs: if the new path is missing, fall back to the bundle one to avoid panics.
+        let bundle_initramfs_rel = self.manifest.initramfs.as_ref().map(|i| i.path().clone());
+        let config_initramfs_opt = config_action.boot.initramfs.clone();
+        self.manifest.initramfs = if let Some(ref initramfs) = config_initramfs_opt {
+            if initramfs.exists() {
+                Some(Initramfs::new(initramfs).copy_to(&self.path))
+            } else if let Some(rel) = bundle_initramfs_rel {
+                warn_msg!(
+                    "initramfs {} not found; reusing bundle initramfs",
+                    initramfs.display()
+                );
+                // Align runtime config to the existing bundle file
+                config_action.boot.initramfs = Some(self.path.join(&rel));
+                self.manifest.initramfs.clone()
+            } else {
+                error_msg!("initramfs file not found: {}", initramfs.display());
+                process::exit(Errno::BuildCrate as _);
+            }
+        } else if let Some(rel) = bundle_initramfs_rel {
+            // No initramfs specified now; reuse bundle's initramfs
+            config_action.boot.initramfs = Some(self.path.join(&rel));
+            self.manifest.initramfs.clone()
+        } else {
+            None
+        };
+
+        // Refresh VM image metadata if it exists and is invalid (without copying onto itself)
+        if let Some(ref mut vm_image) = self.manifest.vm_image {
+            if !vm_image.validate() {
+                let image_rel = vm_image.path().clone();
+                let _guard = DirGuard::change_dir(&self.path);
+                *vm_image = AsterVmImage::new(image_rel, vm_image.typ().clone(), vm_image.aster_version().clone());
+            }
+        }
+
+        // Refresh aster_bin metadata similarly if invalid
+        if let Some(ref mut aster_bin) = self.manifest.aster_bin {
+            if !aster_bin.validate() {
+                let bin_rel = aster_bin.path().clone();
+                let _guard = DirGuard::change_dir(&self.path);
+                *aster_bin = AsterBin::new(
+                    bin_rel,
+                    aster_bin.arch(),
+                    aster_bin.typ().clone(),
+                    aster_bin.version().clone(),
+                    aster_bin.stripped(),
+                );
+            }
+        }
+
+        // Update stored config snapshot after mutations
+        self.manifest.config = config.clone();
+
+    self.write_manifest_to_fs();
     }
 
     fn write_manifest_to_fs(&mut self) {

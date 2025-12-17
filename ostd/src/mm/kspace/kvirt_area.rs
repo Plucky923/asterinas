@@ -6,25 +6,13 @@ use core::ops::Range;
 
 use super::{KERNEL_PAGE_TABLE, VMALLOC_VADDR_RANGE};
 use crate::{
+    early_println,
     mm::{
         HasSize, PAGE_SIZE, Paddr, Split, Vaddr,
         frame::{Frame, meta::AnyFrameMeta},
-        kspace::{KernelPtConfig, MappedItem},
+        kspace::{KernelPtConfig, MODULE_RANGE, MappedItem},
         page_prop::PageProperty,
         page_table::largest_pages,
-    },
-    task::disable_preempt,
-    util::range_alloc::RangeAllocator,
-    early_println, mm::{
-        PAGE_SIZE, Paddr, Vaddr, frame::{Frame, meta::AnyFrameMeta}, kspace::{KernelPtConfig, MODULE_RANGE, MappedItem}, page_prop::PageProperty, page_table::largest_pages
-    }, task::disable_preempt, util::range_alloc::RangeAllocator
-    early_println,
-    mm::{
-        frame::{meta::AnyFrameMeta, Frame},
-        kspace::{KernelPtConfig, MappedItem, MODULE_RANGE},
-        page_prop::PageProperty,
-        page_table::largest_pages,
-        Paddr, Vaddr, PAGE_SIZE,
     },
     task::disable_preempt,
     util::range_alloc::RangeAllocator,

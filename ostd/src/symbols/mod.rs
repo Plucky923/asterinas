@@ -5,9 +5,9 @@ use alloc::{collections::btree_map::BTreeMap, format, string::String, vec::Vec};
 use rustc_demangle::demangle;
 use spin::Once;
 use xmas_elf::{
+    ElfFile,
     sections::{SectionData, ShType},
     symbol_table::{Binding, Entry},
-    ElfFile,
 };
 
 use crate::{alloc::string::ToString, early_print, early_println, sync::SpinLock};
@@ -169,50 +169,39 @@ fn strip_hash_suffix(name: &str) -> &str {
 ///
 /// This function searches for a symbol by its name. It will:
 /// 1. Try to match the exact name (mangled or demangled)
-/// 2. Try to demangle the input name and match against demangled names (ignoring hash suffixes)
+/// 2. Try to demangle the input name and match against demangled names
 ///
 /// Returns the symbol address if found, None otherwise.
 pub fn symbol_addr_by_name(name: &str) -> Option<usize> {
     let table = symbol_table().lock();
 
-    // 1. First, try exact match (usually demangled names stored in the table).
+    early_println!("[ostd] Looking up symbol by name: input='{}'", name);
+
+    // 1. Try exact match
     for (_addr, entry) in table.iter() {
         if entry.name == name {
+            early_println!("[ostd] Found exact match: {} -> 0x{:x}", name, entry.addr);
             return Some(entry.addr);
         }
     }
 
-    // 2. Demangle the input name and strip hash suffix.
+    // 2. Try demangled match
     let demangled = demangle(name).to_string();
-    let demangled_no_hash = strip_hash_suffix(&demangled);
-
-    early_println!("[ostd] Looking up symbol by name: input='{}', demangled='{}'", name, demangled_no_hash);
-
-    // 2.1 Build candidate names:
-    //   - the original demangled_no_hash
-    let mut candidates: Vec<String> = Vec::new();
-    candidates.push(demangled_no_hash.to_string());
-
-    let tmp_addr: usize = 0;
-    // 2.2 Try to match each candidate against the demangled symbol names in the table.
-    for cand in &candidates {
+    if demangled != name {
+        early_println!("[ostd] Trying demangled name: '{}'", demangled);
         for (_addr, entry) in table.iter() {
-            let entry_no_hash = strip_hash_suffix(&entry.name);
-            if entry_no_hash == cand {
-                early_println!("[ostd] Matched symbol '{}' to entry '{}'", cand, entry.name);
-                let tmp_addr = entry.addr;
+            if entry.name == demangled {
+                early_println!(
+                    "[ostd] Found demangled match: {} -> 0x{:x}",
+                    demangled,
+                    entry.addr
+                );
+                return Some(entry.addr);
             }
         }
     }
-    return Some(tmp_addr);
 
-    // 3. Fallback: also try matching the raw input name against stored names (including mangled).
-    for (_addr, entry) in table.iter() {
-        if entry.name == name {
-            return Some(entry.addr);
-        }
-    }
-
+    early_println!("[ostd] Symbol not found: {}", name);
     None
 }
 

@@ -3,29 +3,9 @@ use ostd::task::{
     DisabledPreemptGuard as OstdDisabledPreemptGuard,
 };
 
-pub trait InAtomicMode: core::fmt::Debug {
-    fn get_inner(&self) -> &OstdDisabledPreemptGuard;
-}
+pub trait InAtomicMode: core::fmt::Debug {}
 
 pub trait AsAtomicModeGuard {
-    fn inner(&self) -> &OstdDisabledPreemptGuard;
-    fn as_atomic_mode_guard(&self) -> &dyn InAtomicMode;
-}
-
-impl<G: InAtomicMode> AsAtomicModeGuard for G {
-    fn inner(&self) -> &OstdDisabledPreemptGuard {
-        self.get_inner()
-    }
-    fn as_atomic_mode_guard(&self) -> &dyn InAtomicMode {
-        self
-    }
-}
-
-impl AsAtomicModeGuard for dyn InAtomicMode + '_ {
-    fn inner(&self) -> &OstdDisabledPreemptGuard {
-        self.get_inner()
-    }
-    fn as_atomic_mode_guard(&self) -> &dyn InAtomicMode {
-        self
-    }
+    type Inner: OstdAsAtomicModeGuard;
+    fn get_inner(&self) -> &Self::Inner;
 }

@@ -3,7 +3,9 @@ use core::ops::Range;
 
 use ostd::{
     early_println,
-    mm::{vm_space::CursorMut as OstdCursorMut, VmSpace as OstdVmSpace},
+    mm::{
+        vm_space::CursorMut as OstdCursorMut, Fallible, VmReader, VmSpace as OstdVmSpace, VmWriter,
+    },
     task::atomic_mode::AsAtomicModeGuard as OstdAsAtomicModeGuard,
     Error,
 };
@@ -49,6 +51,14 @@ impl VmSpace {
         early_println!("[framevisor] Activating VM space...");
         self.vmspace().activate();
         early_println!("[framevisor] VM space activated");
+    }
+
+    pub fn reader(&self, vaddr: Vaddr, len: usize) -> Result<VmReader<'_, Fallible>> {
+        self.vmspace().reader(vaddr, len)
+    }
+
+    pub fn writer(&self, vaddr: Vaddr, len: usize) -> Result<VmWriter<'_, Fallible>> {
+        self.vmspace().writer(vaddr, len)
     }
 }
 

@@ -27,11 +27,13 @@ pub use self::{
     preempt::{DisabledPreemptGuard, disable_preempt, halt_cpu},
     scheduler::info::{AtomicCpuId, TaskScheduleInfo},
 };
-use crate::{arch::task::TaskContext, irq::InterruptLevel, prelude::*};
+use crate::{arch::task::TaskContext, irq::InterruptLevel, prelude::*, sync::Mutex};
 
 static PRE_SCHEDULE_HANDLER: Once<fn()> = Once::new();
 
-static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
+static POST_SCHEDULE_HANDLER: Once<fn() -> bool> = Once::new();
+
+static POST_FRAMEVM_TASK_SCHEDULE_HANDLER: Mutex<Option<fn()>> = Mutex::new(None);
 
 /// Injects a handler to be executed before scheduling.
 pub fn inject_pre_schedule_handler(handler: fn()) {
@@ -39,8 +41,20 @@ pub fn inject_pre_schedule_handler(handler: fn()) {
 }
 
 /// Injects a handler to be executed after scheduling.
-pub fn inject_post_schedule_handler(handler: fn()) {
+pub fn inject_post_schedule_handler(handler: fn() -> bool) {
     POST_SCHEDULE_HANDLER.call_once(|| handler);
+}
+
+pub fn inject_post_framevm_task_schedule_handler(handler: fn()) {
+    *POST_FRAMEVM_TASK_SCHEDULE_HANDLER.lock() = Some(handler);
+}
+
+/// Clears the FrameVM task schedule handler.
+///
+/// This should be called when the FrameVM module is unloaded to prevent
+/// accessing unloaded module code.
+pub fn clear_post_framevm_task_schedule_handler() {
+    *POST_FRAMEVM_TASK_SCHEDULE_HANDLER.lock() = None;
 }
 
 /// A task that executes a function to the end.
@@ -54,6 +68,7 @@ pub struct Task {
     func: ForceSync<Cell<Option<Box<dyn FnOnce() + Send>>>>,
 
     data: Box<dyn Any + Send + Sync>,
+    framevm: Box<dyn Any + Send + Sync>,
     local_data: ForceSync<Box<dyn Any + Send>>,
 
     ctx: SyncUnsafeCell<TaskContext>,
@@ -106,6 +121,10 @@ impl Task {
         &self.data
     }
 
+    pub fn framevm(&self) -> &Box<dyn Any + Send + Sync> {
+        &self.framevm
+    }
+
     /// Get the attached scheduling information.
     pub fn schedule_info(&self) -> &TaskScheduleInfo {
         &self.schedule_info
@@ -116,6 +135,7 @@ impl Task {
 pub struct TaskOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
     data: Option<Box<dyn Any + Send + Sync>>,
+    framevm: Option<Box<dyn Any + Send + Sync>>,
     local_data: Option<Box<dyn Any + Send>>,
 }
 
@@ -128,6 +148,7 @@ impl TaskOptions {
         Self {
             func: Some(Box::new(func)),
             data: None,
+            framevm: None,
             local_data: None,
         }
     }
@@ -142,20 +163,44 @@ impl TaskOptions {
     }
 
     /// Sets the data associated with the task.
-    pub fn data<T>(mut self, data: T) -> Self
+    pub fn data<T>(self, data: T) -> Self
     where
         T: Any + Send + Sync,
     {
-        self.data = Some(Box::new(data));
+        self.data_any(Box::new(data))
+    }
+
+    /// Sets the data associated with the task, but with an already-boxed value.
+    pub fn data_any(mut self, data: Box<dyn Any + Send + Sync>) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// Sets the framevm data associated with the task.
+    pub fn framevm<T>(self, framevm: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        self.framevm_any(Box::new(framevm))
+    }
+
+    /// Sets the framevm data associated with the task, but with an already-boxed value.
+    pub fn framevm_any(mut self, framevm: Box<dyn Any + Send + Sync>) -> Self {
+        self.framevm = Some(framevm);
         self
     }
 
     /// Sets the local data associated with the task.
-    pub fn local_data<T>(mut self, data: T) -> Self
+    pub fn local_data<T>(self, data: T) -> Self
     where
         T: Any + Send,
     {
-        self.local_data = Some(Box::new(data));
+        self.local_data_any(Box::new(data))
+    }
+
+    /// Sets the local data associated with the task, but with an already-boxed value.
+    pub fn local_data_any(mut self, data: Box<dyn Any + Send>) -> Self {
+        self.local_data = Some(data);
         self
     }
 
@@ -215,6 +260,7 @@ impl TaskOptions {
         let new_task = Task {
             func: ForceSync::new(Cell::new(self.func)),
             data: self.data.unwrap_or_else(|| Box::new(())),
+            framevm: self.framevm.unwrap_or_else(|| Box::new(())),
             local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),
             ctx: SyncUnsafeCell::new(ctx),
             kstack,

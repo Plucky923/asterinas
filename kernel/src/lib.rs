@@ -65,6 +65,8 @@ mod vmm;
 mod vdso;
 mod vm;
 
+pub use thread::kernel_thread::ThreadOptions;
+
 #[controlled]
 #[ostd::main]
 fn main() {

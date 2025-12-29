@@ -13,6 +13,8 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[no_mangle]
         extern "Rust" fn __framevm_main() -> () {
             let _: () = #main_fn_name();
+            ostd::task::clear_post_framevm_task_schedule_handler();
+            aster_framevisor::task::Task::yield_now();
         }
 
         #[expect(unused)]

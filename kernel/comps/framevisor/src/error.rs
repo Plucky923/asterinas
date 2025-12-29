@@ -26,6 +26,20 @@ impl From<PageTableError> for Error {
     }
 }
 
+impl From<ostd::Error> for Error {
+    fn from(err: ostd::Error) -> Error {
+        match err {
+            ostd::Error::InvalidArgs => Error::InvalidArgs,
+            ostd::Error::NoMemory => Error::NoMemory,
+            ostd::Error::PageFault => Error::PageFault,
+            ostd::Error::AccessDenied => Error::AccessDenied,
+            ostd::Error::IoError => Error::IoError,
+            ostd::Error::NotEnoughResources => Error::NotEnoughResources,
+            ostd::Error::Overflow => Error::Overflow,
+        }
+    }
+}
+
 pub fn init_error() {
     let result = Error::InvalidArgs;
     match result {

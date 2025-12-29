@@ -18,6 +18,7 @@ mod stats;
 use stats::CONTEXT_SWITCH_COUNTER;
 pub use stats::collect_context_switch_count;
 pub mod exception;
+pub mod framevm_task;
 pub mod kernel_thread;
 pub mod oops;
 pub mod task;
@@ -36,7 +37,7 @@ fn pre_schedule_handler() {
     thread_local.fpu().before_schedule();
 }
 
-fn post_schedule_handler() {
+fn post_schedule_handler() -> bool {
     // No races because preemption shouldn't happen in pre-/post-schedule handlers.
     CONTEXT_SWITCH_COUNTER
         .get()
@@ -45,7 +46,7 @@ fn post_schedule_handler() {
 
     let task = Task::current().unwrap();
     let Some(thread_local) = task.as_thread_local() else {
-        return;
+        return false;
     };
 
     let vmar = thread_local.vmar().borrow();
@@ -54,6 +55,7 @@ fn post_schedule_handler() {
     }
 
     thread_local.fpu().after_schedule();
+    true
 }
 
 pub(super) fn init() {
@@ -61,6 +63,7 @@ pub(super) fn init() {
     ostd::task::inject_pre_schedule_handler(pre_schedule_handler);
     ostd::task::inject_post_schedule_handler(post_schedule_handler);
     ostd::arch::trap::inject_user_page_fault_handler(exception::page_fault_handler);
+    framevm_task::init();
 }
 
 /// A thread is a wrapper on top of task.

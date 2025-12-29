@@ -8,11 +8,11 @@
 #![deny(unsafe_code)]
 
 extern crate alloc;
-extern crate ostd;
 
 pub mod cpu;
 pub mod error;
 pub mod mm;
+pub mod power;
 pub mod prelude;
 pub mod task;
 pub mod util;
@@ -20,7 +20,7 @@ pub mod util;
 use alloc::{boxed::Box, string::String};
 
 pub use aster_framevisor_macros::main;
-pub use ostd::{arch, user};
+pub use ostd::{arch, prelude::println, user};
 use ostd::{mm::heap::GlobalHeapAllocator, prelude::*};
 
 /// Hello World function to be called by framevm

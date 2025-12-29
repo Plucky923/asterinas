@@ -7,6 +7,6 @@ edition = "2021"
 ostd = { path = "../../../ostd" }
 component = { path = "../../libs/comp-sys/component" }
 aster-framevisor-macros = { path = "macros" }
-
+spin = "0.9"
 [lints]
 workspace = true

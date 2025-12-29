@@ -8,8 +8,10 @@ name = "framevm"
 path = "src/main.rs"
 
 [dependencies]
-# ostd = { package = "ostd" , path = "../../../ostd" }
+ostd = { path = "../../../ostd" }
 aster-framevisor = { path = "../framevisor" }
 align_ext = { path = "../../../ostd/libs/align_ext" }
+spin = "0.9.4"
+xmas-elf = "0.10.0"
 [lints]
 workspace = true

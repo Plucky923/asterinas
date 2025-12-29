@@ -679,7 +679,9 @@ fn run_rustc_command<P: AsRef<Path>>(
     // Force these flags at the END to ensure they override any defaults and eliminate GOTPCREL
     recreated_cmd.arg("-C").arg("relocation-model=static");
     recreated_cmd.arg("-C").arg("code-model=kernel");
-    recreated_cmd.arg("-Z").arg("direct-access-external-data=yes");
+    recreated_cmd
+        .arg("-Z")
+        .arg("direct-access-external-data=yes");
     recreated_cmd.arg("-Z").arg("relax-elf-relocations=no");
     recreated_cmd.arg("-Z").arg("plt=yes");
     recreated_cmd.arg("-C").arg("no-redzone=y");

@@ -1,4 +1,4 @@
-use alloc::{collections::btree_map::BTreeMap, sync::Arc};
+use alloc::{collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
 use core::cmp;
 
 use rustc_demangle::demangle;
@@ -25,6 +25,7 @@ use crate::{
         page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
     },
     symbols::symbol_addr_by_name,
+    task::{Task, TaskOptions},
 };
 
 pub struct FrameVmInfo<'a> {
@@ -97,6 +98,7 @@ impl<'a> FrameVmInfo<'a> {
 
         let entry: extern "Rust" fn() = unsafe { core::mem::transmute(start) };
         unsafe { entry() };
+
         early_println!("framevm end");
         Ok(())
     }
@@ -250,7 +252,9 @@ fn caculate_section_size(elf_file: &ElfFile) -> (usize, usize, usize) {
             continue;
         }
 
-        if name.contains("debug") {
+        // 只跳过真正的 debug section（以 .debug 开头），而不是名称中包含 "debug" 的所有 section
+        // 因为代码 section 的名称可能包含 "debug" 字符串（如函数名）
+        if name.starts_with(".debug") {
             continue;
         }
 
@@ -410,7 +414,9 @@ fn load_section_data<'a>(
             continue;
         }
 
-        if name.contains("debug") {
+        // 只跳过真正的 debug section（以 .debug 开头），而不是名称中包含 "debug" 的所有 section
+        // 因为代码 section 的名称可能包含 "debug" 字符串（如函数名）
+        if name.starts_with(".debug") {
             continue;
         }
 
@@ -696,11 +702,52 @@ fn apply_relocate_add(
     symbol_table: &[Entry64],
 ) -> Result<()> {
     // 获取目标 section 的基地址
+    early_println!(
+        "[Loader] Looking up target section index {} in loaded_sections (total: {} sections)",
+        target_section_index,
+        sections_metadata.loaded_sections.len()
+    );
+
+    // 打印所有已加载的 section 索引，用于调试
+    let loaded_indices: Vec<usize> = sections_metadata.loaded_sections.keys().copied().collect();
+    early_println!("[Loader] Available section indices: {:?}", loaded_indices);
+
     let target_section_base = sections_metadata
         .loaded_sections
         .get(&target_section_index)
-        .ok_or(crate::Error::InvalidArgs)?
-        .base_addr;
+        .map(|section| {
+            early_println!(
+                "[Loader] Found target section {}: base_addr=0x{:x}, offset=0x{:x}, size=0x{:x}, align=0x{:x}",
+                target_section_index,
+                section.base_addr,
+                section.offset,
+                section.size,
+                section.align
+            );
+            section.base_addr
+        })
+        .ok_or_else(|| {
+            early_println!(
+                "[Loader] Error: Target section index {} not found in loaded_sections!",
+                target_section_index
+            );
+            early_println!(
+                "[Loader] Available section indices: {:?}",
+                sections_metadata.loaded_sections.keys().collect::<Vec<_>>()
+            );
+            // 尝试获取 section 名称以便调试
+            if let Ok(target_section) = elf_file.section_header(target_section_index as u16) {
+                if let Ok(name) = target_section.get_name(elf_file) {
+                    early_println!(
+                        "[Loader] Target section name: '{}', type: {:?}, flags: 0x{:x}",
+                        name,
+                        target_section.get_type().unwrap_or(ShType::Null),
+                        target_section.flags()
+                    );
+                }
+            }
+            crate::Error::InvalidArgs
+        })?;
 
     early_println!(
         "[Loader] Applying {} relocations to section {} (base: 0x{:x})",
@@ -925,6 +972,12 @@ fn apply_relocate_add(
             }
 
             // 写入新值
+            early_println!(
+                "[Loader] About to write {} bytes to 0x{:x} (val=0x{:x})",
+                size,
+                loc,
+                val
+            );
             let mut writer = VmWriter::from_kernel_space(loc as *mut u8, size);
             match size {
                 4 => {
@@ -933,7 +986,15 @@ fn apply_relocate_add(
                         // R_X86_64_32: 无符号 32 位
                         10 => {
                             let val_u32 = val as u32;
-                            writer.write_val(&val_u32)?;
+                            writer.write_val(&val_u32).map_err(|e| {
+                                early_println!(
+                                    "[Loader] Error: Failed to write 32-bit value 0x{:x} to 0x{:x}: {:?}",
+                                    val_u32,
+                                    loc,
+                                    e
+                                );
+                                e
+                            })?;
                         }
                         // R_X86_64_32S, R_X86_64_PC32, R_X86_64_PLT32: 有符号 32 位
                         _ => {
@@ -945,15 +1006,36 @@ fn apply_relocate_add(
                                 val_i32 as u32,
                                 val_i32
                             );
-                            writer.write_val(&val_i32)?;
+                            writer.write_val(&val_i32).map_err(|e| {
+                                early_println!(
+                                    "[Loader] Error: Failed to write 32-bit PC relative value 0x{:x} to 0x{:x}: {:?}",
+                                    val_i32 as u32,
+                                    loc,
+                                    e
+                                );
+                                e
+                            })?;
                         }
                     }
                 }
                 8 => {
                     // 64 位值直接写入
-                    writer.write_val(&val)?;
+                    writer.write_val(&val).map_err(|e| {
+                        early_println!(
+                            "[Loader] Error: Failed to write 64-bit value 0x{:x} to 0x{:x}: {:?}",
+                            val,
+                            loc,
+                            e
+                        );
+                        e
+                    })?;
                 }
                 _ => {
+                    early_println!(
+                        "[Loader] Error: Invalid size {} for relocation type {}",
+                        size,
+                        reloc_type
+                    );
                     return Err(crate::Error::InvalidArgs);
                 }
             }

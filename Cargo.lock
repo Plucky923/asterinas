@@ -214,6 +214,7 @@ dependencies = [
  "aster-framevisor-macros",
  "component",
  "ostd",
+ "spin",
 ]
 
 [[package]]
@@ -231,6 +232,9 @@ version = "0.1.0"
 dependencies = [
  "align_ext",
  "aster-framevisor",
+ "ostd",
+ "spin",
+ "xmas-elf",
 ]
 
 [[package]]

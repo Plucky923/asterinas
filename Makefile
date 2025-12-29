@@ -594,3 +594,7 @@ framevm:
 	@grub-mkrescue -o target/osdk/aster-nix/aster-nix-osdk-bin.iso target/osdk/iso_root 2> /dev/null
 	@echo "[make] ISO successfully updated at target/osdk/aster-nix/aster-nix-osdk-bin.iso"
 	@cd kernel && cargo osdk run --no-build $(CARGO_OSDK_BUILD_ARGS)
+
+.PHONY: run_framevm
+run_framevm: 
+	@cd kernel && cargo osdk run --no-build --kcmd-args="ostd.log_level=error" --kcmd-args="console=hvc0" --target-arch=x86_64 --boot-method="grub-rescue-iso" --grub-boot-protocol=multiboot2 --qemu-args="-accel kvm"

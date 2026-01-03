@@ -13,7 +13,7 @@ use ostd::{early_println, mm::Frame as OstdFrame};
 pub use vm_space::{init_vm_space, VmSpace};
 
 pub use self::{
-    io::FallibleVmRead,
+    io::{FallibleVmRead, FallibleVmWrite},
     page_prop::{CachePolicy, PageFlags, PageProperty},
 };
 use crate::mm::frame::{init_frame, untyped::UFrame};

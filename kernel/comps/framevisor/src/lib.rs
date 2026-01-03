@@ -11,16 +11,19 @@ extern crate alloc;
 
 pub mod cpu;
 pub mod error;
+pub mod irq;
 pub mod mm;
 pub mod power;
 pub mod prelude;
 pub mod task;
 pub mod util;
+pub mod vsock;
 
 use alloc::{boxed::Box, string::String};
 
+pub use aster_framevisor_exchangeable::*;
 pub use aster_framevisor_macros::main;
-pub use ostd::{arch, prelude::println, user};
+pub use ostd::{arch, prelude::println, user, Error, Result};
 use ostd::{mm::heap::GlobalHeapAllocator, prelude::*};
 
 /// Hello World function to be called by framevm
@@ -43,4 +46,8 @@ pub fn start_framevm() {
     task::init_task();
     error::init_error();
     cpu::init_cpu();
+    irq::init();
+    vsock::init();
+    // Initialize vCPU queues (default to 1 vCPU)
+    vsock::init_vcpu_queue(1);
 }

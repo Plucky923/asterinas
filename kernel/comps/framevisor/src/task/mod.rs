@@ -32,6 +32,10 @@ pub fn inject_post_schedule_handler(handler: fn()) {
     ostd::task::inject_post_framevm_task_schedule_handler(handler);
 }
 
+pub fn clear_post_framevm_task_schedule_handler() {
+    ostd::task::clear_post_framevm_task_schedule_handler();
+}
+
 pub struct CurrentTask(Task);
 
 #[derive(Debug)]

@@ -8,8 +8,10 @@ name = "framevm"
 path = "src/main.rs"
 
 [dependencies]
-ostd = { path = "../../../ostd" }
+# ostd = { path = "../../../ostd" }
 aster-framevisor = { path = "../framevisor" }
+aster-framevsock = { path = "../framevsock" }
+exchangeable = { package = "aster-framevisor-exchangeable", path = "../framevisor/exchangeable" }
 align_ext = { path = "../../../ostd/libs/align_ext" }
 spin = "0.9.4"
 xmas-elf = "0.10.0"

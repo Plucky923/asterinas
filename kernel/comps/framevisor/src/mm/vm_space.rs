@@ -7,13 +7,12 @@ use ostd::{
         vm_space::CursorMut as OstdCursorMut, Fallible, VmReader, VmSpace as OstdVmSpace, VmWriter,
     },
     task::atomic_mode::AsAtomicModeGuard as OstdAsAtomicModeGuard,
-    Error,
+    Error, Result,
 };
 
 use crate::{
     mm::{frame::untyped::UFrame, page_prop::PageProperty, Vaddr},
     task::{atomic_mode::AsAtomicModeGuard, disable_preempt},
-    Result,
 };
 
 #[derive(Debug)]
@@ -38,13 +37,9 @@ impl VmSpace {
         va: &Range<Vaddr>,
     ) -> Result<CursorMut<'a>> {
         early_println!("[framevisor] Creating mutable cursor for VM space...");
-        let inner = self.vmspace().cursor_mut(guard.get_inner(), va);
-
-        if let Ok(cursor) = inner {
-            return Ok(CursorMut::new_with_inner(cursor));
-        }
-
-        return Err(Error::InvalidArgs);
+        self.vmspace()
+            .cursor_mut(guard.get_inner(), va)
+            .map(CursorMut::new_with_inner)
     }
 
     pub fn activate(self: &Arc<Self>) {

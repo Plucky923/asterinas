@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{
-    boxed::Box,
-    sync::{Arc, Weak},
-};
+use alloc::{boxed::Box, sync::Arc};
 use core::any::Any;
 
 use aster_framevisor::task::{FramevmTaskCreator, register_creator};
@@ -13,7 +10,6 @@ use ostd::{
 };
 
 use crate::{
-    prelude::*,
     sched::{Nice, SchedPolicy},
     thread::Thread,
 };

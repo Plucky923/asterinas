@@ -35,6 +35,7 @@ members = [
     "kernel/comps/mlsdisk",
     "kernel/comps/framevm",
     "kernel/comps/framevisor",
+    "kernel/comps/framevsock",
     "kernel/comps/time",
     "kernel/comps/virtio",
     "kernel/comps/pci",

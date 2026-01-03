@@ -36,8 +36,19 @@ impl FileOps for FrameVmFileOps {
 
         let first_byte = reader.read_val::<u8>()?;
 
-        if first_byte == b'1' {
-            vmm::load_framevm()?;
+        match first_byte {
+            b'1' => {
+                // Load FrameVM without tests
+                vmm::load_framevm()?;
+            }
+            b'2' => {
+                // Load FrameVM with Host->Guest tests
+                vmm::load_framevm_with_tests()?;
+            }
+            _ => {
+                // Default: load without tests
+                vmm::load_framevm()?;
+            }
         }
 
         if len > 1 {

@@ -6,6 +6,7 @@ pub use family::{
 };
 
 mod family;
+mod framevsock;
 mod ip;
 mod netlink;
 mod unix;

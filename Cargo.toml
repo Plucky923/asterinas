@@ -36,6 +36,7 @@ members = [
     "kernel/comps/systree",
     "kernel/comps/framevm",
     "kernel/comps/framevisor",
+    "kernel/comps/framevsock",
     "kernel/comps/time",
     "kernel/comps/virtio",
     "kernel/libs/aster-bigtcp",
@@ -105,6 +106,8 @@ aster-network = { path = "kernel/comps/network" }
 aster-pci = { path = "kernel/comps/pci" }
 aster-softirq = { path = "kernel/comps/softirq" }
 aster-systree = { path = "kernel/comps/systree" }
+aster-framevisor = { path = "kernel/comps/framevisor" }
+aster-framevsock = { path = "kernel/comps/framevsock" }
 aster-time = { path = "kernel/comps/time" }
 aster-virtio = { path = "kernel/comps/virtio" }
 

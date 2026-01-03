@@ -3,6 +3,7 @@
 nix = { name = "aster-nix" }
 virtio = { name = "aster-virtio" }
 framevisor = { name = "aster-framevisor" }
+framevsock = { name = "aster-framevsock" }
 input = { name = "aster-input" }
 block = { name = "aster-block" }
 cmdline = { name = "aster-cmdline" }

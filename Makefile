@@ -597,4 +597,4 @@ framevm:
 
 .PHONY: run_framevm
 run_framevm: 
-	@cd kernel && cargo osdk run --no-build --kcmd-args="ostd.log_level=error" --kcmd-args="console=hvc0" --target-arch=x86_64 --boot-method="grub-rescue-iso" --grub-boot-protocol=multiboot2 --qemu-args="-accel kvm"
+	@cd kernel && cargo osdk run --no-build $(CARGO_OSDK_BUILD_ARGS)

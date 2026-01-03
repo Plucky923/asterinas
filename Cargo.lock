@@ -211,10 +211,19 @@ dependencies = [
 name = "aster-framevisor"
 version = "0.1.0"
 dependencies = [
+ "aster-framevisor-exchangeable",
  "aster-framevisor-macros",
+ "aster-framevsock",
  "component",
  "ostd",
  "spin",
+]
+
+[[package]]
+name = "aster-framevisor-exchangeable"
+version = "0.1.0"
+dependencies = [
+ "ostd",
 ]
 
 [[package]]
@@ -232,9 +241,21 @@ version = "0.1.0"
 dependencies = [
  "align_ext",
  "aster-framevisor",
- "ostd",
+ "aster-framevisor-exchangeable",
+ "aster-framevsock",
  "spin",
  "xmas-elf",
+]
+
+[[package]]
+name = "aster-framevsock"
+version = "0.1.0"
+dependencies = [
+ "aster-framevisor-exchangeable",
+ "component",
+ "log",
+ "ostd",
+ "spin",
 ]
 
 [[package]]
@@ -272,6 +293,8 @@ dependencies = [
  "aster-cmdline",
  "aster-console",
  "aster-framebuffer",
+ "aster-framevisor",
+ "aster-framevsock",
  "aster-i8042",
  "aster-input",
  "aster-logger",

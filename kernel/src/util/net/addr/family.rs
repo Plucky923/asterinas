@@ -4,7 +4,10 @@ use core::cmp::min;
 
 use ostd::{mm::VmIo, task::Task};
 
-use super::{ip::CSocketAddrInet, netlink::CSocketAddrNetlink, unix, vsock::CSocketAddrVm};
+use super::{
+    framevsock::CSocketAddrFrameVsock, ip::CSocketAddrInet, netlink::CSocketAddrNetlink, unix,
+    vsock::CSocketAddrVm,
+};
 use crate::{current_userspace, net::socket::util::SocketAddr, prelude::*};
 
 /// Address family.
@@ -110,6 +113,8 @@ pub enum CSocketAddrFamily {
     AF_XDP = 44,
     /// Management component transport protocol
     AF_MCTP = 45,
+    /// FrameVsock sockets for zero-copy communication
+    AF_FRAMEVSOCK = 46,
 }
 
 const ADDR_MAX_LEN: usize = 128;
@@ -172,6 +177,13 @@ pub fn read_socket_addr_from_user(addr: Vaddr, addr_len: usize) -> Result<Socket
             }
             let addr = CSocketAddrVm::from_bytes(storage.as_bytes());
             SocketAddr::Vsock(addr.into())
+        }
+        Ok(CSocketAddrFamily::AF_FRAMEVSOCK) => {
+            if addr_len < size_of::<CSocketAddrFrameVsock>() {
+                return_errno_with_message!(Errno::EINVAL, "the socket address length is too small");
+            }
+            let addr = CSocketAddrFrameVsock::from_bytes(storage.as_bytes());
+            SocketAddr::FrameVsock(addr.into())
         }
         _ => {
             return_errno_with_message!(
@@ -258,6 +270,9 @@ pub fn write_socket_addr_with_max_len(
         }
         SocketAddr::Vsock(addr) => {
             write_c_socket_address_util::<CSocketAddrVm, _>(*addr, dest, max_len as usize)?
+        }
+        SocketAddr::FrameVsock(addr) => {
+            write_c_socket_address_util::<CSocketAddrFrameVsock, _>(*addr, dest, max_len as usize)?
         }
     };
 

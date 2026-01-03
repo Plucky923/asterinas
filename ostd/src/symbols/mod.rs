@@ -1,6 +1,4 @@
-//! Runtime symbol table support for resolving function and object names.
-
-use alloc::{collections::btree_map::BTreeMap, format, string::String, vec::Vec};
+use alloc::{collections::btree_map::BTreeMap, format, string::String, sync::Arc, vec::Vec};
 
 use rustc_demangle::demangle;
 use spin::Once;
@@ -25,19 +23,56 @@ pub fn symbols_table_init() {
 #[derive(Clone, Debug)]
 pub struct SymbolEntry {
     /// Demangled symbol name.
-    pub name: String,
+    pub name: Arc<str>,
     /// Starting address of the symbol in the kernel image.
     pub addr: usize,
     /// Length of the symbol in bytes.
     pub size: usize,
 }
 
-type SymbolTable = SpinLock<BTreeMap<usize, SymbolEntry>>;
+struct SymbolTableInner {
+    by_addr: BTreeMap<usize, SymbolEntry>,
+    by_name: BTreeMap<Arc<str>, usize>,
+}
+
+impl SymbolTableInner {
+    fn new() -> Self {
+        Self {
+            by_addr: BTreeMap::new(),
+            by_name: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, addr: usize, entry: SymbolEntry) {
+        // If there's an existing entry with the same name, we keep the one with the smaller address
+        // or just overwrite. The requirement says "lowest starting address".
+        // Let's check if the name is already in by_name.
+        if let Some(&existing_addr) = self.by_name.get(&entry.name) {
+            if addr < existing_addr {
+                self.by_name.insert(entry.name.clone(), addr);
+            }
+        } else {
+            self.by_name.insert(entry.name.clone(), addr);
+        }
+        self.by_addr.insert(addr, entry);
+    }
+
+    fn clear(&mut self) {
+        self.by_addr.clear();
+        self.by_name.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.by_addr.len()
+    }
+}
+
+type SymbolTable = SpinLock<SymbolTableInner>;
 
 static SYMBOLS_TABLE: Once<SymbolTable> = Once::new();
 
 fn symbol_table() -> &'static SymbolTable {
-    SYMBOLS_TABLE.call_once(|| SpinLock::new(BTreeMap::new()))
+    SYMBOLS_TABLE.call_once(|| SpinLock::new(SymbolTableInner::new()))
 }
 
 fn parse_symbols_file_from_binary(symbols: &[u8]) {
@@ -82,7 +117,6 @@ fn parse_symbols_file_from_binary(symbols: &[u8]) {
 
         let mut total_symbols = 0;
         let mut processed_symbols = 0;
-        let mut framevisor_count = 0;
 
         for entry in symtab.iter() {
             total_symbols += 1;
@@ -97,27 +131,12 @@ fn parse_symbols_file_from_binary(symbols: &[u8]) {
                     let size = entry.size() as usize;
                     let name = entry.get_name(&elf_file).unwrap_or("<invalid utf8>");
                     let demangled = demangle(name).to_string();
-
-                    // Match framevisor symbols case-insensitively
-                    // Check both raw name and demangled name
-                    let name_lower = name.to_lowercase();
-                    let demangled_lower = demangled.to_lowercase();
-                    if name_lower.contains("framevisor")
-                        || name_lower.contains("aster_framevisor")
-                        || demangled_lower.contains("framevisor")
-                        || demangled_lower.contains("aster_framevisor")
-                    {
-                        early_println!(
-                            "[ostd] Found framevisor symbol: {} (raw: {})",
-                            demangled,
-                            name
-                        );
-                    }
+                    let demangled_arc: Arc<str> = demangled.into();
 
                     table.insert(
                         address,
                         SymbolEntry {
-                            name: demangled,
+                            name: demangled_arc,
                             addr: address,
                             size,
                         },
@@ -127,10 +146,9 @@ fn parse_symbols_file_from_binary(symbols: &[u8]) {
         }
 
         early_println!(
-            "[ostd] Symbol parsing: total={}, processed={}, framevisor={}",
+            "[ostd] Symbol parsing: total={}, processed={}",
             total_symbols,
             processed_symbols,
-            framevisor_count
         );
     }
 
@@ -147,70 +165,17 @@ pub fn add_symbol_entry(addr: usize, entry: SymbolEntry) {
 
 /// Retrieves the symbol information for a specific address, if present.
 pub fn symbol_by_addr(addr: usize) -> Option<SymbolEntry> {
-    symbol_table().lock().get(&addr).cloned()
-}
-
-/// Strips the hash suffix from a demangled symbol name.
-/// For example: "aster_framevisor::hello_world::h22af09a1146ed360" -> "aster_framevisor::hello_world"
-fn strip_hash_suffix(name: &str) -> &str {
-    // Rust mangled names have format: path::to::function::h<hex_hash>
-    // We want to remove the ::h<hex_hash> part
-    if let Some(pos) = name.rfind("::h") {
-        // Check if what follows looks like a hex hash (at least 8 hex digits)
-        let after_hash = &name[pos + 3..];
-        if after_hash.len() >= 8 && after_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return &name[..pos];
-        }
-    }
-    name
+    symbol_table().lock().by_addr.get(&addr).cloned()
 }
 
 /// Retrieves the symbol address by name.
-///
-/// This function searches for a symbol by its name. It will:
-/// 1. Try to match the exact name (mangled or demangled)
-/// 2. Try to demangle the input name and match against demangled names
-///
-/// Returns the symbol address if found, None otherwise.
 pub fn symbol_addr_by_name(name: &str) -> Option<usize> {
     let table = symbol_table().lock();
-
-    early_println!("[ostd] Looking up symbol by name: input='{}'", name);
-
-    // 1. Try exact match
-    for (_addr, entry) in table.iter() {
-        if entry.name == name {
-            early_println!("[ostd] Found exact match: {} -> 0x{:x}", name, entry.addr);
-            return Some(entry.addr);
-        }
-    }
-
-    // 2. Try demangled match
-    let demangled = demangle(name).to_string();
-    if demangled != name {
-        early_println!("[ostd] Trying demangled name: '{}'", demangled);
-        for (_addr, entry) in table.iter() {
-            if entry.name == demangled {
-                early_println!(
-                    "[ostd] Found demangled match: {} -> 0x{:x}",
-                    demangled,
-                    entry.addr
-                );
-                return Some(entry.addr);
-            }
-        }
-    }
-
-    early_println!("[ostd] Symbol not found: {}", name);
-    None
+    let search_key = demangle(name).to_string();
+    table.by_name.get(search_key.as_str()).copied()
 }
 
 /// Returns the number of tracked symbols.
 pub fn symbols_len() -> usize {
     symbol_table().lock().len()
-}
-
-/// Logs every loaded symbol to the early console for diagnostics.
-pub fn traverse_symbols() {
-    let table = symbol_table().lock();
 }

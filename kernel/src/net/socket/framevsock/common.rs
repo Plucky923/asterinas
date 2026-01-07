@@ -233,7 +233,7 @@ impl FrameVsockSpace {
             listen.push_incoming(connected.clone())?;
 
             // Also add to connected sockets map
-            let conn_id = ConnectionId::from_addrs(dst_addr, src_addr);
+            let conn_id = ConnectionId::from_addrs(dst_addr.into(), src_addr.into());
             self.insert_connected_socket(conn_id, connected);
 
             debug!(

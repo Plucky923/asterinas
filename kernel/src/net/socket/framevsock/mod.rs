@@ -25,7 +25,6 @@ use spin::Once;
 pub mod addr;
 pub mod common;
 pub mod stream;
-pub mod test;
 
 use common::FrameVsockSpace;
 pub use stream::socket::FrameVsockStreamSocket;

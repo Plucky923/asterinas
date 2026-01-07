@@ -117,8 +117,6 @@ _start:
     mov     $(msg_waiting_end - msg_waiting), %rdx
     syscall
 
-    xor     %r15, %r15              # r15 = retry counter for progress dots
-
 accept_loop:
     mov     $SYS_ACCEPT, %rax
     mov     %r12, %rdi
@@ -126,9 +124,9 @@ accept_loop:
     xor     %rdx, %rdx              # addrlen = NULL
     syscall
 
-    # Check if EAGAIN
+    # Check if EAGAIN - just retry without printing
     cmp     $-EAGAIN, %rax
-    je      accept_retry
+    je      accept_loop
 
     # Check for other errors
     test    %rax, %rax
@@ -136,21 +134,6 @@ accept_loop:
 
     # Accept succeeded!
     mov     %rax, %r13              # r13 = client_fd
-    jmp     accept_done
-
-accept_retry:
-    # Print a dot every 10000 iterations to show progress
-    inc     %r15
-    cmp     $10000, %r15
-    jne     accept_loop
-    xor     %r15, %r15
-
-    mov     $SYS_WRITE, %rax
-    mov     $1, %rdi
-    lea     msg_dot(%rip), %rsi
-    mov     $1, %rdx
-    syscall
-    jmp     accept_loop
 
 accept_done:
     mov     $SYS_WRITE, %rax
@@ -331,9 +314,6 @@ msg_listen_ok_end:
 msg_waiting:
     .ascii "[Echo Server] Waiting for connection"
 msg_waiting_end:
-
-msg_dot:
-    .ascii "."
 
 msg_accepted:
     .ascii "\n[Echo Server] Connection accepted!\n"

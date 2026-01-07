@@ -22,7 +22,7 @@ FEATURES ?=
 NO_DEFAULT_FEATURES ?= 0
 COVERAGE ?= 0
 # Specify whether to build regression tests under `test/initramfs/src/apps`.
-ENABLE_BASIC_TEST ?= false
+ENABLE_BASIC_TEST ?= true
 # Specify the primary system console (supported: hvc0, tty0).
 # - hvc0: The virtio-console terminal.
 # - tty0: The active virtual terminal (VT).
@@ -580,7 +580,11 @@ fv_init_ramfs: framevm_obj
 		FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
 
 .PHONY: framevm
-framevm: 
+framevm:
+	@echo "[make] Compiling FrameVM user-space assembly code"
+	@cd kernel/comps/framevm/src && \
+		gcc -nostdlib -static -o vsock_echo_server vsock_echo_server.S && \
+		gcc -nostdlib -static -o vsock_client vsock_client.S
 	@make clean 
 	@make kernel
 	@make fv_init_ramfs

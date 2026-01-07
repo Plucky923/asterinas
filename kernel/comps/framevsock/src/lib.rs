@@ -726,5 +726,3 @@ pub fn create_data_packet_with_credit(
     packet.header.fwd_cnt = fwd_cnt;
     RRef::new(packet)
 }
-
-// Deprecated code removed: FrameVsockBufferLegacy, create_data_buffer

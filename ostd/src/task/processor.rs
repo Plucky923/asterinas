@@ -8,7 +8,6 @@ use crate::{
     arch::task::{context_switch, first_context_switch},
     cpu_local_cell,
     irq::DisabledLocalIrqGuard,
-    task::POST_FRAMEVM_TASK_SCHEDULE_HANDLER,
 };
 
 cpu_local_cell! {
@@ -139,12 +138,6 @@ pub(super) unsafe fn after_switching_to() {
     let mut is_kernel_task = false;
     if let Some(handler) = POST_SCHEDULE_HANDLER.get() {
         is_kernel_task = handler();
-    }
-
-    if !is_kernel_task {
-        if let Some(framevm_task_handler) = POST_FRAMEVM_TASK_SCHEDULE_HANDLER.lock().as_ref() {
-            framevm_task_handler();
-        }
     }
 
     // See `switch_to_task`, where we forgot an IRQ guard.

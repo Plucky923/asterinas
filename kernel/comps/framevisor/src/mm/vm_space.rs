@@ -43,9 +43,7 @@ impl VmSpace {
     }
 
     pub fn activate(self: &Arc<Self>) {
-        early_println!("[framevisor] Activating VM space...");
         self.vmspace().activate();
-        early_println!("[framevisor] VM space activated");
     }
 
     pub fn reader(&self, vaddr: Vaddr, len: usize) -> Result<VmReader<'_, Fallible>> {

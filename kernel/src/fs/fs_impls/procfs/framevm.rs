@@ -38,15 +38,11 @@ impl FileOps for FrameVmFileOps {
 
         match first_byte {
             b'1' => {
-                // Load FrameVM without tests
-                vmm::load_framevm()?;
-            }
-            b'2' => {
-                // Load FrameVM with Host->Guest tests
-                vmm::load_framevm_with_tests()?;
+                // Load FrameVM in background (non-blocking): return from write_at immediately.
+                vmm::load_framevm_background()?;
             }
             _ => {
-                // Default: load without tests
+                // Default: load synchronously
                 vmm::load_framevm()?;
             }
         }

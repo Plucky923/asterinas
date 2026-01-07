@@ -9,7 +9,6 @@ use crate::{
         fs_resolver::FsPath,
         utils::{AccessMode, InodeMode, OpenArgs},
     },
-    net::socket::framevsock::test as framevsock_test,
     prelude::*,
     process::posix_thread::AsThreadLocal,
     thread::kernel_thread::ThreadOptions,
@@ -18,65 +17,55 @@ use crate::{
 /// Load and start the FrameVM (synchronous, blocks until FrameVM exits)
 pub fn load_framevm() -> Result<()> {
     let elf_data = read_framevm_elf()?;
-
-    // Setup FrameVsock test infrastructure before starting FrameVM
-    // This starts the Host echo server so Guest can connect to it
-    if let Err(e) = framevsock_test::setup_pre_framevm() {
-        println!(
-            "[FrameVM] Warning: Failed to setup FrameVsock tests: {:?}",
-            e
-        );
-    }
-
     start_framevm();
     load_framevm_file(&elf_data)?;
     Ok(())
 }
 
-/// Load and start the FrameVM with post-start tests
-/// Use this for testing bidirectional communication
+/// Load and start the FrameVM in a background thread.
 ///
-/// This spawns FrameVM in a background kernel thread, then runs
-/// Host -> Guest tests in the main thread.
-pub fn load_framevm_with_tests() -> Result<()> {
-    // Read ELF data in the main thread (has access to filesystem)
+/// This function is designed for `/proc/framevm`: it returns immediately after spawning the
+/// background loader thread, so the write syscall can return without blocking the caller shell.
+pub fn load_framevm_background() -> Result<()> {
+    // Read the ELF data in the current task context (has filesystem access and process context).
+    // We must NOT hold the file handle into the kernel thread, because:
+    // - Kernel threads don't have an associated process
+    // - When the file handle is dropped, InodeHandle::drop calls release_range_locks
+    // - release_range_locks creates RangeLockItem::new() which calls current!().pid()
+    // - current!() calls Process::current().unwrap(), which panics in a kernel thread
     let elf_data = read_framevm_elf()?;
 
-    // Setup test infrastructure first
-    if let Err(e) = framevsock_test::setup_pre_framevm() {
-        println!(
-            "[FrameVM] Warning: Failed to setup FrameVsock tests: {:?}",
-            e
-        );
-    }
-
-    // Spawn FrameVM in a separate kernel thread
     println!("[FrameVM] Spawning FrameVM in background thread...");
     ThreadOptions::new(move || {
-        start_framevm();
-        if let Err(e) = load_framevm_file(&elf_data) {
+        let res: Result<()> = (|| {
+            start_framevm();
+            load_framevm_file(&elf_data)?;
+            Ok(())
+        })();
+
+        if let Err(e) = res {
             println!("[FrameVM] FrameVM thread error: {:?}", e);
         }
     })
     .spawn();
-
-    println!("[FrameVM] Waiting for Guest to start...");
-    for _ in 0..100000 {
-        Task::yield_now();
-    }
-    println!("[FrameVM] Guest initialization period complete");
-
-    // Run Host -> Guest tests
-    println!("[FrameVM] Running Host -> Guest tests...");
-    if let Err(e) = framevsock_test::run_post_framevm_tests() {
-        println!("[FrameVM] Post-FrameVM tests failed: {:?}", e);
-    }
 
     Ok(())
 }
 
 /// Read the FrameVM ELF file from the filesystem
 fn read_framevm_elf() -> Result<Vec<u8>> {
+    let framevm_file = open_framevm_elf_file()?;
+
+    let file_size = framevm_file.inode().size();
+    println!("[FrameVM] file size: {} bytes", file_size);
+
+    let mut elf_data = vec![0u8; file_size];
+    framevm_file.read_bytes_at(0, &mut elf_data)?;
+
+    Ok(elf_data)
+}
+
+fn open_framevm_elf_file() -> Result<Arc<dyn FileLike>> {
     println!("[FrameVM] open /framevm/framevm.o");
     let task = Task::current().unwrap();
     let thread_local = task.as_thread_local().unwrap();
@@ -94,14 +83,7 @@ fn read_framevm_elf() -> Result<Vec<u8>> {
         Arc::new(inode_handle)
     };
     println!("[FrameVM] /framevm/framevm.o file opened successfully");
-
-    let file_size = framevm_file.inode().size();
-    println!("[FrameVM] file size: {} bytes", file_size);
-
-    let mut elf_data = vec![0u8; file_size];
-    framevm_file.read_bytes_at(0, &mut elf_data)?;
-
-    Ok(elf_data)
+    Ok(framevm_file)
 }
 
 /// Load and run FrameVM from ELF data (blocks until FrameVM exits)

@@ -8,10 +8,14 @@ use crate::{
     fs::{file_handle::FileLike, utils::Inode},
     net::socket::{
         Socket,
-        framevsock::{FRAME_VSOCK_GLOBAL, addr::FrameVsockAddr},
+        framevsock::{
+            FRAME_VSOCK_GLOBAL,
+            addr::{self, FrameVsockAddr},
+        },
         new_pseudo_inode,
+        util::{options::{SocketOptionSet, SetSocketLevelOption, GetSocketLevelOption}, MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr},
+        options::SocketOption,
         private::SocketPrivate,
-        util::{MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr},
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
@@ -22,6 +26,7 @@ pub struct FrameVsockStreamSocket {
     status: RwLock<Status>,
     is_nonblocking: AtomicBool,
     pseudo_inode: Arc<dyn Inode>,
+    options: RwLock<SocketOptionSet>,
 }
 
 pub enum Status {
@@ -37,6 +42,7 @@ impl FrameVsockStreamSocket {
             status: RwLock::new(Status::Init(init)),
             is_nonblocking: AtomicBool::new(nonblocking),
             pseudo_inode: new_pseudo_inode(),
+            options: RwLock::new(SocketOptionSet::default()),
         })
     }
 
@@ -45,6 +51,7 @@ impl FrameVsockStreamSocket {
             status: RwLock::new(Status::Connected(connected)),
             is_nonblocking: AtomicBool::new(false),
             pseudo_inode: new_pseudo_inode(),
+            options: RwLock::new(SocketOptionSet::default()),
         }
     }
 
@@ -65,6 +72,9 @@ impl FrameVsockStreamSocket {
             .get()
             .unwrap()
             .insert_connected_socket(connected.id(), connected.clone());
+
+        // TODO: Pass the peer credit info to the new socket?
+        // The connected socket already has it.
 
         let socket = Arc::new(FrameVsockStreamSocket::new_from_connected(connected));
         Ok((socket, peer_addr))
@@ -129,9 +139,17 @@ impl SocketPrivate for FrameVsockStreamSocket {
     }
 }
 
+impl GetSocketLevelOption for FrameVsockStreamSocket {
+    fn is_listening(&self) -> bool {
+        matches!(&*self.status.read(), Status::Listen(_))
+    }
+}
+
+impl SetSocketLevelOption for FrameVsockStreamSocket {}
+
 impl Socket for FrameVsockStreamSocket {
     fn bind(&self, sockaddr: SocketAddr) -> Result<()> {
-        let addr = FrameVsockAddr::try_from(sockaddr)?;
+        let addr = addr::try_from_socketaddr(sockaddr)?;
         let inner = self.status.read();
         match &*inner {
             Status::Init(init) => init.bind(addr),
@@ -161,7 +179,7 @@ impl Socket for FrameVsockStreamSocket {
                 return_errno_with_message!(Errno::EINVAL, "the socket is connected");
             }
         };
-        let remote_addr = FrameVsockAddr::try_from(sockaddr)?;
+        let remote_addr = addr::try_from_socketaddr(sockaddr)?;
         let local_addr = init.bound_addr();
         if let Some(addr) = local_addr {
             if addr == remote_addr {
@@ -268,6 +286,15 @@ impl Socket for FrameVsockStreamSocket {
         }
     }
 
+    fn get_option(&self, option: &mut dyn SocketOption) -> Result<()> {
+        self.options.read().get_option(option, self)
+    }
+
+    fn set_option(&self, option: &dyn SocketOption) -> Result<()> {
+        self.options.write().set_option(option, self)?;
+        Ok(())
+    }
+
     fn sendmsg(
         &self,
         reader: &mut dyn MultiRead,
@@ -312,7 +339,7 @@ impl Socket for FrameVsockStreamSocket {
         let addr = match &*inner {
             Status::Init(init) => init.bound_addr(),
             Status::Listen(listen) => Some(listen.addr()),
-            Status::Connected(connected) => Some(connected.local_addr()),
+            Status::Connected(connected) => Some(connected.local_addr().into()),
         };
         // FIXME: Support conversion to generic SocketAddr
         addr.map(Into::<SocketAddr>::into)
@@ -326,7 +353,7 @@ impl Socket for FrameVsockStreamSocket {
         let inner = self.status.read();
         if let Status::Connected(connected) = &*inner {
             // FIXME: Support conversion to generic SocketAddr
-            Ok(connected.peer_addr().into())
+            Ok(Into::<FrameVsockAddr>::into(connected.peer_addr()).into())
         } else {
             return_errno_with_message!(Errno::EINVAL, "the socket is not connected");
         }

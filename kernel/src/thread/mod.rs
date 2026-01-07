@@ -46,7 +46,7 @@ fn post_schedule_handler() -> bool {
 
     let task = Task::current().unwrap();
     let Some(thread_local) = task.as_thread_local() else {
-        return false;
+        return aster_framevisor::task::dispatch_post_schedule();
     };
 
     let vmar = thread_local.vmar().borrow();

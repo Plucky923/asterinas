@@ -1,38 +1,7 @@
-// SPDX-License-Identifier: MPL-2.0
-
+pub use aster_framevsock::FrameVsockAddr;
 use aster_framevsock::FrameVsockHeader;
 
 use crate::{net::socket::util::SocketAddr, prelude::*};
-
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct FrameVsockAddr {
-    pub cid: u64,
-    pub port: u32,
-}
-
-impl FrameVsockAddr {
-    pub fn new(cid: u64, port: u32) -> Self {
-        Self { cid, port }
-    }
-
-    pub fn any_addr() -> Self {
-        Self {
-            cid: VMADDR_CID_ANY,
-            port: VMADDR_PORT_ANY,
-        }
-    }
-}
-
-impl TryFrom<SocketAddr> for FrameVsockAddr {
-    type Error = Error;
-
-    fn try_from(value: SocketAddr) -> Result<Self> {
-        let SocketAddr::FrameVsock(framevsock_addr) = value else {
-            return_errno_with_message!(Errno::EINVAL, "invalid framevsock socket addr");
-        };
-        Ok(framevsock_addr)
-    }
-}
 
 impl From<FrameVsockAddr> for SocketAddr {
     fn from(value: FrameVsockAddr) -> Self {
@@ -40,12 +9,17 @@ impl From<FrameVsockAddr> for SocketAddr {
     }
 }
 
-impl From<FrameVsockHeader> for FrameVsockAddr {
-    fn from(value: FrameVsockHeader) -> Self {
-        FrameVsockAddr {
-            cid: value.src_cid,
-            port: value.src_port,
-        }
+pub fn try_from_socketaddr(value: SocketAddr) -> Result<FrameVsockAddr> {
+    let SocketAddr::FrameVsock(framevsock_addr) = value else {
+        return_errno_with_message!(Errno::EINVAL, "invalid framevsock socket addr");
+    };
+    Ok(framevsock_addr)
+}
+
+pub fn from_header(value: FrameVsockHeader) -> FrameVsockAddr {
+    FrameVsockAddr {
+        cid: value.src_cid,
+        port: value.src_port,
     }
 }
 

@@ -575,7 +575,11 @@ fv_init_ramfs: framevm_obj
 		FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
 
 .PHONY: framevm
-framevm: 
+framevm:
+	@echo "[make] Compiling FrameVM user-space assembly code"
+	@cd kernel/comps/framevm/src && \
+		gcc -nostdlib -static -o vsock_echo_server vsock_echo_server.S && \
+		gcc -nostdlib -static -o vsock_client vsock_client.S
 	@make clean 
 	@make kernel
 	@make fv_init_ramfs

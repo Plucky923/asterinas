@@ -94,11 +94,11 @@ impl Connected {
         }
     }
 
-    pub fn peer_addr(&self) -> FrameVsockAddr {
+    pub fn peer_addr(&self) -> aster_framevsock::FrameVsockAddr {
         self.id.peer_addr
     }
 
-    pub fn local_addr(&self) -> FrameVsockAddr {
+    pub fn local_addr(&self) -> aster_framevsock::FrameVsockAddr {
         self.id.local_addr
     }
 

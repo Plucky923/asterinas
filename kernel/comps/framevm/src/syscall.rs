@@ -39,6 +39,7 @@ pub const SYS_WRITE: usize = 1;
 pub const SYS_CLOSE: usize = 3;
 pub const SYS_SOCKET: usize = 41;
 pub const SYS_ACCEPT: usize = 43;
+pub const SYS_CONNECT: usize = 42;
 pub const SYS_SENDTO: usize = 44;
 pub const SYS_RECVFROM: usize = 45;
 pub const SYS_BIND: usize = 49;
@@ -55,6 +56,7 @@ pub fn handle_syscall(user_context: &mut UserContext, vm_space: &VmSpace) -> boo
         SYS_WRITE => sys_write(user_context, vm_space),
         SYS_CLOSE => sys_close(user_context),
         SYS_SOCKET => sys_socket(user_context),
+        SYS_CONNECT => sys_connect(user_context, vm_space),
         SYS_ACCEPT => sys_accept(user_context),
         SYS_SENDTO => sys_sendto(user_context, vm_space),
         SYS_RECVFROM => sys_recvfrom(user_context, vm_space),
@@ -191,14 +193,26 @@ fn sys_accept(ctx: &mut UserContext) -> Result<isize> {
     let fd = ctx.rdi() as i32;
     // addr and addrlen ignored for simplicity
 
-    println!("[FrameVM] accept(fd={})", fd);
-
     let socket = vsock::get_socket(fd)?;
     let conn = socket.accept()?;
     let new_fd = vsock::alloc_fd(conn);
 
     println!("[FrameVM] accept() -> fd={}", new_fd);
     Ok(new_fd as isize)
+}
+
+fn sys_connect(ctx: &mut UserContext, vm_space: &VmSpace) -> Result<isize> {
+    let fd = ctx.rdi() as i32;
+    let addr_ptr = ctx.rsi();
+    let addr_len = ctx.rdx();
+
+    let addr = read_sockaddr(vm_space, addr_ptr, addr_len)?;
+    let socket = vsock::get_socket(fd)?;
+
+    println!("[FrameVM] connect(fd={}, addr={:?})", fd, addr);
+    socket.connect(addr)?;
+
+    Ok(0)
 }
 
 /// sys_sendto - Send data to socket

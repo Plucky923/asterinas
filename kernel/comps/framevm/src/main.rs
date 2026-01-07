@@ -80,7 +80,14 @@ pub fn main() {
 }
 
 fn load_program_binary() -> Vec<u8> {
+    // Select which program to run:
+    // - vsock_echo_server: Acts as a Server (Host -> Guest)
+    // - vsock_client: Acts as a Client (Guest -> Host)
+    
+    // Uncomment the one you want to run:
     let program_data = include_bytes!("vsock_echo_server");
+    // let program_data = include_bytes!("vsock_client");
+
     // Copy to heap-allocated Vec to ensure basic alignment and mutability if needed
     let mut program_binary_vec = vec![0u8; program_data.len()];
     program_binary_vec.copy_from_slice(program_data);

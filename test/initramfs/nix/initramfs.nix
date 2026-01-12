@@ -1,5 +1,5 @@
 { lib, pkgs, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox
-, benchmark, conformance, regression, dnsServer
+, benchmark, conformance, regression, nestedQemu, dnsServer
 , framevmObjPath ? ""
 , framevmInstallPath ? "/framevm/framevm.o" }:
 let
@@ -28,6 +28,7 @@ let
     ++ lib.optionals (benchmark != null) [ benchmark.package ]
     ++ lib.optionals (conformance != null) [ conformance.package ]
     ++ lib.optionals (regression != null) [ regression.package ]
+    ++ lib.optionals (nestedQemu != null) [ nestedQemu ]
     ++ lib.optionals is_evtest_included [ pkgs.evtest ];
 in stdenvNoCC.mkDerivation {
   name = "initramfs";
@@ -72,6 +73,10 @@ in stdenvNoCC.mkDerivation {
       cp -L ${gvisor_libs}/libgcc_s.so.1 $out/lib/x86_64-linux-gnu/libgcc_s.so.1
       cp -L ${gvisor_libs}/libc.so.6 $out/lib/x86_64-linux-gnu/libc.so.6
       cp -L ${gvisor_libs}/libm.so.6 $out/lib/x86_64-linux-gnu/libm.so.6
+    ''}
+
+    ${lib.optionalString (nestedQemu != null) ''
+      cp ${nestedQemu}/bin/qemu-system-x86_64 $out/usr/bin/qemu-system-x86_64
     ''}
 
     ${lib.optionalString (framevmObj != null) ''

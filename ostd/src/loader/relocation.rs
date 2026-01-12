@@ -1,18 +1,18 @@
-use alloc::{string::ToString, vec::Vec};
+use alloc::{format, string::ToString, vec::Vec};
 
 use rustc_demangle::demangle;
 use xmas_elf::{
-    ElfFile,
-    sections::{Rela, SHF_ALLOC, SHN_UNDEF, SectionData, ShType},
+    sections::{Rela, SectionData, ShType, SHF_ALLOC, SHN_UNDEF},
     symbol_table::{Entry, Entry64},
+    ElfFile,
 };
 
-use super::{parser::SectionsMetadata, symbol::get_symbol_table};
-use crate::{Result, early_println, mm::io::VmWriter, symbols::symbol_addr_by_name};
+use super::{invalid_args, parser::SectionsMetadata, symbol::get_symbol_table};
+use crate::{early_println, mm::io::VmWriter, symbols::symbol_addr_by_name, Result};
 
 pub fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadata) -> Result<()> {
     let symbol_table = get_symbol_table(elf_file)?;
-    early_println!("[Loader] Starting relocation...");
+    log::info!("[Loader] Starting relocation...");
 
     let mut total_relocations = 0;
 
@@ -40,7 +40,7 @@ pub fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadat
 
         let name = target_section
             .get_name(elf_file)
-            .map_err(|_| crate::Error::InvalidArgs)?;
+            .map_err(|_| invalid_args("failed to read relocation target section name"))?;
 
         match reloc_section.get_data(elf_file) {
             Ok(SectionData::Rela64(rela)) => {
@@ -51,7 +51,7 @@ pub fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadat
                     &sections_metadata,
                     symbol_table,
                 )?;
-                early_println!(
+                log::info!(
                     "[Loader] Applied {} RELA relocations to section '{}'",
                     rela.len(),
                     name
@@ -71,7 +71,7 @@ pub fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadat
             }
         }
     }
-    early_println!(
+    log::info!(
         "[Loader] Relocation completed. Total applied: {}",
         total_relocations
     );
@@ -142,7 +142,10 @@ fn get_target_section_base(
                     );
                 }
             }
-            crate::Error::InvalidArgs
+            invalid_args(format!(
+                "target section index {} not found in loaded section map",
+                target_section_index
+            ))
         })
 }
 
@@ -163,9 +166,12 @@ fn process_relocation_entry(
     let loc = target_section_base + offset as usize;
 
     // 获取符号
-    let symbol = symbol_table
-        .get(symbol_idx)
-        .ok_or(crate::Error::InvalidArgs)?;
+    let symbol = symbol_table.get(symbol_idx).ok_or_else(|| {
+        invalid_args(format!(
+            "invalid symbol table index {} in relocation",
+            symbol_idx
+        ))
+    })?;
 
     let symbol_name = symbol.get_name(elf_file).unwrap_or("");
 
@@ -185,7 +191,10 @@ fn process_relocation_entry(
             let val_u32 = val as u32;
             if val != val_u32 as u64 {
                 log_overflow(reloc_type, val);
-                return Err(crate::Error::InvalidArgs);
+                return Err(invalid_args(format!(
+                    "32-bit signed relocation overflow for type {} with value 0x{:x}",
+                    reloc_type, val
+                )));
             }
             write_val(loc, val, 4)
         }
@@ -194,7 +203,10 @@ fn process_relocation_entry(
             let val_i32 = val as i32;
             if val as i64 != val_i32 as i64 {
                 log_overflow(reloc_type, val);
-                return Err(crate::Error::InvalidArgs);
+                return Err(invalid_args(format!(
+                    "32-bit relocation overflow for type {} with value 0x{:x}",
+                    reloc_type, val
+                )));
             }
             write_val(loc, val, 4)
         }
@@ -208,7 +220,10 @@ fn process_relocation_entry(
                 reloc_type,
                 symbol_name
             );
-            Err(crate::Error::InvalidArgs)
+            Err(invalid_args(format!(
+                "unsupported relocation type {} for symbol `{}`",
+                reloc_type, symbol_name
+            )))
         }
     }
 }
@@ -231,7 +246,10 @@ fn resolve_symbol_address(
                     demangled,
                     reloc_type
                 );
-                Err(crate::Error::InvalidArgs)
+                Err(invalid_args(format!(
+                    "cannot resolve undefined symbol `{}` (demangled: `{}`) for relocation type {}",
+                    symbol_name, demangled, reloc_type
+                )))
             }
         }
     } else if let Some(section) = sections_metadata.loaded_sections.get(&(shndx as usize)) {
@@ -263,7 +281,13 @@ fn handle_pc_relative(
                 loc,
                 symbol_addr
             );
-            return Err(crate::Error::InvalidArgs);
+            return Err(invalid_args(format!(
+                "PC-relative relocation type {} out of range: rel=0x{:x}, loc=0x{:x}, symbol=0x{:x}",
+                reloc_type,
+                rel_val,
+                loc,
+                symbol_addr
+            )));
         }
     }
 
@@ -276,16 +300,27 @@ fn write_val(loc: usize, val: u64, size: usize) -> Result<()> {
         match size {
             4 => {
                 let val_u32 = val as u32;
-                writer
-                    .write_val(&val_u32)
-                    .map_err(|_| crate::Error::InvalidArgs)?;
+                writer.write_val(&val_u32).map_err(|_| {
+                    invalid_args(format!(
+                        "failed to write {}-byte relocation at 0x{:x}",
+                        size, loc
+                    ))
+                })?;
             }
             8 => {
-                writer
-                    .write_val(&val)
-                    .map_err(|_| crate::Error::InvalidArgs)?;
+                writer.write_val(&val).map_err(|_| {
+                    invalid_args(format!(
+                        "failed to write {}-byte relocation at 0x{:x}",
+                        size, loc
+                    ))
+                })?;
             }
-            _ => return Err(crate::Error::InvalidArgs),
+            _ => {
+                return Err(invalid_args(format!(
+                    "unsupported relocation write size {} at 0x{:x}",
+                    size, loc
+                )))
+            }
         }
     }
     Ok(())

@@ -2,8 +2,12 @@
 , enableRegressionTest ? false, conformanceTestSuite ? "ltp"
 , conformanceTestWorkDir ? "/tmp", regressionTestPlatform ? "asterinas"
 , dnsServer ? "none", smp ? 1, initramfsCompressed ? true
+, enableNestedQemu ? false
 , framevmObjPath ? ""
-, framevmInstallPath ? "/framevm/framevm.o" }:
+, framevmInstallPath ? "/framevm/framevm.o"
+, memCompareWorksetBytes ? "536870912", memCompareRuns ? "5"
+, memCompareSeed ? "12345", memCompareDoStore ? "0", memPageRandRuns ? "5"
+, memPageRandSeed ? "12345", memPageRandDoStore ? "0" }:
 let
   crossSystem.config = if target == "x86_64" then
     "x86_64-unknown-linux-gnu"
@@ -12,13 +16,21 @@ let
   else
     throw "Target arch ${target} not yet supported.";
 
-  # Pinned nixpkgs (nix version: 2.29.1, channel: nixos-25.05, release date: 2025-07-01)
-  nixpkgs = fetchTarball {
-    url =
-      "https://github.com/NixOS/nixpkgs/archive/c0bebd16e69e631ac6e52d6eb439daba28ac50cd.tar.gz";
-    sha256 = "1fbhkqm8cnsxszw4d4g0402vwsi75yazxkpfx3rdvln4n6s68saf";
-  };
-  pkgs = import nixpkgs {
+  # Prefer the preinstalled nixpkgs channel inside the dev container to avoid
+  # unnecessary network fetches during normal builds. Fall back to the pinned
+  # tarball when no local channel is available.
+  nixpkgsPath = if builtins.pathExists
+  /nix/var/nix/profiles/per-user/root/channels/nixpkgs then
+    /nix/var/nix/profiles/per-user/root/channels/nixpkgs
+  else if builtins.getEnv "NIX_PATH" != "" then
+    <nixpkgs>
+  else
+    fetchTarball {
+      url =
+        "https://github.com/NixOS/nixpkgs/archive/c0bebd16e69e631ac6e52d6eb439daba28ac50cd.tar.gz";
+      sha256 = "1fbhkqm8cnsxszw4d4g0402vwsi75yazxkpfx3rdvln4n6s68saf";
+    };
+  pkgs = import nixpkgsPath {
     config = { };
     overlays = [ ];
     inherit crossSystem;
@@ -34,12 +46,15 @@ in rec {
   };
   regression =
     pkgs.callPackage ./regression { testPlatform = regressionTestPlatform; };
+  nestedQemu =
+    if enableNestedQemu && target == "x86_64" then pkgs.qemu else null;
 
   initramfs = pkgs.callPackage ./initramfs.nix {
     inherit busybox;
     benchmark = if enableBenchmarkTest then benchmark else null;
     conformance = if enableConformanceTest then conformance else null;
     regression = if enableRegressionTest then regression else null;
+    nestedQemu = nestedQemu;
     dnsServer = dnsServer;
     framevmObjPath = framevmObjPath;
     framevmInstallPath = framevmInstallPath;

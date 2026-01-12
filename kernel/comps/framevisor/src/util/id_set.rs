@@ -1,3 +1,5 @@
+//! Thin wrapper around OSTD ID-set utilities.
+
 use core::fmt::Debug;
 
 use ostd::util::id_set::{Id as OstdId, IdSet as OstdIdSet};

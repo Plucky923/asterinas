@@ -13,12 +13,19 @@
 //! - No actual hardware interrupt allocation is needed
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::ops::Deref;
+use core::{
+    ops::Deref,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use ostd::arch::trap::TrapFrame;
-use spin::RwLock;
+use spin::{Once, RwLock};
 
-use crate::prelude::*;
+use crate::{
+    iht,
+    prelude::*,
+    vm::{self, VmId},
+};
 
 /// FrameVsock dedicated virtual IRQ number
 pub const FRAMEVSOCK_IRQ_NUM: u8 = 0x80;
@@ -205,13 +212,144 @@ pub fn make_synthetic_trapframe(irq_num: u8) -> TrapFrame {
     }
 }
 
-/// Injects a FrameVsock RX ready interrupt.
-pub fn inject_vsock_rx_interrupt() {
-    let trap_frame = make_synthetic_trapframe(FRAMEVSOCK_IRQ_NUM);
-    inject_irq(FRAMEVSOCK_IRQ_NUM, &trap_frame);
+/// Per-vCPU vsock IRQ dedup flag.
+///
+/// When set, a vsock IRQ callback is already pending in the IHT's irq_log.
+/// Subsequent injections skip the push to avoid duplicate callbacks that
+/// contend on the IHT SpinLock without doing useful work.
+/// Cleared by the callback itself after execution.
+const MAX_VCPUS: usize = 16;
+static VSOCK_IRQ_PENDING: [AtomicBool; MAX_VCPUS] = [const { AtomicBool::new(false) }; MAX_VCPUS];
+
+/// Debug counters for vsock IRQ injection path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VsockIrqDebugStats {
+    pub inject_attempts: u64,
+    pub dedup_skips: u64,
+    pub enqueue_success: u64,
+    pub enqueue_fail_no_vm: u64,
+    pub enqueue_fail_no_ctx: u64,
+    pub callback_runs: u64,
+    pub callback_vcpu_unknown: u64,
 }
 
-/// Initialize the IRQ subsystem
+static VSOCK_IRQ_INJECT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static VSOCK_IRQ_DEDUP_SKIPS: AtomicU64 = AtomicU64::new(0);
+static VSOCK_IRQ_ENQUEUE_SUCCESS: AtomicU64 = AtomicU64::new(0);
+static VSOCK_IRQ_ENQUEUE_FAIL_NO_VM: AtomicU64 = AtomicU64::new(0);
+static VSOCK_IRQ_ENQUEUE_FAIL_NO_CTX: AtomicU64 = AtomicU64::new(0);
+static VSOCK_IRQ_CALLBACK_RUNS: AtomicU64 = AtomicU64::new(0);
+static VSOCK_IRQ_CALLBACK_VCPU_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot vsock IRQ debug counters.
+pub fn vsock_irq_debug_stats() -> VsockIrqDebugStats {
+    VsockIrqDebugStats {
+        inject_attempts: VSOCK_IRQ_INJECT_ATTEMPTS.load(Ordering::Relaxed),
+        dedup_skips: VSOCK_IRQ_DEDUP_SKIPS.load(Ordering::Relaxed),
+        enqueue_success: VSOCK_IRQ_ENQUEUE_SUCCESS.load(Ordering::Relaxed),
+        enqueue_fail_no_vm: VSOCK_IRQ_ENQUEUE_FAIL_NO_VM.load(Ordering::Relaxed),
+        enqueue_fail_no_ctx: VSOCK_IRQ_ENQUEUE_FAIL_NO_CTX.load(Ordering::Relaxed),
+        callback_runs: VSOCK_IRQ_CALLBACK_RUNS.load(Ordering::Relaxed),
+        callback_vcpu_unknown: VSOCK_IRQ_CALLBACK_VCPU_UNKNOWN.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset vsock IRQ debug counters.
+pub fn reset_vsock_irq_debug_stats() {
+    VSOCK_IRQ_INJECT_ATTEMPTS.store(0, Ordering::Relaxed);
+    VSOCK_IRQ_DEDUP_SKIPS.store(0, Ordering::Relaxed);
+    VSOCK_IRQ_ENQUEUE_SUCCESS.store(0, Ordering::Relaxed);
+    VSOCK_IRQ_ENQUEUE_FAIL_NO_VM.store(0, Ordering::Relaxed);
+    VSOCK_IRQ_ENQUEUE_FAIL_NO_CTX.store(0, Ordering::Relaxed);
+    VSOCK_IRQ_CALLBACK_RUNS.store(0, Ordering::Relaxed);
+    VSOCK_IRQ_CALLBACK_VCPU_UNKNOWN.store(0, Ordering::Relaxed);
+}
+
+/// Injects a FrameVsock RX ready interrupt for a specific VM.
+#[ostd::ensure_stack(4096)]
+pub fn inject_vsock_rx_interrupt_for_vm(vm_id: VmId, vcpu_id: usize) {
+    VSOCK_IRQ_INJECT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+
+    // Dedup: skip if a callback is already pending for this vCPU
+    if vcpu_id < MAX_VCPUS && VSOCK_IRQ_PENDING[vcpu_id].swap(true, Ordering::AcqRel) {
+        VSOCK_IRQ_DEDUP_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    let vm = match vm::get_vm_by_id(vm_id) {
+        Some(v) => v,
+        None => {
+            if vcpu_id < MAX_VCPUS {
+                VSOCK_IRQ_PENDING[vcpu_id].store(false, Ordering::Release);
+            }
+            VSOCK_IRQ_ENQUEUE_FAIL_NO_VM.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    if let Some(ctx) = vm.iht_context(vcpu_id) {
+        iht::log_irq_fn_to_context(&ctx, vsock_rx_irq_callback);
+        VSOCK_IRQ_ENQUEUE_SUCCESS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // Important: clear pending flag on enqueue failure path,
+        // otherwise this vCPU can get permanently "dedup blocked".
+        if vcpu_id < MAX_VCPUS {
+            VSOCK_IRQ_PENDING[vcpu_id].store(false, Ordering::Release);
+        }
+        VSOCK_IRQ_ENQUEUE_FAIL_NO_CTX.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Injects a FrameVsock RX ready interrupt (backward compatible, uses first VM).
+#[ostd::ensure_stack(4096)]
+pub fn inject_vsock_rx_interrupt(vcpu_id: usize) {
+    VSOCK_IRQ_INJECT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+
+    // Dedup: skip if a callback is already pending for this vCPU
+    if vcpu_id < MAX_VCPUS && VSOCK_IRQ_PENDING[vcpu_id].swap(true, Ordering::AcqRel) {
+        VSOCK_IRQ_DEDUP_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    // Schedule the interrupt handler on the IHT for the given vCPU.
+    // If no VM/context exists, clear dedup flag to avoid permanent blockage.
+    let Some(vm) = vm::get_vm() else {
+        if vcpu_id < MAX_VCPUS {
+            VSOCK_IRQ_PENDING[vcpu_id].store(false, Ordering::Release);
+        }
+        VSOCK_IRQ_ENQUEUE_FAIL_NO_VM.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+
+    let Some(ctx) = vm.iht_context(vcpu_id) else {
+        if vcpu_id < MAX_VCPUS {
+            VSOCK_IRQ_PENDING[vcpu_id].store(false, Ordering::Release);
+        }
+        VSOCK_IRQ_ENQUEUE_FAIL_NO_CTX.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+
+    iht::log_irq_fn_to_context(&ctx, vsock_rx_irq_callback);
+    VSOCK_IRQ_ENQUEUE_SUCCESS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn vsock_rx_irq_callback() {
+    VSOCK_IRQ_CALLBACK_RUNS.fetch_add(1, Ordering::Relaxed);
+    let trap_frame = make_synthetic_trapframe(FRAMEVSOCK_IRQ_NUM);
+    inject_irq(FRAMEVSOCK_IRQ_NUM, &trap_frame);
+    // Clear dedup flag AFTER drain completes so packets arriving during
+    // drain don't get lost — they will trigger a new callback after this one.
+    if let Some(vcpu_id) = iht::current_vcpu_id() {
+        if vcpu_id < MAX_VCPUS {
+            VSOCK_IRQ_PENDING[vcpu_id].store(false, Ordering::Release);
+        }
+    } else {
+        VSOCK_IRQ_CALLBACK_VCPU_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Initialize the IRQ subsystem.
 pub fn init() {
-    ostd::early_println!("[framevisor] IRQ subsystem initialized");
+    // Virtual IRQ table is statically initialized, no runtime setup needed.
 }

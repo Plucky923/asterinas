@@ -1,28 +1,30 @@
-use alloc::string::ToString;
+use alloc::{format, string::ToString};
 
 use rustc_demangle::demangle;
 use xmas_elf::{
-    ElfFile,
-    sections::{SHN_UNDEF, SectionData, ShType},
+    sections::{SectionData, ShType, SHN_UNDEF},
     symbol_table::{Entry, Entry64},
+    ElfFile,
 };
 
-use super::parser::SectionsMetadata;
-use crate::{Result, symbols::symbol_addr_by_name};
+use super::{invalid_args, parser::SectionsMetadata};
+use crate::{symbols::symbol_addr_by_name, Result};
 
 pub fn get_symbol_table<'a>(elf_file: &'a ElfFile) -> Result<&'a [Entry64]> {
     let symtab_data = elf_file
         .section_iter()
         .find(|sec| sec.get_type() == Ok(ShType::SymTab))
-        .ok_or(crate::Error::InvalidArgs)
+        .ok_or_else(|| invalid_args("missing `.symtab` in FrameVM object"))
         .and_then(|sec| {
             sec.get_data(&elf_file)
-                .map_err(|_| crate::Error::InvalidArgs)
+                .map_err(|_| invalid_args("failed to read `.symtab` from FrameVM object"))
         });
 
     match symtab_data {
         Ok(SectionData::SymbolTable64(symtab)) => Ok(symtab),
-        _ => Err(crate::Error::InvalidArgs),
+        _ => Err(invalid_args(
+            "unsupported symbol table format in FrameVM object",
+        )),
     }
 }
 
@@ -44,7 +46,9 @@ pub fn find_entry_point(
                 if let Some(addr) = symbol_addr_by_name(name) {
                     return Ok(Some(addr));
                 }
-                continue;
+                return Err(invalid_args(format!(
+                    "entry symbol `__framevm_main` is undefined and cannot be resolved"
+                )));
             }
 
             if let Some(loaded_section) = sections_metadata

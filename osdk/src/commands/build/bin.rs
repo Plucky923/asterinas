@@ -194,7 +194,6 @@ fn install_setup_with_arch(
     // into a deadlock reading the workspace files.
     cmd.arg("--target-dir").arg(target_dir.as_os_str());
 
-
     let status = cmd.status().unwrap();
     if !status.success() {
         panic!(

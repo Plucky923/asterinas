@@ -1,1 +1,19 @@
 [build]
+
+[registries.crates-io]
+protocol = "sparse"
+
+[source.crates-io]
+replace-with = "rsproxy"
+
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+retry = 20
+git-fetch-with-cli = true
+
+[http]
+timeout = 600
+multiplexing = false
+low-speed-limit = 1

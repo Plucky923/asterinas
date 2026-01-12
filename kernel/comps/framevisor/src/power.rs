@@ -1,1 +1,3 @@
-pub use ostd::power::{poweroff, ExitCode};
+//! Power-management re-exports used by FrameVisor callers.
+
+pub use ostd::power::{ExitCode, poweroff};

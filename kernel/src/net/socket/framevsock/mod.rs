@@ -34,15 +34,6 @@ pub static FRAME_VSOCK_GLOBAL: Once<Arc<FrameVsockSpace>> = Once::new();
 /// Data packet handler callback for Guest -> Host data packets
 /// Zero-copy: packet ownership is transferred to the connected socket
 fn handle_guest_data_packet(packet: RRef<DataPacket>) {
-    info!(
-        "[FrameVsock] Received data packet from FrameVM: src={}:{}, dst={}:{}, len={}",
-        packet.header.src_cid,
-        packet.header.src_port,
-        packet.header.dst_cid,
-        packet.header.dst_port,
-        packet.data.len()
-    );
-
     // Dispatch packet to FrameVsockSpace (zero-copy: ownership transfer)
     if let Some(space) = FRAME_VSOCK_GLOBAL.get() {
         let _ = space.on_data_packet_received(packet);
@@ -51,18 +42,18 @@ fn handle_guest_data_packet(packet: RRef<DataPacket>) {
 
 /// Control packet handler callback for Guest -> Host control packets
 fn handle_guest_control_packet(packet: RRef<ControlPacket>) {
-    info!(
-        "[FrameVsock] Received control packet from FrameVM: op={:?}, src={}:{}, dst={}:{}",
-        packet.operation(),
-        packet.header.src_cid,
-        packet.header.src_port,
-        packet.header.dst_cid,
-        packet.header.dst_port
-    );
-
     // Dispatch packet to FrameVsockSpace
     if let Some(space) = FRAME_VSOCK_GLOBAL.get() {
         let _ = space.on_control_packet_received(packet);
+    }
+}
+
+/// Host->Guest TX queue drain callback.
+///
+/// Called by FrameVisor when Guest pops a data packet from backend queue.
+fn handle_host_queue_drain(vcpu_id: usize, queue_reserved_len_before_pop: usize) {
+    if let Some(space) = FRAME_VSOCK_GLOBAL.get() {
+        space.notify_tx_queue_drained(vcpu_id, queue_reserved_len_before_pop);
     }
 }
 
@@ -72,15 +63,13 @@ fn handle_guest_control_packet(packet: RRef<ControlPacket>) {
 pub(in crate::net) fn init() {
     info!("[FrameVsock] Initializing FrameVsock subsystem...");
 
-    // Initialize FrameVisor vsock backend
-    framevisor_vsock::init();
-
     // Initialize global space
     FRAME_VSOCK_GLOBAL.call_once(|| Arc::new(FrameVsockSpace::new()));
 
     // Register the packet handlers for Guest -> Host packets
-    framevisor_vsock::register_data_packet_handler(handle_guest_data_packet);
-    framevisor_vsock::register_control_packet_handler(handle_guest_control_packet);
+    framevisor_vsock::register_host_data_handler(handle_guest_data_packet);
+    framevisor_vsock::register_host_control_handler(handle_guest_control_packet);
+    framevisor_vsock::register_host_queue_drain_handler(handle_host_queue_drain);
 
     info!("[FrameVsock] FrameVsock subsystem initialized successfully");
 }

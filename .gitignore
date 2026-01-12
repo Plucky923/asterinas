@@ -40,3 +40,45 @@ cachix.list
 
 # temporary configuration file for NixOS tests
 distro/etc_nixos/_config_for_test.nix
+
+# tracked build artifacts that should stay local
+/bzImage
+
+# FrameVM guest test binaries
+/kernel/comps/framevm/test/bench_memory_ept_pf
+/kernel/comps/framevm/test/bench_memory_ept_walk
+/kernel/comps/framevm/test/bench_memory_rand_cold
+/kernel/comps/framevm/test/bench_memory_rand_warm
+/kernel/comps/framevm/test/bench_memory_seq_cold
+/kernel/comps/framevm/test/bench_memory_seq_warm
+/kernel/comps/framevm/test/bench_memory_page_*
+/kernel/comps/framevm/test/bench_memory_word_*
+/kernel/comps/framevm/test/guest_sender_*
+/kernel/comps/framevm/test/guest_receiver_*
+/kernel/comps/framevm/test/guest_rtt_client
+/kernel/comps/framevm/test/guest_rtt_server
+/kernel/comps/framevm/test/guest_fork_receiver
+/kernel/comps/framevm/test/guest_fork_receiver_*
+/kernel/comps/framevm/test/guest_fork_test
+
+# initramfs app binaries accidentally built in source directories
+/test/initramfs/src/apps/framevsock/host_multi_sender
+/test/initramfs/src/apps/framevsock/host_receiver
+/test/initramfs/src/apps/framevsock/host_rtt_client
+/test/initramfs/src/apps/framevsock/host_rtt_server
+/test/initramfs/src/apps/framevsock/host_sender
+/test/initramfs/src/apps/network/vsock/vsock_client
+/test/initramfs/src/apps/network/vsock/vsock_fork_receiver
+/test/initramfs/src/apps/network/vsock/vsock_multi_sender
+/test/initramfs/src/apps/network/vsock/vsock_receiver
+/test/initramfs/src/apps/network/vsock/vsock_rtt_client
+/test/initramfs/src/apps/network/vsock/vsock_rtt_seq_client
+/test/initramfs/src/apps/network/vsock/vsock_rtt_seq_server
+/test/initramfs/src/apps/network/vsock/vsock_rtt_server
+/test/initramfs/src/apps/network/vsock/vsock_sender
+/test/initramfs/src/apps/network/vsock/vsock_server
+/test/initramfs/src/apps/vm/bench_vmexit_precise
+/test/initramfs/src/apps/vm/mini_hypervisor
+
+# Python bytecode
+/tools/vsock_quant/analysis/__pycache__/

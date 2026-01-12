@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Initial host-side state for a newly created FrameVsock stream socket.
+
 use crate::{
     events::IoEvents,
     net::socket::framevsock::{
@@ -27,7 +29,9 @@ impl Init {
         if self.bound_addr.lock().is_some() {
             return_errno_with_message!(Errno::EINVAL, "the socket is already bound");
         }
-        let vsockspace = FRAME_VSOCK_GLOBAL.get().unwrap();
+        let vsockspace = FRAME_VSOCK_GLOBAL
+            .get()
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "FrameVsock is not initialized"))?;
 
         // Host side uses CID 2 (VMADDR_CID_HOST)
         // Guest (FrameVM) uses CID 3 (VMADDR_CID_GUEST)

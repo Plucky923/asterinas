@@ -1,7 +1,10 @@
-use ostd::early_println;
+// SPDX-License-Identifier: MPL-2.0
+
+//! Error types for FrameVisor operations.
 
 use crate::mm::page_table::PageTableError;
 
+/// Error types for FrameVisor operations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
     /// Invalid arguments provided.
@@ -40,27 +43,7 @@ impl From<ostd::Error> for Error {
     }
 }
 
+/// Initialize error module (no-op, kept for API compatibility).
 pub fn init_error() {
-    let result = Error::InvalidArgs;
-    match result {
-        Error::InvalidArgs => early_println!("[framevisor] Invalid arguments provided"),
-        Error::NoMemory => early_println!("[framevisor] Insufficient memory available"),
-        Error::PageFault => early_println!("[framevisor] Page fault occurred"),
-        Error::AccessDenied => early_println!("[framevisor] Access to a resource is denied"),
-        Error::IoError => early_println!("[framevisor] Input/output error"),
-        Error::NotEnoughResources => early_println!("[framevisor] Insufficient system resources"),
-        Error::Overflow => early_println!("[framevisor] Arithmetic Overflow occurred"),
-    }
-    let result = PageTableError::UnalignedVaddr;
-    let error = Error::from(result);
-    match error {
-        Error::InvalidArgs => early_println!("[framevisor] Invalid arguments provided"),
-        Error::NoMemory => early_println!("[framevisor] Insufficient memory available"),
-        Error::PageFault => early_println!("[framevisor] Page fault occurred"),
-        Error::AccessDenied => early_println!("[framevisor] Access to a resource is denied"),
-        Error::IoError => early_println!("[framevisor] Input/output error"),
-        Error::NotEnoughResources => early_println!("[framevisor] Insufficient system resources"),
-        Error::Overflow => early_println!("[framevisor] Arithmetic Overflow occurred"),
-    }
-    early_println!("[framevisor] Initializing error...");
+    // Error types are statically defined, no runtime initialization needed.
 }

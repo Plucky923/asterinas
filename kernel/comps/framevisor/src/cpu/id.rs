@@ -1,3 +1,5 @@
+//! CPU identifier and CPU-set wrappers used by FrameVisor.
+
 use ostd::{
     cpu::{CpuId as OstdCpuId, CpuSet as OstdCpuSet},
     early_println,

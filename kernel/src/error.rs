@@ -204,6 +204,20 @@ impl From<ostd::Error> for Error {
     }
 }
 
+impl From<aster_framevisor::Error> for Error {
+    fn from(framevisor_error: aster_framevisor::Error) -> Self {
+        match framevisor_error {
+            aster_framevisor::Error::InvalidArgs => Error::new(Errno::EINVAL),
+            aster_framevisor::Error::NoMemory => Error::new(Errno::ENOMEM),
+            aster_framevisor::Error::PageFault => Error::new(Errno::EFAULT),
+            aster_framevisor::Error::AccessDenied => Error::new(Errno::EPERM),
+            aster_framevisor::Error::IoError => Error::new(Errno::EIO),
+            aster_framevisor::Error::NotEnoughResources => Error::new(Errno::EBUSY),
+            aster_framevisor::Error::Overflow => Error::new(Errno::EINVAL),
+        }
+    }
+}
+
 impl From<(ostd::Error, usize)> for Error {
     // Used in fallible memory read/write API
     fn from(ostd_error: (ostd::Error, usize)) -> Self {

@@ -1,14 +1,16 @@
 [package]
 name = "aster-framevisor"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-ostd = { path = "../../../ostd" }
-component = { path = "../../libs/comp-sys/component" }
-aster-framevisor-macros = { path = "macros" }
-aster-framevisor-exchangeable = { path = "exchangeable" }
-aster-framevsock = { path = "../framevsock" }
-spin = "0.9"
+ostd = { workspace = true }
+component = { workspace = true }
+aster-framevisor-macros = { workspace = true }
+aster-framevisor-exchangeable = { workspace = true }
+aster-framevsock = { workspace = true }
+log = { workspace = true }
+spin = { workspace = true }
+hashbrown = { workspace = true }
 [lints]
 workspace = true

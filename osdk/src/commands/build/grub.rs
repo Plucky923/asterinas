@@ -43,11 +43,7 @@ pub fn create_bootdev_image(
 
     // Copy the initramfs to the boot directory.
     if let Some(init_path) = initramfs_path {
-        hard_link_or_copy(
-            init_path,
-            iso_root.join("boot").join("initramfs.cpio.gz"),
-        )
-        .unwrap();
+        hard_link_or_copy(init_path, iso_root.join("boot").join("initramfs.cpio.gz")).unwrap();
     }
 
     let binary_in_image = if let Some(binary_path) = binary_path {
@@ -154,12 +150,9 @@ fn generate_grub_cfg(
             };
 
             grub_cfg
-            .replace("#GRUB_CMD_KERNEL#", "multiboot")
-            .replace("#KERNEL#", &aster_bin_path_on_device)
-            .replace(
-                "#GRUB_CMD_INITRAMFS#",
-                &initramfs_cmd,
-            )
+                .replace("#GRUB_CMD_KERNEL#", "multiboot")
+                .replace("#KERNEL#", &aster_bin_path_on_device)
+                .replace("#GRUB_CMD_INITRAMFS#", &initramfs_cmd)
         }
         BootProtocol::Multiboot2 => {
             let initramfs_cmd = if let Some(p) = &initramfs_path {
@@ -174,13 +167,10 @@ fn generate_grub_cfg(
             };
 
             grub_cfg
-            .replace("#GRUB_CMD_KERNEL#", "multiboot2")
-            .replace("#KERNEL#", &aster_bin_path_on_device)
-            .replace(
-                "#GRUB_CMD_INITRAMFS#",
-                &initramfs_cmd,
-            )
-            .replace("#GRUB_CMD_BINARY#", &binary_cmd)
+                .replace("#GRUB_CMD_KERNEL#", "multiboot2")
+                .replace("#KERNEL#", &aster_bin_path_on_device)
+                .replace("#GRUB_CMD_INITRAMFS#", &initramfs_cmd)
+                .replace("#GRUB_CMD_BINARY#", &binary_cmd)
         }
         BootProtocol::Linux => grub_cfg
             .replace("#GRUB_CMD_KERNEL#", "linux")

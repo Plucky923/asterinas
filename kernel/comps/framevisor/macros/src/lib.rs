@@ -10,9 +10,10 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let main_fn_name = &main_fn.sig.ident;
 
     quote!(
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         extern "Rust" fn __framevm_main() -> () {
             let _: () = #main_fn_name();
+            aster_framevisor::task::clear_user_page_fault_handler();
             aster_framevisor::task::clear_post_schedule_handler();
             aster_framevisor::task::Task::yield_now();
         }

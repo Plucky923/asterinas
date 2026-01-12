@@ -2,9 +2,7 @@
 
 //! FrameVsock address definitions
 
-pub use aster_framevsock::{
-    FrameVsockAddr, VMADDR_CID_ANY, VMADDR_CID_GUEST, VMADDR_CID_HOST, VMADDR_PORT_ANY,
-};
+pub use aster_framevsock::{FrameVsockAddr, VMADDR_CID_ANY, VMADDR_PORT_ANY};
 
 /// AF_FRAMEVSOCK family
 pub const AF_FRAMEVSOCK: i32 = 46;

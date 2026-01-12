@@ -7,6 +7,7 @@ ENABLE_CONFORMANCE_TEST ?= false
 CONFORMANCE_TEST_SUITE ?= ltp
 CONFORMANCE_TEST_WORKDIR ?= /tmp
 ENABLE_REGRESSION_TEST ?= false
+ENABLE_NESTED_QEMU ?= false
 # Specify platform macros when building regression tests (supported: asterinas, linux).
 # - asterinas: Define both `__asterinas__` and `__linux__`. Tests may fail in Linux.
 # - linux: Define only `__linux__`. Tests may fail in Asterinas.
@@ -15,6 +16,13 @@ DNS_SERVER ?= none
 # FrameVM payload settings
 FRAMEVM_OBJ_PATH ?=
 FRAMEVM_INSTALL_PATH ?= /framevm/framevm.o
+MEM_COMPARE_WORKSET_BYTES ?= 536870912
+MEM_COMPARE_RUNS ?= 5
+MEM_COMPARE_SEED ?= 12345
+MEM_COMPARE_DO_STORE ?= 0
+MEM_PAGE_RAND_RUNS ?= 5
+MEM_PAGE_RAND_SEED ?= 12345
+MEM_PAGE_RAND_DO_STORE ?= 0
 # Set Nix's cached tarballs to be live for a longer period of time (30 days) to avoid network traffics.
 # Nix's default value is rather small (1 hour or 3600 seconds).
 NIXPKGS_CACHE_TTL := 2592000 # In seconds
@@ -63,12 +71,14 @@ framevm_initramfs: $(INITRAMFS_IMAGE)
 
 .PHONY: $(INITRAMFS_IMAGE)
 $(INITRAMFS_IMAGE): $(INITRAMFS)
+	@rm -rf $@
 	@nix-build \
 		--tarball-ttl $(NIXPKGS_CACHE_TTL) \
 		--argstr target $(OSDK_TARGET_ARCH) \
 		--arg enableBenchmarkTest $(ENABLE_BENCHMARK_TEST) \
 		--arg enableConformanceTest $(ENABLE_CONFORMANCE_TEST) \
 		--arg enableRegressionTest $(ENABLE_REGRESSION_TEST) \
+		--arg enableNestedQemu $(ENABLE_NESTED_QEMU) \
 		--argstr conformanceTestSuite $(CONFORMANCE_TEST_SUITE) \
 		--argstr conformanceTestWorkDir $(CONFORMANCE_TEST_WORKDIR) \
 		--argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \
@@ -81,12 +91,14 @@ $(INITRAMFS_IMAGE): $(INITRAMFS)
 
 .PHONY: $(INITRAMFS)
 $(INITRAMFS):
+	@rm -rf $@
 	@nix-build \
 		--tarball-ttl $(NIXPKGS_CACHE_TTL) \
 		--argstr target $(OSDK_TARGET_ARCH) \
 		--arg enableBenchmarkTest $(ENABLE_BENCHMARK_TEST) \
 		--arg enableConformanceTest $(ENABLE_CONFORMANCE_TEST) \
 		--arg enableRegressionTest $(ENABLE_REGRESSION_TEST) \
+		--arg enableNestedQemu $(ENABLE_NESTED_QEMU) \
 		--argstr conformanceTestSuite $(CONFORMANCE_TEST_SUITE) \
 		--argstr conformanceTestWorkDir $(CONFORMANCE_TEST_WORKDIR) \
 		--argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \

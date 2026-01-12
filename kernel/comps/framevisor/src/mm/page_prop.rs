@@ -1,3 +1,5 @@
+//! Page-property wrappers re-exported by FrameVisor.
+
 use ostd::mm::{
     CachePolicy as OstdCachePolicy, PageFlags as OstdPageFlags, PageProperty as OstdPageProperty,
 };

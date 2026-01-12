@@ -6,6 +6,9 @@ BUILD_DIR ?= $(CUR_DIR)/../../../../build
 OUTPUT_DIR ?= $(BUILD_DIR)/initramfs/test
 BIN_OUTPUT_DIR := $(OUTPUT_DIR)/intel_tdx/gen_quote
 TDX_ATTEST_DIR ?= $(CUR_DIR)
+ifeq ($(strip $(TDX_ATTEST_DIR)),)
+override TDX_ATTEST_DIR := $(CUR_DIR)
+endif
 TDX_SRCS := test_tdx_attest.c tdx_attest.c qgs_msg_lib.cpp
 CC ?= gcc
 # FIXME: Disable use-after-free warning as error due to potential false positive

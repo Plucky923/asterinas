@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(addr2line:*)",
+      "Bash(ls:*)",
+      "Bash(claude:*)"
+    ]
+  }
+}

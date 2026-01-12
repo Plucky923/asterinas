@@ -4,7 +4,7 @@
 
 use core::ops::Range;
 
-use self::allocator::kvirt_area_allocator;
+use self::allocator::{kvirt_area_allocator, module_kvirt_area_allocator};
 use super::{KERNEL_PAGE_TABLE, KernelPtConfig, MappedItem, MODULE_RANGE};
 use crate::{
     irq,
@@ -45,6 +45,12 @@ mod allocator {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KVirtAllocatorKind {
+    Vmalloc,
+    Module,
+}
+
 /// Kernel virtual area.
 ///
 /// A kernel virtual area manages a range of memory in [`VMALLOC_VADDR_RANGE`].
@@ -61,6 +67,7 @@ mod allocator {
 #[derive(Debug)]
 pub struct KVirtArea {
     range: Range<Vaddr>,
+    allocator_kind: KVirtAllocatorKind,
 }
 
 impl HasSize for KVirtArea {
@@ -79,8 +86,14 @@ impl Split for KVirtArea {
         let left_range = old.start()..old.start() + offset;
         let right_range = old.start() + offset..old.end();
         (
-            KVirtArea { range: left_range },
-            KVirtArea { range: right_range },
+            KVirtArea {
+                range: left_range,
+                allocator_kind: old.allocator_kind,
+            },
+            KVirtArea {
+                range: right_range,
+                allocator_kind: old.allocator_kind,
+            },
         )
     }
 }
@@ -151,7 +164,10 @@ impl KVirtArea {
             unsafe { cursor.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) };
         }
 
-        Self { range }
+        Self {
+            range,
+            allocator_kind: KVirtAllocatorKind::Vmalloc,
+        }
     }
 
     pub fn map_module_frames<T: AnyFrameMeta>(
@@ -165,10 +181,9 @@ impl KVirtArea {
 
         let irq_guard = irq::disable_local();
 
-        let range = allocator::module_kvirt_area_allocator(&irq_guard)
+        let range = module_kvirt_area_allocator(&irq_guard)
             .alloc(area_size)
             .unwrap();
-
 
         assert!(
             range.start >= MODULE_RANGE.start,
@@ -197,7 +212,10 @@ impl KVirtArea {
                 .expect("Failed to map frame in a new `KVirtArea`");
         }
 
-        Self { range }
+        Self {
+            range,
+            allocator_kind: KVirtAllocatorKind::Module,
+        }
     }
 
     /// Creates a kernel virtual area and maps untracked frames into it.
@@ -248,7 +266,10 @@ impl KVirtArea {
             }
         }
 
-        Self { range }
+        Self {
+            range,
+            allocator_kind: KVirtAllocatorKind::Vmalloc,
+        }
     }
 }
 
@@ -270,6 +291,9 @@ impl Drop for KVirtArea {
         }
 
         // 2. Free the virtual block.
-        kvirt_area_allocator(&irq_guard).free(range);
+        match self.allocator_kind {
+            KVirtAllocatorKind::Vmalloc => kvirt_area_allocator(&irq_guard).free(range),
+            KVirtAllocatorKind::Module => module_kvirt_area_allocator(&irq_guard).free(range),
+        }
     }
 }

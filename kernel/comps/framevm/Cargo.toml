@@ -1,19 +1,19 @@
 [package]
 name = "aster-framevm"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "framevm"
 path = "src/main.rs"
 
 [dependencies]
-# ostd = { path = "../../../ostd" }
-aster-framevisor = { path = "../framevisor" }
-aster-framevsock = { path = "../framevsock" }
-exchangeable = { package = "aster-framevisor-exchangeable", path = "../framevisor/exchangeable" }
-align_ext = { path = "../../../ostd/libs/align_ext" }
-spin = "0.9.4"
-xmas-elf = "0.10.0"
+ostd = { workspace = true }
+aster-framevisor = { workspace = true }
+aster-framevsock = { workspace = true }
+exchangeable = { workspace = true }
+align_ext = { workspace = true }
+spin = { workspace = true }
+xmas-elf = { workspace = true }
 [lints]
 workspace = true

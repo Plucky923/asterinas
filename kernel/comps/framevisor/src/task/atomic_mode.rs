@@ -1,6 +1,8 @@
+//! Traits for interoperating with atomic-mode execution guards.
+
 use ostd::task::{
-    atomic_mode::AsAtomicModeGuard as OstdAsAtomicModeGuard,
     DisabledPreemptGuard as OstdDisabledPreemptGuard,
+    atomic_mode::AsAtomicModeGuard as OstdAsAtomicModeGuard,
 };
 
 pub trait InAtomicMode: core::fmt::Debug {}

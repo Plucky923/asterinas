@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Host-side listening state for FrameVsock stream sockets.
+
 use super::connected::Connected;
 use crate::{
     events::IoEvents,

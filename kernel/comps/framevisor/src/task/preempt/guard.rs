@@ -1,6 +1,9 @@
+//! Guard type for disabled preemption sections.
+
 use ostd::task::{
+    DisabledPreemptGuard as OstdDisabledPreemptGuard,
     atomic_mode::{AsAtomicModeGuard as OstdAsAtomicModeGuard, InAtomicMode as OstdInAtomicMode},
-    disable_preempt as ostd_disable_preempt, DisabledPreemptGuard as OstdDisabledPreemptGuard,
+    disable_preempt as ostd_disable_preempt,
 };
 
 use crate::task::atomic_mode::{AsAtomicModeGuard, InAtomicMode};

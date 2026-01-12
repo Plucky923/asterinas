@@ -1,39 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! FrameVsock - Zero-copy vsock communication between FrameVM and FrameVisor
-//!
-//! # Architecture
-//!
-//! ## TX Path (Guest → Host): Synchronous
-//! - Guest directly calls Host's `submit_packet()` function
-//! - No send queue needed - immediate function call semantics
-//!
-//! ## RX Path (Host → Guest): Asynchronous
-//! - Host pushes packets to per-vCPU `RxQueue`
-//! - Host injects virtual interrupt to notify Guest
-//! - Guest reads from `RxQueue` in interrupt handler
-//!
-//! ## Data Transfer
-//! - All data passes via `RRef<FrameVsockBuffer<T>>` for zero-copy
-//! - No shared memory required
-//! - Only ONE copy happens: at syscall boundary (user-space ↔ kernel-space)
-//!
-//! # Generic Buffer Design
-//!
-//! `FrameVsockBuffer<T>` is generic over the payload type:
-//! - `FrameVsockBuffer<()>` (ControlPacket): For control messages without data
-//! - `FrameVsockBuffer<Vec<u8>>` (DataPacket): For data transfer with dynamic payload
+//! Shared FrameVsock protocol types and runtime helpers.
 
 #![no_std]
 #![deny(unsafe_code)]
 
 extern crate alloc;
 
-use alloc::{collections::VecDeque, vec::Vec};
+pub mod notify;
+pub mod ring;
+pub mod trace;
+pub mod tuning;
+
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use exchangeable::{Exchangeable, RRef};
-use spin::Mutex;
 
 /// The vSocket equivalent of INADDR_ANY.
 pub const VMADDR_CID_ANY: u64 = u64::MAX;
@@ -44,8 +26,34 @@ pub const HOST_CID: u64 = 2;
 pub const VMADDR_CID_HOST: u64 = 2;
 /// Guest (FrameVM) CID
 pub const VMADDR_CID_GUEST: u64 = 3;
+/// Base CID for guest VMs (VMs get CID = BASE + vm_id)
+pub const GUEST_CID_BASE: u64 = VMADDR_CID_GUEST;
 /// Bind to any available port.
 pub const VMADDR_PORT_ANY: u32 = u32::MAX;
+
+// ========== CID / VM ID Conversion ==========
+
+/// Check if CID represents a guest VM.
+#[inline]
+pub const fn is_guest_cid(cid: u64) -> bool {
+    cid >= GUEST_CID_BASE
+}
+
+/// Convert CID to VM ID (returns None if CID is not a guest CID).
+#[inline]
+pub const fn cid_to_vm_id(cid: u64) -> Option<u32> {
+    if cid >= GUEST_CID_BASE {
+        Some((cid - GUEST_CID_BASE) as u32)
+    } else {
+        None
+    }
+}
+
+/// Convert VM ID to CID.
+#[inline]
+pub const fn vm_id_to_cid(vm_id: u32) -> u64 {
+    (vm_id as u64) + GUEST_CID_BASE
+}
 
 /// FrameVsock socket address
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -184,15 +192,155 @@ impl FrameVsockHeader {
 
 impl Exchangeable for FrameVsockHeader {}
 
+/// Zero-copy data buffer with offset tracking.
+///
+/// This structure avoids O(N²) copy overhead when doing partial reads.
+/// Instead of using `Vec::split_off` which copies remaining data,
+/// we track the consumed offset and only return a slice view.
+#[derive(Clone, Default)]
+pub struct DataBuffer {
+    data: Vec<u8>,
+    offset: usize,
+}
+
+impl DataBuffer {
+    /// Create a new DataBuffer from a Vec.
+    #[inline]
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    /// Create an empty DataBuffer.
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            offset: 0,
+        }
+    }
+
+    /// Get the remaining payload slice (after offset).
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[self.offset..]
+    }
+
+    /// Get mutable remaining payload slice.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data[self.offset..]
+    }
+
+    /// Get the remaining length (total - consumed).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data.len().saturating_sub(self.offset)
+    }
+
+    /// Check if all data has been consumed.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.offset >= self.data.len()
+    }
+
+    /// Consume `bytes` from the front. Returns true if data remains.
+    ///
+    /// This is O(1) - just advances the offset pointer.
+    #[inline]
+    pub fn consume(&mut self, bytes: usize) -> bool {
+        self.offset = (self.offset + bytes).min(self.data.len());
+        !self.is_empty()
+    }
+
+    /// Take ownership of the underlying Vec, consuming self.
+    ///
+    /// Returns data from current offset onwards.
+    ///
+    /// # Performance
+    /// - If offset == 0: O(1) - direct ownership transfer
+    /// - If offset > 0: O(n) copy is unavoidable for Vec ownership
+    ///
+    /// For zero-copy access, prefer using `as_slice()` when possible.
+    #[inline]
+    pub fn take(self) -> Vec<u8> {
+        if self.offset == 0 {
+            self.data
+        } else {
+            // When offset > 0, we must copy to return owned Vec
+            // This is unavoidable if caller needs Vec<u8> ownership
+            self.data[self.offset..].to_vec()
+        }
+    }
+
+    /// Take the remaining data as a new DataBuffer without copying.
+    ///
+    /// This is more efficient than `take()` when you don't need a `Vec<u8>`,
+    /// as it avoids the O(n) copy for partial reads.
+    ///
+    /// # Performance
+    /// O(1) - just moves ownership, no data copying.
+    #[inline]
+    pub fn take_buffer(self) -> Self {
+        // Just return self - the offset is already tracked
+        self
+    }
+
+    /// Consume self and return the underlying data, resetting offset.
+    ///
+    /// This drains the front bytes that were consumed, returning
+    /// a new Vec containing only the remaining data.
+    ///
+    /// # Performance
+    /// - If offset == 0: O(1)
+    /// - If offset > 0: O(n) where n = remaining bytes
+    #[inline]
+    pub fn into_remaining(mut self) -> Vec<u8> {
+        if self.offset == 0 {
+            self.data
+        } else {
+            // drain(..offset) removes consumed bytes, leaving remaining
+            self.data.drain(..self.offset);
+            self.data
+        }
+    }
+
+    /// Get the current offset (for debugging/stats).
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Try to extend the buffer with new data (no reallocation).
+    ///
+    /// Returns `Ok(())` on success. If there is a non-zero offset (partial read
+    /// in progress) or there is not enough spare capacity, returns `Err(data)`
+    /// so the caller can fall back without data loss.
+    #[inline]
+    pub fn try_extend(&mut self, mut data: Vec<u8>) -> Result<(), Vec<u8>> {
+        if self.offset != 0 {
+            return Err(data);
+        }
+        let available = self.data.capacity().saturating_sub(self.data.len());
+        if available < data.len() {
+            return Err(data);
+        }
+        self.data.append(&mut data);
+        Ok(())
+    }
+}
+
+impl Exchangeable for DataBuffer {}
+
 /// Generic FrameVsock Buffer for zero-copy data transfer
 ///
 /// # Type Parameter
 /// - `T = ()`: Control packet with no data payload
-/// - `T = Vec<u8>`: Data packet with dynamically-sized payload
+/// - `T = DataBuffer`: Data packet with zero-copy partial read support
 ///
 /// # Zero-Copy Design
 /// The buffer owns its data. When transferred via RRef, ownership moves
-/// without copying the underlying data.
+/// without copying the underlying data. Partial reads use offset tracking
+/// instead of data copying.
 #[repr(C)]
 pub struct FrameVsockBuffer<T: Exchangeable = ()> {
     /// Packet header
@@ -204,8 +352,8 @@ pub struct FrameVsockBuffer<T: Exchangeable = ()> {
 /// Type alias for control packets (no data payload)
 pub type ControlPacket = FrameVsockBuffer<()>;
 
-/// Type alias for data packets (with Vec<u8> payload)
-pub type DataPacket = FrameVsockBuffer<Vec<u8>>;
+/// Type alias for data packets (with zero-copy DataBuffer payload)
+pub type DataPacket = FrameVsockBuffer<DataBuffer>;
 
 impl<T: Exchangeable> FrameVsockBuffer<T> {
     /// Get the operation type
@@ -290,7 +438,7 @@ impl FrameVsockBuffer<()> {
     pub fn with_data(self, data: Vec<u8>) -> DataPacket {
         FrameVsockBuffer {
             header: self.header,
-            data,
+            data: DataBuffer::new(data),
         }
     }
 }
@@ -301,13 +449,13 @@ impl Default for FrameVsockBuffer<()> {
     }
 }
 
-// Data packet (Vec<u8>) implementations
-impl FrameVsockBuffer<Vec<u8>> {
+// Data packet (DataBuffer) implementations - zero-copy optimized
+impl FrameVsockBuffer<DataBuffer> {
     /// Create a new data packet with empty data
     pub fn new_data() -> Self {
         Self {
             header: FrameVsockHeader::new(),
-            data: Vec::new(),
+            data: DataBuffer::empty(),
         }
     }
 
@@ -322,7 +470,7 @@ impl FrameVsockBuffer<Vec<u8>> {
     ) -> Self {
         Self {
             header: FrameVsockHeader::with_addrs(src_cid, dst_cid, src_port, dst_port, op),
-            data,
+            data: DataBuffer::new(data),
         }
     }
 
@@ -331,29 +479,33 @@ impl FrameVsockBuffer<Vec<u8>> {
         Self::with_header_and_data(src_cid, dst_cid, src_port, dst_port, VsockOp::Rw, data)
     }
 
-    /// Get payload slice
+    /// Get payload slice (remaining data after offset)
+    #[inline]
     pub fn payload(&self) -> &[u8] {
-        &self.data
+        self.data.as_slice()
     }
 
     /// Get mutable payload slice
+    #[inline]
     pub fn payload_mut(&mut self) -> &mut [u8] {
-        &mut self.data
+        self.data.as_mut_slice()
     }
 
-    /// Get payload length
+    /// Get payload length (remaining after consumed bytes)
+    #[inline]
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
     /// Check if payload is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
-    /// Take ownership of the data
-    pub fn take_data(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.data)
+    /// Take ownership of the remaining data
+    pub fn take_data(self) -> Vec<u8> {
+        self.data.take()
     }
 
     /// Create a response packet with swapped addresses
@@ -368,26 +520,27 @@ impl FrameVsockBuffer<Vec<u8>> {
     pub fn create_data_response(&self, op: VsockOp, data: Vec<u8>) -> DataPacket {
         DataPacket {
             header: self.header.create_response_header(op),
-            data,
+            data: DataBuffer::new(data),
         }
     }
 
-    /// Consume partial data and return remaining as a new packet (for partial reads)
+    /// Consume partial data - O(1) operation, no copying!
+    ///
+    /// This is the key optimization: instead of using `Vec::split_off` which
+    /// copies O(N) bytes for each partial read, we just advance an offset.
+    ///
+    /// Returns `Some(self)` if data remains after consuming, `None` if fully consumed.
+    #[inline]
     pub fn consume_partial(mut self, bytes: usize) -> Option<Self> {
-        if bytes >= self.data.len() {
-            None // Fully consumed
+        if self.data.consume(bytes) {
+            Some(self)
         } else {
-            // Split the data
-            let remaining = self.data.split_off(bytes);
-            Some(Self {
-                header: self.header,
-                data: remaining,
-            })
+            None // Fully consumed
         }
     }
 }
 
-impl Default for FrameVsockBuffer<Vec<u8>> {
+impl Default for FrameVsockBuffer<DataBuffer> {
     fn default() -> Self {
         Self::new_data()
     }
@@ -395,7 +548,7 @@ impl Default for FrameVsockBuffer<Vec<u8>> {
 
 // Implement Exchangeable for FrameVsockBuffer<T>
 impl Exchangeable for FrameVsockBuffer<()> {}
-impl Exchangeable for FrameVsockBuffer<Vec<u8>> {}
+impl Exchangeable for FrameVsockBuffer<DataBuffer> {}
 
 /// Connection identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -446,164 +599,112 @@ impl ConnectionId {
     }
 }
 
-/// Simple packet queue for buffering data packets
-pub struct DataPacketQueue {
-    queue: Mutex<VecDeque<RRef<DataPacket>>>,
-    capacity: usize,
-}
+// ========== Flow Control Configuration ==========
 
-impl DataPacketQueue {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            queue: Mutex::new(VecDeque::with_capacity(capacity)),
-            capacity,
-        }
-    }
-
-    pub fn push(&self, packet: RRef<DataPacket>) -> Result<(), RRef<DataPacket>> {
-        let mut queue = self.queue.lock();
-        if queue.len() >= self.capacity {
-            return Err(packet);
-        }
-        queue.push_back(packet);
-        Ok(())
-    }
-
-    pub fn pop(&self) -> Option<RRef<DataPacket>> {
-        self.queue.lock().pop_front()
-    }
-
-    pub fn len(&self) -> usize {
-        self.queue.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.queue.lock().is_empty()
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.queue.lock().len() >= self.capacity
-    }
-}
-
-/// FrameVsock Channel - Bidirectional communication channel
+/// Flow control configuration for FrameVsock connections.
 ///
-/// This is the core communication mechanism:
-/// - Guest sends to Host via `guest_to_host` queue
-/// - Host sends to Guest via `host_to_guest` queue
-/// - Both sides use RRef<DataPacket> for zero-copy transfer
-pub struct FrameVsockChannel {
-    /// Queue for Guest -> Host packets
-    guest_to_host: DataPacketQueue,
-    /// Queue for Host -> Guest packets  
-    host_to_guest: DataPacketQueue,
-    /// Channel is active
-    active: AtomicBool,
-    /// Next sequence number for Guest
-    guest_seq: AtomicU32,
-    /// Next sequence number for Host
-    host_seq: AtomicU32,
-}
+/// This module provides tunable parameters for optimizing throughput and latency.
+/// The default values are chosen to balance between small packet scenarios (64B)
+/// and large bulk transfers (1MB+).
+///
+/// # Design Philosophy (Linux-style)
+///
+/// Unlike the previous packet-count-based approach, we now use a buffer-percentage
+/// approach similar to Linux virtio-vsock:
+/// - Credit updates are sent when free space drops below a threshold
+/// - This naturally handles both small and large packets efficiently
+/// - Large packets no longer trigger excessive credit updates
+pub mod flow_control {
+    /// Default buffer allocation advertised to peer.
+    ///
+    /// This is the receive window size. Larger values allow more in-flight data
+    /// but consume more memory. Should be >= MAX_PENDING_PACKETS * avg_packet_size.
+    ///
+    /// Set to 4MB to allow more outstanding data and reduce credit update frequency.
+    pub const DEFAULT_BUF_ALLOC: u32 = 4 * 1024 * 1024; // 4MB
 
-impl FrameVsockChannel {
-    pub const DEFAULT_QUEUE_SIZE: usize = 64;
+    /// Maximum pending packets per connection.
+    ///
+    /// With DEFAULT_BUF_ALLOC=4MB and 64B packets, we need at least 65536 slots.
+    pub const MIN_PKT_BUF_SIZE: u32 = 64; // 64B
+    pub const MAX_PENDING_PACKETS: usize = (DEFAULT_BUF_ALLOC / MIN_PKT_BUF_SIZE) as usize;
 
-    pub fn new() -> Self {
-        Self {
-            guest_to_host: DataPacketQueue::new(Self::DEFAULT_QUEUE_SIZE),
-            host_to_guest: DataPacketQueue::new(Self::DEFAULT_QUEUE_SIZE),
-            active: AtomicBool::new(true),
-            guest_seq: AtomicU32::new(0),
-            host_seq: AtomicU32::new(0),
+    /// Maximum single packet size (same as Linux VIRTIO_VSOCK_MAX_PKT_BUF_SIZE).
+    ///
+    /// Used for credit update threshold calculations.
+    pub const MAX_PKT_BUF_SIZE: u32 = 64 * 1024; // 64KB
+
+    /// Minimum credit update threshold.
+    ///
+    /// For very small packets, we want frequent updates to avoid sender stalls.
+    pub const MIN_CREDIT_UPDATE_THRESHOLD: u32 = 4 * 1024; // 4KB
+
+    /// Maximum credit update threshold.
+    ///
+    /// For large packets, we use buffer-percentage based updates.
+    /// Set to 512KB (12.5% of DEFAULT_BUF_ALLOC) to balance credit update
+    /// frequency vs overhead. Lower values improve multi-connection fairness
+    /// by replenishing sender credit faster, at the cost of slightly more
+    /// control packets (~1.5μs each, negligible vs data throughput).
+    pub const MAX_CREDIT_UPDATE_THRESHOLD: u32 = 512 * 1024; // 512KB
+
+    /// Calculate adaptive credit update threshold based on actual buffer allocation.
+    ///
+    /// This is the preferred function when you have the actual buf_alloc value.
+    #[inline]
+    pub const fn adaptive_threshold_for_buf(buf_alloc: u32) -> u32 {
+        // Use 25% of buffer allocation as threshold
+        let threshold = buf_alloc / 4;
+        if threshold < MIN_CREDIT_UPDATE_THRESHOLD {
+            MIN_CREDIT_UPDATE_THRESHOLD
+        } else if threshold > MAX_CREDIT_UPDATE_THRESHOLD {
+            MAX_CREDIT_UPDATE_THRESHOLD
+        } else {
+            threshold
         }
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            guest_to_host: DataPacketQueue::new(capacity),
-            host_to_guest: DataPacketQueue::new(capacity),
-            active: AtomicBool::new(true),
-            guest_seq: AtomicU32::new(0),
-            host_seq: AtomicU32::new(0),
-        }
+    /// Fast threshold for low-latency scenarios.
+    ///
+    /// Used when we detect the sender might be stalled (credit near zero).
+    pub const URGENT_CREDIT_UPDATE_THRESHOLD: u32 = 4 * 1024; // 4KB
+
+    /// Credit watermark: when available credit drops below this percentage
+    /// of buf_alloc, receiver should proactively send credit update.
+    ///
+    /// 25% means: if we've consumed 75% of the window, send update early.
+    pub const LOW_CREDIT_WATERMARK_PERCENT: u32 = 25;
+
+    /// Calculate low credit watermark value.
+    #[inline]
+    pub const fn low_credit_watermark(buf_alloc: u32) -> u32 {
+        buf_alloc / 4 // 25%
     }
 
-    /// Check if channel is active
-    pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
-    }
+    /// Check if credit update should be sent (Linux-style).
+    ///
+    /// This function implements the Linux virtio-vsock credit update logic:
+    /// 1. Send update if free space < MAX_PKT_BUF_SIZE (receiver almost full)
+    /// 2. Send update if consumed since last update >= threshold
+    ///
+    /// # Arguments
+    /// * `buf_alloc` - Total buffer allocation
+    /// * `buf_used` - Currently used buffer space
+    /// * `fwd_cnt` - Current forward count
+    /// * `last_fwd_cnt` - Forward count at last credit update
+    #[inline]
+    pub const fn should_send_credit_update(
+        buf_alloc: u32,
+        buf_used: u32,
+        fwd_cnt: u32,
+        last_fwd_cnt: u32,
+    ) -> bool {
+        let free_space = buf_alloc.saturating_sub(buf_used);
+        let consumed_since_last = fwd_cnt.wrapping_sub(last_fwd_cnt);
+        let threshold = adaptive_threshold_for_buf(buf_alloc);
 
-    /// Deactivate the channel
-    pub fn deactivate(&self) {
-        self.active.store(false, Ordering::SeqCst);
-    }
-
-    // ========== Guest-side operations ==========
-
-    /// Guest sends a packet to Host
-    pub fn guest_send(&self, packet: RRef<DataPacket>) -> Result<(), RRef<DataPacket>> {
-        if !self.is_active() {
-            return Err(packet);
-        }
-        self.guest_seq.fetch_add(1, Ordering::SeqCst);
-        self.guest_to_host.push(packet)
-    }
-
-    /// Guest receives a packet from Host
-    pub fn guest_recv(&self) -> Option<RRef<DataPacket>> {
-        self.host_to_guest.pop()
-    }
-
-    /// Check if Guest has pending packets to receive
-    pub fn guest_has_pending(&self) -> bool {
-        !self.host_to_guest.is_empty()
-    }
-
-    /// Check if Guest can send (not full)
-    pub fn guest_can_send(&self) -> bool {
-        !self.guest_to_host.is_full() && self.is_active()
-    }
-
-    // ========== Host-side operations ==========
-
-    /// Host sends a packet to Guest
-    pub fn host_send(&self, packet: RRef<DataPacket>) -> Result<(), RRef<DataPacket>> {
-        if !self.is_active() {
-            return Err(packet);
-        }
-        self.host_seq.fetch_add(1, Ordering::SeqCst);
-        self.host_to_guest.push(packet)
-    }
-
-    /// Host receives a packet from Guest
-    pub fn host_recv(&self) -> Option<RRef<DataPacket>> {
-        self.guest_to_host.pop()
-    }
-
-    /// Check if Host has pending packets to receive
-    pub fn host_has_pending(&self) -> bool {
-        !self.guest_to_host.is_empty()
-    }
-
-    /// Check if Host can send (not full)
-    pub fn host_can_send(&self) -> bool {
-        !self.host_to_guest.is_full() && self.is_active()
-    }
-
-    // ========== Statistics ==========
-
-    pub fn guest_send_count(&self) -> u32 {
-        self.guest_seq.load(Ordering::SeqCst)
-    }
-
-    pub fn host_send_count(&self) -> u32 {
-        self.host_seq.load(Ordering::SeqCst)
-    }
-}
-
-impl Default for FrameVsockChannel {
-    fn default() -> Self {
-        Self::new()
+        // Linux-style: update when free space is low OR when we've consumed enough
+        free_space <= MAX_PKT_BUF_SIZE || consumed_since_last >= threshold
     }
 }
 
@@ -625,6 +726,22 @@ pub fn create_request(
     ))
 }
 
+/// Create a connection request with credit info (control packet)
+pub fn create_request_with_credit(
+    src_cid: u64,
+    src_port: u32,
+    dst_cid: u64,
+    dst_port: u32,
+    buf_alloc: u32,
+    fwd_cnt: u32,
+) -> RRef<ControlPacket> {
+    let mut packet =
+        ControlPacket::with_header(src_cid, dst_cid, src_port, dst_port, VsockOp::Request);
+    packet.header.buf_alloc = buf_alloc;
+    packet.header.fwd_cnt = fwd_cnt;
+    RRef::new(packet)
+}
+
 /// Create a connection response (control packet)
 pub fn create_response(
     src_cid: u64,
@@ -639,6 +756,22 @@ pub fn create_response(
         dst_port,
         VsockOp::Response,
     ))
+}
+
+/// Create a connection response with credit info (control packet)
+pub fn create_response_with_credit(
+    src_cid: u64,
+    src_port: u32,
+    dst_cid: u64,
+    dst_port: u32,
+    buf_alloc: u32,
+    fwd_cnt: u32,
+) -> RRef<ControlPacket> {
+    let mut packet =
+        ControlPacket::with_header(src_cid, dst_cid, src_port, dst_port, VsockOp::Response);
+    packet.header.buf_alloc = buf_alloc;
+    packet.header.fwd_cnt = fwd_cnt;
+    RRef::new(packet)
 }
 
 /// Create a reset packet (control packet)

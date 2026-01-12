@@ -13,6 +13,7 @@ OUTPUT_DIR ?= $(BUILD_DIR)/initramfs/test
 # REMINDER: Whenever you change this list, update the corresponding `default.nix` file.
 SUBDIRS := \
 	device \
+	framevsock \
 	fs \
 	hello_world \
 	io \
@@ -22,9 +23,12 @@ SUBDIRS := \
 	process \
 	scripts \
 	security \
+	vm \
 
 ifeq ($(HOST_PLATFORM), x86_64-linux)
+ifeq ($(INTEL_TDX), 1)
 SUBDIRS += intel_tdx
+endif
 endif
 
 # The C header and source files of all regression tests.

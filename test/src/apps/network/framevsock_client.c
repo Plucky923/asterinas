@@ -16,6 +16,9 @@
 #include <sys/socket.h>
 #include <errno.h>
 
+#include <stdint.h>
+#include <inttypes.h>
+
 // Definition for AF_FRAMEVSOCK if not in system headers
 #ifndef AF_FRAMEVSOCK
 #define AF_FRAMEVSOCK 46
@@ -30,10 +33,11 @@ struct sockaddr_framevsock {
     unsigned short svm_family;
     unsigned short svm_reserved1;
     unsigned int svm_port;
-    unsigned int svm_cid;
+    uint64_t svm_cid;
     unsigned char svm_zero[sizeof(struct sockaddr) -
                            sizeof(unsigned short) * 2 -
-                           sizeof(unsigned int) * 2];
+                           sizeof(unsigned int) -
+                           sizeof(uint64_t)];
 };
 
 #define TEST_PORT 12345
@@ -57,7 +61,7 @@ int main() {
     addr.svm_cid = VMADDR_CID_GUEST;
     addr.svm_port = TEST_PORT;
 
-    printf("[Host Client] Connecting to Guest (CID=%u, Port=%u)...\n", 
+    printf("[Host Client] Connecting to Guest (CID=%" PRIu64 ", Port=%u)...\n", 
            addr.svm_cid, addr.svm_port);
     
     // Connect to Guest

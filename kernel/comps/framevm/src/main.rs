@@ -85,7 +85,7 @@ fn load_program_binary() -> Vec<u8> {
     // - vsock_client: Acts as a Client (Guest -> Host)
     
     // Uncomment the one you want to run:
-    let program_data = include_bytes!("vsock_echo_server");
+    let program_data = include_bytes!("vsock_client");
     // let program_data = include_bytes!("vsock_client");
 
     // Copy to heap-allocated Vec to ensure basic alignment and mutability if needed

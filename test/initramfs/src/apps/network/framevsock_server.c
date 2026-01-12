@@ -16,6 +16,9 @@
 #include <sys/socket.h>
 #include <errno.h>
 
+#include <stdint.h>
+#include <inttypes.h>
+
 #ifndef AF_FRAMEVSOCK
 #define AF_FRAMEVSOCK 46
 #endif
@@ -32,10 +35,11 @@ struct sockaddr_framevsock {
     unsigned short svm_family;
     unsigned short svm_reserved1;
     unsigned int svm_port;
-    unsigned int svm_cid;
+    uint64_t svm_cid;
     unsigned char svm_zero[sizeof(struct sockaddr) -
                            sizeof(unsigned short) * 2 -
-                           sizeof(unsigned int) * 2];
+                           sizeof(unsigned int) -
+                           sizeof(uint64_t)];
 };
 
 #define SERVER_PORT 8080
@@ -59,7 +63,7 @@ int main() {
     addr.svm_cid = VMADDR_CID_HOST; // Bind to Host CID
     addr.svm_port = SERVER_PORT;
 
-    printf("[Host Server] Binding to CID=%u, Port=%u...\n", addr.svm_cid, addr.svm_port);
+    printf("[Host Server] Binding to CID=%" PRIu64 ", Port=%u...\n", addr.svm_cid, addr.svm_port);
     ret = bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr));
     if (ret < 0) {
         perror("[Host Server] bind failed");
@@ -84,7 +88,7 @@ int main() {
         return 1;
     }
 
-    printf("[Host Server] Accepted connection from CID=%u, Port=%u\n",
+    printf("[Host Server] Accepted connection from CID=%" PRIu64 ", Port=%u\n",
            client_addr.svm_cid, client_addr.svm_port);
 
     // Echo loop

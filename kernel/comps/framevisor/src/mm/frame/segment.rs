@@ -1,7 +1,9 @@
+//! Segment wrappers around OSTD frame segments.
+
 use ostd::mm::{
+    Segment as OstdSegment,
     frame::{meta::AnyFrameMeta as OstdAnyFrameMeta, untyped::AnyUFrameMeta as OstdAnyUFrameMeta},
     io::VmIo,
-    Segment as OstdSegment,
 };
 
 use crate::{mm::Frame, prelude::Result};

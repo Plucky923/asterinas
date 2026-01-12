@@ -1,3 +1,5 @@
+//! Address conversions for host-side FrameVsock sockets.
+
 pub use aster_framevsock::FrameVsockAddr;
 use aster_framevsock::FrameVsockHeader;
 

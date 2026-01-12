@@ -81,3 +81,5 @@ If additional configuration files or directories are needed, ensure they are app
 
 - **Nix Usage**: Use `Nix` whenever possible to manage dependencies and builds for ease of maintenance and consistency.
 - **Multi-Architecture Support**: Ensure new apps or benchmarks properly support multiple CPU architectures.
+- **Nested KVM in guest**: see `test/initramfs/NESTED_VIRTUALIZATION.md` for
+  enabling `ENABLE_NESTED_QEMU=true` and launching L2 from L1.

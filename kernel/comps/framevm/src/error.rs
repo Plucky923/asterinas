@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Error types for FrameVM.
+
+/// POSIX-compatible error numbers.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
     EPERM = 1,
     ENOENT = 2,
+    ESRCH = 3,
     EIO = 5,
     EBADF = 9,
     EAGAIN = 11,
@@ -16,6 +20,7 @@ pub enum Errno {
     ENOSYS = 38,
     ENOTSOCK = 88,
     ESOCKTNOSUPPORT = 94,
+    ENOTSUP = 95,
     EAFNOSUPPORT = 97,
     EADDRINUSE = 98,
     ECONNRESET = 104,
@@ -26,7 +31,7 @@ pub enum Errno {
     EINPROGRESS = 115,
 }
 
-/// Error type for FrameVM.
+/// Error type for FrameVM operations.
 #[derive(Debug, Clone, Copy)]
 pub struct Error {
     errno: Errno,
@@ -56,7 +61,7 @@ impl From<Errno> for Error {
     }
 }
 
-/// Convert from aster_framevisor::Error (which is ostd::Error)
+/// Convert from `aster_framevisor::Error`.
 impl From<aster_framevisor::Error> for Error {
     fn from(e: aster_framevisor::Error) -> Self {
         let errno = match e {
@@ -78,28 +83,28 @@ impl From<(aster_framevisor::Error, usize)> for Error {
     }
 }
 
-/// Convert from aster_framevisor::error::Error (custom framevisor error)
-impl From<aster_framevisor::error::Error> for Error {
-    fn from(e: aster_framevisor::error::Error) -> Self {
+impl From<ostd::Error> for Error {
+    fn from(e: ostd::Error) -> Self {
         let errno = match e {
-            aster_framevisor::error::Error::InvalidArgs => Errno::EINVAL,
-            aster_framevisor::error::Error::NoMemory => Errno::ENOMEM,
-            aster_framevisor::error::Error::PageFault => Errno::EFAULT,
-            aster_framevisor::error::Error::AccessDenied => Errno::EPERM,
-            aster_framevisor::error::Error::IoError => Errno::EIO,
-            aster_framevisor::error::Error::NotEnoughResources => Errno::EBUSY,
-            aster_framevisor::error::Error::Overflow => Errno::EINVAL,
+            ostd::Error::InvalidArgs => Errno::EINVAL,
+            ostd::Error::NoMemory => Errno::ENOMEM,
+            ostd::Error::PageFault => Errno::EFAULT,
+            ostd::Error::AccessDenied => Errno::EPERM,
+            ostd::Error::IoError => Errno::EIO,
+            ostd::Error::NotEnoughResources => Errno::EBUSY,
+            ostd::Error::Overflow => Errno::EINVAL,
         };
         Self::new(errno)
     }
 }
 
-impl From<(aster_framevisor::error::Error, usize)> for Error {
-    fn from((e, _): (aster_framevisor::error::Error, usize)) -> Self {
+impl From<(ostd::Error, usize)> for Error {
+    fn from((e, _): (ostd::Error, usize)) -> Self {
         Self::from(e)
     }
 }
 
+/// Result type for FrameVM operations.
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[macro_export]

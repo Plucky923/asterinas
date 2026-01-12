@@ -1,3 +1,5 @@
+//! Frame allocator wrappers used by FrameVisor memory management.
+
 use ostd::{early_println, mm::FrameAllocOptions as OstdFrameAllocOptions};
 
 use crate::{mm::frame::segment::Segment, prelude::Result};
@@ -10,13 +12,14 @@ impl FrameAllocOptions {
     }
 
     pub fn alloc_segment(&self, nframes: usize) -> Result<Segment<()>> {
-        let ostd_segment = self.0.alloc_segment(nframes).unwrap();
+        let ostd_segment = self.0.alloc_segment(nframes)?;
         Ok(Segment::new_with_inner(ostd_segment))
     }
 }
 
-pub fn init_frame_allocator() {
+pub fn init_frame_allocator() -> Result<()> {
     early_println!("[framevisor] Initializing frame allocator...");
-    let segment = FrameAllocOptions::new().alloc_segment(1).unwrap();
+    let _segment = FrameAllocOptions::new().alloc_segment(1)?;
     early_println!("[framevisor] Frame allocator initialized");
+    Ok(())
 }

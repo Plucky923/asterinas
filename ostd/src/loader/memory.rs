@@ -1,18 +1,19 @@
 use core::cmp;
 
 use xmas_elf::{
-    ElfFile,
     sections::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE},
+    ElfFile,
 };
 
 use crate::{
-    Result, early_println,
+    early_println,
     mm::{
-        PAGE_SIZE,
         frame::allocator::FrameAllocOptions,
         kspace::kvirt_area::KVirtArea,
         page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
+        PAGE_SIZE,
     },
+    Result,
 };
 
 /// 决定后续分配为 section 分配的内存应该是什么类型
@@ -48,7 +49,7 @@ pub struct SectionMemory {
 }
 
 pub fn caculate_section_size(elf_file: &ElfFile) -> (usize, usize, usize) {
-    early_println!("[Loader] Analyzing sections...");
+    log::info!("[Loader] Analyzing sections...");
 
     let mut exec_cursor = 0;
     let mut ro_cursor = 0;
@@ -97,7 +98,7 @@ pub fn alloc_section_memory(
     ro_bytes: usize,
     rw_bytes: usize,
 ) -> Result<SectionMemory> {
-    early_println!(
+    log::info!(
         "[Loader] Allocating memory: Text={} bytes, RoData={} bytes, RwData={} bytes",
         exec_bytes,
         ro_bytes,

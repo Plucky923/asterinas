@@ -20,12 +20,13 @@ let
       extraAttrs = { C_FLAGS = "-I${pkgs.libnl.dev}/include/libnl3"; };
       extraBuildInputs = [ pkgs.libnl ];
     });
-  } // lib.optionalAttrs (pkgs.hostPlatform.system == "x86_64-linux") {
-    intel_tdx = callPackage ./common.nix (commonArgs // {
-      dir = "intel_tdx";
-      extraAttrs = { TDX_ATTEST_DIR = "${tdxAttest}/QuoteGeneration"; };
-    });
-  };
+  } // lib.optionalAttrs (pkgs.hostPlatform.system == "x86_64-linux"
+    && builtins.getEnv "INTEL_TDX" == "1") {
+      intel_tdx = callPackage ./common.nix (commonArgs // {
+        dir = "intel_tdx";
+        extraAttrs = { TDX_ATTEST_DIR = "${tdxAttest}/QuoteGeneration"; };
+      });
+    };
 in {
   package = stdenv.mkDerivation {
     pname = "apps";

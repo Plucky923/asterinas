@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Memory management for FrameVisor.
+
+use alloc::sync::Arc;
+
 pub mod frame;
 pub mod io;
 pub(crate) mod page_prop;
@@ -5,18 +11,23 @@ pub(crate) mod page_table;
 pub mod vm_space;
 
 pub use frame::FrameAllocOptions;
+use ostd::mm::Frame as OstdFrame;
 pub use ostd::mm::{
-    frame::{meta::AnyFrameMeta as OstdAnyFrameMeta, untyped::AnyUFrameMeta as OstdAnyUFrameMeta},
     VmReader, VmWriter,
+    frame::{meta::AnyFrameMeta as OstdAnyFrameMeta, untyped::AnyUFrameMeta as OstdAnyUFrameMeta},
 };
-use ostd::{early_println, mm::Frame as OstdFrame};
-pub use vm_space::{init_vm_space, VmSpace};
+pub use vm_space::{VmSpace, init_vm_space};
 
 pub use self::{
     io::{FallibleVmRead, FallibleVmWrite},
     page_prop::{CachePolicy, PageFlags, PageProperty},
 };
-use crate::mm::frame::{init_frame, untyped::UFrame};
+use crate::{
+    Result,
+    mm::frame::{init_frame, untyped::UFrame},
+};
+
+static SAFE_VM_SPACE: spin::Once<Arc<VmSpace>> = spin::Once::new();
 
 /// Virtual addresses.
 pub type Vaddr = usize;
@@ -27,6 +38,7 @@ pub type Paddr = usize;
 /// Device addresses.
 pub type Daddr = usize;
 
+/// Frame wrapper for FrameVisor.
 pub struct Frame<M: OstdAnyFrameMeta + ?Sized>(OstdFrame<M>);
 
 impl<M: OstdAnyFrameMeta + ?Sized> Frame<M> {
@@ -49,8 +61,15 @@ impl From<UFrame> for Frame<dyn OstdAnyFrameMeta> {
     }
 }
 
-pub fn init_mm() {
-    early_println!("[framevisor] Initializing MM...");
+/// Initialize the memory management subsystem.
+pub fn init_mm() -> Result<()> {
     init_vm_space();
-    init_frame();
+    init_frame()?;
+    Ok(())
+}
+
+/// Activate a long-lived VM space for kernel-only execution after guest teardown.
+pub fn activate_safe_vm_space() {
+    let safe_vm_space = SAFE_VM_SPACE.call_once(|| Arc::new(VmSpace::new()));
+    safe_vm_space.activate();
 }

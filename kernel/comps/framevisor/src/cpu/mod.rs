@@ -1,10 +1,12 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! CPU management for FrameVisor.
+
 mod id;
 
 pub use id::init_cpu_id;
-use ostd::early_println;
 
+/// Initialize the CPU subsystem.
 pub fn init_cpu() {
-    early_println!("[framevisor] Initializing CPU...");
     init_cpu_id();
-    early_println!("[framevisor] CPU initialized");
 }

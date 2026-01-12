@@ -113,7 +113,10 @@ aster-pci = { path = "kernel/comps/pci" }
 aster-softirq = { path = "kernel/comps/softirq" }
 aster-systree = { path = "kernel/comps/systree" }
 aster-framevisor = { path = "kernel/comps/framevisor" }
+aster-framevisor-exchangeable = { path = "kernel/comps/framevisor/exchangeable" }
+aster-framevisor-macros = { path = "kernel/comps/framevisor/macros" }
 aster-framevsock = { path = "kernel/comps/framevsock" }
+exchangeable = { package = "aster-framevisor-exchangeable", path = "kernel/comps/framevisor/exchangeable" }
 aster-time = { path = "kernel/comps/time" }
 aster-uart = { path = "kernel/comps/uart" }
 aster-virtio = { path = "kernel/comps/virtio" }
@@ -228,3 +231,10 @@ lto = true
 panic = "abort"
 # set codegen-units as the smallest number
 codegen-units = 1
+
+# Release profile without LTO for FrameVM dynamic loading.
+# LTO generates 32-bit relocations that are incompatible with high address loading.
+[profile.release-no-lto]
+inherits = "release"
+lto = false
+panic = "unwind"

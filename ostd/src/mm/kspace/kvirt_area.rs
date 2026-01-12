@@ -6,7 +6,6 @@ use core::ops::Range;
 
 use super::{KERNEL_PAGE_TABLE, VMALLOC_VADDR_RANGE};
 use crate::{
-    early_println,
     mm::{
         HasSize, PAGE_SIZE, Paddr, Split, Vaddr,
         frame::{Frame, meta::AnyFrameMeta},
@@ -20,6 +19,12 @@ use crate::{
 
 static KVIRT_AREA_ALLOCATOR: RangeAllocator = RangeAllocator::new(VMALLOC_VADDR_RANGE);
 static MODULE_KVIRT_AREA_ALLOCATOR: RangeAllocator = RangeAllocator::new(MODULE_RANGE);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KVirtAllocatorKind {
+    Vmalloc,
+    Module,
+}
 
 /// Kernel virtual area.
 ///
@@ -37,6 +42,7 @@ static MODULE_KVIRT_AREA_ALLOCATOR: RangeAllocator = RangeAllocator::new(MODULE_
 #[derive(Debug)]
 pub struct KVirtArea {
     range: Range<Vaddr>,
+    allocator_kind: KVirtAllocatorKind,
 }
 
 impl HasSize for KVirtArea {
@@ -55,8 +61,14 @@ impl Split for KVirtArea {
         let left_range = old.start()..old.start() + offset;
         let right_range = old.start() + offset..old.end();
         (
-            KVirtArea { range: left_range },
-            KVirtArea { range: right_range },
+            KVirtArea {
+                range: left_range,
+                allocator_kind: old.allocator_kind,
+            },
+            KVirtArea {
+                range: right_range,
+                allocator_kind: old.allocator_kind,
+            },
         )
     }
 }
@@ -124,9 +136,11 @@ impl KVirtArea {
             // that this mapping does not affect kernel's memory safety.
             unsafe { cursor.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) };
         }
-        early_println!("MODULE_RANGE: {:#x?}", MODULE_RANGE);
 
-        Self { range }
+        Self {
+            range,
+            allocator_kind: KVirtAllocatorKind::Vmalloc,
+        }
     }
 
     pub fn map_module_frames<T: AnyFrameMeta>(
@@ -155,9 +169,6 @@ impl KVirtArea {
         );
 
         let cursor_range = range.start + map_offset..range.end;
-        early_println!("cursor_range: {:#x?}", cursor_range);
-        early_println!("range: {:#x?}", range);
-        early_println!("MODULE_RANGE: {:#x?}", MODULE_RANGE);
         let page_table = KERNEL_PAGE_TABLE.get().unwrap();
         let preempt_guard = disable_preempt();
         let mut cursor = page_table
@@ -167,11 +178,13 @@ impl KVirtArea {
         for frame in frames.into_iter() {
             // SAFETY: The constructor of the `KVirtArea` has already ensured
             // that this mapping does not affect kernel's memory safety.
-            unsafe { cursor.map(MappedItem::Tracked(frame.into(), prop)) }
-                .expect("Failed to map frame in a new `KVirtArea`");
+            unsafe { cursor.map(MappedItem::Tracked(frame.into(), prop)) };
         }
 
-        Self { range }
+        Self {
+            range,
+            allocator_kind: KVirtAllocatorKind::Module,
+        }
     }
 
     /// Creates a kernel virtual area and maps untracked frames into it.
@@ -221,7 +234,10 @@ impl KVirtArea {
             }
         }
 
-        Self { range }
+        Self {
+            range,
+            allocator_kind: KVirtAllocatorKind::Vmalloc,
+        }
     }
 }
 
@@ -241,6 +257,9 @@ impl Drop for KVirtArea {
             drop(frag);
         }
         // 2. free the virtual block
-        KVIRT_AREA_ALLOCATOR.free(range);
+        match self.allocator_kind {
+            KVirtAllocatorKind::Vmalloc => KVIRT_AREA_ALLOCATOR.free(range),
+            KVirtAllocatorKind::Module => MODULE_KVIRT_AREA_ALLOCATOR.free(range),
+        }
     }
 }

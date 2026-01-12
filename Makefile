@@ -39,6 +39,7 @@ FRAMEVM_OBJ_OUTPUT ?= build/framevm/framevm.o
 FRAMEVM_TARGET ?= x86_64-unknown-none
 FRAMEVM_INITRAMFS_INCLUDE ?= 1
 FRAMEVM_INITRAMFS_PATH ?= /framevm/framevm.o
+FRAMEVM_MSG_SIZE ?= 4096
 # End of FrameVM options.
 
 # GDB debugging and profiling options.
@@ -117,19 +118,32 @@ export VSOCK=on
 CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_vsock_test.sh"
 endif
 
-ifeq ($(RELEASE_LTO), 1)
-CARGO_OSDK_COMMON_ARGS += --profile release-lto
-OSTD_TASK_STACK_SIZE_IN_PAGES = 8
-else ifeq ($(RELEASE), 1)
-CARGO_OSDK_COMMON_ARGS += --release
-	ifeq ($(OSDK_TARGET_ARCH), riscv64)
-	# FIXME: Unwinding in RISC-V seems to cost more stack space, so we increase
-	# the stack size for it. This may need further investigation.
-	# See https://github.com/asterinas/asterinas/pull/2383#discussion_r2307673156
-	OSTD_TASK_STACK_SIZE_IN_PAGES = 16
-	else
-	OSTD_TASK_STACK_SIZE_IN_PAGES = 8
-	endif
+# When BUILD_FRAMEVM_OBJ=1, Kernel must use release-no-lto to preserve symbols
+# that FrameVM needs. LTO would inline/remove these symbols.
+ifeq ($(BUILD_FRAMEVM_OBJ), 1)
+  ifeq ($(RELEASE_LTO), 1)
+    $(warning FrameVM enabled: Kernel downgraded from release-lto to release-no-lto)
+    CARGO_OSDK_COMMON_ARGS += --profile release-no-lto
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+  else ifeq ($(RELEASE), 1)
+    CARGO_OSDK_COMMON_ARGS += --profile release-no-lto
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+  endif
+else
+  ifeq ($(RELEASE_LTO), 1)
+    CARGO_OSDK_COMMON_ARGS += --profile release-lto
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+  else ifeq ($(RELEASE), 1)
+    CARGO_OSDK_COMMON_ARGS += --release
+    ifeq ($(OSDK_TARGET_ARCH), riscv64)
+    # FIXME: Unwinding in RISC-V seems to cost more stack space, so we increase
+    # the stack size for it. This may need further investigation.
+    # See https://github.com/asterinas/asterinas/pull/2383#discussion_r2307673156
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 16
+    else
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+    endif
+  endif
 endif
 
 # If the BENCHMARK is set, we will run the benchmark in the kernel mode.
@@ -204,14 +218,15 @@ CARGO_OSDK_BUILD_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 CARGO_OSDK_TEST_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 
 # FrameVM profile/target directories for locating the emitted object file.
+# FrameVM always uses release-no-lto to avoid 32-bit relocation issues with LTO.
 FRAMEVM_PROFILE_DIR := debug
 FRAMEVM_CARGO_PROFILE :=
 ifeq ($(RELEASE_LTO), 1)
-FRAMEVM_CARGO_PROFILE := --profile release-lto
-FRAMEVM_PROFILE_DIR := release-lto
+FRAMEVM_CARGO_PROFILE := --profile release-no-lto
+FRAMEVM_PROFILE_DIR := release-no-lto
 else ifeq ($(RELEASE), 1)
-FRAMEVM_CARGO_PROFILE := --release
-FRAMEVM_PROFILE_DIR := release
+FRAMEVM_CARGO_PROFILE := --profile release-no-lto
+FRAMEVM_PROFILE_DIR := release-no-lto
 endif
 FRAMEVM_DEPS_DIR := target/$(FRAMEVM_TARGET)/$(FRAMEVM_PROFILE_DIR)/deps
 
@@ -530,9 +545,15 @@ clean:
 	@echo "Cleaning up OSDK workspace target files"
 	@cd osdk && cargo clean
 	@echo "Cleaning up mdBook output files"
-	@cd book && mdbook clean
+	@if command -v mdbook >/dev/null 2>&1; then \
+		cd book && mdbook clean; \
+	else \
+		echo "Skipping mdBook cleanup: 'mdbook' not found"; \
+	fi
 	@echo "Cleaning up test target files"
 	@$(MAKE) --no-print-directory -C test/initramfs clean
+	@echo "Cleaning up FrameVM test programs"
+	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test clean
 	@echo "Uninstalling OSDK"
 	@rm -f $(CARGO_OSDK)
 	@rm -rf build/
@@ -543,7 +564,6 @@ framevm_sdk:
 	@rm -rf build/deps
 	@cargo run --manifest-path framevm_tools/copy_build_deps/Cargo.toml -- \
 		-i target/$(OSDK_TARGET_ARCH)-unknown-none/$(FRAMEVM_PROFILE_DIR)/deps \
-		--input-host target/debug/deps \
 		--output-deps build/deps
 
 .PHONY: framevm_obj
@@ -570,30 +590,38 @@ framevm_obj: framevm_sdk
 .PHONY: fv_init_ramfs
 fv_init_ramfs: framevm_obj
 	@echo "[make] Building FrameVM initramfs"
-	@$(MAKE) --no-print-directory -C test framevm_initramfs \
+	@$(MAKE) --no-print-directory -C test/initramfs framevm_initramfs \
 		FRAMEVM_OBJ_PATH=$(abspath $(FRAMEVM_OBJ_OUTPUT)) \
 		FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
 
+# Build FrameVM benchmarks (guest binaries + initramfs apps).
+# Usage: make framevm_test
+.PHONY: framevm_test
+framevm_test:
+	@echo "[make] Building FrameVM test programs..."
+	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test clean
+	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test compare_all
+	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test vsock_all
+	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test fork_all
+	@$(MAKE) --no-print-directory -C test/initramfs/src/apps memory
+	@$(MAKE) --no-print-directory -C test/initramfs/src/apps/network vsock
+	@$(MAKE) --no-print-directory -C test/initramfs/src/apps framevsock
+	@echo "[make] FrameVM test programs built successfully"
+
 .PHONY: framevm
 framevm:
-	@echo "[make] Compiling FrameVM user-space assembly code"
-	@cd kernel/comps/framevm/src && \
-		gcc -nostdlib -static -o vsock_echo_server vsock_echo_server.S && \
-		gcc -nostdlib -static -o vsock_client vsock_client.S
-	@make clean 
-	@make kernel
-	@make fv_init_ramfs
+	@$(MAKE) --no-print-directory clean
+	@$(MAKE) --no-print-directory framevm_test
+	@echo "[make] FrameVM test build completed"
+	@$(MAKE) --no-print-directory kernel
+	@$(MAKE) --no-print-directory fv_init_ramfs
 	@echo "[make] FrameVM build completed"
 	@echo "[make] Manually regenerating ISO with new initramfs..."
-    
-	# 1. Copy the new initramfs to the OSDK iso_root
-	@cp test/build/initramfs.cpio.gz target/osdk/iso_root/boot/initramfs.cpio.gz
-    
-	# 2. Regenerate the ISO using the updated iso_root
-	@grub-mkrescue -o target/osdk/aster-nix/aster-nix-osdk-bin.iso target/osdk/iso_root 2> /dev/null
-	@echo "[make] ISO successfully updated at target/osdk/aster-nix/aster-nix-osdk-bin.iso"
+	@# 1. Copy the new initramfs to the OSDK iso_root
+	@cp test/initramfs/build/initramfs.cpio.gz target/osdk/iso_root/boot/initramfs.cpio.gz
+	@# 2. Regenerate the ISO using the updated iso_root
+	@grub-mkrescue -o target/osdk/aster-kernel-osdk-bin.iso target/osdk/iso_root 2> /dev/null
+	@echo "[make] ISO successfully updated at target/osdk/aster-kernel-osdk-bin.iso"
 	@cd kernel && cargo osdk run --no-build $(CARGO_OSDK_BUILD_ARGS)
-
-.PHONY: run_framevm
 run_framevm: 
 	@cd kernel && cargo osdk run --no-build $(CARGO_OSDK_BUILD_ARGS)

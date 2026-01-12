@@ -1,3 +1,5 @@
+//! Page-table error types used by FrameVisor abstractions.
+
 use crate::mm::Vaddr;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

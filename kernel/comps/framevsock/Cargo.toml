@@ -1,15 +1,14 @@
 [package]
 name = "aster-framevsock"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-ostd = { path = "../../../ostd" }
-component = { path = "../../libs/comp-sys/component" }
-exchangeable = { package = "aster-framevisor-exchangeable", path = "../framevisor/exchangeable" }
-log = "0.4"
-spin = "0.9"
+ostd = { workspace = true }
+component = { workspace = true }
+exchangeable = { workspace = true }
+log = { workspace = true }
+spin = { workspace = true }
 
 [lints]
 workspace = true
-

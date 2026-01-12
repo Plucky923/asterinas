@@ -1,5 +1,5 @@
 { lib, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox, apps
-, benchmark, syscall, dnsServer, pkgs, framevmObjPath ? ""
+, benchmark, nestedQemu ? null, syscall, dnsServer, pkgs, framevmObjPath ? ""
 , framevmInstallPath ? "/framevm/framevm.o" }:
 let
   boot_hello = builtins.path { path = ./../src/boot_hello.sh; };
@@ -17,14 +17,19 @@ let
   resolv_conf = pkgs.callPackage ./resolv_conf.nix { dnsServer = dnsServer; };
   # Whether the initramfs should include evtest, a common tool to debug input devices (`/dev/input/eventX`)
   is_evtest_included = false;
-  framevmObj =
-    if framevmObjPath == "" then null else builtins.path {
+  framevmObj = if framevmObjPath == "" then
+    null
+  else
+    builtins.path {
       name = "framevm-object";
       path = framevmObjPath;
     };
+  nestedQemuStoreBase =
+    if nestedQemu == null then "" else builtins.baseNameOf nestedQemu;
   all_pkgs = [ busybox etc resolv_conf ]
     ++ lib.optionals (apps != null) [ apps.package ]
     ++ lib.optionals (benchmark != null) [ benchmark.package ]
+    ++ lib.optionals (nestedQemu != null) [ nestedQemu ]
     ++ lib.optionals (syscall != null) [ syscall.package ]
     ++ lib.optionals is_evtest_included [ pkgs.evtest ];
 in stdenvNoCC.mkDerivation {
@@ -54,6 +59,18 @@ in stdenvNoCC.mkDerivation {
 
     ${lib.optionalString (benchmark != null) ''
       cp -r "${benchmark.package}"/* $out/benchmark/
+    ''}
+
+    ${lib.optionalString (nestedQemu != null) ''
+      # Keep the original qemu package path layout for runtime assets under /nix/store.
+      mkdir -p $out/nix/store
+      cp -r "${nestedQemu}" $out/nix/store/
+      ln -sfn /nix/store/${nestedQemuStoreBase}/bin/qemu-system-x86_64 \
+        $out/usr/bin/qemu-system-x86_64
+      if [ -x "${nestedQemu}/bin/qemu-img" ]; then
+        ln -sfn /nix/store/${nestedQemuStoreBase}/bin/qemu-img \
+          $out/usr/bin/qemu-img
+      fi
     ''}
 
     ${lib.optionalString (syscall != null) ''

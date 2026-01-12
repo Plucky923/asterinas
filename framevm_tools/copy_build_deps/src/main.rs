@@ -4,6 +4,25 @@ use std::{env, fs, path::Path};
 
 use getopts::Options;
 
+const COPIED_DEP_EXTENSIONS: [&str; 3] = [".rlib", ".rmeta", ".so"];
+fn copied_crate_name(file_name: &str) -> Option<&str> {
+    let stem = COPIED_DEP_EXTENSIONS
+        .into_iter()
+        .find_map(|extension| file_name.strip_suffix(extension))?;
+    let crate_name_with_hash = stem.strip_prefix("lib")?;
+
+    Some(
+        crate_name_with_hash
+            .split_once('-')
+            .map(|(crate_name, _)| crate_name)
+            .unwrap_or(crate_name_with_hash),
+    )
+}
+
+fn should_copy_dependency(file_name: &str) -> bool {
+    copied_crate_name(file_name).is_some()
+}
+
 fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
@@ -52,16 +71,43 @@ fn main() -> Result<(), String> {
                 None => continue,
             };
 
-            if file_name.ends_with(".rlib")
-                || file_name.ends_with(".rmeta")
-                || file_name.ends_with(".so")
-            {
-                let dest = Path::new(&output_dir).join(path.file_name().unwrap());
-                fs::copy(&path, &dest)
-                    .map_err(|e| format!("Failed to copy {:?} to {:?}: {}", path, dest, e))?;
+            if !should_copy_dependency(&file_name) {
+                continue;
             }
+
+            let dest = Path::new(&output_dir).join(path.file_name().unwrap());
+            fs::copy(&path, &dest)
+                .map_err(|e| format!("Failed to copy {:?} to {:?}: {}", path, dest, e))?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copied_crate_name, should_copy_dependency};
+
+    #[test]
+    fn parses_dependency_file_names() {
+        assert_eq!(
+            copied_crate_name("libaster_framevisor-abc123.rlib"),
+            Some("aster_framevisor")
+        );
+        assert_eq!(copied_crate_name("libspin-deadbeef.rmeta"), Some("spin"));
+        assert_eq!(
+            copied_crate_name("libproc_macro2-feedface.so"),
+            Some("proc_macro2")
+        );
+        assert_eq!(copied_crate_name("framevm"), None);
+    }
+
+    #[test]
+    fn copies_sysroot_and_non_sysroot_dependencies() {
+        assert!(should_copy_dependency("libcore-abc123.rlib"));
+        assert!(should_copy_dependency("liballoc-abc123.rmeta"));
+        assert!(should_copy_dependency("libcompiler_builtins-abc123.rlib"));
+        assert!(should_copy_dependency("libaster_framevisor-abc123.rlib"));
+        assert!(should_copy_dependency("libspin-abc123.rmeta"));
+    }
 }

@@ -5,8 +5,8 @@ use crate::{
         Frame, FrameAllocOptions, PAGE_SIZE, Paddr,
         frame::max_paddr,
         kspace::{
-            LINEAR_MAPPING_BASE_VADDR, MappedItemRef, VMALLOC_VADDR_RANGE, kvirt_area::KVirtArea,
-            paddr_to_vaddr,
+            LINEAR_MAPPING_BASE_VADDR, MODULE_RANGE, MappedItemRef, VMALLOC_VADDR_RANGE,
+            kvirt_area::KVirtArea, paddr_to_vaddr,
         },
         page_prop::{CachePolicy, PageFlags, PageProperty},
     },
@@ -107,6 +107,29 @@ fn kvirt_area_untracked_drop() {
     let kvirt_area = unsafe { KVirtArea::map_untracked_frames(size, 0, 0..0, default_prop()) };
     let guard = disable_preempt();
     assert!(kvirt_area.query(&guard, kvirt_area.start()).is_none());
+}
+
+#[ktest]
+fn kvirt_area_module_drop() {
+    let size = 2 * PAGE_SIZE;
+    let frames = FrameAllocOptions::default()
+        .alloc_segment_with(2, |_| ())
+        .unwrap();
+
+    let kvirt_area = KVirtArea::map_module_frames(size, 0, frames.into_iter(), default_prop());
+
+    assert!(kvirt_area.start() >= MODULE_RANGE.start);
+    assert!(kvirt_area.end() <= MODULE_RANGE.end);
+
+    let range = kvirt_area.range();
+    drop(kvirt_area);
+
+    let remapped =
+        KVirtArea::map_module_frames(size, 0, core::iter::empty::<Frame<()>>(), default_prop());
+    let guard = disable_preempt();
+
+    assert_eq!(remapped.range(), range);
+    assert!(remapped.query(&guard, remapped.start()).is_none());
 }
 
 #[ktest]

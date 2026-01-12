@@ -1,31 +1,41 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::{AtomicBool, Ordering};
+//! Host-side stream socket wrapper for FrameVsock.
+
+use core::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+
+use aster_framevsock::flow_control::DEFAULT_BUF_ALLOC;
 
 use super::{connected::Connected, connecting::Connecting, init::Init, listen::Listen};
 use crate::{
     events::IoEvents,
-    fs::{file_handle::FileLike, utils::Inode},
+    fs::{file_handle::FileLike, path::Path, pseudofs::SockFs},
     net::socket::{
         Socket,
         framevsock::{
             FRAME_VSOCK_GLOBAL,
             addr::{self, FrameVsockAddr},
         },
-        new_pseudo_inode,
-        util::{options::{SocketOptionSet, SetSocketLevelOption, GetSocketLevelOption}, MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr},
         options::SocketOption,
         private::SocketPrivate,
+        util::{
+            MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr,
+            options::{GetSocketLevelOption, SetSocketLevelOption, SocketOptionSet},
+        },
     },
     prelude::*,
-    process::signal::{PollHandle, Pollable},
+    process::signal::{PollHandle, Pollable, Poller},
+    thread::Thread,
     util::{MultiRead, MultiWrite},
 };
 
 pub struct FrameVsockStreamSocket {
     status: RwLock<Status>,
     is_nonblocking: AtomicBool,
-    pseudo_inode: Arc<dyn Inode>,
+    pseudo_path: Path,
     options: RwLock<SocketOptionSet>,
 }
 
@@ -35,13 +45,17 @@ pub enum Status {
     Connected(Arc<Connected>),
 }
 
+const SEND_RETRY_TIMEOUT: Duration = Duration::from_millis(1);
+const SEND_QUEUE_BLOCK_TIMEOUT_MIN_MS: u64 = 2;
+const SEND_QUEUE_BLOCK_TIMEOUT_MAX_MS: u64 = 16;
+
 impl FrameVsockStreamSocket {
     pub fn new(nonblocking: bool) -> Result<Self> {
         let init = Arc::new(Init::new());
         Ok(Self {
             status: RwLock::new(Status::Init(init)),
             is_nonblocking: AtomicBool::new(nonblocking),
-            pseudo_inode: new_pseudo_inode(),
+            pseudo_path: SockFs::new_path(),
             options: RwLock::new(SocketOptionSet::default()),
         })
     }
@@ -50,7 +64,7 @@ impl FrameVsockStreamSocket {
         Self {
             status: RwLock::new(Status::Connected(connected)),
             is_nonblocking: AtomicBool::new(false),
-            pseudo_inode: new_pseudo_inode(),
+            pseudo_path: SockFs::new_path(),
             options: RwLock::new(SocketOptionSet::default()),
         }
     }
@@ -68,10 +82,10 @@ impl FrameVsockStreamSocket {
         // Return the real peer address (vsock-compatible behavior).
         let peer_addr = SocketAddr::FrameVsock(connected.peer_addr());
 
-        FRAME_VSOCK_GLOBAL
+        let vsockspace = FRAME_VSOCK_GLOBAL
             .get()
-            .unwrap()
-            .insert_connected_socket(connected.id(), connected.clone());
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "FrameVsock is not initialized"))?;
+        vsockspace.insert_connected_socket(connected.id(), connected.clone());
 
         // TODO: Pass the peer credit info to the new socket?
         // The connected socket already has it.
@@ -81,15 +95,75 @@ impl FrameVsockStreamSocket {
     }
 
     fn send(&self, reader: &mut dyn MultiRead, flags: SendRecvFlags) -> Result<usize> {
-        self.block_on(IoEvents::OUT, || {
-            let inner = self.status.read();
-            match &*inner {
-                Status::Connected(connected) => connected.try_send(reader, flags),
-                Status::Init(_) | Status::Listen(_) => {
-                    return_errno_with_message!(Errno::EINVAL, "the socket is not connected");
+        let connected = match &*self.status.read() {
+            Status::Connected(connected) => connected.clone(),
+            Status::Init(_) | Status::Listen(_) => {
+                return_errno_with_message!(Errno::EINVAL, "the socket is not connected");
+            }
+        };
+
+        if self.is_nonblocking() {
+            let mut pending_packet = None;
+            return connected.try_send(reader, flags, &mut pending_packet);
+        }
+
+        let mut pending_packet = None;
+        let mut queue_block_timeout_ms = SEND_QUEUE_BLOCK_TIMEOUT_MIN_MS;
+
+        loop {
+            let epoch_before = connected.tx_progress_epoch();
+
+            match connected.try_send(reader, flags, &mut pending_packet) {
+                Ok(sent) => return Ok(sent),
+                Err(err) if err.error() == Errno::EAGAIN => {
+                    // Fall through to event wait.
+                }
+                Err(err) => return Err(err),
+            }
+
+            let tx_blocked_on_queue = connected.is_tx_blocked_on_queue();
+            let retry_timeout = if tx_blocked_on_queue {
+                Duration::from_millis(queue_block_timeout_ms)
+            } else {
+                queue_block_timeout_ms = SEND_QUEUE_BLOCK_TIMEOUT_MIN_MS;
+                SEND_RETRY_TIMEOUT
+            };
+
+            let mut poller = Poller::new(Some(&retry_timeout));
+            if connected
+                .poll(IoEvents::OUT, Some(poller.as_handle_mut()))
+                .is_empty()
+            {
+                // Avoid missed-wakeup race: if progress already happened after
+                // we observed EAGAIN, skip blocking wait and retry immediately.
+                let epoch_after_register = connected.tx_progress_epoch();
+                if epoch_after_register == epoch_before {
+                    match poller.wait() {
+                        Ok(_) => {
+                            queue_block_timeout_ms = SEND_QUEUE_BLOCK_TIMEOUT_MIN_MS;
+                        }
+                        Err(e) if e.error() == Errno::ETIME => {
+                            let blocked_after_timeout = connected.is_tx_blocked_on_queue();
+                            if blocked_after_timeout {
+                                queue_block_timeout_ms = (queue_block_timeout_ms << 1)
+                                    .min(SEND_QUEUE_BLOCK_TIMEOUT_MAX_MS);
+                            } else {
+                                queue_block_timeout_ms = SEND_QUEUE_BLOCK_TIMEOUT_MIN_MS;
+                            }
+                            // Progress can be time-driven (e.g., credit-request retry)
+                            // without generating a new OUT edge. Retry proactively.
+                            //
+                            // Under tiny-packet queue pressure, aggressive retry loops can
+                            // starve FrameVM receiver execution on shared CPUs. Yield here to
+                            // guarantee the peer gets a scheduling chance to drain.
+                            Thread::yield_now();
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
-        })
+        }
     }
 
     fn try_recv(
@@ -166,7 +240,7 @@ impl Socket for FrameVsockStreamSocket {
         use core::time::Duration;
 
         use aster_framevisor::vsock as framevisor_vsock;
-        use aster_framevsock::create_request;
+        use aster_framevsock::create_request_with_credit;
 
         use crate::process::signal::Poller;
 
@@ -189,14 +263,24 @@ impl Socket for FrameVsockStreamSocket {
             init.bind(FrameVsockAddr::any())?;
         }
 
-        let connecting = Arc::new(Connecting::new(remote_addr, init.bound_addr().unwrap()));
-        let vsockspace = FRAME_VSOCK_GLOBAL.get().unwrap();
+        let local_addr = init
+            .bound_addr()
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "the socket is not bound"))?;
+        let connecting = Arc::new(Connecting::new(remote_addr, local_addr));
+        let vsockspace = FRAME_VSOCK_GLOBAL
+            .get()
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "FrameVsock is not initialized"))?;
         vsockspace.insert_connecting_socket(connecting.local_addr(), connecting.clone());
 
-        // Send connection request to Guest
-        let local = init.bound_addr().unwrap();
-        let request_packet =
-            create_request(local.cid, local.port, remote_addr.cid, remote_addr.port);
+        // Send connection request to Guest with our credit info
+        let request_packet = create_request_with_credit(
+            local_addr.cid,
+            local_addr.port,
+            remote_addr.cid,
+            remote_addr.port,
+            DEFAULT_BUF_ALLOC,
+            0, // Initial fwd_cnt is 0
+        );
 
         // Select vCPU 0 for connection request (Guest will handle it)
         if framevisor_vsock::deliver_control_packet(0, request_packet).is_err() {
@@ -265,10 +349,10 @@ impl Socket for FrameVsockStreamSocket {
         *self.status.write() = Status::Listen(listen.clone());
 
         // push listen socket into vsockspace
-        FRAME_VSOCK_GLOBAL
+        let vsockspace = FRAME_VSOCK_GLOBAL
             .get()
-            .unwrap()
-            .insert_listen_socket(listen.addr(), listen);
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "FrameVsock is not initialized"))?;
+        vsockspace.insert_listen_socket(listen.addr(), listen);
 
         Ok(())
     }
@@ -359,14 +443,16 @@ impl Socket for FrameVsockStreamSocket {
         }
     }
 
-    fn pseudo_inode(&self) -> &Arc<dyn Inode> {
-        &self.pseudo_inode
+    fn pseudo_path(&self) -> &Path {
+        &self.pseudo_path
     }
 }
 
 impl Drop for FrameVsockStreamSocket {
     fn drop(&mut self) {
-        let vsockspace = FRAME_VSOCK_GLOBAL.get().unwrap();
+        let Some(vsockspace) = FRAME_VSOCK_GLOBAL.get() else {
+            return;
+        };
         let inner = self.status.get_mut();
         match inner {
             Status::Init(init) => {

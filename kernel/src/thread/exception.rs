@@ -67,8 +67,14 @@ fn generate_fault_signal(exception: CpuException, ctx: &Context) {
 }
 
 pub(super) fn page_fault_handler(info: &CpuException) -> core::result::Result<(), ()> {
+    if let Some(res) = aster_framevisor::task::dispatch_user_page_fault(info) {
+        return res;
+    }
+
     let task = Task::current().unwrap();
-    let thread_local = task.as_thread_local().unwrap();
+    let Some(thread_local) = task.as_thread_local() else {
+        return Err(());
+    };
 
     if thread_local.is_page_fault_disabled() {
         // Do nothing if the page fault handler is disabled. This will typically cause the fallible

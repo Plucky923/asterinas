@@ -7,7 +7,10 @@ use crate::{
     fs::{
         procfs::{
             ProcDir,
-            sys::kernel::{cap_last_cap::CapLastCapFileOps, pid_max::PidMaxFileOps},
+            sys::kernel::{
+                cap_last_cap::CapLastCapFileOps, framevsock::FrameVsockFileOps,
+                pid_max::PidMaxFileOps,
+            },
             template::{
                 DirOps, ProcDirBuilder, lookup_child_from_table, populate_children_from_table,
             },
@@ -18,6 +21,7 @@ use crate::{
 };
 
 mod cap_last_cap;
+mod framevsock;
 mod pid_max;
 
 /// Represents the inode at `/proc/sys/kernel`.
@@ -37,6 +41,7 @@ impl KernelDirOps {
     #[expect(clippy::type_complexity)]
     const STATIC_ENTRIES: &'static [(&'static str, fn(Weak<dyn Inode>) -> Arc<dyn Inode>)] = &[
         ("cap_last_cap", CapLastCapFileOps::new_inode),
+        ("framevsock", FrameVsockFileOps::new_inode),
         ("pid_max", PidMaxFileOps::new_inode),
     ];
 }

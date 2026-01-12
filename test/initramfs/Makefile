@@ -6,6 +6,7 @@ VERBOSE ?= 1
 SYSCALL_TEST_SUITE ?= ltp
 SYSCALL_TEST_WORKDIR ?= /tmp
 ENABLE_BASIC_TEST ?= false
+ENABLE_NESTED_QEMU ?= false
 # Specify platform macros when building regression tests (supported: asterinas, linux).
 # - asterinas: Define both `__asterinas__` and `__linux__`. Tests may fail in Linux.
 # - linux: Define only `__linux__`. Tests may fail in Asterinas.
@@ -14,6 +15,13 @@ DNS_SERVER ?= none
 # FrameVM payload settings
 FRAMEVM_OBJ_PATH ?=
 FRAMEVM_INSTALL_PATH ?= /framevm/framevm.o
+MEM_COMPARE_WORKSET_BYTES ?= 536870912
+MEM_COMPARE_RUNS ?= 5
+MEM_COMPARE_SEED ?= 12345
+MEM_COMPARE_DO_STORE ?= 0
+MEM_PAGE_RAND_RUNS ?= 5
+MEM_PAGE_RAND_SEED ?= 12345
+MEM_PAGE_RAND_DO_STORE ?= 0
 # Set Nix's cached tarballs to be live for a longer period of time (30 days) to avoid network traffics.
 # Nix's default value is rather small (1 hour or 3600 seconds).
 NIXPKGS_CACHE_TTL := 2592000 # In seconds
@@ -69,37 +77,55 @@ framevm_initramfs: $(INITRAMFS_IMAGE)
 
 .PHONY: $(INITRAMFS_IMAGE)
 $(INITRAMFS_IMAGE): $(INITRAMFS)
+	@rm -rf $@
 	@nix-build \
 		--tarball-ttl $(NIXPKGS_CACHE_TTL) \
 		--argstr target $(OSDK_TARGET_ARCH) \
 		--arg enableBasicTest $(ENABLE_BASIC_TEST) \
+		--arg enableNestedQemu $(ENABLE_NESTED_QEMU) \
 		--argstr basicTestPlatform $(BASIC_TEST_PLATFORM) \
 		--arg enableBenchmark $(ENABLE_BENCHMARK) \
 		--arg enableSyscallTest $(ENABLE_SYSCALL_TEST) \
 		--argstr syscallTestSuite $(SYSCALL_TEST_SUITE) \
 		--argstr syscallTestWorkDir $(SYSCALL_TEST_WORKDIR) \
-		--argstr dnsServer ${DNS_SERVER} \
-		--arg initramfsCompressed $(INITRAMFS_COMPRESSED) \
-		--arg smp $(SMP) \
-		--out-link $@ \
+			--argstr dnsServer ${DNS_SERVER} \
+			--argstr memCompareWorksetBytes "$(MEM_COMPARE_WORKSET_BYTES)" \
+			--argstr memCompareRuns "$(MEM_COMPARE_RUNS)" \
+			--argstr memCompareSeed "$(MEM_COMPARE_SEED)" \
+			--argstr memCompareDoStore "$(MEM_COMPARE_DO_STORE)" \
+			--argstr memPageRandRuns "$(MEM_PAGE_RAND_RUNS)" \
+			--argstr memPageRandSeed "$(MEM_PAGE_RAND_SEED)" \
+			--argstr memPageRandDoStore "$(MEM_PAGE_RAND_DO_STORE)" \
+			--arg initramfsCompressed $(INITRAMFS_COMPRESSED) \
+			--arg smp $(SMP) \
+			--out-link $@ \
 		$(NIX_FRAMEVM_ARGS) \
 		nix -A initramfs-image
 
 .PHONY: $(INITRAMFS)
 $(INITRAMFS):
+	@rm -rf $@
 	@nix-build \
 		--tarball-ttl $(NIXPKGS_CACHE_TTL) \
 		--argstr target $(OSDK_TARGET_ARCH) \
 		--arg enableBasicTest $(ENABLE_BASIC_TEST) \
+		--arg enableNestedQemu $(ENABLE_NESTED_QEMU) \
 		--argstr basicTestPlatform $(BASIC_TEST_PLATFORM) \
 		--arg enableBenchmark $(ENABLE_BENCHMARK) \
 		--arg enableSyscallTest $(ENABLE_SYSCALL_TEST) \
 		--argstr syscallTestSuite $(SYSCALL_TEST_SUITE) \
 		--argstr syscallTestWorkDir $(SYSCALL_TEST_WORKDIR) \
-		--argstr dnsServer ${DNS_SERVER} \
-		--arg smp $(SMP) \
-		--out-link $@ \
-		$(NIX_FRAMEVM_ARGS) \
+			--argstr dnsServer ${DNS_SERVER} \
+			--argstr memCompareWorksetBytes "$(MEM_COMPARE_WORKSET_BYTES)" \
+			--argstr memCompareRuns "$(MEM_COMPARE_RUNS)" \
+			--argstr memCompareSeed "$(MEM_COMPARE_SEED)" \
+			--argstr memCompareDoStore "$(MEM_COMPARE_DO_STORE)" \
+			--argstr memPageRandRuns "$(MEM_PAGE_RAND_RUNS)" \
+			--argstr memPageRandSeed "$(MEM_PAGE_RAND_SEED)" \
+			--argstr memPageRandDoStore "$(MEM_PAGE_RAND_DO_STORE)" \
+			--arg smp $(SMP) \
+			--out-link $@ \
+			$(NIX_FRAMEVM_ARGS) \
 		nix -A initramfs
 
 # Prebuild x86_64 packages

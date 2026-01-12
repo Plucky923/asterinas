@@ -1,0 +1,50 @@
+/*
+ * vsock_segments_template.bt
+ *
+ * Runtime placeholders replaced by collect_kernel_events.sh:
+ *   __TARGET_PID__ : benchmark process pid
+ *   __SIDE__       : host | guest
+ */
+
+BEGIN
+{
+	printf("ts_ns,side,event,probe,pid,tid,cpu,comm\n");
+}
+
+tracepoint:syscalls:sys_enter_sendto
+/pid == __TARGET_PID__/
+{
+	printf("%llu,__SIDE__,SYS_ENTER_SEND,sys_enter_sendto,%d,%d,%d,%s\n",
+	       nsecs, pid, tid, cpu, comm);
+}
+
+tracepoint:syscalls:sys_exit_recvfrom
+/pid == __TARGET_PID__ && args->ret > 0/
+{
+	printf("%llu,__SIDE__,SYS_EXIT_RECV,sys_exit_recvfrom,%d,%d,%d,%s\n",
+	       nsecs, pid, tid, cpu, comm);
+}
+
+/*
+ * TX boundary candidates for virtio/vhost vsock implementations.
+ * Keep them broad and record "probe" for post-run auditability.
+ */
+kprobe:virtio_transport_send_pkt*,
+kprobe:vhost_transport_send_pkt*,
+kprobe:vhost_transport_do_send_pkt*
+{
+	printf("%llu,__SIDE__,TX_OUT,%s,%d,%d,%d,%s\n",
+	       nsecs, probe, pid, tid, cpu, comm);
+}
+
+/*
+ * RX boundary candidates for virtio/vhost vsock implementations.
+ */
+kprobe:virtio_transport_recv_pkt*,
+kprobe:vhost_transport_recv_pkt*,
+kprobe:vhost_transport_do_recv_pkt*
+{
+	printf("%llu,__SIDE__,RX_IN,%s,%d,%d,%d,%s\n",
+	       nsecs, probe, pid, tid, cpu, comm);
+}
+

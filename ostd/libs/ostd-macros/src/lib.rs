@@ -6,7 +6,7 @@
 use proc_macro::{Diagnostic, Level, Span, TokenStream};
 use quote::quote;
 use rand::{Rng, distr::Alphanumeric};
-use syn::{Expr, Ident, ItemFn, parse_macro_input};
+use syn::{Expr, Ident, ItemFn, LitInt, parse_macro_input};
 
 /// A macro attribute to mark the kernel entry point.
 ///
@@ -548,4 +548,49 @@ fn generate_panic_expectation_tokens(attrs: &[syn::Attribute]) -> proc_macro2::T
         "`should_panic` attributes should only have zero or one `expected` argument, \
          with the format of `expected = \"<panic message>\"`"
     );
+}
+
+/// A macro attribute to ensure sufficient stack space before executing a function.
+///
+/// This macro is used to protect against stack exhaustion attacks where an
+/// untrusted caller (e.g., FrameVM) might exhaust their stack before calling
+/// a trusted function (e.g., FrameVisor API).
+///
+/// # Arguments
+///
+/// * `stack_size` - The minimum required stack space in bytes.
+///
+/// # Behavior
+///
+/// - If the current stack has sufficient space, the function executes directly.
+/// - If the stack space is insufficient, execution switches to a service stack.
+///
+/// # Example
+///
+/// ```ignore
+/// use ostd::ensure_stack;
+///
+/// #[ensure_stack(4096)]
+/// pub fn api_function(data: &[u8]) -> Result<(), Error> {
+///     process_data(data)
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn ensure_stack(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let stack_size = parse_macro_input!(attr as LitInt);
+    let input_fn = parse_macro_input!(item as ItemFn);
+
+    let fn_attrs = &input_fn.attrs;
+    let fn_vis = &input_fn.vis;
+    let fn_sig = &input_fn.sig;
+    let fn_block = &input_fn.block;
+
+    let output = quote! {
+        #(#fn_attrs)*
+        #fn_vis #fn_sig {
+            ostd::ensure_stack_impl!(#stack_size, #fn_block)
+        }
+    };
+
+    TokenStream::from(output)
 }

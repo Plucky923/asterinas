@@ -1,15 +1,19 @@
-use alloc::{collections::btree_map::BTreeMap, sync::Arc};
+use alloc::{collections::btree_map::BTreeMap, format, sync::Arc};
 use core::cmp;
 
 use xmas_elf::{
+    sections::{ShType, SHF_ALLOC},
     ElfFile,
-    sections::{SHF_ALLOC, ShType},
 };
 
-use super::memory::{SectionMemory, SectionMemoryType, align_up, select_section_bucket};
+use super::{
+    invalid_args,
+    memory::{align_up, select_section_bucket, SectionMemory, SectionMemoryType},
+};
 use crate::{
-    Result, early_println,
+    early_println,
     mm::io::{Infallible, VmReader, VmWriter},
+    Result,
 };
 
 pub struct SectionsMetadata<'a> {
@@ -31,7 +35,7 @@ pub fn load_section_data<'a>(
     elf_file: &'a ElfFile,
     section_memory: &SectionMemory,
 ) -> Result<SectionsMetadata<'a>> {
-    early_println!("[Loader] Start Loading section data...");
+    log::info!("[Loader] Start Loading section data...");
 
     let mut sections_metadata = SectionsMetadata {
         loaded_sections: BTreeMap::new(),
@@ -70,35 +74,46 @@ pub fn load_section_data<'a>(
         let (cursor, kvirt) = match bucket {
             SectionMemoryType::Text => (
                 &mut exec_cursor,
-                section_memory
-                    .exec_kvirt
-                    .as_ref()
-                    .ok_or(crate::Error::InvalidArgs)?,
+                section_memory.exec_kvirt.as_ref().ok_or_else(|| {
+                    invalid_args(format!(
+                        "missing executable area while loading section `{}`",
+                        name
+                    ))
+                })?,
             ),
             SectionMemoryType::RwData => (
                 &mut rw_cursor,
-                section_memory
-                    .rw_kvirt
-                    .as_ref()
-                    .ok_or(crate::Error::InvalidArgs)?,
+                section_memory.rw_kvirt.as_ref().ok_or_else(|| {
+                    invalid_args(format!(
+                        "missing writable area while loading section `{}`",
+                        name
+                    ))
+                })?,
             ),
             SectionMemoryType::RoData => (
                 &mut ro_cursor,
-                section_memory
-                    .ro_kvirt
-                    .as_ref()
-                    .ok_or(crate::Error::InvalidArgs)?,
+                section_memory.ro_kvirt.as_ref().ok_or_else(|| {
+                    invalid_args(format!(
+                        "missing read-only area while loading section `{}`",
+                        name
+                    ))
+                })?,
             ),
         };
 
         // 对齐到页面大小倍数
         let offset = align_up(*cursor, align);
-        let end = offset.checked_add(size).ok_or(crate::Error::InvalidArgs)?;
+        let end = offset.checked_add(size).ok_or_else(|| {
+            invalid_args(format!("section `{}` size overflow while loading", name))
+        })?;
 
         // 检查是否超出内存区域
         let area_len = kvirt.end() - kvirt.start();
         if end > area_len {
-            return Err(crate::Error::InvalidArgs);
+            return Err(invalid_args(format!(
+                "section `{}` exceeds allocated area: end=0x{:x}, area_len=0x{:x}",
+                name, end, area_len
+            )));
         }
 
         let section_data = if sh_type == ShType::NoBits {
@@ -112,16 +127,29 @@ pub fn load_section_data<'a>(
             if section_data.is_none() {
                 let filled = writer.fill_zeros(size);
                 if filled != size {
-                    return Err(crate::Error::InvalidArgs);
+                    return Err(invalid_args(format!(
+                        "failed to zero-fill section `{}`: expected {}, wrote {}",
+                        name, size, filled
+                    )));
                 }
             } else {
                 let data = section_data.unwrap();
                 if data.len() != size {
-                    return Err(crate::Error::InvalidArgs);
+                    return Err(invalid_args(format!(
+                        "section `{}` size mismatch: section header={}, raw_data={}",
+                        name,
+                        size,
+                        data.len()
+                    )));
                 }
                 let written = writer.write(&mut VmReader::from(data));
                 if written != data.len() {
-                    return Err(crate::Error::InvalidArgs);
+                    return Err(invalid_args(format!(
+                        "failed to copy section `{}` into module memory: expected {}, wrote {}",
+                        name,
+                        data.len(),
+                        written
+                    )));
                 }
             }
         }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ostd = { path = "../../../../ostd" }
+spin = "0.9"
 
 [lints]
 workspace = true

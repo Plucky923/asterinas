@@ -217,3 +217,10 @@ lto = true
 panic = "abort"
 # set codegen-units as the smallest number
 codegen-units = 1
+
+# Release profile without LTO for FrameVM dynamic loading.
+# LTO generates 32-bit relocations that are incompatible with high address loading.
+[profile.release-no-lto]
+inherits = "release"
+lto = false
+panic = "unwind"

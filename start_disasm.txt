@@ -1,0 +1,31 @@
+0000000000401ba0 <_start>:
+  401ba0:	f3 0f 1e fa          	endbr64
+  401ba4:	31 ed                	xor    %ebp,%ebp
+  401ba6:	49 89 d1             	mov    %rdx,%r9
+  401ba9:	5e                   	pop    %rsi
+  401baa:	48 89 e2             	mov    %rsp,%rdx
+  401bad:	48 83 e4 f0          	and    $0xfffffffffffffff0,%rsp
+  401bb1:	50                   	push   %rax
+  401bb2:	54                   	push   %rsp
+  401bb3:	45 31 c0             	xor    %r8d,%r8d
+  401bb6:	31 c9                	xor    %ecx,%ecx
+  401bb8:	48 c7 c7 60 19 40 00 	mov    $0x401960,%rdi
+  401bbf:	67 e8 eb 25 00 00    	addr32 call 4041b0 <__libc_start_main>
+  401bc5:	f4                   	hlt
+  401bc6:	66 2e 0f 1f 84 00 00 	cs nopw 0x0(%rax,%rax,1)
+  401bcd:	00 00 00 
+
+0000000000401bd0 <_dl_relocate_static_pie>:
+  401bd0:	f3 0f 1e fa          	endbr64
+  401bd4:	c3                   	ret
+  401bd5:	66 2e 0f 1f 84 00 00 	cs nopw 0x0(%rax,%rax,1)
+  401bdc:	00 00 00 
+  401bdf:	90                   	nop
+
+0000000000401be0 <deregister_tm_clones>:
+  401be0:	b8 b8 3a 4b 00       	mov    $0x4b3ab8,%eax
+  401be5:	48 3d b8 3a 4b 00    	cmp    $0x4b3ab8,%rax
+  401beb:	74 13                	je     401c00 <deregister_tm_clones+0x20>
+  401bed:	b8 00 00 00 00       	mov    $0x0,%eax
+  401bf2:	48 85 c0             	test   %rax,%rax
+  401bf5:	74 09                	je     401c00 <deregister_tm_clones+0x20>

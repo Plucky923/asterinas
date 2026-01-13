@@ -12,6 +12,7 @@ use core::{panic::PanicInfo, sync::atomic::Ordering};
 use aster_framevisor::{println, task::Task};
 
 mod error;
+mod pollee;
 mod syscall;
 mod task;
 mod vm;
@@ -42,6 +43,7 @@ pub fn main() {
                 "[FrameVM] Critical Error: Failed to create VM space: {:?}",
                 e
             );
+            vsock::shutdown();
             return;
         }
     };
@@ -58,6 +60,7 @@ pub fn main() {
                 "[FrameVM] Critical Error: Failed to create user task: {:?}",
                 e
             );
+            vsock::shutdown();
             return;
         }
     };
@@ -76,17 +79,16 @@ pub fn main() {
     while !finished.load(Ordering::SeqCst) {
         Task::yield_now();
     }
+
+    // Shutdown vsock subsystem before exiting
+    // This prevents Host from calling Guest callbacks after Guest exits
+    vsock::shutdown();
+
     println!("[FrameVM] User task finished. Exiting.");
 }
 
 fn load_program_binary() -> Vec<u8> {
-    // Select which program to run:
-    // - vsock_echo_server: Acts as a Server (Host -> Guest)
-    // - vsock_client: Acts as a Client (Guest -> Host)
-    
-    // Uncomment the one you want to run:
-    let program_data = include_bytes!("vsock_client");
-    // let program_data = include_bytes!("vsock_client");
+    let program_data = include_bytes!("../test/bench_throughput_receiver");
 
     // Copy to heap-allocated Vec to ensure basic alignment and mutability if needed
     let mut program_binary_vec = vec![0u8; program_data.len()];

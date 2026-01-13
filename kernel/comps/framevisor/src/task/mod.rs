@@ -15,10 +15,8 @@ pub use preempt::disable_preempt;
 
 use crate::prelude::Result;
 
-pub type TaskCreatorFn = fn(
-    Box<dyn FnOnce() + Send>,
-    Box<dyn Any + Send + Sync>,
-) -> Result<Arc<OstdTask>>;
+pub type TaskCreatorFn =
+    fn(Box<dyn FnOnce() + Send>, Box<dyn Any + Send + Sync>) -> Result<Arc<OstdTask>>;
 
 static TASK_CREATOR: spin::Once<TaskCreatorFn> = spin::Once::new();
 
@@ -67,7 +65,11 @@ fn get_current_handler() -> Option<fn()> {
 /// 分发 FrameVM task 的调度后处理
 pub fn dispatch_post_schedule() -> bool {
     if let Some(current) = OstdTask::current() {
-        if let Some(ext) = current.cloned().extension().downcast_ref::<FrameVmTaskExt>() {
+        if let Some(ext) = current
+            .cloned()
+            .extension()
+            .downcast_ref::<FrameVmTaskExt>()
+        {
             if let Some(handler) = ext.handler {
                 handler();
             }

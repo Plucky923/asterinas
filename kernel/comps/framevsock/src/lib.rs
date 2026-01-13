@@ -462,7 +462,6 @@ impl DataPacketQueue {
     }
 }
 
-
 // ========== Helper functions for creating packets ==========
 
 /// Create a connection request (control packet)
@@ -481,6 +480,22 @@ pub fn create_request(
     ))
 }
 
+/// Create a connection request with credit info (control packet)
+pub fn create_request_with_credit(
+    src_cid: u64,
+    src_port: u32,
+    dst_cid: u64,
+    dst_port: u32,
+    buf_alloc: u32,
+    fwd_cnt: u32,
+) -> RRef<ControlPacket> {
+    let mut packet =
+        ControlPacket::with_header(src_cid, dst_cid, src_port, dst_port, VsockOp::Request);
+    packet.header.buf_alloc = buf_alloc;
+    packet.header.fwd_cnt = fwd_cnt;
+    RRef::new(packet)
+}
+
 /// Create a connection response (control packet)
 pub fn create_response(
     src_cid: u64,
@@ -495,6 +510,22 @@ pub fn create_response(
         dst_port,
         VsockOp::Response,
     ))
+}
+
+/// Create a connection response with credit info (control packet)
+pub fn create_response_with_credit(
+    src_cid: u64,
+    src_port: u32,
+    dst_cid: u64,
+    dst_port: u32,
+    buf_alloc: u32,
+    fwd_cnt: u32,
+) -> RRef<ControlPacket> {
+    let mut packet =
+        ControlPacket::with_header(src_cid, dst_cid, src_port, dst_port, VsockOp::Response);
+    packet.header.buf_alloc = buf_alloc;
+    packet.header.fwd_cnt = fwd_cnt;
+    RRef::new(packet)
 }
 
 /// Create a reset packet (control packet)

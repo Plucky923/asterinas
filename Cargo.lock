@@ -224,6 +224,7 @@ name = "aster-framevisor-exchangeable"
 version = "0.1.0"
 dependencies = [
  "ostd",
+ "spin",
 ]
 
 [[package]]

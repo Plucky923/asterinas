@@ -3,7 +3,10 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::any::Any;
 
-use aster_framevisor::task::inject_task_creator;
+use aster_framevisor::{
+    iht::{IhtContext, iht_main_loop},
+    task::inject_task_creator,
+};
 use ostd::{
     cpu::CpuSet,
     task::{Task as OstdTask, TaskOptions},
@@ -11,7 +14,7 @@ use ostd::{
 
 use crate::{
     sched::{Nice, SchedPolicy},
-    thread::Thread,
+    thread::{AsThread, Thread},
 };
 
 struct FrameVmThread;
@@ -29,6 +32,7 @@ fn create_framevm_task(
             FrameVmThread,
             affinity,
             policy,
+            // SchedPolicy::Fair(Nice::default())
         ));
 
         TaskOptions::new(func)
@@ -39,6 +43,43 @@ fn create_framevm_task(
     }))
 }
 
+fn create_iht_task(ctx: Arc<IhtContext>) -> Arc<OstdTask> {
+    use crate::{
+        sched::{RealTimePolicy, RealTimePriority},
+        thread::kernel_thread::ThreadOptions,
+    };
+
+    // Use RT priority 50
+    // Note: In Asterinas (and Linux), RealTimePriority is RangedU8<1, 99>.
+    // Usually smaller number = higher priority for RT tasks in implementation?
+    // Or 99 is highest?
+    // Linux user space: 1 (low) to 99 (high).
+    // Linux kernel internal (prio): 0-99 (RT), 100-139 (Fair).
+    // In Asterinas `sched_class/real_time.rs`, `PrioArray` has 100 queues.
+    // If it maps 1:1, 99 is index 99.
+    // Let's use 50 as planned.
+    let rt_prio = RealTimePriority::new(50);
+    let rt_policy = RealTimePolicy::Fifo;
+
+    let thread_fn = move || iht_main_loop(ctx);
+
+    // IHT handles interrupts, so it should run on any CPU or bound to specific vCPU's PCPU.
+    // For now use full affinity.
+    let affinity = CpuSet::new_full();
+
+    let task = ThreadOptions::new(thread_fn)
+        .sched_policy(SchedPolicy::RealTime { rt_prio, rt_policy })
+        .cpu_affinity(affinity)
+        .build();
+
+    // Must spawn (run) the task!
+    let thread = task.as_thread().unwrap().clone();
+    thread.run();
+
+    task
+}
+
 pub fn init() {
     inject_task_creator(create_framevm_task);
+    aster_framevisor::iht::inject_iht_creator(create_iht_task);
 }

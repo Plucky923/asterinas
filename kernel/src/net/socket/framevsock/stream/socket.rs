@@ -13,9 +13,12 @@ use crate::{
             addr::{self, FrameVsockAddr},
         },
         new_pseudo_inode,
-        util::{options::{SocketOptionSet, SetSocketLevelOption, GetSocketLevelOption}, MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr},
         options::SocketOption,
         private::SocketPrivate,
+        util::{
+            MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr,
+            options::{GetSocketLevelOption, SetSocketLevelOption, SocketOptionSet},
+        },
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
@@ -166,7 +169,7 @@ impl Socket for FrameVsockStreamSocket {
         use core::time::Duration;
 
         use aster_framevisor::vsock as framevisor_vsock;
-        use aster_framevsock::create_request;
+        use aster_framevsock::create_request_with_credit;
 
         use crate::process::signal::Poller;
 
@@ -193,10 +196,16 @@ impl Socket for FrameVsockStreamSocket {
         let vsockspace = FRAME_VSOCK_GLOBAL.get().unwrap();
         vsockspace.insert_connecting_socket(connecting.local_addr(), connecting.clone());
 
-        // Send connection request to Guest
+        // Send connection request to Guest with our credit info
         let local = init.bound_addr().unwrap();
-        let request_packet =
-            create_request(local.cid, local.port, remote_addr.cid, remote_addr.port);
+        let request_packet = create_request_with_credit(
+            local.cid,
+            local.port,
+            remote_addr.cid,
+            remote_addr.port,
+            super::connected::DEFAULT_BUF_ALLOC,
+            0, // Initial fwd_cnt is 0
+        );
 
         // Select vCPU 0 for connection request (Guest will handle it)
         if framevisor_vsock::deliver_control_packet(0, request_packet).is_err() {

@@ -7,6 +7,8 @@ mod kernel_stack;
 mod preempt;
 mod processor;
 pub mod scheduler;
+pub mod service_stack;
+pub mod stack;
 mod utils;
 
 use core::{
@@ -83,6 +85,18 @@ impl Task {
 
     pub(super) fn ctx(&self) -> &SyncUnsafeCell<TaskContext> {
         &self.ctx
+    }
+
+    /// Returns the bottom address (low address) of the kernel stack.
+    ///
+    /// This is useful for checking remaining stack space.
+    pub fn stack_bottom(&self) -> usize {
+        self.kstack.bottom_vaddr()
+    }
+
+    /// Returns the top address (high address) of the kernel stack.
+    pub fn stack_top(&self) -> usize {
+        self.kstack.end_vaddr()
     }
 
     /// Yields execution so that another task may be scheduled.

@@ -36,7 +36,7 @@ use crate::{
 const MAX_PENDING_PACKETS: usize = 64;
 
 /// Default buffer allocation advertised to peer
-const DEFAULT_BUF_ALLOC: u32 = 64 * 1024; // 64KB
+pub const DEFAULT_BUF_ALLOC: u32 = 64 * 1024; // 64KB
 
 /// Credit update threshold - send update when this many bytes consumed
 const CREDIT_UPDATE_THRESHOLD: u32 = DEFAULT_BUF_ALLOC / 4;
@@ -104,6 +104,16 @@ impl Connected {
 
     pub fn id(&self) -> ConnectionId {
         self.id
+    }
+
+    /// Get our buffer allocation (for credit info in packets)
+    pub fn buf_alloc(&self) -> u32 {
+        self.connection.disable_irq().lock().buf_alloc()
+    }
+
+    /// Get our forward count (for credit info in packets)
+    pub fn fwd_cnt(&self) -> u32 {
+        self.connection.disable_irq().lock().fwd_cnt()
     }
 
     /// Receive data to a MultiWrite (user buffer)
@@ -236,7 +246,6 @@ impl Connected {
         // Select vCPU and deliver
         let vcpu_id = self.select_vcpu();
         if framevisor_vsock::deliver_data_packet(vcpu_id, packet).is_err() {
-            debug!("[FrameVsock] Failed to deliver data packet to Guest");
             return_errno_with_message!(Errno::ECONNRESET, "failed to send data to guest");
         }
 

@@ -28,8 +28,9 @@ use crate::{
         scheme::{ActionChoice, BootMethod},
     },
     error::Errno,
-    error_msg, warn_msg,
+    error_msg,
     util::{DirGuard, new_command_checked_exists},
+    warn_msg,
 };
 
 /// The osdk bundle artifact that stores as `bundle` directory.
@@ -92,7 +93,11 @@ impl Bundle {
         let manifest_file_content = match std::fs::read_to_string(&manifest_file_path) {
             Ok(content) => content,
             Err(e) => {
-                warn_msg!("Failed to read bundle manifest at {:?}: {}", manifest_file_path, e);
+                warn_msg!(
+                    "Failed to read bundle manifest at {:?}: {}",
+                    manifest_file_path,
+                    e
+                );
                 return None;
             }
         };
@@ -376,7 +381,10 @@ impl Bundle {
     }
 
     pub fn vm_image_path(&self) -> Option<PathBuf> {
-        self.manifest.vm_image.as_ref().map(|vm| self.path.join(vm.path()))
+        self.manifest
+            .vm_image
+            .as_ref()
+            .map(|vm| self.path.join(vm.path()))
     }
 
     pub fn aster_bin_path(&self) -> Option<PathBuf> {
@@ -447,7 +455,11 @@ impl Bundle {
             if !vm_image.validate() {
                 let image_rel = vm_image.path().clone();
                 let _guard = DirGuard::change_dir(&self.path);
-                *vm_image = AsterVmImage::new(image_rel, vm_image.typ().clone(), vm_image.aster_version().clone());
+                *vm_image = AsterVmImage::new(
+                    image_rel,
+                    vm_image.typ().clone(),
+                    vm_image.aster_version().clone(),
+                );
             }
         }
 
@@ -469,7 +481,7 @@ impl Bundle {
         // Update stored config snapshot after mutations
         self.manifest.config = config.clone();
 
-    self.write_manifest_to_fs();
+        self.write_manifest_to_fs();
     }
 
     fn write_manifest_to_fs(&mut self) {

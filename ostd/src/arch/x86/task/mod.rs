@@ -5,6 +5,7 @@
 use crate::task::TaskContextApi;
 
 core::arch::global_asm!(include_str!("switch.S"));
+core::arch::global_asm!(include_str!("stack_switch.S"));
 
 #[derive(Debug, Clone)]
 #[repr(C)]
@@ -66,4 +67,26 @@ unsafe extern "C" {
     pub(crate) unsafe fn context_switch(nxt: *const TaskContext, cur: *mut TaskContext);
     pub(crate) unsafe fn first_context_switch(nxt: *const TaskContext);
     pub(crate) unsafe fn kernel_task_entry_wrapper();
+}
+
+// Stack switching support
+unsafe extern "C" {
+    /// Switches to a new stack and calls a function.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_stack_top` - The top of the new stack (high address)
+    /// * `func_ptr` - Pointer to the function to call
+    /// * `arg_ptr` - Argument to pass to the function
+    ///
+    /// # Safety
+    ///
+    /// - `new_stack_top` must be a valid, properly aligned stack address
+    /// - `func_ptr` must be a valid function pointer
+    /// - The function will be called with `arg_ptr` as its first argument
+    pub(crate) unsafe fn call_on_stack(
+        new_stack_top: usize,
+        func_ptr: usize,
+        arg_ptr: usize,
+    );
 }

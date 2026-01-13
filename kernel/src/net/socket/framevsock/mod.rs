@@ -34,15 +34,6 @@ pub static FRAME_VSOCK_GLOBAL: Once<Arc<FrameVsockSpace>> = Once::new();
 /// Data packet handler callback for Guest -> Host data packets
 /// Zero-copy: packet ownership is transferred to the connected socket
 fn handle_guest_data_packet(packet: RRef<DataPacket>) {
-    info!(
-        "[FrameVsock] Received data packet from FrameVM: src={}:{}, dst={}:{}, len={}",
-        packet.header.src_cid,
-        packet.header.src_port,
-        packet.header.dst_cid,
-        packet.header.dst_port,
-        packet.data.len()
-    );
-
     // Dispatch packet to FrameVsockSpace (zero-copy: ownership transfer)
     if let Some(space) = FRAME_VSOCK_GLOBAL.get() {
         let _ = space.on_data_packet_received(packet);
@@ -51,15 +42,6 @@ fn handle_guest_data_packet(packet: RRef<DataPacket>) {
 
 /// Control packet handler callback for Guest -> Host control packets
 fn handle_guest_control_packet(packet: RRef<ControlPacket>) {
-    info!(
-        "[FrameVsock] Received control packet from FrameVM: op={:?}, src={}:{}, dst={}:{}",
-        packet.operation(),
-        packet.header.src_cid,
-        packet.header.src_port,
-        packet.header.dst_cid,
-        packet.header.dst_port
-    );
-
     // Dispatch packet to FrameVsockSpace
     if let Some(space) = FRAME_VSOCK_GLOBAL.get() {
         let _ = space.on_control_packet_received(packet);

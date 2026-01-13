@@ -38,6 +38,7 @@ FRAMEVM_OBJ_OUTPUT ?= build/framevm/framevm.o
 FRAMEVM_TARGET ?= x86_64-unknown-none
 FRAMEVM_INITRAMFS_INCLUDE ?= 1
 FRAMEVM_INITRAMFS_PATH ?= /framevm/framevm.o
+FRAMEVM_MSG_SIZE ?= 4096
 # End of FrameVM options.
 
 # GDB debugging and profiling options.
@@ -121,19 +122,32 @@ export VSOCK=on
 CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_vsock_test.sh"
 endif
 
-ifeq ($(RELEASE_LTO), 1)
-CARGO_OSDK_COMMON_ARGS += --profile release-lto
-OSTD_TASK_STACK_SIZE_IN_PAGES = 8
-else ifeq ($(RELEASE), 1)
-CARGO_OSDK_COMMON_ARGS += --release
-	ifeq ($(OSDK_TARGET_ARCH), riscv64)
-	# FIXME: Unwinding in RISC-V seems to cost more stack space, so we increase
-	# the stack size for it. This may need further investigation.
-	# See https://github.com/asterinas/asterinas/pull/2383#discussion_r2307673156
-	OSTD_TASK_STACK_SIZE_IN_PAGES = 16
-	else
-	OSTD_TASK_STACK_SIZE_IN_PAGES = 8
-	endif
+# When BUILD_FRAMEVM_OBJ=1, Kernel must use release-no-lto to preserve symbols
+# that FrameVM needs. LTO would inline/remove these symbols.
+ifeq ($(BUILD_FRAMEVM_OBJ), 1)
+  ifeq ($(RELEASE_LTO), 1)
+    $(warning FrameVM enabled: Kernel downgraded from release-lto to release-no-lto)
+    CARGO_OSDK_COMMON_ARGS += --profile release-no-lto
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+  else ifeq ($(RELEASE), 1)
+    CARGO_OSDK_COMMON_ARGS += --profile release-no-lto
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+  endif
+else
+  ifeq ($(RELEASE_LTO), 1)
+    CARGO_OSDK_COMMON_ARGS += --profile release-lto
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+  else ifeq ($(RELEASE), 1)
+    CARGO_OSDK_COMMON_ARGS += --release
+    ifeq ($(OSDK_TARGET_ARCH), riscv64)
+    # FIXME: Unwinding in RISC-V seems to cost more stack space, so we increase
+    # the stack size for it. This may need further investigation.
+    # See https://github.com/asterinas/asterinas/pull/2383#discussion_r2307673156
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 16
+    else
+    OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+    endif
+  endif
 endif
 
 # If the BENCHMARK is set, we will run the benchmark in the kernel mode.
@@ -208,14 +222,15 @@ CARGO_OSDK_BUILD_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 CARGO_OSDK_TEST_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 
 # FrameVM profile/target directories for locating the emitted object file.
+# FrameVM always uses release-no-lto to avoid 32-bit relocation issues with LTO.
 FRAMEVM_PROFILE_DIR := debug
 FRAMEVM_CARGO_PROFILE :=
 ifeq ($(RELEASE_LTO), 1)
-FRAMEVM_CARGO_PROFILE := --profile release-lto
-FRAMEVM_PROFILE_DIR := release-lto
+FRAMEVM_CARGO_PROFILE := --profile release-no-lto
+FRAMEVM_PROFILE_DIR := release-no-lto
 else ifeq ($(RELEASE), 1)
-FRAMEVM_CARGO_PROFILE := --release
-FRAMEVM_PROFILE_DIR := release
+FRAMEVM_CARGO_PROFILE := --profile release-no-lto
+FRAMEVM_PROFILE_DIR := release-no-lto
 endif
 FRAMEVM_DEPS_DIR := target/$(FRAMEVM_TARGET)/$(FRAMEVM_PROFILE_DIR)/deps
 
@@ -565,13 +580,18 @@ fv_init_ramfs: framevm_obj
 		FRAMEVM_OBJ_PATH=$(abspath $(FRAMEVM_OBJ_OUTPUT)) \
 		FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
 
+# Build FrameVM test programs (bench_throughput_sender/receiver)
+# Usage: make framevm_test FRAMEVM_MSG_SIZE=65536
+.PHONY: framevm_test
+framevm_test:
+	@echo "[make] Building FrameVM test programs with MSG_SIZE=$(FRAMEVM_MSG_SIZE)"
+	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test clean
+	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test CFLAGS="-static -nostdlib -fno-builtin -O2 -Wall -DMSG_SIZE=$(FRAMEVM_MSG_SIZE)"
+	@echo "[make] FrameVM test programs built successfully"
+
 .PHONY: framevm
-framevm:
-	@echo "[make] Compiling FrameVM user-space assembly code"
-	@cd kernel/comps/framevm/src && \
-		gcc -nostdlib -static -o vsock_echo_server vsock_echo_server.S && \
-		gcc -nostdlib -static -o vsock_client vsock_client.S
-	@make clean 
+framevm: framevm_test
+	@echo "[make] FrameVM test build started"
 	@make kernel
 	@make fv_init_ramfs
 	@echo "[make] FrameVM build completed"

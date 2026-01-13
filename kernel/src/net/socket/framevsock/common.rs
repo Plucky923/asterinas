@@ -144,15 +144,6 @@ impl FrameVsockSpace {
         let dst_addr = FrameVsockAddr::new(packet.header.dst_cid, packet.header.dst_port);
         let conn_id = ConnectionId::from_addrs(dst_addr, src_addr);
 
-        debug!(
-            "[FrameVsock] Received data packet: src={}:{}, dst={}:{}, len={}",
-            src_addr.cid,
-            src_addr.port,
-            dst_addr.cid,
-            dst_addr.port,
-            packet.data.len()
-        );
-
         if let Some(connected) = self.get_connected_socket(&conn_id) {
             // Zero-copy: pass packet ownership to connected socket
             return connected.on_data_packet_received(packet);
@@ -234,15 +225,15 @@ impl FrameVsockSpace {
 
             // Also add to connected sockets map
             let conn_id = ConnectionId::from_addrs(dst_addr.into(), src_addr.into());
-            self.insert_connected_socket(conn_id, connected);
+            self.insert_connected_socket(conn_id, connected.clone());
 
             debug!(
                 "[FrameVsock] Accepted connection from {}:{} to {}:{}",
                 src_addr.cid, src_addr.port, dst_addr.cid, dst_addr.port
             );
 
-            // Send Response back to Guest
-            self.send_response_to_guest(dst_addr, src_addr);
+            // Send Response back to Guest with our credit info
+            self.send_response_to_guest(&connected, dst_addr, src_addr);
 
             return Ok(());
         }
@@ -256,16 +247,23 @@ impl FrameVsockSpace {
         Ok(())
     }
 
-    /// Send a Response packet to Guest
-    fn send_response_to_guest(&self, local_addr: FrameVsockAddr, peer_addr: FrameVsockAddr) {
+    /// Send a Response packet to Guest with credit info
+    fn send_response_to_guest(
+        &self,
+        connected: &Connected,
+        local_addr: FrameVsockAddr,
+        peer_addr: FrameVsockAddr,
+    ) {
         use aster_framevisor::vsock as framevisor_vsock;
-        use aster_framevsock::create_response;
+        use aster_framevsock::create_response_with_credit;
 
-        let packet = create_response(
+        let packet = create_response_with_credit(
             local_addr.cid,
             local_addr.port,
             peer_addr.cid,
             peer_addr.port,
+            connected.buf_alloc(),
+            connected.fwd_cnt(),
         );
 
         // Deliver to Guest via FrameVisor (use vCPU 0 for now)

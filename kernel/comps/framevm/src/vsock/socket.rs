@@ -16,31 +16,27 @@
 //! - buf_alloc: Buffer space allocated by receiver
 //! - fwd_cnt: Bytes consumed by receiver
 //! - available_credit = peer_buf_alloc - (tx_cnt - peer_fwd_cnt)
+//!
+//! # Flow Control Optimizations
+//! - Adaptive credit update threshold based on packet sizes
+//! - Proactive credit updates when sender credit is low
 
 #![deny(unsafe_code)]
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use aster_framevisor::task::Task;
+use aster_framevisor::{sync::WaitQueue, task::Task};
 use aster_framevsock::{
     create_credit_update, create_rst, create_shutdown, ControlPacket, DataPacket, VsockOp,
     SHUTDOWN_FLAG_BOTH, VMADDR_CID_GUEST,
+    flow_control::{
+        DEFAULT_BUF_ALLOC, MAX_PENDING_PACKETS, URGENT_CREDIT_UPDATE_THRESHOLD,
+        adaptive_threshold,
+    },
 };
 use exchangeable::RRef;
 use spin::Mutex;
-
-/// Maximum number of poll iterations for blocking operations
-const MAX_POLL_ITERATIONS: u32 = 1_000_000;
-
-/// Maximum pending packets per socket
-const MAX_PENDING_PACKETS: usize = 64;
-
-/// Credit update threshold - send update when this many bytes consumed
-const CREDIT_UPDATE_THRESHOLD: u32 = 4096 / 4;
-
-/// Default buffer allocation advertised to peer
-const DEFAULT_BUF_ALLOC: u32 = 64 * 1024; // 64KB
 
 use super::addr::{FrameVsockAddr, VMADDR_CID_ANY, VMADDR_PORT_ANY};
 use crate::{
@@ -83,6 +79,10 @@ struct PartialRead {
 /// - Pending packets are stored as RRef<DataPacket>
 /// - No intermediate VecDeque<u8> buffer
 /// - Data is read directly from packet to user buffer
+///
+/// # Low-Latency Optimizations
+/// - Uses `recv_waiters` counter for Host to know when to inject interrupts
+/// - Host only injects interrupt when Guest is actually waiting, avoiding overhead
 pub struct FrameVsockSocket {
     /// Socket state
     state: Mutex<SocketState>,
@@ -116,6 +116,21 @@ pub struct FrameVsockSocket {
     peer_fwd_cnt: AtomicU32,
     /// Total bytes we've sent
     tx_cnt: AtomicU32,
+
+    // Adaptive flow control
+    /// Running average of received packet sizes (for adaptive threshold)
+    avg_rx_packet_size: AtomicU32,
+    /// Current adaptive credit update threshold
+    credit_update_threshold: AtomicU32,
+
+    /// WaitQueue for blocking operations (recv, accept)
+    wait_queue: WaitQueue,
+
+    /// Number of tasks currently waiting for data in recv operations.
+    /// Used by Host for conditional interrupt injection: Host only injects
+    /// interrupt when this counter > 0, avoiding unnecessary overhead when
+    /// Guest is actively polling (fast path).
+    recv_waiters: AtomicU32,
 }
 
 impl FrameVsockSocket {
@@ -136,6 +151,10 @@ impl FrameVsockSocket {
             peer_buf_alloc: AtomicU32::new(DEFAULT_BUF_ALLOC),
             peer_fwd_cnt: AtomicU32::new(0),
             tx_cnt: AtomicU32::new(0),
+            avg_rx_packet_size: AtomicU32::new(1024),
+            credit_update_threshold: AtomicU32::new(adaptive_threshold(1024)),
+            wait_queue: WaitQueue::new(),
+            recv_waiters: AtomicU32::new(0),
         }
     }
 
@@ -156,6 +175,10 @@ impl FrameVsockSocket {
             peer_buf_alloc: AtomicU32::new(DEFAULT_BUF_ALLOC),
             peer_fwd_cnt: AtomicU32::new(0),
             tx_cnt: AtomicU32::new(0),
+            avg_rx_packet_size: AtomicU32::new(1024),
+            credit_update_threshold: AtomicU32::new(adaptive_threshold(1024)),
+            wait_queue: WaitQueue::new(),
+            recv_waiters: AtomicU32::new(0),
         }
     }
 
@@ -197,12 +220,35 @@ impl FrameVsockSocket {
         peer_buf_alloc.saturating_sub(outstanding)
     }
 
-    /// Check if we should send a credit update to peer
+    /// Update running average of received packet sizes and adjust threshold
+    fn update_packet_stats(&self, packet_size: usize) {
+        let size = packet_size as u32;
+        let old_avg = self.avg_rx_packet_size.load(Ordering::Relaxed);
+
+        // Exponential moving average with alpha = 1/8 for stability
+        let new_avg = (old_avg * 7 + size) / 8;
+        self.avg_rx_packet_size.store(new_avg, Ordering::Relaxed);
+
+        // Update threshold
+        let new_threshold = adaptive_threshold(new_avg);
+        self.credit_update_threshold.store(new_threshold, Ordering::Relaxed);
+    }
+
+    /// Check if we should send a credit update to peer (adaptive threshold)
     fn should_send_credit_update(&self) -> bool {
         let fwd_cnt = self.fwd_cnt.load(Ordering::Relaxed);
         let last_update = self.last_credit_update_fwd_cnt.load(Ordering::Relaxed);
+        let threshold = self.credit_update_threshold.load(Ordering::Relaxed);
         let consumed_since_last = fwd_cnt.wrapping_sub(last_update);
-        consumed_since_last >= CREDIT_UPDATE_THRESHOLD
+        consumed_since_last >= threshold
+    }
+
+    /// Check if we should send an urgent credit update (peer might be stalled)
+    fn should_send_urgent_credit_update(&self) -> bool {
+        let fwd_cnt = self.fwd_cnt.load(Ordering::Relaxed);
+        let last_update = self.last_credit_update_fwd_cnt.load(Ordering::Relaxed);
+        let consumed_since_last = fwd_cnt.wrapping_sub(last_update);
+        consumed_since_last >= URGENT_CREDIT_UPDATE_THRESHOLD
     }
 
     /// Send credit update to peer
@@ -288,24 +334,27 @@ impl FrameVsockSocket {
             return_errno!(Errno::EAGAIN);
         }
 
-        // Blocking mode: poll with yield until connection arrives
-        for _ in 0..MAX_POLL_ITERATIONS {
-            // Process any pending RX packets that might contain connection requests
-            super::process_rx_packets();
-
+        // Blocking mode: loop indefinitely until connection arrives
+        // For a server socket, we should wait forever for connections
+        self.wait_queue.wait_until(|| {
             // Check for pending connection again
             let mut pending = self.pending_connections.lock();
             if let Some(conn) = pending.pop_front() {
-                return Ok(conn);
+                return Some(Ok(conn));
             }
             drop(pending);
 
-            // Yield to allow other tasks to run
-            Task::yield_now();
-        }
+            // Check if socket state changed (e.g., closed)
+            let state = *self.state.lock();
+            if state != SocketState::Listening {
+                return Some(Err(Error::with_message(
+                    Errno::EINVAL,
+                    "socket no longer listening",
+                )));
+            }
 
-        // Timeout after MAX_POLL_ITERATIONS
-        return_errno_with_message!(Errno::ETIMEDOUT, "accept timed out waiting for connection");
+            None
+        })
     }
 
     /// Connect to peer address
@@ -348,11 +397,9 @@ impl FrameVsockSocket {
         super::submit_control_packet(RRef::new(packet))?;
 
         // Wait for Response packet from host
-        const MAX_RETRIES: u32 = 1000;
+        // For connect, we use a reasonable timeout since we expect a quick response
+        const MAX_RETRIES: u32 = 10_000_000;
         for _ in 0..MAX_RETRIES {
-            // Process any pending RX packets
-            super::process_rx_packets();
-
             let current_state = *self.state.lock();
             match current_state {
                 SocketState::Connected => return Ok(()),
@@ -361,8 +408,8 @@ impl FrameVsockSocket {
                     return_errno_with_message!(Errno::ECONNREFUSED, "connection refused");
                 }
                 SocketState::Connecting => {
-                    // Still waiting, continue
-                    core::hint::spin_loop();
+                    // Still waiting, yield to allow packet processing
+                    Task::yield_now();
                 }
                 _ => {
                     return_errno_with_message!(Errno::EINVAL, "unexpected state during connect");
@@ -429,14 +476,7 @@ impl FrameVsockSocket {
 
         // Wait until we have enough credit to send the whole Vec without splitting.
         let need = data.len() as u32;
-        for _ in 0..MAX_POLL_ITERATIONS {
-            if self.available_credit() >= need {
-                break;
-            }
-
-            // Let RX/control packets make progress (credit updates, shutdown, etc.).
-            super::process_rx_packets();
-
+        while self.available_credit() < need {
             // If peer shutdowns while we are waiting, fail the send.
             let state = *self.state.lock();
             if matches!(state, SocketState::ShutdownPeer | SocketState::Shutdown) {
@@ -444,10 +484,6 @@ impl FrameVsockSocket {
             }
 
             Task::yield_now();
-        }
-
-        if self.available_credit() < need {
-            return_errno_with_message!(Errno::ETIMEDOUT, "send timed out waiting for credit");
         }
 
         // Build a data packet by moving the Vec (zero-copy).
@@ -460,9 +496,42 @@ impl FrameVsockSocket {
         Ok(need as usize)
     }
 
+    /// Try to receive a packet without blocking (fast path)
+    fn try_recv_packet_fast(&self) -> Option<RRef<DataPacket>> {
+        let mut pending = self.pending_data_packets.lock();
+        if let Some(packet) = pending.pop_front() {
+            let len = packet.data.len() as u32;
+            self.fwd_cnt.fetch_add(len, Ordering::Relaxed);
+            drop(pending);
+
+            if self.should_send_credit_update() {
+                let _ = self.send_credit_update();
+            }
+            return Some(packet);
+        }
+        None
+    }
+
     /// Receive a data packet (zero-copy)
     /// Returns the packet with ownership transferred to caller
+    ///
+    /// # Race Condition Fix
+    /// The wait-notify pattern is fixed by registering as waiter BEFORE checking
+    /// the queue condition. This ensures that any notification after registration
+    /// will wake us up, avoiding the classic race:
+    /// ```text
+    /// T1: Guest checks queue.is_empty() -> true
+    /// T2: Host delivers packet to queue
+    /// T3: Host checks recv_waiters -> 0 (Guest not yet waiting)
+    /// T4: Host decides not to inject interrupt
+    /// T5: Guest enters wait and blocks forever
+    /// ```
     pub fn recv_packet(&self) -> Result<RRef<DataPacket>> {
+        // Fast path: Check queue first without state lock
+        if let Some(packet) = self.try_recv_packet_fast() {
+            return Ok(packet);
+        }
+
         let state = self.state.lock();
         match *state {
             SocketState::Connected | SocketState::ShutdownPeer => {}
@@ -475,55 +544,51 @@ impl FrameVsockSocket {
         }
         drop(state);
 
-        // Try to get a pending packet
-        let mut pending = self.pending_data_packets.lock();
-        if let Some(packet) = pending.pop_front() {
-            // Update forward count
-            let len = packet.data.len() as u32;
-            self.fwd_cnt.fetch_add(len, Ordering::Relaxed);
-            drop(pending);
-
-            // Check if we should send credit update
-            if self.should_send_credit_update() {
-                let _ = self.send_credit_update();
-            }
-
-            return Ok(packet);
-        }
-        drop(pending);
-
         // No packet available
         if self.nonblocking.load(Ordering::Relaxed) {
             return_errno!(Errno::EAGAIN);
         }
 
-        // Blocking mode: poll with yield until packet arrives
-        for _ in 0..MAX_POLL_ITERATIONS {
-            super::process_rx_packets();
+        // Blocking mode: Register as waiter FIRST to avoid race condition
+        // This must happen BEFORE any condition check in the wait loop
+        self.recv_waiters.fetch_add(1, Ordering::Release);
 
-            let mut pending = self.pending_data_packets.lock();
-            if let Some(packet) = pending.pop_front() {
-                let len = packet.data.len() as u32;
-                self.fwd_cnt.fetch_add(len, Ordering::Relaxed);
-                drop(pending);
-
-                if self.should_send_credit_update() {
-                    let _ = self.send_credit_update();
-                }
-
-                return Ok(packet);
-            }
-            drop(pending);
-
-            // Check if peer has shutdown
-            if *self.state.lock() == SocketState::ShutdownPeer {
-                return_errno_with_message!(Errno::ECONNRESET, "connection reset by peer");
-            }
-
-            Task::yield_now();
+        // Double-check after registering (critical for race-free operation)
+        if let Some(packet) = self.try_recv_packet_fast() {
+            self.recv_waiters.fetch_sub(1, Ordering::Release);
+            return Ok(packet);
         }
 
-        return_errno_with_message!(Errno::ETIMEDOUT, "recv timed out waiting for data");
+        let result = self.wait_queue.wait_until(|| {
+            if let Some(packet) = self.try_recv_packet_fast() {
+                return Some(Ok(packet));
+            }
+
+            // Check if peer has shutdown or connection state changed
+            let state = *self.state.lock();
+            match state {
+                SocketState::Connected => None,
+                SocketState::ShutdownPeer => {
+                    // Check one more time for any remaining data
+                    if let Some(packet) = self.try_recv_packet_fast() {
+                        return Some(Ok(packet));
+                    }
+                    return Some(Err(Error::with_message(
+                        Errno::ECONNRESET,
+                        "connection reset by peer",
+                    )));
+                }
+                _ => {
+                    return Some(Err(Error::with_message(
+                        Errno::ENOTCONN,
+                        "connection closed",
+                    )));
+                }
+            }
+        });
+
+        self.recv_waiters.fetch_sub(1, Ordering::Release);
+        result
     }
 
     /// Receive owned bytes from peer with **zero-copy inside the kernel**.
@@ -596,7 +661,35 @@ impl FrameVsockSocket {
         }
         drop(partial);
 
-        // Try to get a new packet
+        // Try to get a new packet from the queue (fast path, no blocking)
+        {
+            let mut pending = self.pending_data_packets.lock();
+            if let Some(packet) = pending.pop_front() {
+                drop(pending);
+
+                let data = &packet.data;
+                let to_copy = buf.len().min(data.len());
+                buf[..to_copy].copy_from_slice(&data[..to_copy]);
+
+                // Only update fwd_cnt by the amount actually consumed
+                self.fwd_cnt.fetch_add(to_copy as u32, Ordering::Relaxed);
+
+                // If packet not fully consumed, save for partial read
+                if to_copy < data.len() {
+                    *self.partial_read.lock() = Some(PartialRead {
+                        packet,
+                        offset: to_copy,
+                    });
+                }
+
+                if self.should_send_credit_update() {
+                    let _ = self.send_credit_update();
+                }
+
+                return Ok(to_copy);
+            }
+        }
+
         let mut pending = self.pending_data_packets.lock();
 
         // If no packets, handle blocking/non-blocking
@@ -611,26 +704,49 @@ impl FrameVsockSocket {
                 return_errno!(Errno::EAGAIN);
             }
 
-            // Blocking mode: poll with yield
-            for _ in 0..MAX_POLL_ITERATIONS {
-                super::process_rx_packets();
+            // Blocking mode: Register as waiter FIRST to avoid race condition
+            self.recv_waiters.fetch_add(1, Ordering::Release);
 
+            // Double-check after registering (critical for race-free operation)
+            {
+                let pending_check = self.pending_data_packets.lock();
+                if !pending_check.is_empty() {
+                    drop(pending_check);
+                    self.recv_waiters.fetch_sub(1, Ordering::Release);
+                    // Retry from the beginning
+                    return self.recv_to_buffer(buf);
+                }
+            }
+
+            let wait_result: Result<()> = self.wait_queue.wait_until(|| {
                 let pending = self.pending_data_packets.lock();
                 if !pending.is_empty() {
-                    break;
+                    return Some(Ok(()));
                 }
                 drop(pending);
 
-                if *self.state.lock() == SocketState::ShutdownPeer {
-                    return Ok(0);
+                let current_state = *self.state.lock();
+                if current_state == SocketState::ShutdownPeer {
+                    return Some(Ok(())); // EOF
+                }
+                if current_state != SocketState::Connected {
+                    return Some(Err(Error::with_message(
+                        Errno::ENOTCONN,
+                        "connection closed",
+                    )));
                 }
 
-                Task::yield_now();
-            }
+                None
+            });
+
+            self.recv_waiters.fetch_sub(1, Ordering::Release);
+
+            wait_result?;
 
             pending = self.pending_data_packets.lock();
             if pending.is_empty() {
-                return_errno_with_message!(Errno::ETIMEDOUT, "recv timed out");
+                // Must be EOF
+                return Ok(0);
             }
         }
 
@@ -725,16 +841,27 @@ impl FrameVsockSocket {
     /// Handle incoming data packet (called from RX interrupt handler)
     /// Zero-copy: packet is stored directly in pending queue
     pub fn on_data_packet_received(&self, packet: RRef<DataPacket>) {
-        // Update peer credit info from packet header
+        let data_len = packet.data.len();
+
+        // Update peer credit info from packet header (piggyback credit)
         self.peer_buf_alloc
             .store(packet.header.buf_alloc, Ordering::Relaxed);
         self.peer_fwd_cnt
             .store(packet.header.fwd_cnt, Ordering::Relaxed);
 
+        // Update packet size statistics for adaptive threshold
+        self.update_packet_stats(data_len);
+
         // Store packet in pending queue (zero-copy)
         let mut pending = self.pending_data_packets.lock();
         if pending.len() < MAX_PENDING_PACKETS {
             pending.push_back(packet);
+            drop(pending); // Release lock before wake
+
+            // Wake up waiting tasks - this is sufficient since we're already
+            // running in Guest context (called from RX interrupt handler).
+            // No need for additional interrupt injection here.
+            self.wait_queue.wake_one();
         }
         // If queue is full, packet is dropped (flow control should prevent this)
     }
@@ -768,6 +895,7 @@ impl FrameVsockSocket {
                     }
                     _ => {}
                 }
+                self.wait_queue.wake_all();
             }
             VsockOp::Rst => {
                 // Connection reset
@@ -776,6 +904,7 @@ impl FrameVsockSocket {
                 // Clear pending packets
                 self.pending_data_packets.lock().clear();
                 *self.partial_read.lock() = None;
+                self.wait_queue.wake_all();
             }
             VsockOp::CreditUpdate => {
                 // Update peer credit info
@@ -783,6 +912,13 @@ impl FrameVsockSocket {
                     .store(packet.header.buf_alloc, Ordering::Relaxed);
                 self.peer_fwd_cnt
                     .store(packet.header.fwd_cnt, Ordering::Relaxed);
+
+                // Wake up any tasks waiting for credit to send data
+                // This fixes the issue where senders block waiting for credit
+                // but never get woken up when credit becomes available
+                if self.available_credit() > 0 {
+                    self.wait_queue.wake_all();
+                }
             }
             VsockOp::CreditRequest => {
                 // Peer requests our credit info, send update
@@ -837,6 +973,7 @@ impl FrameVsockSocket {
             return_errno_with_message!(Errno::ECONNREFUSED, "backlog full");
         }
         pending.push_back(conn);
+        self.wait_queue.wake_all();
         Ok(())
     }
 
@@ -893,6 +1030,9 @@ impl FrameVsockSocket {
             None => return,
         };
 
+        let buf_alloc = self.buf_alloc.load(Ordering::Relaxed);
+        let fwd_cnt = self.fwd_cnt.load(Ordering::Relaxed);
+
         let mut packet = ControlPacket::with_header(
             local.cid,
             peer.cid,
@@ -900,8 +1040,8 @@ impl FrameVsockSocket {
             peer.port,
             VsockOp::Response,
         );
-        packet.header.buf_alloc = self.buf_alloc.load(Ordering::Relaxed);
-        packet.header.fwd_cnt = self.fwd_cnt.load(Ordering::Relaxed);
+        packet.header.buf_alloc = buf_alloc;
+        packet.header.fwd_cnt = fwd_cnt;
 
         let _ = super::submit_control_packet(RRef::new(packet));
     }

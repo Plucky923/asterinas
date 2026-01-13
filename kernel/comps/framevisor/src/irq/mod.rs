@@ -16,12 +16,26 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::ops::Deref;
 
 use ostd::arch::trap::TrapFrame;
-use spin::RwLock;
+use spin::{Once, RwLock};
 
 use crate::prelude::*;
 
 /// FrameVsock dedicated virtual IRQ number
 pub const FRAMEVSOCK_IRQ_NUM: u8 = 0x80;
+
+/// Fast path handler for FrameVsock
+static FRAMEVSOCK_FAST_CALLBACK: Once<Box<dyn Fn() + Send + Sync>> = Once::new();
+
+/// Registers a fast handler for FrameVsock interrupts.
+///
+/// This allows bypassing the general IRQ dispatch overhead.
+#[ostd::ensure_stack(4096)]
+pub fn register_framevsock_handler<F>(handler: F)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    FRAMEVSOCK_FAST_CALLBACK.call_once(|| Box::new(handler));
+}
 
 /// Virtual IRQ number range for FrameVisor
 const IRQ_NUM_MIN: u8 = 0x80;
@@ -206,12 +220,19 @@ pub fn make_synthetic_trapframe(irq_num: u8) -> TrapFrame {
 }
 
 /// Injects a FrameVsock RX ready interrupt.
+#[ostd::ensure_stack(4096)]
 pub fn inject_vsock_rx_interrupt() {
+    // Fast path: direct callback without TrapFrame overhead
+    if let Some(callback) = FRAMEVSOCK_FAST_CALLBACK.get() {
+        callback();
+        return;
+    }
+
     let trap_frame = make_synthetic_trapframe(FRAMEVSOCK_IRQ_NUM);
     inject_irq(FRAMEVSOCK_IRQ_NUM, &trap_frame);
 }
 
-/// Initialize the IRQ subsystem
+/// Initialize the IRQ subsystem.
 pub fn init() {
-    ostd::early_println!("[framevisor] IRQ subsystem initialized");
+    // Virtual IRQ table is statically initialized, no runtime setup needed.
 }

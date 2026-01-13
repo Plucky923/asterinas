@@ -5,7 +5,7 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use rand::{Rng, distr::Alphanumeric};
-use syn::{Expr, Ident, ItemFn, parse_macro_input};
+use syn::{Expr, Ident, ItemFn, LitInt, parse_macro_input};
 
 /// A macro attribute to mark the kernel entry point.
 ///
@@ -375,6 +375,56 @@ pub fn ktest(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #input
 
         #register_ktest_item
+    };
+
+    TokenStream::from(output)
+}
+
+/// A macro attribute to ensure sufficient stack space before executing a function.
+///
+/// This macro is used to protect against stack exhaustion attacks where an
+/// untrusted caller (e.g., FrameVM) might exhaust their stack before calling
+/// a trusted function (e.g., FrameVisor API).
+///
+/// # Arguments
+///
+/// * `stack_size` - The minimum required stack space in bytes.
+///
+/// # Behavior
+///
+/// - If the current stack has sufficient space, the function executes directly (fast path).
+/// - If the stack space is insufficient, execution switches to a service stack (slow path).
+///
+/// # Example
+///
+/// ```ignore
+/// use ostd::ensure_stack;
+///
+/// #[ensure_stack(4096)]
+/// pub fn api_function(data: &[u8]) -> Result<(), Error> {
+///     // This function is guaranteed to have at least 4KB of stack space
+///     process_data(data)
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn ensure_stack(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Parse the required stack size from attribute
+    let stack_size = parse_macro_input!(attr as LitInt);
+
+    // Parse the function
+    let input_fn = parse_macro_input!(item as ItemFn);
+
+    let fn_attrs = &input_fn.attrs;
+    let fn_vis = &input_fn.vis;
+    let fn_sig = &input_fn.sig;
+    let fn_block = &input_fn.block;
+
+    // Generate the wrapped function
+    let output = quote! {
+        #(#fn_attrs)*
+        #fn_vis #fn_sig {
+            ostd::ensure_stack_impl!(#stack_size, #fn_block)
+        }
     };
 
     TokenStream::from(output)

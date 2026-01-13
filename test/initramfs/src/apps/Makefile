@@ -46,6 +46,8 @@ TEST_APPS := \
 	sched \
 	shm \
 	vsock \
+	vm \
+	framevsock \
 
 # TODO: Refactor those tests for target CPU arch using C macro-based conditional compilation.
 ifeq ($(HOST_PLATFORM), x86_64-linux)

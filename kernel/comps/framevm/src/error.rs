@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Error types for FrameVM.
+
+/// POSIX-compatible error numbers.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
@@ -26,7 +29,7 @@ pub enum Errno {
     EINPROGRESS = 115,
 }
 
-/// Error type for FrameVM.
+/// Error type for FrameVM operations.
 #[derive(Debug, Clone, Copy)]
 pub struct Error {
     errno: Errno,
@@ -56,7 +59,7 @@ impl From<Errno> for Error {
     }
 }
 
-/// Convert from aster_framevisor::Error (which is ostd::Error)
+/// Convert from aster_framevisor::Error (re-exported from ostd::Error)
 impl From<aster_framevisor::Error> for Error {
     fn from(e: aster_framevisor::Error) -> Self {
         let errno = match e {
@@ -78,7 +81,7 @@ impl From<(aster_framevisor::Error, usize)> for Error {
     }
 }
 
-/// Convert from aster_framevisor::error::Error (custom framevisor error)
+/// Convert from aster_framevisor::error::Error (the framevisor-local error type)
 impl From<aster_framevisor::error::Error> for Error {
     fn from(e: aster_framevisor::error::Error) -> Self {
         let errno = match e {
@@ -94,12 +97,7 @@ impl From<aster_framevisor::error::Error> for Error {
     }
 }
 
-impl From<(aster_framevisor::error::Error, usize)> for Error {
-    fn from((e, _): (aster_framevisor::error::Error, usize)) -> Self {
-        Self::from(e)
-    }
-}
-
+/// Result type for FrameVM operations.
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[macro_export]

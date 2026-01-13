@@ -6,7 +6,7 @@ use ostd::task::Task;
 use crate::{
     fs::{
         file_handle::FileLike,
-        fs_resolver::FsPath,
+        path::FsPath,
         utils::{AccessMode, InodeMode, OpenArgs},
     },
     prelude::*,
@@ -56,7 +56,7 @@ pub fn load_framevm_background() -> Result<()> {
 fn read_framevm_elf() -> Result<Vec<u8>> {
     let framevm_file = open_framevm_elf_file()?;
 
-    let file_size = framevm_file.inode().size();
+    let file_size = framevm_file.path().inode().size();
     println!("[FrameVM] file size: {} bytes", file_size);
 
     let mut elf_data = vec![0u8; file_size];

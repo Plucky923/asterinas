@@ -9,11 +9,11 @@ use super::{
     util::{DEFAULT_TARGET_RELPATH, is_tdx_enabled},
 };
 use crate::{
-    config::{Config, scheme::ActionChoice},
+    bundle::Bundle,
     cli::RunArgs,
+    config::{Config, scheme::ActionChoice},
     error::Errno,
     error_msg,
-    bundle::Bundle,
     util::{get_kernel_crate, get_target_directory},
     warn_msg,
 };
@@ -87,7 +87,10 @@ fn load_existing_bundle_for_run(bundle_dir: &Path, config: &mut Config) -> Bundl
     match bundle.can_run_with_config(config, ActionChoice::Run) {
         Ok(()) => bundle,
         Err(e) => {
-            warn_msg!("Existing bundle incompatible ({}), refreshing bundle metadata to match current config...", e);
+            warn_msg!(
+                "Existing bundle incompatible ({}), refreshing bundle metadata to match current config...",
+                e
+            );
             bundle.update_config(config, ActionChoice::Run);
             if let Err(e2) = bundle.can_run_with_config(config, ActionChoice::Run) {
                 error_msg!("Failed to refresh existing bundle: {}", e2);

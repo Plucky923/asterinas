@@ -25,8 +25,8 @@ use crate::{
     },
     cli::BuildArgs,
     config::{
-        scheme::{ActionChoice, BootMethod, BootProtocol},
         Config,
+        scheme::{ActionChoice, BootMethod, BootProtocol},
     },
     error::Errno,
     error_msg,
@@ -222,14 +222,13 @@ fn generate_kernel_symbols_module(aster_elf: &AsterBin) -> Option<PathBuf> {
             symbols_path
         );
         let mut cmd = new_command_checked_exists("rust-objcopy");
-        cmd.arg("--only-keep-debug").arg(aster_elf.path()).arg(&symbols_path);
+        cmd.arg("--only-keep-debug")
+            .arg(aster_elf.path())
+            .arg(&symbols_path);
         match cmd.status() {
             Ok(status) if status.success() => {
                 if let Ok(size) = fs::metadata(&symbols_path).and_then(|m| Ok(m.len())) {
-                    info!(
-                        "Kernel symbols file generated ({} bytes)",
-                        size
-                    );
+                    info!("Kernel symbols file generated ({} bytes)", size);
                 }
             }
             Ok(status) => {
@@ -240,10 +239,7 @@ fn generate_kernel_symbols_module(aster_elf: &AsterBin) -> Option<PathBuf> {
                 return None;
             }
             Err(err) => {
-                warn!(
-                    "Failed to run rust-objcopy for kernel symbols: {}",
-                    err
-                );
+                warn!("Failed to run rust-objcopy for kernel symbols: {}", err);
                 return None;
             }
         }

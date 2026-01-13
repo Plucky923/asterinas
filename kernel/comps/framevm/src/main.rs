@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! FrameVM - A lightweight virtual machine running on FrameVisor.
+
 #![no_std]
 #![no_main]
 #![deny(unsafe_code)]
@@ -11,7 +13,9 @@ use core::{panic::PanicInfo, sync::atomic::Ordering};
 
 use aster_framevisor::{println, task::Task};
 
+mod bench;
 mod error;
+mod pollee;
 mod syscall;
 mod task;
 mod vm;
@@ -19,6 +23,9 @@ mod vsock;
 
 use task::{create_user_task, post_schedule_handler, UserTaskData};
 use vm::create_vm_space;
+
+/// Run benchmarks if enabled
+const RUN_BENCHMARKS: bool = true;
 
 /// The kernel's boot and initialization process is managed by OSTD.
 #[aster_framevisor::main]
@@ -28,6 +35,13 @@ pub fn main() {
     // Initialize vsock subsystem
     vsock::init();
     println!("[FrameVM] Vsock subsystem initialized");
+
+    // Run benchmarks if enabled
+    if RUN_BENCHMARKS {
+        println!("[FrameVM] Running benchmarks...");
+        bench::run_all_benchmarks();
+        println!("[FrameVM] Benchmarks completed.");
+    }
 
     aster_framevisor::task::inject_post_schedule_handler(post_schedule_handler);
 
@@ -42,6 +56,7 @@ pub fn main() {
                 "[FrameVM] Critical Error: Failed to create VM space: {:?}",
                 e
             );
+            vsock::shutdown();
             return;
         }
     };
@@ -58,6 +73,7 @@ pub fn main() {
                 "[FrameVM] Critical Error: Failed to create user task: {:?}",
                 e
             );
+            vsock::shutdown();
             return;
         }
     };
@@ -76,28 +92,20 @@ pub fn main() {
     while !finished.load(Ordering::SeqCst) {
         Task::yield_now();
     }
+
+    // Shutdown vsock subsystem before exiting
+    // This prevents Host from calling Guest callbacks after Guest exits
+    vsock::shutdown();
+
     println!("[FrameVM] User task finished. Exiting.");
 }
 
 fn load_program_binary() -> Vec<u8> {
-    // Select which program to run:
-    // - vsock_echo_server: Acts as a Server (Host -> Guest)
-    // - vsock_client: Acts as a Client (Guest -> Host)
-    
-    // Uncomment the one you want to run:
-    let program_data = include_bytes!("vsock_client");
-    // let program_data = include_bytes!("vsock_client");
+    let program_data = include_bytes!("../test/bench_rtt_server");
 
     // Copy to heap-allocated Vec to ensure basic alignment and mutability if needed
     let mut program_binary_vec = vec![0u8; program_data.len()];
     program_binary_vec.copy_from_slice(program_data);
-
-    if program_binary_vec.as_ptr() as usize % 8 != 0 {
-        println!(
-            "[FrameVM] Warning: Program binary not 8-byte aligned! Addr: {:p}",
-            program_binary_vec.as_ptr()
-        );
-    }
 
     println!(
         "[FrameVM] Loaded program binary ({} bytes)",

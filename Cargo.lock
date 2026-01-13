@@ -215,6 +215,7 @@ dependencies = [
  "aster-framevisor-macros",
  "aster-framevsock",
  "component",
+ "hashbrown 0.14.5",
  "ostd",
  "spin",
 ]
@@ -224,6 +225,7 @@ name = "aster-framevisor-exchangeable"
 version = "0.1.0"
 dependencies = [
  "ostd",
+ "spin",
 ]
 
 [[package]]
@@ -294,6 +296,7 @@ dependencies = [
  "aster-console",
  "aster-framebuffer",
  "aster-framevisor",
+ "aster-framevisor-exchangeable",
  "aster-framevsock",
  "aster-i8042",
  "aster-input",

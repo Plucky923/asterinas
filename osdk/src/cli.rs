@@ -40,10 +40,7 @@ pub fn main() {
             execute_build_command(&load_config(&build_args.common_args), build_args);
         }
         OsdkSubcommand::Run(run_args) => {
-            execute_run_command(
-                &load_config(&run_args.common_args),
-                run_args,
-            );
+            execute_run_command(&load_config(&run_args.common_args), run_args);
         }
         OsdkSubcommand::Debug(debug_args) => {
             execute_debug_command(

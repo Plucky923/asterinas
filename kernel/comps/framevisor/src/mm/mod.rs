@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Memory management for FrameVisor.
+
 pub mod frame;
 pub mod io;
 pub(crate) mod page_prop;
@@ -9,7 +13,7 @@ pub use ostd::mm::{
     frame::{meta::AnyFrameMeta as OstdAnyFrameMeta, untyped::AnyUFrameMeta as OstdAnyUFrameMeta},
     VmReader, VmWriter,
 };
-use ostd::{early_println, mm::Frame as OstdFrame};
+use ostd::mm::Frame as OstdFrame;
 pub use vm_space::{init_vm_space, VmSpace};
 
 pub use self::{
@@ -27,6 +31,7 @@ pub type Paddr = usize;
 /// Device addresses.
 pub type Daddr = usize;
 
+/// Frame wrapper for FrameVisor.
 pub struct Frame<M: OstdAnyFrameMeta + ?Sized>(OstdFrame<M>);
 
 impl<M: OstdAnyFrameMeta + ?Sized> Frame<M> {
@@ -49,8 +54,8 @@ impl From<UFrame> for Frame<dyn OstdAnyFrameMeta> {
     }
 }
 
+/// Initialize the memory management subsystem.
 pub fn init_mm() {
-    early_println!("[framevisor] Initializing MM...");
     init_vm_space();
     init_frame();
 }

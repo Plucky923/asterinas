@@ -5,6 +5,8 @@
 
 extern crate alloc;
 
+pub mod notify;
+
 use alloc::{collections::VecDeque, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -422,6 +424,79 @@ impl ConnectionId {
     }
 }
 
+// ========== Flow Control Configuration ==========
+
+/// Flow control configuration for FrameVsock connections.
+///
+/// This module provides tunable parameters for optimizing throughput and latency.
+/// The default values are chosen to balance between small packet scenarios (64B)
+/// and large bulk transfers (1MB).
+pub mod flow_control {
+    /// Default buffer allocation advertised to peer.
+    ///
+    /// This is the receive window size. Larger values allow more in-flight data
+    /// but consume more memory. Should be >= MAX_PENDING_PACKETS * avg_packet_size.
+    ///
+    /// Increased to 4MB for better throughput - larger window reduces credit stalls.
+    pub const DEFAULT_BUF_ALLOC: u32 = 4 * 1024 * 1024; // 4MB
+
+    /// Maximum pending packets per connection.
+    ///
+    /// With DEFAULT_BUF_ALLOC=1MB and 64B packets, we need at least 16384 slots.
+    /// Using 8192 as a reasonable balance between memory and throughput.
+    pub const MAX_PENDING_PACKETS: usize = 8192;
+
+    /// Minimum credit update threshold.
+    ///
+    /// For very small packets, we want frequent updates to avoid sender stalls.
+    pub const MIN_CREDIT_UPDATE_THRESHOLD: u32 = 1024;
+
+    /// Maximum credit update threshold.
+    ///
+    /// For large packets, we don't need updates too frequently.
+    /// Increased to 512KB to reduce CreditUpdate packet overhead.
+    pub const MAX_CREDIT_UPDATE_THRESHOLD: u32 = 512 * 1024; // 512KB
+
+    /// Calculate adaptive credit update threshold based on recent packet sizes.
+    ///
+    /// Strategy: Update credit every N packets worth, where N balances between
+    /// - Too frequent: overhead from control packets
+    /// - Too infrequent: sender stalls waiting for credit
+    ///
+    /// For 64B packets: threshold = 64 * 256 = 16KB (update every ~256 packets)
+    /// For 1KB packets: threshold = 1024 * 256 = 256KB (update every ~256 packets)
+    /// For 64KB packets: threshold = 512KB (capped)
+    #[inline]
+    pub const fn adaptive_threshold(avg_packet_size: u32) -> u32 {
+        // Update every ~256 packets worth of data (increased from 128 for better throughput)
+        let threshold = avg_packet_size.saturating_mul(256);
+        if threshold < MIN_CREDIT_UPDATE_THRESHOLD {
+            MIN_CREDIT_UPDATE_THRESHOLD
+        } else if threshold > MAX_CREDIT_UPDATE_THRESHOLD {
+            MAX_CREDIT_UPDATE_THRESHOLD
+        } else {
+            threshold
+        }
+    }
+
+    /// Fast threshold for low-latency scenarios.
+    ///
+    /// Used when we detect the sender might be stalled (credit near zero).
+    pub const URGENT_CREDIT_UPDATE_THRESHOLD: u32 = 1024;
+
+    /// Credit watermark: when available credit drops below this percentage
+    /// of buf_alloc, receiver should proactively send credit update.
+    ///
+    /// 25% means: if we've consumed 75% of the window, send update early.
+    pub const LOW_CREDIT_WATERMARK_PERCENT: u32 = 25;
+
+    /// Calculate low credit watermark value.
+    #[inline]
+    pub const fn low_credit_watermark(buf_alloc: u32) -> u32 {
+        buf_alloc / 4 // 25%
+    }
+}
+
 /// Simple packet queue for buffering data packets
 pub struct DataPacketQueue {
     queue: Mutex<VecDeque<RRef<DataPacket>>>,
@@ -462,7 +537,6 @@ impl DataPacketQueue {
     }
 }
 
-
 // ========== Helper functions for creating packets ==========
 
 /// Create a connection request (control packet)
@@ -481,6 +555,22 @@ pub fn create_request(
     ))
 }
 
+/// Create a connection request with credit info (control packet)
+pub fn create_request_with_credit(
+    src_cid: u64,
+    src_port: u32,
+    dst_cid: u64,
+    dst_port: u32,
+    buf_alloc: u32,
+    fwd_cnt: u32,
+) -> RRef<ControlPacket> {
+    let mut packet =
+        ControlPacket::with_header(src_cid, dst_cid, src_port, dst_port, VsockOp::Request);
+    packet.header.buf_alloc = buf_alloc;
+    packet.header.fwd_cnt = fwd_cnt;
+    RRef::new(packet)
+}
+
 /// Create a connection response (control packet)
 pub fn create_response(
     src_cid: u64,
@@ -495,6 +585,22 @@ pub fn create_response(
         dst_port,
         VsockOp::Response,
     ))
+}
+
+/// Create a connection response with credit info (control packet)
+pub fn create_response_with_credit(
+    src_cid: u64,
+    src_port: u32,
+    dst_cid: u64,
+    dst_port: u32,
+    buf_alloc: u32,
+    fwd_cnt: u32,
+) -> RRef<ControlPacket> {
+    let mut packet =
+        ControlPacket::with_header(src_cid, dst_cid, src_port, dst_port, VsockOp::Response);
+    packet.header.buf_alloc = buf_alloc;
+    packet.header.fwd_cnt = fwd_cnt;
+    RRef::new(packet)
 }
 
 /// Create a reset packet (control packet)

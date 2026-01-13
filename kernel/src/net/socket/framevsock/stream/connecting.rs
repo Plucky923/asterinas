@@ -49,7 +49,7 @@ impl Connecting {
     }
 
     fn check_io_events(&self) -> IoEvents {
-        if self.is_connected.load(Ordering::Relaxed) {
+        if self.is_connected.load(Ordering::Acquire) {
             IoEvents::IN
         } else {
             IoEvents::empty()
@@ -57,19 +57,31 @@ impl Connecting {
     }
 
     pub fn set_connected(&self) {
-        self.is_connected.store(true, Ordering::Relaxed);
+        self.is_connected.store(true, Ordering::Release);
         self.pollee.notify(IoEvents::IN);
     }
 
     /// Set connected with peer credit info from Response packet
+    ///
+    /// Uses Release ordering to ensure peer credit values are visible
+    /// before is_connected flag is observed by other threads.
     pub fn set_connected_with_credit(&self, peer_buf_alloc: u32, peer_fwd_cnt: u32) {
+        // Store credit values first with Relaxed ordering (they will be made
+        // visible by the Release fence on is_connected)
         self.peer_buf_alloc.store(peer_buf_alloc, Ordering::Relaxed);
         self.peer_fwd_cnt.store(peer_fwd_cnt, Ordering::Relaxed);
-        self.set_connected();
+        // Use Release ordering to ensure the above stores are visible
+        // before is_connected is observed as true
+        self.is_connected.store(true, Ordering::Release);
+        self.pollee.notify(IoEvents::IN);
     }
 
+    /// Check if connection is established
+    ///
+    /// Uses Acquire ordering to ensure we see the peer credit values
+    /// that were stored before is_connected was set to true.
     pub fn is_connected(&self) -> bool {
-        self.is_connected.load(Ordering::Relaxed)
+        self.is_connected.load(Ordering::Acquire)
     }
 
     /// Get peer buffer allocation (for initializing Connected socket)

@@ -7,11 +7,17 @@
 //! - Data packets (RRef<DataPacket>) are passed by ownership to Connected sockets
 //! - Control packets (RRef<ControlPacket>) are processed and dropped
 //! - No intermediate buffer copies
+//!
+//! # Performance Optimizations
+//!
+//! - Uses HashMap for O(1) socket lookup (critical for packet dispatch)
+//! - Uses HashSet for O(1) port availability check
 
 use alloc::collections::BTreeSet;
 
 use aster_framevisor_exchangeable::RRef;
 use aster_framevsock::{ConnectionId, ControlPacket, DataPacket, VsockOp};
+use hashbrown::HashMap;
 use log::debug;
 use ostd::sync::LocalIrqDisabled;
 
@@ -24,12 +30,16 @@ use crate::prelude::*;
 /// Manage all active sockets
 pub struct FrameVsockSpace {
     // (key, value) = (local_addr, connecting)
-    connecting_sockets: SpinLock<BTreeMap<FrameVsockAddr, Arc<Connecting>>>,
+    // Using HashMap for O(1) lookup - connecting sockets are looked up during connection setup
+    connecting_sockets: SpinLock<HashMap<FrameVsockAddr, Arc<Connecting>>>,
     // (key, value) = (local_addr, listen)
-    listen_sockets: SpinLock<BTreeMap<FrameVsockAddr, Arc<Listen>>>,
+    // Using HashMap for O(1) lookup - listen sockets are looked up when handling connection requests
+    listen_sockets: SpinLock<HashMap<FrameVsockAddr, Arc<Listen>>>,
     // (key, value) = (id(local_addr,peer_addr), connected)
-    connected_sockets: RwLock<BTreeMap<ConnectionId, Arc<Connected>>, LocalIrqDisabled>,
-    // Used ports
+    // Using HashMap for O(1) lookup - connected sockets are looked up for EVERY data packet
+    // This is the most critical path for throughput
+    connected_sockets: RwLock<HashMap<ConnectionId, Arc<Connected>>, LocalIrqDisabled>,
+    // Used ports - keeping BTreeSet for ordered iteration in alloc_ephemeral_port
     used_ports: SpinLock<BTreeSet<u32>>,
 }
 
@@ -37,9 +47,9 @@ impl FrameVsockSpace {
     /// Create a new global FrameVsockSpace
     pub fn new() -> Self {
         Self {
-            connecting_sockets: SpinLock::new(BTreeMap::new()),
-            listen_sockets: SpinLock::new(BTreeMap::new()),
-            connected_sockets: RwLock::new(BTreeMap::new()),
+            connecting_sockets: SpinLock::new(HashMap::new()),
+            listen_sockets: SpinLock::new(HashMap::new()),
+            connected_sockets: RwLock::new(HashMap::new()),
             used_ports: SpinLock::new(BTreeSet::new()),
         }
     }
@@ -144,15 +154,6 @@ impl FrameVsockSpace {
         let dst_addr = FrameVsockAddr::new(packet.header.dst_cid, packet.header.dst_port);
         let conn_id = ConnectionId::from_addrs(dst_addr, src_addr);
 
-        debug!(
-            "[FrameVsock] Received data packet: src={}:{}, dst={}:{}, len={}",
-            src_addr.cid,
-            src_addr.port,
-            dst_addr.cid,
-            dst_addr.port,
-            packet.data.len()
-        );
-
         if let Some(connected) = self.get_connected_socket(&conn_id) {
             // Zero-copy: pass packet ownership to connected socket
             return connected.on_data_packet_received(packet);
@@ -234,15 +235,15 @@ impl FrameVsockSpace {
 
             // Also add to connected sockets map
             let conn_id = ConnectionId::from_addrs(dst_addr.into(), src_addr.into());
-            self.insert_connected_socket(conn_id, connected);
+            self.insert_connected_socket(conn_id, connected.clone());
 
             debug!(
                 "[FrameVsock] Accepted connection from {}:{} to {}:{}",
                 src_addr.cid, src_addr.port, dst_addr.cid, dst_addr.port
             );
 
-            // Send Response back to Guest
-            self.send_response_to_guest(dst_addr, src_addr);
+            // Send Response back to Guest with our credit info
+            self.send_response_to_guest(&connected, dst_addr, src_addr);
 
             return Ok(());
         }
@@ -256,16 +257,23 @@ impl FrameVsockSpace {
         Ok(())
     }
 
-    /// Send a Response packet to Guest
-    fn send_response_to_guest(&self, local_addr: FrameVsockAddr, peer_addr: FrameVsockAddr) {
+    /// Send a Response packet to Guest with credit info
+    fn send_response_to_guest(
+        &self,
+        connected: &Connected,
+        local_addr: FrameVsockAddr,
+        peer_addr: FrameVsockAddr,
+    ) {
         use aster_framevisor::vsock as framevisor_vsock;
-        use aster_framevsock::create_response;
+        use aster_framevsock::create_response_with_credit;
 
-        let packet = create_response(
+        let packet = create_response_with_credit(
             local_addr.cid,
             local_addr.port,
             peer_addr.cid,
             peer_addr.port,
+            connected.buf_alloc(),
+            connected.fwd_cnt(),
         );
 
         // Deliver to Guest via FrameVisor (use vCPU 0 for now)
@@ -302,17 +310,13 @@ impl FrameVsockSpace {
     fn handle_response(
         &self,
         packet: &ControlPacket,
-        src_addr: FrameVsockAddr,
+        _src_addr: FrameVsockAddr,
         dst_addr: FrameVsockAddr,
     ) -> Result<()> {
         // Check if there's a connecting socket waiting for this response
         if let Some(connecting) = self.get_connecting_socket(&dst_addr) {
             // Update with peer's credit info
             connecting.set_connected_with_credit(packet.header.buf_alloc, packet.header.fwd_cnt);
-            debug!(
-                "[FrameVsock] Connection established to {}:{}",
-                src_addr.cid, src_addr.port
-            );
         }
         Ok(())
     }

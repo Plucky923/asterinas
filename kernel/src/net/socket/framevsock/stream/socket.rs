@@ -2,20 +2,24 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use aster_framevsock::flow_control::DEFAULT_BUF_ALLOC;
+
 use super::{connected::Connected, connecting::Connecting, init::Init, listen::Listen};
 use crate::{
     events::IoEvents,
-    fs::{file_handle::FileLike, utils::Inode},
+    fs::{file_handle::FileLike, path::Path, pseudofs::SockFs},
     net::socket::{
         Socket,
         framevsock::{
             FRAME_VSOCK_GLOBAL,
             addr::{self, FrameVsockAddr},
         },
-        new_pseudo_inode,
-        util::{options::{SocketOptionSet, SetSocketLevelOption, GetSocketLevelOption}, MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr},
         options::SocketOption,
         private::SocketPrivate,
+        util::{
+            MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr,
+            options::{GetSocketLevelOption, SetSocketLevelOption, SocketOptionSet},
+        },
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
@@ -25,7 +29,7 @@ use crate::{
 pub struct FrameVsockStreamSocket {
     status: RwLock<Status>,
     is_nonblocking: AtomicBool,
-    pseudo_inode: Arc<dyn Inode>,
+    pseudo_path: Path,
     options: RwLock<SocketOptionSet>,
 }
 
@@ -41,7 +45,7 @@ impl FrameVsockStreamSocket {
         Ok(Self {
             status: RwLock::new(Status::Init(init)),
             is_nonblocking: AtomicBool::new(nonblocking),
-            pseudo_inode: new_pseudo_inode(),
+            pseudo_path: SockFs::new_path(),
             options: RwLock::new(SocketOptionSet::default()),
         })
     }
@@ -50,7 +54,7 @@ impl FrameVsockStreamSocket {
         Self {
             status: RwLock::new(Status::Connected(connected)),
             is_nonblocking: AtomicBool::new(false),
-            pseudo_inode: new_pseudo_inode(),
+            pseudo_path: SockFs::new_path(),
             options: RwLock::new(SocketOptionSet::default()),
         }
     }
@@ -166,7 +170,7 @@ impl Socket for FrameVsockStreamSocket {
         use core::time::Duration;
 
         use aster_framevisor::vsock as framevisor_vsock;
-        use aster_framevsock::create_request;
+        use aster_framevsock::create_request_with_credit;
 
         use crate::process::signal::Poller;
 
@@ -193,10 +197,16 @@ impl Socket for FrameVsockStreamSocket {
         let vsockspace = FRAME_VSOCK_GLOBAL.get().unwrap();
         vsockspace.insert_connecting_socket(connecting.local_addr(), connecting.clone());
 
-        // Send connection request to Guest
+        // Send connection request to Guest with our credit info
         let local = init.bound_addr().unwrap();
-        let request_packet =
-            create_request(local.cid, local.port, remote_addr.cid, remote_addr.port);
+        let request_packet = create_request_with_credit(
+            local.cid,
+            local.port,
+            remote_addr.cid,
+            remote_addr.port,
+            DEFAULT_BUF_ALLOC,
+            0, // Initial fwd_cnt is 0
+        );
 
         // Select vCPU 0 for connection request (Guest will handle it)
         if framevisor_vsock::deliver_control_packet(0, request_packet).is_err() {
@@ -359,8 +369,8 @@ impl Socket for FrameVsockStreamSocket {
         }
     }
 
-    fn pseudo_inode(&self) -> &Arc<dyn Inode> {
-        &self.pseudo_inode
+    fn pseudo_path(&self) -> &Path {
+        &self.pseudo_path
     }
 }
 

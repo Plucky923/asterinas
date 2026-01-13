@@ -16,8 +16,10 @@ let
   resolv_conf = pkgs.callPackage ./resolv_conf.nix { dnsServer = dnsServer; };
   # Whether the initramfs should include evtest, a common tool to debug input devices (`/dev/input/eventX`)
   is_evtest_included = false;
-  framevmObj =
-    if framevmObjPath == "" then null else builtins.path {
+  framevmObj = if framevmObjPath == "" then
+    null
+  else
+    builtins.path {
       name = "framevm-object";
       path = framevmObjPath;
     };

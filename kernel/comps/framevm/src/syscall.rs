@@ -14,6 +14,7 @@ use alloc::{sync::Arc, vec, vec::Vec};
 use core::str;
 
 use aster_framevisor::{
+    arch,
     arch::cpu::context::UserContext,
     mm::{
         io::{FallibleVmRead, FallibleVmWrite},
@@ -45,6 +46,7 @@ pub const SYS_RECVFROM: usize = 45;
 pub const SYS_BIND: usize = 49;
 pub const SYS_LISTEN: usize = 50;
 pub const SYS_EXIT: usize = 60;
+pub const SYS_CLOCK_GETTIME: usize = 228;
 
 // Socket types
 pub const SOCK_STREAM: i32 = 1;
@@ -62,6 +64,7 @@ pub fn handle_syscall(user_context: &mut UserContext, vm_space: &VmSpace) -> boo
         SYS_RECVFROM => sys_recvfrom(user_context, vm_space),
         SYS_BIND => sys_bind(user_context, vm_space),
         SYS_LISTEN => sys_listen(user_context),
+        SYS_CLOCK_GETTIME => sys_clock_gettime(user_context, vm_space),
         SYS_EXIT => {
             println!("[FrameVM] SYS_EXIT called with code {}", user_context.rdi());
             return true;
@@ -145,9 +148,6 @@ fn sys_close(ctx: &mut UserContext) -> Result<isize> {
 fn sys_socket(ctx: &mut UserContext) -> Result<isize> {
     let domain = ctx.rdi() as i32;
     let sock_type = ctx.rsi() as i32;
-    let _protocol = ctx.rdx() as i32;
-
-    println!("[FrameVM] socket(domain={}, type={})", domain, sock_type);
 
     if domain != AF_FRAMEVSOCK {
         return_errno_with_message!(Errno::EAFNOSUPPORT, "unsupported domain");
@@ -161,7 +161,6 @@ fn sys_socket(ctx: &mut UserContext) -> Result<isize> {
     let socket = Arc::new(FrameVsockSocket::new(nonblocking));
     let fd = vsock::alloc_fd(socket);
 
-    println!("[FrameVM] socket() -> fd={}", fd);
     Ok(fd as isize)
 }
 
@@ -174,15 +173,12 @@ fn sys_bind(ctx: &mut UserContext, vm_space: &VmSpace) -> Result<isize> {
     let socket = vsock::get_socket(fd)?;
     socket.bind(addr)?;
 
-    println!("[FrameVM] bind(fd={}) -> addr={:?}", fd, addr);
     Ok(0)
 }
 
 fn sys_listen(ctx: &mut UserContext) -> Result<isize> {
     let fd = ctx.rdi() as i32;
     let backlog = ctx.rsi() as u32;
-
-    println!("[FrameVM] listen(fd={}, backlog={})", fd, backlog);
 
     let socket = vsock::get_socket(fd)?;
     socket.listen(backlog)?;
@@ -191,13 +187,11 @@ fn sys_listen(ctx: &mut UserContext) -> Result<isize> {
 
 fn sys_accept(ctx: &mut UserContext) -> Result<isize> {
     let fd = ctx.rdi() as i32;
-    // addr and addrlen ignored for simplicity
 
     let socket = vsock::get_socket(fd)?;
     let conn = socket.accept()?;
     let new_fd = vsock::alloc_fd(conn);
 
-    println!("[FrameVM] accept() -> fd={}", new_fd);
     Ok(new_fd as isize)
 }
 
@@ -208,8 +202,6 @@ fn sys_connect(ctx: &mut UserContext, vm_space: &VmSpace) -> Result<isize> {
 
     let addr = read_sockaddr(vm_space, addr_ptr, addr_len)?;
     let socket = vsock::get_socket(fd)?;
-
-    println!("[FrameVM] connect(fd={}, addr={:?})", fd, addr);
     socket.connect(addr)?;
 
     Ok(0)
@@ -246,7 +238,6 @@ fn sys_sendto(ctx: &mut UserContext, vm_space: &VmSpace) -> Result<isize> {
     // Send packet (zero-copy: RRef ownership transfer)
     socket.send_packet(RRef::new(packet))?;
 
-    println!("[FrameVM] sendto(fd={}, len={}) -> {}", fd, len, sent_len);
     Ok(sent_len as isize)
 }
 
@@ -270,8 +261,49 @@ fn sys_recvfrom(ctx: &mut UserContext, vm_space: &VmSpace) -> Result<isize> {
     let to_copy = packet.data.len().min(len);
     write_to_user(vm_space, buf_addr, &packet.data[..to_copy])?;
 
-    println!("[FrameVM] recvfrom(fd={}, len={}) -> {}", fd, len, to_copy);
     Ok(to_copy as isize)
+}
+
+// ============ Time Syscalls ============
+
+const CLOCK_REALTIME: usize = 0;
+const CLOCK_MONOTONIC: usize = 1;
+
+/// sys_clock_gettime - Get current time
+fn sys_clock_gettime(ctx: &mut UserContext, vm_space: &VmSpace) -> Result<isize> {
+    let clock_id = ctx.rdi();
+    let tp_ptr = ctx.rsi();
+
+    // Only support CLOCK_REALTIME and CLOCK_MONOTONIC for now
+    // Since we don't have a real RTC source easily accessible here without more dependencies,
+    // we use TSC for both, but treating them as monotonic time since boot.
+    if clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC {
+        return_errno_with_message!(Errno::EINVAL, "unsupported clock_id");
+    }
+
+    // Read TSC using safe API
+    let tsc = arch::read_tsc();
+    let freq = arch::tsc_freq();
+
+    if freq == 0 {
+        return_errno_with_message!(Errno::EINVAL, "TSC frequency not initialized");
+    }
+
+    // Calculate time from TSC
+    // time = tsc / freq (seconds)
+    // ns = (tsc % freq) * 1_000_000_000 / freq
+    let sec = tsc / freq;
+    let nsec = (tsc % freq) * 1_000_000_000 / freq;
+
+    // struct timespec { time_t tv_sec; long tv_nsec; };
+    // 64-bit: 8 bytes sec + 8 bytes nsec
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&sec.to_ne_bytes());
+    buf[8..16].copy_from_slice(&nsec.to_ne_bytes());
+
+    write_to_user(vm_space, tp_ptr, &buf)?;
+
+    Ok(0)
 }
 
 // ============ Helper Functions ============

@@ -13,6 +13,7 @@ aster-cmdline.workspace = true
 aster-console.workspace = true
 aster-framebuffer.workspace = true
 aster-framevisor.workspace = true
+aster-framevisor-exchangeable.workspace = true
 aster-framevsock.workspace = true
 aster-i8042.workspace = true
 aster-input.workspace = true

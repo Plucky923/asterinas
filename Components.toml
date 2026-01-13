@@ -10,7 +10,6 @@ cmdline = { name = "aster-cmdline" }
 console = { name = "aster-console" }
 framebuffer = { name = "aster-framebuffer" }
 i8042 = { name = "aster-i8042" }
-input = { name = "aster-input" }
 kernel = { name = "aster-kernel" }
 logger = { name = "aster-logger" }
 mlsdisk = { name = "aster-mlsdisk" }
@@ -19,7 +18,6 @@ pci = { name = "aster-pci" }
 softirq = { name = "aster-softirq" }
 systree = { name = "aster-systree" }
 time = { name = "aster-time" }
-virtio = { name = "aster-virtio" }
 
 [whitelist]
 [whitelist.nix.main]

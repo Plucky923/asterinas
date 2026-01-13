@@ -122,7 +122,6 @@ impl KVirtArea {
             unsafe { cursor.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) }
                 .expect("Failed to map frame in a new `KVirtArea`");
         }
-        early_println!("MODULE_RANGE: {:#x?}", MODULE_RANGE);
 
         Self { range }
     }
@@ -153,9 +152,6 @@ impl KVirtArea {
         );
 
         let cursor_range = range.start + map_offset..range.end;
-        early_println!("cursor_range: {:#x?}", cursor_range);
-        early_println!("range: {:#x?}", range);
-        early_println!("MODULE_RANGE: {:#x?}", MODULE_RANGE);
         let page_table = KERNEL_PAGE_TABLE.get().unwrap();
         let preempt_guard = disable_preempt();
         let mut cursor = page_table

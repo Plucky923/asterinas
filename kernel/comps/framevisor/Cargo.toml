@@ -10,5 +10,6 @@ aster-framevisor-macros = { path = "macros" }
 aster-framevisor-exchangeable = { path = "exchangeable" }
 aster-framevsock = { path = "../framevsock" }
 spin = "0.9"
+hashbrown = "0.14"
 [lints]
 workspace = true

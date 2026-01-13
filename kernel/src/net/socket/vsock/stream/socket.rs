@@ -153,6 +153,19 @@ impl Socket for VsockStreamSocket {
         }
     }
 
+    fn set_option(&self, option: &dyn crate::net::socket::SocketOption) -> Result<()> {
+        use crate::net::socket::options::{RecvLowat, VmSockBufferMaxSize};
+
+        if let Some(_) = option.as_any().downcast_ref::<VmSockBufferMaxSize>() {
+            return Ok(());
+        }
+        if let Some(_) = option.as_any().downcast_ref::<RecvLowat>() {
+            return Ok(());
+        }
+
+        return_errno_with_message!(Errno::EOPNOTSUPP, "setsockopt() is not supported")
+    }
+
     // Since blocking mode is supported, there is no need to store the connecting status.
     // TODO: Refactor when nonblocking mode is supported.
     fn connect(&self, sockaddr: SocketAddr) -> Result<()> {
@@ -278,7 +291,9 @@ impl Socket for VsockStreamSocket {
             warn!("unsupported flags: {:?}", flags);
         }
 
+        println!("[VSOCK RECVMSG] capacity={}", writer.sum_lens());
         let (received_bytes, _) = self.block_on(IoEvents::IN, || self.try_recv(writer, flags))?;
+        println!("[VSOCK RECVMSG] received {} bytes", received_bytes);
 
         // TODO: Receive control message
 

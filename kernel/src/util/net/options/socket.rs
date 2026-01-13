@@ -7,7 +7,8 @@ use crate::{
     current_userspace, impl_raw_sock_option_get_only, impl_raw_socket_option,
     net::socket::options::{
         AcceptConn, Broadcast, Error, KeepAlive, Linger, PassCred, PeerCred, PeerGroups, Priority,
-        RecvBuf, RecvBufForce, ReuseAddr, ReusePort, SendBuf, SendBufForce, SocketOption,
+        RecvBuf, RecvBufForce, RecvLowat, ReuseAddr, ReusePort, SendBuf, SendBufForce, SocketOption,
+        VmSockBufferMaxSize,
     },
     prelude::*,
     process::Gid,
@@ -38,6 +39,7 @@ enum CSocketOptionName {
     REUSEPORT = 15,
     PASSCRED = 16,
     PEERCRED = 17,
+    RCVLOWAT = 18,
     ATTACH_FILTER = 26,
     DETACH_FILTER = 27,
     ACCPETCONN = 30,
@@ -63,6 +65,7 @@ pub fn new_socket_option(name: i32) -> Result<Box<dyn RawSocketOption>> {
         CSocketOptionName::REUSEPORT => Ok(Box::new(ReusePort::new())),
         CSocketOptionName::PASSCRED => Ok(Box::new(PassCred::new())),
         CSocketOptionName::PEERCRED => Ok(Box::new(PeerCred::new())),
+        CSocketOptionName::RCVLOWAT => Ok(Box::new(RecvLowat::new())),
         CSocketOptionName::ACCPETCONN => Ok(Box::new(AcceptConn::new())),
         CSocketOptionName::SNDBUFFORCE => Ok(Box::new(SendBufForce::new())),
         CSocketOptionName::RCVBUFFORCE => Ok(Box::new(RecvBufForce::new())),
@@ -85,6 +88,8 @@ impl_raw_sock_option_get_only!(PeerCred);
 impl_raw_sock_option_get_only!(AcceptConn);
 impl_raw_socket_option!(SendBufForce);
 impl_raw_socket_option!(RecvBufForce);
+impl_raw_socket_option!(RecvLowat);
+impl_raw_socket_option!(VmSockBufferMaxSize);
 
 // SO_PEERGROUPS is a read-only option. However, calling setsockopt on SO_PEERGROUPS will return EINVAL
 // instead of ENOPROTOOPT like other options. Therefore, we manually implement `RawSocketOption` for it.

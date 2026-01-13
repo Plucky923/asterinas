@@ -63,6 +63,7 @@ mod tcp;
 mod utils;
 
 use self::{socket::new_socket_option, tcp::new_tcp_option};
+use crate::net::socket::options::VmSockBufferMaxSize;
 
 pub trait RawSocketOption: SocketOption {
     fn read_from_user(&mut self, addr: Vaddr, max_len: u32) -> Result<()>;
@@ -169,6 +170,13 @@ pub fn new_raw_socket_option(
         CSocketOptionLevel::SOL_IP => new_ip_option(name),
         CSocketOptionLevel::SOL_TCP => new_tcp_option(name),
         CSocketOptionLevel::SOL_NETLINK => new_netlink_option(name),
+        CSocketOptionLevel::SOL_VSOCK => {
+            if name == 2 || name == 0 || name == 1 {
+                Ok(Box::new(VmSockBufferMaxSize::new()))
+            } else {
+                return_errno_with_message!(Errno::ENOPROTOOPT, "unsupported vsock option")
+            }
+        }
         _ => return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported option level"),
     }
 }
@@ -186,6 +194,7 @@ pub enum CSocketOptionLevel {
     SOL_SOCKET = 1,
     SOL_TCP = 6,
     SOL_UDP = 17,
+    SOL_VSOCK = 40,
     SOL_IPV6 = 41,
     SOL_RAW = 255,
     SOL_NETLINK = 270,

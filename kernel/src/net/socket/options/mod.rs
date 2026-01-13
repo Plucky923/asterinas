@@ -29,5 +29,7 @@ impl_socket_options!(
     pub struct AcceptConn(bool);
     pub struct SendBufForce(u32);
     pub struct RecvBufForce(u32);
+    pub struct RecvLowat(i32);
     pub struct PeerGroups(Arc<[Gid]>);
+    pub struct VmSockBufferMaxSize(u64);
 );

@@ -15,13 +15,16 @@ pub fn sys_setsockopt(
     optlen: u32,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let level = CSocketOptionLevel::try_from(level).map_err(|_| Errno::EOPNOTSUPP)?;
+    let level = CSocketOptionLevel::try_from(level).map_err(|_| {
+        println!("sys_setsockopt: unsupported level {}", level);
+        Errno::EOPNOTSUPP
+    })?;
     if optval == 0 {
         return_errno_with_message!(Errno::EINVAL, "optval is null pointer");
     }
 
-    debug!(
-        "level = {:?}, sockfd = {}, optname = {}, optval = {}",
+    println!(
+        "sys_setsockopt: level = {:?}, sockfd = {}, optname = {}, optlen = {}",
         level, sockfd, optname, optlen
     );
 

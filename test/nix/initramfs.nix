@@ -15,6 +15,8 @@ let
   resolv_conf = pkgs.callPackage ./resolv_conf.nix { dnsServer = dnsServer; };
   # Whether the initramfs should include evtest, a common tool to debug input devices (`/dev/input/eventX`)
   is_evtest_included = false;
+  vsock_perf_simple = ../../vsock_perf_simple;
+  vsock_perf = ../../vsock_perf;
   all_pkgs = [ busybox etc resolv_conf ]
     ++ lib.optionals (apps != null) [ apps.package ]
     ++ lib.optionals (benchmark != null) [ benchmark.package ]
@@ -34,6 +36,11 @@ in stdenvNoCC.mkDerivation {
     ${lib.optionalString is_evtest_included ''
       cp -r ${pkgs.evtest}/bin/* $out/bin/
     ''}
+    cp ${vsock_perf_simple} $out/bin/vsock_perf_simple
+    chmod +x $out/bin/vsock_perf_simple
+
+    cp ${vsock_perf} $out/bin/vsock_perf
+    chmod +x $out/bin/vsock_perf
 
     cp -r ${etc}/* $out/etc/
 

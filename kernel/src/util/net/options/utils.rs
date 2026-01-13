@@ -65,8 +65,35 @@ macro_rules! impl_read_write_for_32bit_type {
     };
 }
 
+macro_rules! impl_read_write_for_64bit_type {
+    ($pod_ty: ty) => {
+        impl ReadFromUser for $pod_ty {
+            fn read_from_user(addr: Vaddr, max_len: u32) -> Result<Self> {
+                if (max_len as usize) < size_of::<$pod_ty>() {
+                    return_errno_with_message!(Errno::EINVAL, "max_len is too short");
+                }
+                Ok(crate::current_userspace!().read_val::<$pod_ty>(addr)?)
+            }
+        }
+
+        impl WriteToUser for $pod_ty {
+            fn write_to_user(&self, addr: Vaddr, max_len: u32) -> Result<usize> {
+                let write_len = size_of::<$pod_ty>();
+
+                if (max_len as usize) < write_len {
+                    return_errno_with_message!(Errno::EINVAL, "max_len is too short");
+                }
+
+                crate::current_userspace!().write_val(addr, self)?;
+                Ok(write_len)
+            }
+        }
+    };
+}
+
 impl_read_write_for_32bit_type!(i32);
 impl_read_write_for_32bit_type!(u32);
+impl_read_write_for_64bit_type!(u64);
 
 impl ReadFromUser for bool {
     fn read_from_user(addr: Vaddr, max_len: u32) -> Result<Self> {

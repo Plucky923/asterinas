@@ -9,7 +9,7 @@ use crate::{
     device::{Device, DeviceType, add_node},
     events::IoEvents,
     fs::{
-        file::{FileIo, StatusFlags},
+        file::{FileIo, FileMode, StatusFlags},
         vfs::{inode::InodeIo, path::PathResolver},
     },
     prelude::*,
@@ -127,12 +127,8 @@ impl Pollable for OpenBlockFile {
 }
 
 impl FileIo for OpenBlockFile {
-    fn check_seekable(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn is_offset_aware(&self) -> bool {
-        true
+    fn mode(&self) -> FileMode {
+        FileMode::LSEEK | FileMode::PREAD | FileMode::PWRITE | FileMode::ATOMIC_POS
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {

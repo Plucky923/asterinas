@@ -50,6 +50,10 @@ FN_TEST(write)
 {
 	TEST_ERRNO(write(fd, buffer, 1), ENOSPC);
 	TEST_ERRNO(write(fd, buffer, 0), ENOSPC);
+	// Verifies `/dev/full` positional writes keep returning `ENOSPC`.
+	// `/dev/full` support was introduced in PR #2439.
+	TEST_ERRNO(pwrite(fd, buffer, 0, 0), ENOSPC);
+	TEST_ERRNO(pwrite(fd, buffer, 1, 0), ENOSPC);
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnonnull"

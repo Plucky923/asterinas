@@ -21,7 +21,7 @@ use super::EvdevDevice;
 use crate::{
     events::IoEvents,
     fs::{
-        file::{FileIo, StatusFlags},
+        file::{FileIo, FileMode, StatusFlags},
         vfs::inode::InodeIo,
     },
     prelude::*,
@@ -411,12 +411,8 @@ impl InodeIo for EvdevFile {
 }
 
 impl FileIo for EvdevFile {
-    fn check_seekable(&self) -> Result<()> {
-        return_errno_with_message!(Errno::ESPIPE, "the inode is an evdev file");
-    }
-
-    fn is_offset_aware(&self) -> bool {
-        false
+    fn mode(&self) -> FileMode {
+        FileMode::STREAM
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {

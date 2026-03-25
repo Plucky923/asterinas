@@ -9,7 +9,7 @@ use super::{Tty, TtyDriver};
 use crate::{
     events::IoEvents,
     fs::{
-        file::{FileIo, StatusFlags},
+        file::{FileIo, FileMode, StatusFlags},
         vfs::inode::InodeIo,
     },
     prelude::*,
@@ -54,11 +54,11 @@ impl<D: TtyDriver> InodeIo for TtyFile<D> {
 impl<D: TtyDriver> FileIo for TtyFile<D> {
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32>;
 
-    fn check_seekable(&self) -> Result<()> {
-        return_errno_with_message!(Errno::ESPIPE, "the inode is a TTY");
+    fn mode(&self) -> FileMode {
+        FileMode::empty()
     }
 
-    fn is_offset_aware(&self) -> bool {
+    fn uses_pos(&self) -> bool {
         false
     }
 }

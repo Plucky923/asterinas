@@ -80,38 +80,9 @@ fn do_sys_pwritev(
     let mut file_table = ctx.thread_local.borrow_file_table_mut();
     let file = get_file_fast!(&mut file_table, fd);
 
-    // TODO: Check (f.file->f_mode & FMODE_PREAD); We don't have f_mode in our FileLike trait
-    if io_vec_count == 0 {
-        return Ok(0);
-    }
-
-    let mut total_len: usize = 0;
-    let mut cur_offset = offset as usize;
-
     let user_space = ctx.user_space();
     let mut reader_array = VmReaderArray::from_user_io_vecs(&user_space, io_vec_ptr, io_vec_count)?;
-    for reader in reader_array.readers_mut() {
-        debug_assert!(reader.has_remain());
-
-        // TODO: According to the man page
-        // at <https://man7.org/linux/man-pages/man2/readv.2.html>,
-        // writev must be atomic,
-        // but the current implementation does not ensure atomicity.
-        // A suitable fix would be to add a `writev` method for the `FileLike` trait,
-        // allowing each subsystem to implement atomicity.
-        match file.write_at(cur_offset, reader) {
-            Ok(write_len) => {
-                total_len += write_len;
-                cur_offset += write_len;
-            }
-            Err(_) if total_len > 0 => break,
-            Err(err) => return Err(err),
-        }
-        if reader.has_remain() {
-            // Partial write, maybe errors in the middle
-            break;
-        }
-    }
+    let total_len = file.write_at_array(offset as usize, &mut reader_array)?;
     if total_len > 0 {
         fs::vfs::notify::on_modify(&file);
     }

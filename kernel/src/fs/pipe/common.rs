@@ -10,7 +10,7 @@ use ostd::sync::WaitQueue;
 use crate::{
     events::IoEvents,
     fs::{
-        file::{AccessMode, FileIo, StatusFlags},
+        file::{AccessMode, FileIo, FileMode, StatusFlags},
         utils::{Endpoint, EndpointState},
         vfs::inode::InodeIo,
     },
@@ -130,12 +130,8 @@ impl InodeIo for PipeHandle {
 }
 
 impl FileIo for PipeHandle {
-    fn check_seekable(&self) -> Result<()> {
-        return_errno_with_message!(Errno::ESPIPE, "the inode is a FIFO file")
-    }
-
-    fn is_offset_aware(&self) -> bool {
-        false
+    fn mode(&self) -> FileMode {
+        FileMode::STREAM
     }
 }
 

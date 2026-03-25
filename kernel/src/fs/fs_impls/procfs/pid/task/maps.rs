@@ -6,7 +6,7 @@ use super::TidDirOps;
 use crate::{
     events::IoEvents,
     fs::{
-        file::{AccessMode, FileIo, StatusFlags, mkmod},
+        file::{AccessMode, FileIo, FileMode, StatusFlags, mkmod},
         procfs::template::{FileOpsByHandle, ProcFileBuilder},
         vfs::inode::{Inode, InodeIo},
     },
@@ -113,11 +113,7 @@ impl InodeIo for MapsFileHandle {
 }
 
 impl FileIo for MapsFileHandle {
-    fn check_seekable(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn is_offset_aware(&self) -> bool {
-        true
+    fn mode(&self) -> FileMode {
+        FileMode::LSEEK | FileMode::PREAD | FileMode::PWRITE | FileMode::ATOMIC_POS
     }
 }

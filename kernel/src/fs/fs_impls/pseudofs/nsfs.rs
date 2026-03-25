@@ -11,7 +11,7 @@ use crate::{
     events::IoEvents,
     fs::{
         file::{
-            AccessMode, FileIo, InodeHandle, InodeMode, InodeType, StatusFlags,
+            AccessMode, FileIo, FileMode, InodeHandle, InodeMode, InodeType, StatusFlags,
             file_table::{FdFlags, FileDesc},
             mkmod,
         },
@@ -169,11 +169,11 @@ impl<T: NsCommonOps> NsFile<T> {
 }
 
 impl<T: NsCommonOps> FileIo for NsFile<T> {
-    fn check_seekable(&self) -> Result<()> {
-        return_errno_with_message!(Errno::ESPIPE, "ns files are not seekable");
+    fn mode(&self) -> FileMode {
+        FileMode::PREAD | FileMode::PWRITE
     }
 
-    fn is_offset_aware(&self) -> bool {
+    fn uses_pos(&self) -> bool {
         false
     }
 

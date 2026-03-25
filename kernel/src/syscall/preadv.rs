@@ -79,37 +79,9 @@ fn do_sys_preadv(
     let mut file_table = ctx.thread_local.borrow_file_table_mut();
     let file = get_file_fast!(&mut file_table, fd);
 
-    if io_vec_count == 0 {
-        return Ok(0);
-    }
-
-    let mut total_len: usize = 0;
-    let mut cur_offset = offset as usize;
-
     let user_space = ctx.user_space();
     let mut writer_array = VmWriterArray::from_user_io_vecs(&user_space, io_vec_ptr, io_vec_count)?;
-    for writer in writer_array.writers_mut() {
-        debug_assert!(writer.has_avail());
-
-        // TODO: According to the man page
-        // at <https://man7.org/linux/man-pages/man2/readv.2.html>,
-        // readv must be atomic,
-        // but the current implementation does not ensure atomicity.
-        // A suitable fix would be to add a `readv` method for the `FileLike` trait,
-        // allowing each subsystem to implement atomicity.
-        match file.read_at(cur_offset, writer) {
-            Ok(read_len) => {
-                total_len += read_len;
-                cur_offset += read_len;
-            }
-            Err(_) if total_len > 0 => break,
-            Err(err) => return Err(err),
-        }
-        if writer.has_avail() {
-            // End of file reached or no more data to read
-            break;
-        }
-    }
+    let total_len = file.read_at_array(offset as usize, &mut writer_array)?;
 
     if total_len > 0 {
         fs::vfs::notify::on_access(&file);

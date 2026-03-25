@@ -8,13 +8,15 @@ use core::fmt::Display;
 
 use ostd::io::IoMem;
 
-use super::{AccessMode, InodeHandle, StatusFlags, file_table::FdFlags, inode_handle::SeekFrom};
+use super::{
+    AccessMode, FileMode, InodeHandle, StatusFlags, file_table::FdFlags, inode_handle::SeekFrom,
+};
 use crate::{
     fs::vfs::{inode::FallocMode, path::Path},
     net::socket::Socket,
     prelude::*,
     process::signal::Pollable,
-    util::ioctl::RawIoctl,
+    util::{VmReaderArray, VmWriterArray, ioctl::RawIoctl},
     vm::vmo::Vmo,
 };
 
@@ -31,6 +33,8 @@ pub trait FileLike: Pollable + Send + Sync + Any {
     /// Read at the given file offset.
     ///
     /// The file must be seekable to support `read_at`.
+    /// Unsupported offset-based I/O should be rejected even for zero-length requests so that the
+    /// `pread`/`preadv` family returns the Linux-compatible errno.
     /// Unlike [`read`], `read_at` will not change the file offset.
     ///
     /// [`read`]: FileLike::read
@@ -38,15 +42,87 @@ pub trait FileLike: Pollable + Send + Sync + Any {
         return_errno_with_message!(Errno::ESPIPE, "read_at is not supported");
     }
 
+    /// Reads into a collection of buffers at the given file offset.
+    ///
+    /// The default implementation issues one or more [`read_at`] calls in order. When the buffer
+    /// collection is empty, it still delegates to [`read_at`] with a zero-length writer so that
+    /// the `preadv` family keeps returning the Linux-compatible errno for unsupported files.
+    ///
+    /// [`read_at`]: FileLike::read_at
+    fn read_at_array(&self, offset: usize, writers: &mut VmWriterArray) -> Result<usize> {
+        if writers.writers_mut().is_empty() {
+            let mut empty = [0u8; 0];
+            let mut writer = VmWriter::from(empty.as_mut_slice()).to_fallible();
+            return self.read_at(offset, &mut writer);
+        }
+
+        let mut total_len = 0;
+        let mut cur_offset = offset;
+        for writer in writers.writers_mut() {
+            debug_assert!(writer.has_avail());
+
+            match self.read_at(cur_offset, writer) {
+                Ok(read_len) => {
+                    total_len += read_len;
+                    cur_offset += read_len;
+                }
+                Err(_) if total_len > 0 => break,
+                Err(err) => return Err(err),
+            }
+            if writer.has_avail() {
+                break;
+            }
+        }
+
+        Ok(total_len)
+    }
+
     /// Write at the given file offset.
     ///
     /// The file must be seekable to support `write_at`.
+    /// Unsupported offset-based I/O should be rejected even for zero-length requests so that the
+    /// `pwrite`/`pwritev` family returns the Linux-compatible errno.
     /// Unlike [`write`], `write_at` will not change the file offset.
     /// If the file is append-only, the `offset` will be ignored.
     ///
     /// [`write`]: FileLike::write
     fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
         return_errno_with_message!(Errno::ESPIPE, "write_at is not supported");
+    }
+
+    /// Writes from a collection of buffers at the given file offset.
+    ///
+    /// The default implementation issues one or more [`write_at`] calls in order. When the buffer
+    /// collection is empty, it still delegates to [`write_at`] with a zero-length reader so that
+    /// the `pwritev` family keeps returning the Linux-compatible errno for unsupported files.
+    ///
+    /// [`write_at`]: FileLike::write_at
+    fn write_at_array(&self, offset: usize, readers: &mut VmReaderArray) -> Result<usize> {
+        if readers.readers_mut().is_empty() {
+            let empty = [0u8; 0];
+            let mut reader = VmReader::from(empty.as_slice()).to_fallible();
+            return self.write_at(offset, &mut reader);
+        }
+
+        let mut total_len = 0;
+        let mut cur_offset = offset;
+        for reader in readers.readers_mut() {
+            debug_assert!(reader.has_remain());
+
+            match self.write_at(cur_offset, reader) {
+                Ok(write_len) => {
+                    total_len += write_len;
+                    cur_offset += write_len;
+                }
+                Err(_) if total_len > 0 => break,
+                Err(err) => return Err(err),
+            }
+            if reader.has_remain() {
+                break;
+            }
+        }
+
+        Ok(total_len)
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
@@ -77,6 +153,10 @@ pub trait FileLike: Pollable + Send + Sync + Any {
 
     fn set_status_flags(&self, _new_flags: StatusFlags) -> Result<()> {
         return_errno_with_message!(Errno::EINVAL, "set_status_flags is not supported");
+    }
+
+    fn mode(&self) -> FileMode {
+        FileMode::from(self.access_mode())
     }
 
     fn access_mode(&self) -> AccessMode {

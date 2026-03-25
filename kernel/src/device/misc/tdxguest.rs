@@ -23,7 +23,7 @@ use crate::{
     device::{Device, DeviceType},
     events::IoEvents,
     fs::{
-        file::{FileIo, StatusFlags},
+        file::{FileIo, FileMode, StatusFlags},
         vfs::inode::InodeIo,
     },
     prelude::*,
@@ -141,12 +141,8 @@ impl InodeIo for TdxGuestFile {
 }
 
 impl FileIo for TdxGuestFile {
-    fn check_seekable(&self) -> Result<()> {
-        return_errno_with_message!(Errno::ESPIPE, "seek is not supported")
-    }
-
-    fn is_offset_aware(&self) -> bool {
-        false
+    fn mode(&self) -> FileMode {
+        FileMode::STREAM
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {

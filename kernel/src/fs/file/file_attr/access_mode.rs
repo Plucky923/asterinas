@@ -2,6 +2,7 @@
 
 use aster_rights::Rights;
 
+use super::file_mode::FileMode;
 use crate::prelude::*;
 
 #[expect(non_camel_case_types)]
@@ -49,6 +50,20 @@ impl From<Rights> for AccessMode {
             (false, true) => AccessMode::O_WRONLY,
             // The file is opened with `O_PATH`. We follow Linux to report `O_RDONLY` here (e.g.,
             // in `/proc/[pid]/fdinfo/[n]`).
+            (false, false) => AccessMode::O_RDONLY,
+        }
+    }
+}
+
+impl From<FileMode> for AccessMode {
+    fn from(mode: FileMode) -> Self {
+        match (
+            mode.contains(FileMode::READ),
+            mode.contains(FileMode::WRITE),
+        ) {
+            (true, true) => AccessMode::O_RDWR,
+            (true, false) => AccessMode::O_RDONLY,
+            (false, true) => AccessMode::O_WRONLY,
             (false, false) => AccessMode::O_RDONLY,
         }
     }

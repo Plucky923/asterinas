@@ -11,7 +11,7 @@ use crate::{
     current_userspace,
     events::IoEvents,
     fs::{
-        file::{FileIo, Mappable, StatusFlags},
+        file::{FileIo, FileMode, Mappable, StatusFlags},
         vfs::inode::InodeIo,
     },
     prelude::*,
@@ -458,12 +458,8 @@ impl InodeIo for FbHandle {
 }
 
 impl FileIo for FbHandle {
-    fn check_seekable(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn is_offset_aware(&self) -> bool {
-        true
+    fn mode(&self) -> FileMode {
+        FileMode::LSEEK | FileMode::PREAD | FileMode::PWRITE | FileMode::ATOMIC_POS
     }
 
     fn mappable(&self) -> Result<Mappable> {

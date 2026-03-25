@@ -10,7 +10,7 @@ use crate::{
     events::IoEvents,
     fs::{
         devpts::Ptmx,
-        file::{AccessMode, FileIo, OpenArgs, StatusFlags, file_table::FdFlags, mkmod},
+        file::{AccessMode, FileIo, FileMode, OpenArgs, StatusFlags, file_table::FdFlags, mkmod},
         vfs::{inode::InodeIo, path::FsPath},
     },
     prelude::*,
@@ -140,11 +140,11 @@ impl InodeIo for PtyMaster {
 }
 
 impl FileIo for PtyMaster {
-    fn check_seekable(&self) -> Result<()> {
-        return_errno_with_message!(Errno::ESPIPE, "the inode is a pty");
+    fn mode(&self) -> FileMode {
+        FileMode::empty()
     }
 
-    fn is_offset_aware(&self) -> bool {
+    fn uses_pos(&self) -> bool {
         false
     }
 

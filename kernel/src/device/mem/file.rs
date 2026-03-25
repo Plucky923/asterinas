@@ -8,7 +8,7 @@ use crate::{
     error::Errno,
     events::IoEvents,
     fs::{
-        file::{FileIo, StatusFlags},
+        file::{FileIo, FileMode, StatusFlags},
         vfs::inode::InodeIo,
     },
     prelude::Result,
@@ -143,11 +143,11 @@ impl InodeIo for MemFile {
 }
 
 impl FileIo for MemFile {
-    fn check_seekable(&self) -> Result<()> {
-        Ok(())
+    fn mode(&self) -> FileMode {
+        FileMode::LSEEK | FileMode::PREAD | FileMode::PWRITE
     }
 
-    fn is_offset_aware(&self) -> bool {
+    fn uses_pos(&self) -> bool {
         false
     }
 }

@@ -546,9 +546,9 @@ framevm_test:
 	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test compare_all
 	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test vsock_all
 	@$(MAKE) --no-print-directory -C kernel/comps/framevm/test fork_all
-	@$(MAKE) --no-print-directory -C test/initramfs/src/apps memory
-	@$(MAKE) --no-print-directory -C test/initramfs/src/apps/network vsock
-	@$(MAKE) --no-print-directory -C test/initramfs/src/apps framevsock
+	@$(MAKE) --no-print-directory -C test/initramfs/src/regression memory
+	@$(MAKE) --no-print-directory -C test/initramfs/src/regression/network vsock
+	@$(MAKE) --no-print-directory -C test/initramfs/src/regression framevsock
 	@echo "[make] FrameVM test programs built successfully"
 
 .PHONY: framevm

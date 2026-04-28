@@ -118,7 +118,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../../../.." && pwd)"
 
 framevm_dir="${repo_root}/kernel/comps/framevm/test"
-initramfs_mem_dir="${repo_root}/test/initramfs/src/apps/memory"
+initramfs_mem_dir="${repo_root}/test/initramfs/src/regression/memory"
 if [ -z "${initramfs_build_dir}" ]; then
     initramfs_build_dir="${repo_root}/test/initramfs/build_apps_memory"
 fi

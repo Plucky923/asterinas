@@ -98,7 +98,7 @@ if [ "$check_artifacts" -eq 1 ]; then
     check_file "${repo_root}/test/initramfs/build/initramfs.l2.cpio.gz"
     check_file "${repo_root}/test/initramfs/build/ext2.img"
     check_file "/opt/linux_binary_cache/vmlinuz"
-    check_file "${repo_root}/test/initramfs/src/apps/scripts/nested_l2_qemu.sh"
+    check_file "${repo_root}/test/initramfs/src/regression/scripts/nested_l2_qemu.sh"
 fi
 
 if [ "$fail_count" -ne 0 ]; then

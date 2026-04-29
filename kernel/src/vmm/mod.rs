@@ -7,7 +7,6 @@ use core::{
 };
 
 use aster_framevisor::{start_framevm, stop_framevm};
-use log::{debug, error, info, warn};
 use ostd::{
     sync::{SpinLock, WaitQueue},
     task::Task,
@@ -15,9 +14,8 @@ use ostd::{
 
 use crate::{
     fs::{
-        file_handle::FileLike,
-        path::FsPath,
-        utils::{AccessMode, InodeMode, OpenArgs},
+        file::{AccessMode, FileLike, InodeMode, OpenArgs},
+        vfs::path::FsPath,
     },
     prelude::*,
     process::posix_thread::AsThreadLocal,

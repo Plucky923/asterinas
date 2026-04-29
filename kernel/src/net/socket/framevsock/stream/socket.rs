@@ -12,7 +12,7 @@ use aster_framevsock::flow_control::DEFAULT_BUF_ALLOC;
 use super::{connected::Connected, connecting::Connecting, init::Init, listen::Listen};
 use crate::{
     events::IoEvents,
-    fs::{file_handle::FileLike, path::Path, pseudofs::SockFs},
+    fs::{file::FileLike, pseudofs::SockFs, vfs::path::Path},
     net::socket::{
         Socket,
         framevsock::{

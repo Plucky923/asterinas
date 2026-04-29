@@ -32,7 +32,6 @@ use aster_framevsock::{
     flow_control::{DEFAULT_BUF_ALLOC, MAX_PENDING_PACKETS, MAX_PKT_BUF_SIZE},
     trace,
 };
-use log::error;
 
 use super::connecting::Connecting;
 use crate::{

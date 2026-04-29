@@ -169,7 +169,6 @@ dependencies = [
  "device-id",
  "id-alloc",
  "int-to-c-enum",
- "log",
  "ostd",
  "ostd-pod",
  "spin",
@@ -181,7 +180,7 @@ name = "aster-cmdline"
 version = "0.1.0"
 dependencies = [
  "component",
- "log",
+ "inventory",
  "ostd",
  "spin",
 ]
@@ -190,6 +189,7 @@ dependencies = [
 name = "aster-console"
 version = "0.1.0"
 dependencies = [
+ "bitflags 1.3.2",
  "component",
  "font8x8",
  "int-to-c-enum",
@@ -204,7 +204,6 @@ dependencies = [
  "aster-console",
  "aster-input",
  "component",
- "log",
  "ostd",
  "spin",
 ]
@@ -272,7 +271,6 @@ dependencies = [
  "aster-input",
  "bitflags 2.9.1",
  "component",
- "log",
  "ostd",
  "spin",
 ]
@@ -284,7 +282,6 @@ dependencies = [
  "bitflags 1.3.2",
  "bitvec",
  "component",
- "log",
  "ostd",
  "ostd-pod",
  "spin",
@@ -324,7 +321,6 @@ dependencies = [
  "component",
  "const_format",
  "controlled",
- "core2",
  "cpio-decoder",
  "device-id",
  "getset",
@@ -337,16 +333,17 @@ dependencies = [
  "keyable-arc",
  "lending-iterator",
  "libflate",
- "log",
  "logo-ascii-art",
  "loongArch64",
  "lru",
+ "no_std_io2",
  "osdk-frame-allocator",
  "osdk-heap-allocator",
  "ostd",
  "ostd-pod",
  "paste",
  "rand",
+ "ring-buffer",
  "riscv",
  "spin",
  "takeable",
@@ -365,7 +362,6 @@ version = "0.1.0"
 dependencies = [
  "aster-console",
  "component",
- "log",
  "ostd",
  "owo-colors",
 ]
@@ -383,7 +379,6 @@ dependencies = [
  "hashbrown 0.14.5",
  "inherit-methods-macro",
  "lending-iterator",
- "log",
  "lru",
  "ostd",
  "ostd-pod",
@@ -415,7 +410,7 @@ dependencies = [
  "cfg-if",
  "component",
  "fdt",
- "log",
+ "int-to-c-enum",
  "ostd",
  "spin",
 ]
@@ -470,7 +465,6 @@ dependencies = [
  "bitflags 1.3.2",
  "chrono",
  "component",
- "log",
  "ostd",
  "spin",
 ]
@@ -483,7 +477,6 @@ dependencies = [
  "component",
  "fdt",
  "inherit-methods-macro",
- "log",
  "ostd",
  "spin",
 ]
@@ -521,7 +514,6 @@ dependencies = [
  "device-id",
  "id-alloc",
  "int-to-c-enum",
- "log",
  "ostd",
  "ostd-pod",
  "spin",
@@ -766,21 +758,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "core2"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b49ba7ef1ad6107f8824dbe97de947cbaac53c44e7f9756a1fba0d37c1eec505"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "cpio-decoder"
 version = "0.1.0"
 dependencies = [
- "core2",
  "int-to-c-enum",
  "lending-iterator",
+ "no_std_io2",
 ]
 
 [[package]]
@@ -921,6 +904,7 @@ name = "device-id"
 version = "0.1.0"
 dependencies = [
  "aster-util",
+ "spin",
 ]
 
 [[package]]
@@ -1323,35 +1307,35 @@ checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
 
 [[package]]
 name = "libflate"
-version = "2.1.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45d9dfdc14ea4ef0900c1cddbc8dcd553fbaacd8a4a282cf4018ae9dd04fb21e"
+checksum = "cd96e993e5f3368b0cb8497dae6c860c22af8ff18388c61c6c0b86c58d86b5df"
 dependencies = [
  "adler32",
- "core2",
  "crc32fast",
  "dary_heap",
  "libflate_lz77",
+ "no_std_io2",
 ]
 
 [[package]]
 name = "libflate_lz77"
-version = "2.1.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e0d73b369f386f1c44abd9c570d5318f55ccde816ff4b562fa452e5182863d"
+checksum = "ff7a10e427698aef6eef269482776debfef63384d30f13aad39a1a95e0e098fd"
 dependencies = [
- "core2",
- "hashbrown 0.14.5",
+ "hashbrown 0.16.1",
+ "no_std_io2",
  "rle-decode-fast",
 ]
 
 [[package]]
 name = "linux-boot-params"
-version = "0.17.0"
+version = "0.17.1"
 
 [[package]]
 name = "linux-bzimage-builder"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "align_ext",
  "bitflags 1.3.2",
@@ -1364,13 +1348,13 @@ dependencies = [
 
 [[package]]
 name = "linux-bzimage-setup"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "cfg-if",
- "core2",
  "libflate",
  "linux-boot-params",
  "log",
+ "no_std_io2",
  "tdx-guest",
  "uart_16550",
  "uefi",
@@ -1515,6 +1499,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "no_std_io2"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b51ed7824b6e07d354605f4abb3d9d300350701299da96642ee084f5ce631550"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1580,16 +1573,15 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "osdk-frame-allocator"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
- "log",
  "ostd",
  "paste",
 ]
 
 [[package]]
 name = "osdk-heap-allocator"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "log",
  "ostd",
@@ -1597,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "osdk-test-kernel"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "ostd",
  "owo-colors",
@@ -1605,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "ostd"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "acpi",
  "align_ext",
@@ -1645,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "ostd-macros"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1675,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "ostd-test"
-version = "0.17.0"
+version = "0.17.1"
 
 [[package]]
 name = "owo-colors"
@@ -1909,6 +1901,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
+name = "ring-buffer"
+version = "0.1.0"
+dependencies = [
+ "inherit-methods-macro",
+ "ostd",
+ "ostd-pod",
+]
+
+[[package]]
 name = "riscv"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1997,7 +1998,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sctrace"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "clap 4.5.51",
  "nix",

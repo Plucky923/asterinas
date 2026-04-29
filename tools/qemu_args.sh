@@ -59,6 +59,15 @@ fi
 if [ "$1" = "tdx" ]; then
     TDX_OBJECT='{ "qom-type": "tdx-guest", "id": "tdx0", "sept-ve-disable": true, "quote-generation-socket": { "type": "vsock", "cid": "2", "port": "4050" } }'
 
+    OVMF_TDX_PATH="/root/ovmf/release/OVMF.fd"
+    if [ ! -f "$OVMF_TDX_PATH" ]; then
+        for candidate in /usr/share/qemu/OVMF.fd /usr/share/ovmf/OVMF.fd; do
+            if [ -f "$candidate" ]; then
+                OVMF_TDX_PATH="$candidate"
+                break
+            fi
+        done
+    fi
     QEMU_ARGS="\
         -m ${MEM:-8G} \
         -smp ${SMP:-1} \
@@ -66,7 +75,7 @@ if [ "$1" = "tdx" ]; then
         -nographic \
         -monitor pty \
         -nodefaults \
-        -bios /root/ovmf/release/OVMF.fd \
+        -bios $OVMF_TDX_PATH \
         -cpu host,-kvm-steal-time,pmu=off \
         -machine q35,kernel-irqchip=split,confidential-guest-support=tdx0 \
         -object '$TDX_OBJECT' \
@@ -87,11 +96,12 @@ fi
 
 COMMON_QEMU_ARGS="\
     -cpu Icelake-Server,+x2apic \
+    -accel kvm \
     -smp ${SMP:-1} \
     -m ${MEM:-8G} \
     --no-reboot \
     -nographic \
-    -display vnc=0.0.0.0:${VNC_PORT:-42} \
+    -vnc 0.0.0.0:${VNC_PORT:-42} \
     -monitor chardev:mux \
     -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
     $NETDEV_ARGS \
@@ -177,12 +187,31 @@ fi
 
 if [ "$OVMF" = "on" ]; then
     if [ "$1" = "microvm" ]; then
+        OVMF_MICROVM_PATH="/root/ovmf/release/microvm/MICROVM.fd"
+        if [ ! -f "$OVMF_MICROVM_PATH" ]; then
+            for candidate in /usr/share/qemu/MICROVM.fd /usr/share/OVMF/MICROVM.fd; do
+                if [ -f "$candidate" ]; then
+                    OVMF_MICROVM_PATH="$candidate"
+                    break
+                fi
+            done
+        fi
         QEMU_ARGS="${QEMU_ARGS} \
-            -bios /root/ovmf/release/microvm/MICROVM.fd \
+            -bios $OVMF_MICROVM_PATH \
         "
     else
+        # Find OVMF on the host if the container path doesn't exist
+        OVMF_PATH="/root/ovmf/release/OVMF.fd"
+        if [ ! -f "$OVMF_PATH" ]; then
+            for candidate in /usr/share/qemu/OVMF.fd /usr/share/ovmf/OVMF.fd; do
+                if [ -f "$candidate" ]; then
+                    OVMF_PATH="$candidate"
+                    break
+                fi
+            done
+        fi
         QEMU_ARGS="${QEMU_ARGS} \
-            -bios /root/ovmf/release/OVMF.fd \
+            -bios $OVMF_PATH \
         "
     fi
 fi

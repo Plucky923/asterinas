@@ -14,7 +14,6 @@ args = "$(./tools/qemu_args.sh normal)"
 # Special options for running
 [run.boot]
 kcmd_args = [
-    "ostd.log_level=debug",
     "SHELL=/bin/sh",
     "LOGNAME=root",
     "HOME=/",

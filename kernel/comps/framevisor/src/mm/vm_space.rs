@@ -27,7 +27,8 @@ impl VmSpace {
         Self(Arc::new(OstdVmSpace::new()))
     }
 
-    fn vmspace(&self) -> &Arc<OstdVmSpace> {
+    #[inline(never)]
+    pub fn vmspace(&self) -> &Arc<OstdVmSpace> {
         &self.0
     }
 

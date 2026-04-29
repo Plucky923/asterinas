@@ -16,10 +16,10 @@
 
 use alloc::sync::Arc;
 
+use crate::prelude::*;
 use aster_framevisor::vsock as framevisor_vsock;
 use aster_framevisor_exchangeable::RRef;
 use aster_framevsock::{ControlPacket, DataPacket};
-use log::info;
 use spin::Once;
 
 pub mod addr;

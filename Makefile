@@ -510,11 +510,10 @@ framevm_sdk:
 		--output-deps build/deps
 
 .PHONY: framevm_obj
-framevm_obj: framevm_sdk
+framevm_obj:
 	@echo "[make] Building FrameVM object for dynamic loading"
-	@rm -rf target/$(FRAMEVM_TARGET)/$(FRAMEVM_PROFILE_DIR)/.fingerprint
 	@cargo run --manifest-path framevm_tools/framevm_cargo/Cargo.toml -- \
-		--input build/deps \
+		--input target/$(OSDK_TARGET_ARCH)-unknown-none/$(FRAMEVM_PROFILE_DIR)/deps \
 		--output build/framevm \
 		--target $(FRAMEVM_TARGET) \
 		--profile "$(FRAMEVM_CARGO_PROFILE)" \

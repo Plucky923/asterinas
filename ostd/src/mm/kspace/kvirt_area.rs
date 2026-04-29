@@ -208,8 +208,7 @@ impl KVirtArea {
         for frame in frames.into_iter() {
             // SAFETY: The constructor of the `KVirtArea` has already ensured
             // that this mapping does not affect kernel's memory safety.
-            unsafe { cursor.map(MappedItem::Tracked(frame.into(), prop)) }
-                .expect("Failed to map frame in a new `KVirtArea`");
+            unsafe { cursor.map(MappedItem::Tracked(frame.into(), prop)) };
         }
 
         Self {

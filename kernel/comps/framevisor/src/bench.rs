@@ -78,3 +78,11 @@ pub fn bench_ensure_stack_4k_with_args(a: u64, b: u64, c: u64) -> u64 {
     compiler_fence(Ordering::SeqCst);
     a.wrapping_add(b).wrapping_add(c)
 }
+
+/// Preserve benchmark symbols for FrameVM dynamic linking.
+#[used]
+static _PRESERVE_BENCH_SYMBOLS: [fn() -> u64; 3] = [
+    bench_noop,
+    bench_ensure_stack_no_switch,
+    bench_ensure_stack_force_switch,
+];

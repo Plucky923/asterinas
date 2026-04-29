@@ -101,6 +101,16 @@ fn main() -> Result<(), String> {
     let profile = matches.opt_str("profile");
     let features = matches.opt_str("features");
 
+    // Remove stale rlibs/rmetas that were produced by previous framevm_cargo
+    // invocations (before it used a temporary target dir). They have newer
+    // mtimes than the kernel binary but colliding StableCrateIds, which breaks
+    // rustc. Keeping only the versions that existed at kernel-build time lets
+    // select_prebuilt_crate pick the correct OSDK-linked artifacts.
+    if let Some(kernel_mtime) = get_kernel_binary_mtime(&target) {
+        clean_stale_prebuilt_deps(&input_dir_path, kernel_mtime)
+            .map_err(|e| format!("Error cleaning stale prebuilt deps: {}", e))?;
+    }
+
     let prebuilt_crates_set = if input_dir_path.is_dir() {
         populate_crates_from_dir(&input_dir_path)
             .map_err(|e| format!("Error parsing --input arg as directory: {}", e))?
@@ -175,19 +185,47 @@ fn crate_name_with_hash_from_path(path: &Path) -> Option<&str> {
 fn select_prebuilt_crate<'a>(
     crate_candidates: &'a [String],
     original_crate_path: &Path,
-    _is_sysroot_dep: bool,
+    prebuilt_dir: &Path,
+    is_sysroot_dep: bool,
 ) -> Option<&'a str> {
     let original_crate_name_with_hash = crate_name_with_hash_from_path(original_crate_path);
 
-    crate_candidates
+    // For non-sysroot deps, always prefer the most recently modified candidate.
+    // This ensures we use the version built by the latest `cargo osdk build`,
+    // which is the one linked into the host kernel binary.
+    // The exact hash from `run_initial_cargo` may point to a stale cached version
+    // because `cargo rustc -p aster-framevm --lib` uses a different fingerprint
+    // than OSDK's base-crate build.
+    if !is_sysroot_dep {
+        let mut best: Option<(&'a str, std::time::SystemTime)> = None;
+        for candidate in crate_candidates {
+            let path = prebuilt_dir.join(format!("lib{}.rlib", candidate));
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if let Ok(mtime) = meta.modified() {
+                    if best.as_ref().map_or(true, |(_, best_mtime)| mtime > *best_mtime) {
+                        best = Some((candidate.as_str(), mtime));
+                    }
+                }
+            }
+        }
+        if let Some((candidate, _)) = best {
+            if Some(candidate) != original_crate_name_with_hash {
+                eprintln!("#### Warning: using most recent prebuilt crate {:?} instead of {:?}", candidate, original_crate_name_with_hash);
+            }
+            return Some(candidate);
+        }
+    }
+
+    // For sysroot deps, prefer exact hash match for stability.
+    if let Some(exact) = crate_candidates
         .iter()
-        .find(|candidate| Some(candidate.as_str()) != original_crate_name_with_hash)
-        .or_else(|| {
-            crate_candidates
-                .iter()
-                .find(|candidate| Some(candidate.as_str()) == original_crate_name_with_hash)
-        })
-        .map(|candidate| candidate.as_str())
+        .find(|candidate| Some(candidate.as_str()) == original_crate_name_with_hash)
+    {
+        return Some(exact.as_str());
+    }
+
+    // Final fallback.
+    crate_candidates.first().map(|c| c.as_str())
 }
 
 /// Runs the actual cargo build command.
@@ -210,6 +248,7 @@ fn run_initial_cargo<P: AsRef<Path>>(
 
     cmd.arg("-vv");
     cmd.arg("-p").arg("aster-framevm");
+    cmd.arg("--lib");
     cmd.arg("--target").arg(target);
     cmd.arg("-Zbuild-std=core,alloc,compiler_builtins");
     cmd.arg("-Zbuild-std-features=compiler-builtins-mem");
@@ -223,28 +262,46 @@ fn run_initial_cargo<P: AsRef<Path>>(
 
     cmd.arg("--color=always");
 
-    let mut rustflags = vec![
-        "-C",
-        "relocation-model=static",
-        "-C",
-        "code-model=kernel",
-        "-Z",
-        "direct-access-external-data=yes",
-        "-Z",
-        "relax-elf-relocations=no",
-        "-Z",
-        "plt=yes",
-        "-C",
-        "link-arg=-no-pie",
-        "-C",
-        "no-redzone=y",
-        "-C",
-        "target-feature=+ermsb",
-        "-C",
-        "force-unwind-tables=yes",
-    ];
-
     cmd.env("RUST_TARGET_PATH", input_dir_path);
+
+    // Use a temporary target directory for the initial cargo rustc invocation.
+    // This prevents cargo from writing new artifacts into the shared target/deps
+    // directory and creating colliding StableCrateIds with the OSDK build.
+    // run_rustc_command will then pick the prebuilt crates from the original
+    // input_dir (target/deps) that were produced by `cargo osdk build`.
+    let temp_target_dir = std::env::temp_dir().join(format!(
+        "framevm_target_{}",
+        std::process::id()
+    ));
+    cmd.env("CARGO_TARGET_DIR", &temp_target_dir);
+
+    // Set RUSTFLAGS to match OSDK's build flags so cargo does not recompile dependencies.
+    let arch = env::var("OSDK_TARGET_ARCH").unwrap_or_else(|_| "x86_64".to_string());
+    let linker_script_arg = format!("-C link-arg=-T{}.ld", arch);
+    let mut rustflags: Vec<String> = vec![
+        linker_script_arg,
+        "-C relocation-model=static".to_string(),
+        "-C code-model=kernel".to_string(),
+        "-Z direct-access-external-data=yes".to_string(),
+        "-Z relax-elf-relocations=no".to_string(),
+        "-Zplt=yes".to_string(),
+        "-C link-arg=-no-pie".to_string(),
+        "-C relro-level=off".to_string(),
+        "-C force-unwind-tables=yes".to_string(),
+        "--check-cfg cfg(ktest)".to_string(),
+        "-C no-redzone=y".to_string(),
+    ];
+    if arch == "x86_64" {
+        rustflags.push("-C target-feature=+ermsb".to_string());
+    } else if arch == "riscv64" {
+        rustflags.push("-C target-feature=+zicbom".to_string());
+    }
+    // Prepend any user-provided RUSTFLAGS
+    if let Ok(user_rustflags) = env::var("RUSTFLAGS") {
+        if !user_rustflags.trim().is_empty() {
+            rustflags.insert(0, user_rustflags.trim().to_string());
+        }
+    }
     cmd.env("RUSTFLAGS", rustflags.join(" "));
 
     const CFLAGS: &str = "CFLAGS_x86_64-unknown-none";
@@ -263,6 +320,16 @@ fn run_initial_cargo<P: AsRef<Path>>(
     cmd.arg("-C").arg("no-redzone=y");
     cmd.arg("-C").arg("target-feature=+ermsb");
     cmd.arg("--emit=obj");
+
+    // Force cargo to recompile aster-framevm so that -vv emits the rustc
+    // command we need to capture and replay in run_rustc_command.
+    let _ = Command::new("cargo")
+        .arg("clean")
+        .arg("-p")
+        .arg("aster-framevm")
+        .arg("--target")
+        .arg(target)
+        .status();
 
     println!("\nRunning initial cargo command:\n{:?}", cmd);
     cmd.get_envs()
@@ -366,10 +433,17 @@ fn run_initial_cargo<P: AsRef<Path>>(
     match exit_status.code() {
         Some(0) => {}
         Some(code) => {
-            return Err(format!(
-                "cargo command completed with failed exit code {}",
-                code
-            ));
+            // If we captured rustc commands, we can still try to run them manually.
+            // This allows us to fix issues like --emit=obj causing link failures
+            // by modifying the captured commands in run_rustc_command.
+            if !stderr_logs.is_empty() {
+                eprintln!("Warning: initial cargo command failed with exit code {}, but we captured {} rustc command(s). Proceeding...", code, stderr_logs.len());
+            } else {
+                return Err(format!(
+                    "cargo command completed with failed exit code {}",
+                    code
+                ));
+            }
         }
         _ => return Err(format!("cargo command was killed")),
     }
@@ -494,13 +568,26 @@ fn run_rustc_command<P: AsRef<Path>>(
         return Ok(false);
     }
 
-    // Skip crates that have already been built. (Not sure if this is always 100% correct)
-    if prebuilt_crates.contains_key(crate_name) {
-        println!("\n### Skipping already-built crate {:?}", crate_name);
+    // We used to skip crates already present in prebuilt_crates, but that
+    // causes `framevm` to be skipped when a stale `libframevm-*.rlib` exists
+    // in the target directory. We always need to re-run the final `framevm`
+    // rustc command so that `select_prebuilt_crate` can pick the freshest
+    // dependency hashes (from OSDK) rather than the ones chosen by
+    // `cargo rustc -p aster-framevm --lib`.
+    if crate_name != "framevm" {
+        println!("\n### Skipping non-framevm crate {:?}", crate_name);
         return Ok(false);
     }
 
     let args_after_source_file = additional_args.values_of("").unwrap();
+    let args_after_source_file: Vec<&str> = args_after_source_file.collect();
+    // Remove `--` separator if present. Cargo uses `--` to separate its own args
+    // from extra rustc args, but the recreated rustc command doesn't need it.
+    let args_after_source_file: Vec<&str> = args_after_source_file
+        .into_iter()
+        .filter(|&a| a != "--")
+        .collect();
+    println!("### args_after_source_file: {:?}", args_after_source_file);
 
     // Second, we parse all other args in the command that followed the crate source file.
     // Note that the arg name, the parameter in with_name(), in each arg below MUST BE exactly how it is invoked by cargo.
@@ -509,7 +596,7 @@ fn run_rustc_command<P: AsRef<Path>>(
         .setting(clap::AppSettings::DisableHelpSubcommand)
         .setting(clap::AppSettings::ColorNever)
         .setting(clap::AppSettings::NoBinaryName)
-        .get_matches_from_safe(args_after_source_file);
+        .get_matches_from_safe(&args_after_source_file);
 
     let matches = matches.map_err(|e| {
         format!(
@@ -517,6 +604,8 @@ fn run_rustc_command<P: AsRef<Path>>(
             e
         )
     })?;
+
+    let target = matches.value_of("--target").unwrap_or("");
 
     // Now, re-create the rustc command invocation with the proper arguments.
     // First, we handle the --crate-name and --edition arguments, which may come before the crate source file path.
@@ -563,6 +652,16 @@ fn run_rustc_command<P: AsRef<Path>>(
             if arg == "--out-dir" {
                 if let Some(out) = output_dir {
                     new_value = out.to_string_lossy().to_string();
+                }
+            }
+
+            if arg == "--emit" {
+                // Replace link with obj to avoid linking undefined symbols from ostd.
+                // FrameVM is loaded dynamically into the host kernel, so it doesn't
+                // need to link against kernel symbols at build time.
+                if value.contains("link") {
+                    new_value = value.replace("link", "obj");
+                    println!("### Replacing --emit value {:?} with {:?}", value, new_value);
                 }
             }
 
@@ -618,6 +717,7 @@ fn run_rustc_command<P: AsRef<Path>>(
                             select_prebuilt_crate(
                                 crate_candidates,
                                 original_crate_path,
+                                prebuilt_dir,
                                 is_sysroot_dep,
                             )
                         });
@@ -634,6 +734,7 @@ fn run_rustc_command<P: AsRef<Path>>(
                                             select_prebuilt_crate(
                                                 crate_candidates,
                                                 original_crate_path,
+                                                prebuilt_dir,
                                                 is_sysroot_dep,
                                             )
                                         });
@@ -650,9 +751,24 @@ fn run_rustc_command<P: AsRef<Path>>(
 
                     if let Some(extern_crate_name_with_hash) = matched_crate_hash_name {
                         let mut new_crate_path = prebuilt_dir.to_path_buf();
+                        // When generating object files (--emit=obj), rustc needs .rlib to
+                        // access the crate's object code, not just .rmeta metadata.
+                        let actual_extension = if extension == "rmeta" {
+                            let rlib_path = prebuilt_dir.join(format!(
+                                "{}{}.rlib",
+                                RMETA_RLIB_FILE_PREFIX, extern_crate_name_with_hash
+                            ));
+                            if rlib_path.exists() {
+                                "rlib"
+                            } else {
+                                extension
+                            }
+                        } else {
+                            extension
+                        };
                         new_crate_path.push(format!(
                             "{}{}.{}",
-                            RMETA_RLIB_FILE_PREFIX, extern_crate_name_with_hash, extension
+                            RMETA_RLIB_FILE_PREFIX, extern_crate_name_with_hash, actual_extension
                         ));
                         println!(
                             "#### Replacing crate {:?} with prebuilt crate at {}",
@@ -671,22 +787,33 @@ fn run_rustc_command<P: AsRef<Path>>(
                     }
                 }
             } else if arg == "-L" {
-                let (kind, _path) = value
-                    .as_ref()
-                    .find('=')
-                    .map(|idx| value.split_at(idx))
-                    .map(|(kind, path)| (kind, &path[1..])) // ignore the '=' delimiter
-                    .ok_or_else(|| {
-                        format!("Failed to parse value of -L arg as KIND=PATH: {:?}", value)
-                    })?;
-                // println!("Found -L arg, {:?} --> {:?}", kind, _path);
-                if !(kind == "dependency" || kind == "native") {
-                    println!(
-                        "WARNING: Unsupported -L arg value {:?}. We only support 'dependency=PATH' or 'native=PATH'.",
-                        value
-                    );
+                // We need -L paths for two reasons:
+                // 1. Target deps path: transitive dependencies of prebuilt kernel crates
+                //    (e.g., ostd -> gimli -> cfg_if) that are not passed via --extern.
+                //    Replace the temp dir path with the prebuilt dir.
+                // 2. Host deps path: proc-macro crates (e.g., zerocopy_derive) that
+                //    prebuilt kernel crates depend on. Replace with prebuilt host dir
+                //    because the temp dir may not have all proc-macro versions.
+                if value.starts_with("dependency=") {
+                    let path = &value["dependency=".len()..];
+                    if !target.is_empty() && path.contains(target) {
+                        new_value = format!("dependency={}", prebuilt_dir.display());
+                        println!("#### Replacing target -L path with prebuilt dir: {}", new_value);
+                    } else {
+                        // Host deps: compute prebuilt host dir from prebuilt_dir
+                        // prebuilt_dir = .../target/x86_64-unknown-none/debug/deps
+                        // host_dir = .../target/debug/deps
+                        let prebuilt_host_dir = prebuilt_dir
+                            .parent() // debug
+                            .and_then(|p| p.parent()) // x86_64-unknown-none
+                            .and_then(|p| p.parent()) // target
+                            .map(|p| p.join("debug").join("deps"));
+                        if let Some(host_dir) = prebuilt_host_dir {
+                            new_value = format!("dependency={}", host_dir.display());
+                            println!("#### Replacing host -L path with prebuilt host dir: {}", new_value);
+                        }
+                    }
                 }
-                // TODO: if we need to actually modify any -L argument values, then set `new_value` accordingly here.
             }
 
             if value != new_value {
@@ -769,6 +896,63 @@ fn run_rustc_command<P: AsRef<Path>>(
         Some(code) => Err(format!("rustc command exited with failure code {}", code)),
         _ => Err(format!("rustc command failed and was killed.")),
     }
+}
+
+/// Finds the kernel binary produced by `cargo osdk build` and returns its mtime.
+fn get_kernel_binary_mtime(target: &str) -> Option<std::time::SystemTime> {
+    let target_dir = Path::new("target");
+    // Common paths where OSDK places the kernel ELF.
+    let candidates = [
+        target_dir.join(target).join("debug").join("aster-kernel-osdk-bin"),
+        target_dir.join(target).join("release").join("aster-kernel-osdk-bin"),
+        target_dir.join(target).join("release-no-lto").join("aster-kernel-osdk-bin"),
+    ];
+    let mut best: Option<std::time::SystemTime> = None;
+    for path in &candidates {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if let Ok(mtime) = meta.modified() {
+                if best.map_or(true, |b| mtime > b) {
+                    best = Some(mtime);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Removes .rlib/.rmeta files in `deps_dir` that are newer than `kernel_mtime`.
+/// These are stale artifacts from previous framevm_cargo runs that collide with
+/// the OSDK build's StableCrateIds.
+fn clean_stale_prebuilt_deps<P: AsRef<Path>>(
+    deps_dir: P,
+    kernel_mtime: std::time::SystemTime,
+) -> Result<(), io::Error> {
+    let deps_dir = deps_dir.as_ref();
+    if !deps_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(deps_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some(RMETA_FILE_EXTENSION) && ext != Some(RLIB_FILE_EXTENSION) {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        if let Ok(mtime) = meta.modified() {
+            if mtime > kernel_mtime {
+                println!(
+                    "[framevm_cargo] Removing stale prebuilt dep (newer than kernel): {}",
+                    path.display()
+                );
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Iterates over the contents of the given directory to find crates within it.
@@ -972,6 +1156,11 @@ fn rustc_clap_options<'a, 'b>(app_name: &str) -> clap::App<'a, 'b> {
                 .takes_value(false)
                 .multiple(true),
         )
+        .arg(
+            clap::Arg::with_name("--color")
+                .long("color")
+                .takes_value(true),
+        )
 }
 
 #[cfg(test)]
@@ -996,9 +1185,10 @@ mod tests {
             "core-a6994d563524638e".to_string(),
         ];
         let original = Path::new("/tmp/libcore-374c7b58e2f3b90e.rlib");
+        let prebuilt_dir = Path::new("/tmp");
 
         assert_eq!(
-            select_prebuilt_crate(&candidates, original, true),
+            select_prebuilt_crate(&candidates, original, prebuilt_dir, true),
             Some("core-a6994d563524638e")
         );
     }
@@ -1010,9 +1200,11 @@ mod tests {
             "spin-8a26d33328253fff".to_string(),
         ];
         let original = Path::new("/tmp/libspin-8a26d33328253fff.rlib");
+        let prebuilt_dir = Path::new("/tmp");
 
+        // Without real files on disk, mtime fallback fails, so we get the first candidate.
         assert_eq!(
-            select_prebuilt_crate(&candidates, original, false),
+            select_prebuilt_crate(&candidates, original, prebuilt_dir, false),
             Some("spin-5256eef462ae048b")
         );
     }

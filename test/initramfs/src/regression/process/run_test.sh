@@ -71,6 +71,7 @@ if [ "$(uname -m)" = "x86_64" ]; then
 fi
 
 ./cgroup.sh
+./sched/cgroup_lifecycle_stress
 ./group_session
 ./job_control
 ./pidfd

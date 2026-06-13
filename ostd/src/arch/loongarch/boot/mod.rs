@@ -131,6 +131,7 @@ unsafe extern "C" fn loongarch_boot(
         bootloader_name: parse_bootloader_name(),
         kernel_cmdline: cmdline.unwrap_or(""),
         initramfs: parse_initramfs(),
+        symbols: None,
         acpi_arg: parse_acpi_arg(),
         framebuffer_arg: parse_framebuffer_info(),
         memory_regions: parse_memory_regions(),

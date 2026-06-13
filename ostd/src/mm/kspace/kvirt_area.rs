@@ -4,8 +4,8 @@
 
 use core::ops::Range;
 
-use self::allocator::kvirt_area_allocator;
-use super::{KERNEL_PAGE_TABLE, KernelPtConfig, MappedItem};
+use self::allocator::{kvirt_area_allocator, module_kvirt_area_allocator};
+use super::{KERNEL_PAGE_TABLE, KernelPtConfig, MappedItem, MODULE_RANGE};
 use crate::{
     irq,
     mm::{
@@ -18,11 +18,12 @@ use crate::{
 
 mod allocator {
     use crate::{
-        irq::DisabledLocalIrqGuard, mm::kspace::VMALLOC_VADDR_RANGE,
+        irq::DisabledLocalIrqGuard, mm::kspace::{MODULE_RANGE, VMALLOC_VADDR_RANGE},
         util::range_alloc::RangeAllocator,
     };
 
     static KVIRT_AREA_ALLOCATOR: RangeAllocator = RangeAllocator::new(VMALLOC_VADDR_RANGE);
+    static MODULE_KVIRT_AREA_ALLOCATOR: RangeAllocator = RangeAllocator::new(MODULE_RANGE);
 
     /// Returns a reference to the kernel virtual memory allocator.
     ///
@@ -36,6 +37,18 @@ mod allocator {
     pub(super) fn kvirt_area_allocator(_guard: &DisabledLocalIrqGuard) -> &RangeAllocator {
         &KVIRT_AREA_ALLOCATOR
     }
+
+    pub(super) fn module_kvirt_area_allocator(
+        _guard: &DisabledLocalIrqGuard,
+    ) -> &RangeAllocator {
+        &MODULE_KVIRT_AREA_ALLOCATOR
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KVirtAllocatorKind {
+    Vmalloc,
+    Module,
 }
 
 /// Kernel virtual area.
@@ -54,6 +67,7 @@ mod allocator {
 #[derive(Debug)]
 pub struct KVirtArea {
     range: Range<Vaddr>,
+    allocator_kind: KVirtAllocatorKind,
 }
 
 impl HasSize for KVirtArea {
@@ -72,8 +86,14 @@ impl Split for KVirtArea {
         let left_range = old.start()..old.start() + offset;
         let right_range = old.start() + offset..old.end();
         (
-            KVirtArea { range: left_range },
-            KVirtArea { range: right_range },
+            KVirtArea {
+                range: left_range,
+                allocator_kind: old.allocator_kind,
+            },
+            KVirtArea {
+                range: right_range,
+                allocator_kind: old.allocator_kind,
+            },
         )
     }
 }
@@ -144,7 +164,57 @@ impl KVirtArea {
             unsafe { cursor.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) };
         }
 
-        Self { range }
+        Self {
+            range,
+            allocator_kind: KVirtAllocatorKind::Vmalloc,
+        }
+    }
+
+    pub fn map_module_frames<T: AnyFrameMeta>(
+        area_size: usize,
+        map_offset: usize,
+        frames: impl Iterator<Item = Frame<T>>,
+        prop: PageProperty,
+    ) -> Self {
+        assert!(area_size.is_multiple_of(PAGE_SIZE));
+        assert!(map_offset.is_multiple_of(PAGE_SIZE));
+
+        let irq_guard = irq::disable_local();
+
+        let range = module_kvirt_area_allocator(&irq_guard)
+            .alloc(area_size)
+            .unwrap();
+
+        assert!(
+            range.start >= MODULE_RANGE.start,
+            "Allocated range start 0x{:x} is before MODULE_RANGE start 0x{:x}",
+            range.start,
+            MODULE_RANGE.start
+        );
+        assert!(
+            range.end <= MODULE_RANGE.end,
+            "Allocated range end 0x{:x} is after MODULE_RANGE end 0x{:x}",
+            range.end,
+            MODULE_RANGE.end
+        );
+
+        let cursor_range = range.start + map_offset..range.end;
+
+        let page_table = KERNEL_PAGE_TABLE.get().unwrap();
+        let mut cursor = page_table
+            .cursor_mut(&irq_guard, &cursor_range)
+            .unwrap();
+
+        for frame in frames.into_iter() {
+            // SAFETY: The constructor of the `KVirtArea` has already ensured
+            // that this mapping does not affect kernel's memory safety.
+            unsafe { cursor.map(MappedItem::Tracked(frame.into(), prop)) };
+        }
+
+        Self {
+            range,
+            allocator_kind: KVirtAllocatorKind::Module,
+        }
     }
 
     /// Creates a kernel virtual area and maps untracked frames into it.
@@ -195,7 +265,10 @@ impl KVirtArea {
             }
         }
 
-        Self { range }
+        Self {
+            range,
+            allocator_kind: KVirtAllocatorKind::Vmalloc,
+        }
     }
 }
 
@@ -217,6 +290,9 @@ impl Drop for KVirtArea {
         }
 
         // 2. Free the virtual block.
-        kvirt_area_allocator(&irq_guard).free(range);
+        match self.allocator_kind {
+            KVirtAllocatorKind::Vmalloc => kvirt_area_allocator(&irq_guard).free(range),
+            KVirtAllocatorKind::Module => module_kvirt_area_allocator(&irq_guard).free(range),
+        }
     }
 }

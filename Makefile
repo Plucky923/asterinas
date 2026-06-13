@@ -21,6 +21,16 @@ FEATURES ?=
 NO_DEFAULT_FEATURES ?= 0
 COVERAGE ?= 0
 
+# FrameVM development options.
+FRAMEVM_OBJ_OUTPUT ?= build/framevm/framevm.o
+FRAMEVM_TARGET ?= x86_64-unknown-none
+FRAMEVM_INITRAMFS_PATH ?= /framevm/framevm.o
+FRAMEVM_INIT_SCRIPT ?= /test/framevm_start.sh
+FRAMEVM_FEATURES ?=
+FRAMEVM_NO_DEFAULT_FEATURES ?= 0
+FRAMEVM_VCPU_COUNT ?= 1
+FRAMEVM_WAIT_LOOPS ?= 60
+
 # Specify the primary system console (supported: tty0, ttyS0, hvc0).
 # - tty0: The active virtual terminal (VT).
 # - ttyS0: The serial (UART) terminal.
@@ -214,6 +224,26 @@ endif
 CARGO_OSDK_BUILD_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 CARGO_OSDK_TEST_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 
+FRAMEVM_FEATURE_ARGS :=
+ifneq ($(strip $(FRAMEVM_FEATURES)),)
+FRAMEVM_FEATURE_ARGS += --features="$(FRAMEVM_FEATURES)"
+endif
+ifeq ($(FRAMEVM_NO_DEFAULT_FEATURES), 1)
+FRAMEVM_FEATURE_ARGS += --no-default-features
+endif
+
+FRAMEVM_RUSTFLAGS := -C relocation-model=static
+FRAMEVM_RUSTFLAGS += -C code-model=kernel
+FRAMEVM_RUSTFLAGS += -Z direct-access-external-data=yes
+FRAMEVM_RUSTFLAGS += -Z relax-elf-relocations=no
+FRAMEVM_RUSTFLAGS += -Zplt=yes
+FRAMEVM_RUSTFLAGS += -C link-arg=-no-pie
+FRAMEVM_RUSTFLAGS += -C relro-level=off
+FRAMEVM_RUSTFLAGS += -C force-unwind-tables=yes
+FRAMEVM_RUSTFLAGS += --check-cfg cfg(ktest)
+FRAMEVM_RUSTFLAGS += -C no-redzone=y
+FRAMEVM_RUSTFLAGS += -C target-feature=+ermsb
+
 # Pass make variables to all subdirectory makes
 export
 
@@ -259,8 +289,8 @@ check_vdso:
 	fi
 
 .PHONY: initramfs
-initramfs: check_vdso
-	@$(MAKE) --no-print-directory -C test/initramfs
+initramfs: check_vdso $(INITRAMFS_EXTRA_DEPS)
+	@$(MAKE) --no-print-directory -C test/initramfs $(INITRAMFS_EXTRA_ARGS)
 
 # Build the kernel with an initramfs
 .PHONY: kernel
@@ -452,3 +482,42 @@ clean:
 	@$(MAKE) --no-print-directory -C test/initramfs clean
 	@echo "Uninstalling OSDK"
 	@rm -f $(CARGO_OSDK)
+
+.PHONY: framevm_obj
+framevm_obj:
+	@if [ "$(TARGET_ARCH)" != "x86_64" ]; then \
+		echo "Error: FrameVM object build currently supports TARGET_ARCH=x86_64 only."; \
+		exit 1; \
+	fi
+	@echo "[make] Building FrameVM object for dynamic loading"
+	@mkdir -p $(dir $(FRAMEVM_OBJ_OUTPUT))
+	@rm -f $(dir $(FRAMEVM_OBJ_OUTPUT))/framevm-*.o
+	@env \
+		'RUSTFLAGS=$(FRAMEVM_RUSTFLAGS)' \
+		'CFLAGS_x86_64-unknown-none=-fno-PIE -fno-pic -fno-plt' \
+		cargo rustc -p aster-framevm --lib \
+			--target $(FRAMEVM_TARGET) \
+			$(FRAMEVM_FEATURE_ARGS) \
+			-Zbuild-std=core,alloc,compiler_builtins \
+			-Zbuild-std-features=compiler-builtins-mem \
+			-- --emit=obj -o $(FRAMEVM_OBJ_OUTPUT)
+	@obj="$$(ls -t $(dir $(FRAMEVM_OBJ_OUTPUT))/framevm-*.o 2>/dev/null | head -n1)"; \
+	if [ -z "$$obj" ]; then \
+		echo "Error: FrameVM object not found in $(dir $(FRAMEVM_OBJ_OUTPUT))"; \
+		exit 1; \
+	fi; \
+	cp "$$obj" "$(FRAMEVM_OBJ_OUTPUT)"; \
+	echo "[make] FrameVM object copied to $(FRAMEVM_OBJ_OUTPUT)"
+
+.PHONY: framevm_initramfs
+framevm_initramfs: check_vdso framevm_obj
+	@echo "[make] Building initramfs with $(FRAMEVM_INITRAMFS_PATH)"
+	@$(MAKE) --no-print-directory -C test/initramfs \
+		FRAMEVM_OBJ_PATH=$(abspath $(FRAMEVM_OBJ_OUTPUT)) \
+		FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
+
+.PHONY: framevm
+framevm: framevm_initramfs $(CARGO_OSDK)
+	@echo "[make] Running Asterinas and starting FrameVM through /proc/framevm"
+	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) \
+		--init-args="$(FRAMEVM_INIT_SCRIPT) $(FRAMEVM_VCPU_COUNT) $(FRAMEVM_WAIT_LOOPS)"

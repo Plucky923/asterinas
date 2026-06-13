@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Host-side listening state for FrameVsock stream sockets.
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use super::connected::Connected;
+use crate::{
+    events::IoEvents,
+    net::socket::framevsock::addr::FrameVsockAddr,
+    prelude::*,
+    process::signal::{PollHandle, Pollee},
+};
+
+pub struct Listen {
+    addr: FrameVsockAddr,
+    backlog: AtomicUsize,
+    incoming_connection: SpinLock<VecDeque<Arc<Connected>>>,
+    pollee: Pollee,
+}
+
+impl Listen {
+    pub fn new(addr: FrameVsockAddr, backlog: usize) -> Self {
+        Self {
+            addr,
+            pollee: Pollee::new(),
+            backlog: AtomicUsize::new(backlog),
+            incoming_connection: SpinLock::new(VecDeque::with_capacity(backlog)),
+        }
+    }
+
+    pub fn addr(&self) -> FrameVsockAddr {
+        self.addr
+    }
+
+    pub fn push_incoming(&self, connect: Arc<Connected>) -> Result<()> {
+        let mut incoming_connections = self.incoming_connection.disable_irq().lock();
+        if incoming_connections.len() >= self.backlog.load(Ordering::Relaxed) {
+            return_errno_with_message!(Errno::ECONNREFUSED, "queue in listening socket is full")
+        }
+
+        incoming_connections.push_back(connect);
+        self.pollee.notify(IoEvents::IN);
+
+        Ok(())
+    }
+
+    pub fn try_accept(&self) -> Result<Arc<Connected>> {
+        let connection = self
+            .incoming_connection
+            .disable_irq()
+            .lock()
+            .pop_front()
+            .ok_or_else(|| {
+                Error::with_message(Errno::EAGAIN, "no pending connection is available")
+            })?;
+        self.pollee.invalidate();
+
+        Ok(connection)
+    }
+
+    pub fn set_backlog(&self, backlog: usize) {
+        self.backlog.store(backlog, Ordering::Relaxed);
+    }
+
+    pub fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        self.pollee
+            .poll_with(mask, poller, || self.check_io_events())
+    }
+
+    fn check_io_events(&self) -> IoEvents {
+        let incoming_connection = self.incoming_connection.disable_irq().lock();
+
+        if !incoming_connection.is_empty() {
+            IoEvents::IN
+        } else {
+            IoEvents::empty()
+        }
+    }
+}

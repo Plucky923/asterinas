@@ -11,6 +11,7 @@ use template::{
 use self::{
     cmdline::CmdLineFileOps,
     cpuinfo::CpuInfoFileOps,
+    framevm::FrameVmFileOps,
     loadavg::LoadAvgFileOps,
     meminfo::MemInfoFileOps,
     mounts::MountsSymOps,
@@ -43,6 +44,7 @@ use crate::{
 mod cmdline;
 mod cpuinfo;
 mod filesystems;
+mod framevm;
 mod loadavg;
 mod meminfo;
 mod mounts;
@@ -156,6 +158,7 @@ impl RootDirOps {
             InodeType::File,
             FileSystemsFileOps::new_inode,
         ),
+        ("framevm", InodeType::File, FrameVmFileOps::new_inode),
         ("loadavg", InodeType::File, LoadAvgFileOps::new_inode),
         ("meminfo", InodeType::File, MemInfoFileOps::new_inode),
         ("mounts", InodeType::SymLink, MountsSymOps::new_inode),

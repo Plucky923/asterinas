@@ -1,7 +1,10 @@
 { lib, pkgs, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox
-, benchmark, conformance, regression, dnsServer, }:
+, benchmark, conformance, regression, dnsServer
+, framevmObjPath ? ""
+, framevmInstallPath ? "/framevm/framevm.o" }:
 let
   boot_hello = builtins.path { path = ./../src/boot_hello.sh; };
+  framevm_start = builtins.path { path = ./../src/framevm_start.sh; };
   init = builtins.path { path = ./../src/init; };
   etc = lib.fileset.toSource {
     root = ./../etc;
@@ -17,7 +20,11 @@ let
   resolv_conf = pkgs.callPackage ./resolv_conf.nix { dnsServer = dnsServer; };
   # Whether the initramfs should include evtest, a common tool to debug input devices (`/dev/input/eventX`)
   is_evtest_included = false;
-
+  framevmObj =
+    if framevmObjPath == "" then null else builtins.path {
+      name = "framevm-object";
+      path = framevmObjPath;
+    };
   all_pkgs = [ busybox etc resolv_conf ]
     ++ lib.optionals (benchmark != null) [ benchmark.package ]
     ++ lib.optionals (conformance != null) [ conformance.package ]
@@ -39,6 +46,8 @@ in stdenvNoCC.mkDerivation {
     ''}
 
     cp ${boot_hello} $out/test/boot_hello.sh
+    cp ${framevm_start} $out/test/framevm_start.sh
+    chmod +x $out/test/framevm_start.sh
     cp ${init} $out/init
 
     cp -r ${etc}/* $out/etc/
@@ -66,6 +75,10 @@ in stdenvNoCC.mkDerivation {
       cp -L ${gvisor_libs}/libgcc_s.so.1 $out/lib/x86_64-linux-gnu/libgcc_s.so.1
       cp -L ${gvisor_libs}/libc.so.6 $out/lib/x86_64-linux-gnu/libc.so.6
       cp -L ${gvisor_libs}/libm.so.6 $out/lib/x86_64-linux-gnu/libm.so.6
+    ''}
+
+    ${lib.optionalString (framevmObj != null) ''
+      install -Dm644 ${framevmObj} $out${framevmInstallPath}
     ''}
 
     # Use `writeClosure` to retrieve all dependencies of the specified packages.

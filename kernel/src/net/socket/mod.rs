@@ -15,6 +15,7 @@ use crate::{
     util::{MultiRead, MultiWrite},
 };
 
+pub mod framevsock;
 pub mod ip;
 pub mod netlink;
 pub mod options;

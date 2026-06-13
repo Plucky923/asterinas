@@ -1,7 +1,9 @@
 { target ? "x86_64", enableBenchmarkTest ? false, enableConformanceTest ? false
 , enableRegressionTest ? false, conformanceTestSuite ? "ltp"
 , conformanceTestWorkDir ? "/tmp", regressionTestPlatform ? "asterinas"
-, dnsServer ? "none", smp ? 1, initramfsCompressed ? true, }:
+, dnsServer ? "none", smp ? 1, initramfsCompressed ? true
+, framevmObjPath ? ""
+, framevmInstallPath ? "/framevm/framevm.o" }:
 let
   crossSystem.config = if target == "x86_64" then
     "x86_64-unknown-linux-gnu"
@@ -10,7 +12,8 @@ let
   else
     throw "Target arch ${target} not yet supported.";
 
-  # Pinned nixpkgs (nix version: 2.29.1, channel: nixos-25.05, release date: 2025-07-01)
+  # Pinned nixpkgs. The corresponding cache has been built into the Docker
+  # image. So Nix does not need to build the packages from scratch.
   nixpkgs = fetchTarball {
     url =
       "https://github.com/NixOS/nixpkgs/archive/c0bebd16e69e631ac6e52d6eb439daba28ac50cd.tar.gz";
@@ -39,6 +42,8 @@ in rec {
     conformance = if enableConformanceTest then conformance else null;
     regression = if enableRegressionTest then regression else null;
     dnsServer = dnsServer;
+    framevmObjPath = framevmObjPath;
+    framevmInstallPath = framevmInstallPath;
   };
   initramfs-image = pkgs.callPackage ./initramfs-image.nix {
     inherit initramfs;

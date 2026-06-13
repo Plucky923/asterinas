@@ -1,0 +1,14 @@
+[package]
+name = "aster-framevsock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ostd = { workspace = true }
+component = { workspace = true }
+exchangeable = { workspace = true }
+log = { workspace = true }
+spin = { workspace = true }
+
+[lints]
+workspace = true

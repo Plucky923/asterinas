@@ -1,11 +1,15 @@
 # template
 [components]
+nix = { name = "aster-nix" }
+virtio = { name = "aster-virtio" }
+framevisor = { name = "aster-framevisor" }
+framevsock = { name = "aster-framevsock" }
+input = { name = "aster-input" }
 block = { name = "aster-block" }
 cmdline = { name = "aster-cmdline" }
 console = { name = "aster-console" }
 framebuffer = { name = "aster-framebuffer" }
 i8042 = { name = "aster-i8042" }
-input = { name = "aster-input" }
 kernel = { name = "aster-kernel" }
 logger = { name = "aster-logger" }
 mlsdisk = { name = "aster-mlsdisk" }
@@ -16,7 +20,6 @@ softirq = { name = "aster-softirq" }
 systree = { name = "aster-systree" }
 time = { name = "aster-time" }
 uart = { name = "aster-uart" }
-virtio = { name = "aster-virtio" }
 
 [whitelist]
 [whitelist.nix.main]

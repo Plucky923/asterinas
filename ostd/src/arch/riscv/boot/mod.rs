@@ -134,6 +134,7 @@ unsafe extern "C" fn riscv_boot(hart_id: usize, device_tree_paddr: usize) -> ! {
         bootloader_name: parse_bootloader_name(),
         kernel_cmdline: parse_kernel_commandline(),
         initramfs: parse_initramfs(),
+        symbols: None,
         acpi_arg: parse_acpi_arg(),
         framebuffer_arg: parse_framebuffer_info(),
         memory_regions: parse_memory_regions(),

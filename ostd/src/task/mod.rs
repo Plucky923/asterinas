@@ -7,6 +7,8 @@ mod kernel_stack;
 mod preempt;
 mod processor;
 pub mod scheduler;
+pub mod service_stack;
+pub mod stack;
 mod utils;
 
 use core::{
@@ -35,7 +37,7 @@ use crate::{
 
 static PRE_SCHEDULE_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 
-static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
+static POST_SCHEDULE_HANDLER: Once<fn() -> bool> = Once::new();
 
 static PRE_USER_RUN_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 
@@ -45,7 +47,7 @@ pub fn inject_pre_schedule_handler(handler: fn(&DisabledLocalIrqGuard)) {
 }
 
 /// Injects a handler to be executed after scheduling.
-pub fn inject_post_schedule_handler(handler: fn()) {
+pub fn inject_post_schedule_handler(handler: fn() -> bool) {
     POST_SCHEDULE_HANDLER.call_once(|| handler);
 }
 
@@ -75,6 +77,7 @@ pub struct Task {
     func: ForceSync<Cell<Option<Box<dyn FnOnce() + Send>>>>,
 
     data: Box<dyn Any + Send + Sync>,
+    extension: Box<dyn Any + Send + Sync>,
     local_data: ForceSync<Box<dyn Any + Send>>,
 
     ctx: SyncUnsafeCell<TaskContext>,
@@ -105,6 +108,18 @@ impl Task {
         &self.ctx
     }
 
+    /// Returns the bottom address (low address) of the kernel stack.
+    ///
+    /// This is useful for checking remaining stack space.
+    pub fn stack_bottom(&self) -> usize {
+        self.kstack.bottom_vaddr()
+    }
+
+    /// Returns the top address (high address) of the kernel stack.
+    pub fn stack_top(&self) -> usize {
+        self.kstack.end_vaddr()
+    }
+
     /// Yields execution so that another task may be scheduled.
     ///
     /// Note that this method cannot be simply named "yield" as the name is
@@ -133,6 +148,10 @@ impl Task {
         &self.data
     }
 
+    pub fn extension(&self) -> &Box<dyn Any + Send + Sync> {
+        &self.extension
+    }
+
     /// Get the attached scheduling information.
     pub fn schedule_info(&self) -> &TaskScheduleInfo {
         &self.schedule_info
@@ -143,6 +162,7 @@ impl Task {
 pub struct TaskOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
     data: Option<Box<dyn Any + Send + Sync>>,
+    extension: Option<Box<dyn Any + Send + Sync>>,
     local_data: Option<Box<dyn Any + Send>>,
 }
 
@@ -155,6 +175,7 @@ impl TaskOptions {
         Self {
             func: Some(Box::new(func)),
             data: None,
+            extension: None,
             local_data: None,
         }
     }
@@ -169,20 +190,44 @@ impl TaskOptions {
     }
 
     /// Sets the data associated with the task.
-    pub fn data<T>(mut self, data: T) -> Self
+    pub fn data<T>(self, data: T) -> Self
     where
         T: Any + Send + Sync,
     {
-        self.data = Some(Box::new(data));
+        self.data_any(Box::new(data))
+    }
+
+    /// Sets the data associated with the task, but with an already-boxed value.
+    pub fn data_any(mut self, data: Box<dyn Any + Send + Sync>) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// Sets the extension data associated with the task.
+    pub fn extension<T>(self, extension: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        self.extension_any(Box::new(extension))
+    }
+
+    /// Sets the extension data associated with the task, but with an already-boxed value.
+    pub fn extension_any(mut self, extension: Box<dyn Any + Send + Sync>) -> Self {
+        self.extension = Some(extension);
         self
     }
 
     /// Sets the local data associated with the task.
-    pub fn local_data<T>(mut self, data: T) -> Self
+    pub fn local_data<T>(self, data: T) -> Self
     where
         T: Any + Send,
     {
-        self.local_data = Some(Box::new(data));
+        self.local_data_any(Box::new(data))
+    }
+
+    /// Sets the local data associated with the task, but with an already-boxed value.
+    pub fn local_data_any(mut self, data: Box<dyn Any + Send>) -> Self {
+        self.local_data = Some(data);
         self
     }
 
@@ -243,6 +288,7 @@ impl TaskOptions {
         let new_task = Task {
             func: ForceSync::new(Cell::new(self.func)),
             data: self.data.unwrap_or_else(|| Box::new(())),
+            extension: self.extension.unwrap_or_else(|| Box::new(())),
             local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),
             ctx: SyncUnsafeCell::new(ctx),
             kstack,

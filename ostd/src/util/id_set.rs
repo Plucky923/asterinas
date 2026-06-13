@@ -29,7 +29,7 @@ use core::{
 use bitvec::{order::Lsb0, view::BitView};
 use smallvec::SmallVec;
 
-use crate::const_assert;
+use crate::{const_assert, early_println};
 
 /// A trait to abstract an ID type.
 ///

@@ -40,6 +40,9 @@ members = [
     "kernel/comps/pci",
     "kernel/comps/softirq",
     "kernel/comps/systree",
+    "kernel/comps/framevm",
+    "kernel/comps/framevisor",
+    "kernel/comps/framevsock",
     "kernel/comps/time",
     "kernel/comps/uart",
     "kernel/comps/virtio",
@@ -159,6 +162,11 @@ aster-nvme = { path = "kernel/comps/nvme" }
 aster-pci = { path = "kernel/comps/pci" }
 aster-softirq = { path = "kernel/comps/softirq" }
 aster-systree = { path = "kernel/comps/systree" }
+aster-framevisor = { path = "kernel/comps/framevisor" }
+aster-framevisor-exchangeable = { path = "kernel/comps/framevisor/exchangeable" }
+aster-framevisor-macros = { path = "kernel/comps/framevisor/macros" }
+aster-framevsock = { path = "kernel/comps/framevsock" }
+exchangeable = { package = "aster-framevisor-exchangeable", path = "kernel/comps/framevisor/exchangeable" }
 aster-time = { path = "kernel/comps/time" }
 aster-uart = { path = "kernel/comps/uart" }
 aster-virtio = { path = "kernel/comps/virtio" }

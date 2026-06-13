@@ -1,0 +1,29 @@
+[package]
+name = "aster-framevm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "framevm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "framevm"
+path = "src/main.rs"
+
+[dependencies]
+ostd = { workspace = true }
+aster-framevisor = { workspace = true }
+aster-framevsock = { workspace = true }
+exchangeable = { workspace = true }
+align_ext = { workspace = true }
+spin = { workspace = true }
+xmas-elf = { workspace = true }
+
+[features]
+default = ["cvm_guest"]
+cvm_guest = ["ostd/cvm_guest"]
+guest_payload = []
+
+[lints]
+workspace = true

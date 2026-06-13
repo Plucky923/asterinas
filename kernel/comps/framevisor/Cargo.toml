@@ -1,0 +1,16 @@
+[package]
+name = "aster-framevisor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ostd = { workspace = true }
+component = { workspace = true }
+aster-framevisor-macros = { workspace = true }
+aster-framevisor-exchangeable = { workspace = true }
+aster-framevsock = { workspace = true }
+log = { workspace = true }
+spin = { workspace = true }
+hashbrown = { workspace = true }
+[lints]
+workspace = true

@@ -142,6 +142,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-framevisor"
+version = "0.1.0"
+dependencies = [
+ "aster-framevisor-exchangeable",
+ "aster-framevisor-macros",
+ "aster-framevsock",
+ "component",
+ "hashbrown 0.14.5",
+ "log",
+ "ostd",
+ "spin",
+]
+
+[[package]]
+name = "aster-framevisor-exchangeable"
+version = "0.1.0"
+dependencies = [
+ "ostd",
+ "spin",
+]
+
+[[package]]
+name = "aster-framevisor-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.101",
+]
+
+[[package]]
+name = "aster-framevm"
+version = "0.1.0"
+dependencies = [
+ "align_ext",
+ "aster-framevisor",
+ "aster-framevisor-exchangeable",
+ "aster-framevsock",
+ "ostd",
+ "spin",
+ "xmas-elf",
+]
+
+[[package]]
+name = "aster-framevsock"
+version = "0.1.0"
+dependencies = [
+ "aster-framevisor-exchangeable",
+ "component",
+ "log",
+ "ostd",
+ "spin",
+]
+
+[[package]]
 name = "aster-fuse"
 version = "0.1.0"
 dependencies = [
@@ -187,6 +242,9 @@ dependencies = [
  "aster-cmdline",
  "aster-console",
  "aster-framebuffer",
+ "aster-framevisor",
+ "aster-framevisor-exchangeable",
+ "aster-framevsock",
  "aster-fuse",
  "aster-i8042",
  "aster-input",
@@ -1383,6 +1441,7 @@ dependencies = [
  "ostd-pod",
  "ostd-test",
  "riscv",
+ "rustc-demangle",
  "sbi-rt",
  "smallvec",
  "spin",
@@ -1391,6 +1450,7 @@ dependencies = [
  "volatile 0.6.1",
  "x86",
  "x86_64",
+ "xmas-elf",
  "zerocopy",
 ]
 
@@ -1674,6 +1734,12 @@ name = "rle-decode-fast"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
+
+[[package]]
+name = "rustc-demangle"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56f7d92ca342cea22a06f2121d944b4fd82af56988c270852495420f961d4ace"
 
 [[package]]
 name = "rustc_version"

@@ -1,19 +1,31 @@
-//! Page-property wrappers re-exported by FrameVisor.
+//! Page-property wrappers exposed through the OSTD-compatible surface.
 
-use ostd::mm::{
+use host_ostd::mm::{
     CachePolicy as OstdCachePolicy, PageFlags as OstdPageFlags, PageProperty as OstdPageProperty,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PageProperty(OstdPageProperty);
+pub struct PageProperty {
+    /// The flags associated with the page.
+    pub flags: PageFlags,
+    /// The cache policy for the page.
+    pub cache: CachePolicy,
+}
 
 impl PageProperty {
     pub fn new_user(flags: PageFlags, cache: CachePolicy) -> Self {
-        Self(OstdPageProperty::new_user(flags, cache))
+        Self { flags, cache }
     }
 
-    pub fn inner(self) -> OstdPageProperty {
-        self.0
+    pub(crate) fn new_with_inner(prop: OstdPageProperty) -> Self {
+        Self {
+            flags: prop.flags,
+            cache: prop.cache,
+        }
+    }
+
+    pub(crate) fn inner(self) -> OstdPageProperty {
+        OstdPageProperty::new_user(self.flags, self.cache)
     }
 }
 

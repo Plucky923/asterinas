@@ -9,10 +9,13 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use aster_framevisor_exchangeable::RRef;
+use aster_framevisor_exchangeable::{DomainId, RRef};
 use aster_framevsock::{
-    ControlPacket, DataPacket, flow_control::MAX_PENDING_PACKETS, notify::InterruptStrategy,
-    ring::PacketRingBuffer, trace, tuning,
+    ControlPacket, DataPacket,
+    flow_control::MAX_PENDING_PACKETS,
+    notify::InterruptStrategy,
+    ring::{CONTROL_RING_STATS, DATA_RING_STATS, PacketRingBuffer},
+    trace, tuning,
 };
 // ============================================================================
 // Constants
@@ -76,8 +79,8 @@ impl VcpuQueues {
     pub fn new() -> Self {
         let config = tuning::irq_config();
         Self {
-            control: PacketRingBuffer::new(MAX_CONTROL_QUEUE_SIZE),
-            data: PacketRingBuffer::new(MAX_DATA_QUEUE_SIZE),
+            control: PacketRingBuffer::new_with_stats(MAX_CONTROL_QUEUE_SIZE, &CONTROL_RING_STATS),
+            data: PacketRingBuffer::new_with_stats(MAX_DATA_QUEUE_SIZE, &DATA_RING_STATS),
             irq_strategy: InterruptStrategy::with_time_threshold(
                 config.batch_threshold(),
                 config.time_threshold_us(),
@@ -90,13 +93,15 @@ impl VcpuQueues {
         }
     }
 
-    /// Push a data packet to the queue.
-    ///
-    /// Returns `Err` with the packet if queue is full.
+    /// Transfers a data packet after queue reservation and pushes it.
     #[inline]
-    pub fn push_data(&self, packet: RRef<DataPacket>) -> Result<(), RRef<DataPacket>> {
+    pub fn push_data_to_domain(
+        &self,
+        packet: RRef<DataPacket>,
+        owner: DomainId,
+    ) -> Result<(), RRef<DataPacket>> {
         let _trace = trace::TraceGuard::new(&trace::FRAMEVISOR_QUEUE_PUSH_DATA);
-        match self.data.push(packet) {
+        match self.data.push_transfer_to(packet, owner) {
             Ok(()) => {
                 self.data_push_count.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -105,31 +110,15 @@ impl VcpuQueues {
         }
     }
 
-    /// Push multiple data packets at once with optimized single-CAS reservation.
-    ///
-    /// Returns (success_count, remaining_packets) where remaining_packets
-    /// contains packets that couldn't be pushed due to capacity limits.
+    /// Transfers a control packet after queue reservation and pushes it.
     #[inline]
-    pub fn push_data_batch(
+    pub fn push_control_to_domain(
         &self,
-        packets: Vec<RRef<DataPacket>>,
-    ) -> (usize, Vec<RRef<DataPacket>>) {
-        let _trace = trace::TraceGuard::new(&trace::FRAMEVISOR_QUEUE_PUSH_DATA);
-        let (count, remaining) = self.data.push_batch_optimized(packets);
-        if count > 0 {
-            self.data_push_count
-                .fetch_add(count as u64, Ordering::Relaxed);
-        }
-        (count, remaining)
-    }
-
-    /// Push a control packet to the queue.
-    ///
-    /// Returns `Err` with the packet if queue is full.
-    #[inline]
-    pub fn push_control(&self, packet: RRef<ControlPacket>) -> Result<(), RRef<ControlPacket>> {
+        packet: RRef<ControlPacket>,
+        owner: DomainId,
+    ) -> Result<(), RRef<ControlPacket>> {
         let _trace = trace::TraceGuard::new(&trace::FRAMEVISOR_QUEUE_PUSH_CONTROL);
-        match self.control.push(packet) {
+        match self.control.push_transfer_to(packet, owner) {
             Ok(()) => {
                 self.control_push_count.fetch_add(1, Ordering::Relaxed);
                 Ok(())
@@ -240,6 +229,14 @@ impl VcpuQueues {
     #[inline]
     pub fn control_queue_len(&self) -> usize {
         self.control.len()
+    }
+
+    /// Get the reserved length of control queue (includes in-flight producer slots).
+    ///
+    /// This matches the queue-full check used by push path.
+    #[inline]
+    pub fn control_queue_reserved_len(&self) -> usize {
+        self.control.reserved_len()
     }
 
     /// Snapshot current queue stats.

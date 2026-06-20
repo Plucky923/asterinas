@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ostd = { workspace = true }
+ostd = { workspace = true, optional = true }
 spin = { workspace = true }
+
+[features]
+default = ["ostd-domain"]
+ostd-domain = ["dep:ostd"]
 
 [lints]
 workspace = true

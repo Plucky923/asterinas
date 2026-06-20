@@ -1,3 +1,3 @@
-//! Miscellaneous utility helpers shared across FrameVisor.
+//! Utility helpers.
 
 pub mod id_set;

@@ -1,19 +1,18 @@
 use core::cmp;
 
 use xmas_elf::{
-    sections::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE},
     ElfFile,
+    sections::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE},
 };
 
 use crate::{
-    early_println,
+    Result, early_println,
     mm::{
+        PAGE_SIZE,
         frame::allocator::FrameAllocOptions,
         kspace::kvirt_area::KVirtArea,
         page_prop::{CachePolicy, PageFlags, PageProperty, PrivilegedPageFlags},
-        PAGE_SIZE,
     },
-    Result,
 };
 
 /// 决定后续分配为 section 分配的内存应该是什么类型

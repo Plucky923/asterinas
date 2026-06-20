@@ -2,18 +2,17 @@ use alloc::{collections::btree_map::BTreeMap, format, sync::Arc};
 use core::cmp;
 
 use xmas_elf::{
-    sections::{ShType, SHF_ALLOC},
     ElfFile,
+    sections::{SHF_ALLOC, ShType},
 };
 
 use super::{
     invalid_args,
-    memory::{align_up, select_section_bucket, SectionMemory, SectionMemoryType},
+    memory::{SectionMemory, SectionMemoryType, align_up, select_section_bucket},
 };
 use crate::{
-    early_println,
+    Result, early_println,
     mm::io::{Infallible, VmReader, VmWriter},
-    Result,
 };
 
 pub struct SectionsMetadata<'a> {

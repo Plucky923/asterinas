@@ -1,25 +1,37 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Virtual memory space management for FrameVisor.
+//! Virtual memory space management exposed through the OSTD-compatible surface.
 
 use alloc::sync::Arc;
 use core::ops::Range;
 
-use ostd::{
-    Result,
-    mm::{
-        Fallible, VmReader, VmSpace as OstdVmSpace, VmWriter, vm_space::CursorMut as OstdCursorMut,
+use host_ostd::mm::{
+    VmSpace as OstdVmSpace,
+    tlb::TlbFlushOp,
+    vm_space::{
+        Cursor as OstdCursor, CursorMut as OstdCursorMut, VmQueriedItem as OstdVmQueriedItem,
     },
 };
 
 use crate::{
-    mm::{Vaddr, frame::untyped::UFrame, page_prop::PageProperty},
-    task::{atomic_mode::AsAtomicModeGuard, disable_preempt},
+    Result,
+    mm::{
+        CachePolicy, Fallible, Paddr, PageFlags, PageProperty, Vaddr, VmReader, VmWriter,
+        frame::{FrameRef, untyped::UFrame},
+    },
+    sync::Once,
+    task::atomic_mode::AsAtomicModeGuard,
 };
 
-/// Virtual memory space wrapper for FrameVM.
+/// A virtual memory space.
 #[derive(Debug)]
 pub struct VmSpace(Arc<OstdVmSpace>);
+
+static FALLBACK_VM_SPACE: Once<Arc<OstdVmSpace>> = Once::new();
+
+fn fallback_vm_space() -> &'static Arc<OstdVmSpace> {
+    FALLBACK_VM_SPACE.call_once(|| Arc::new(OstdVmSpace::new()))
+}
 
 impl VmSpace {
     /// Create a new virtual memory space.
@@ -27,9 +39,19 @@ impl VmSpace {
         Self(Arc::new(OstdVmSpace::new()))
     }
 
-    #[inline(never)]
-    pub fn vmspace(&self) -> &Arc<OstdVmSpace> {
+    fn vmspace(&self) -> &Arc<OstdVmSpace> {
         &self.0
+    }
+
+    /// Gets an immutable cursor in the virtual address range.
+    pub fn cursor<'a, G: AsAtomicModeGuard>(
+        &'a self,
+        guard: &'a G,
+        va: &Range<Vaddr>,
+    ) -> Result<Cursor<'a>> {
+        Ok(Cursor::new_with_inner(
+            self.vmspace().cursor(guard.get_inner(), va)?,
+        ))
     }
 
     /// Create a mutable cursor for page table manipulation.
@@ -38,9 +60,9 @@ impl VmSpace {
         guard: &'a G,
         va: &Range<Vaddr>,
     ) -> Result<CursorMut<'a>> {
-        self.vmspace()
-            .cursor_mut(guard.get_inner(), va)
-            .map(CursorMut::new_with_inner)
+        Ok(CursorMut::new_with_inner(
+            self.vmspace().cursor_mut(guard.get_inner(), va)?,
+        ))
     }
 
     /// Activate this virtual memory space.
@@ -50,12 +72,25 @@ impl VmSpace {
 
     /// Create a reader for reading from user space.
     pub fn reader(&self, vaddr: Vaddr, len: usize) -> Result<VmReader<'_, Fallible>> {
-        self.vmspace().reader(vaddr, len)
+        Ok(VmReader::new_with_inner(self.vmspace().reader(vaddr, len)?))
     }
 
     /// Create a writer for writing to user space.
     pub fn writer(&self, vaddr: Vaddr, len: usize) -> Result<VmWriter<'_, Fallible>> {
-        self.vmspace().writer(vaddr, len)
+        Ok(VmWriter::new_with_inner(self.vmspace().writer(vaddr, len)?))
+    }
+
+    /// Create a reader/writer pair for the same user-space range.
+    pub fn reader_writer(
+        &self,
+        vaddr: Vaddr,
+        len: usize,
+    ) -> Result<(VmReader<'_, Fallible>, VmWriter<'_, Fallible>)> {
+        let (reader, writer) = self.vmspace().reader_writer(vaddr, len)?;
+        Ok((
+            VmReader::new_with_inner(reader),
+            VmWriter::new_with_inner(writer),
+        ))
     }
 }
 
@@ -65,23 +100,138 @@ impl Default for VmSpace {
     }
 }
 
+impl Drop for VmSpace {
+    fn drop(&mut self) {
+        fallback_vm_space().activate();
+    }
+}
+
+/// The cursor for querying over the VM space without modifying it.
+pub struct Cursor<'a>(OstdCursor<'a>);
+
+impl<'a> Cursor<'a> {
+    pub(crate) fn new_with_inner(cursor: OstdCursor<'a>) -> Self {
+        Self(cursor)
+    }
+
+    /// Queries the mapping at the current virtual address.
+    pub fn query(&mut self) -> Result<(Range<Vaddr>, Option<VmQueriedItem<'_>>)> {
+        let (range, item) = self.0.query()?;
+        Ok((range, item.map(VmQueriedItem::from)))
+    }
+
+    /// Moves the cursor forward to the next mapped virtual address.
+    pub fn find_next(&mut self, len: usize) -> Option<Vaddr> {
+        self.0.find_next(len)
+    }
+
+    /// Jumps to the virtual address.
+    pub fn jump(&mut self, va: Vaddr) -> Result<()> {
+        self.0.jump(va)?;
+        Ok(())
+    }
+
+    /// Gets the virtual address of the current slot.
+    pub fn virt_addr(&self) -> Vaddr {
+        self.0.virt_addr()
+    }
+}
+
 /// Mutable cursor for page table operations.
 pub struct CursorMut<'a>(OstdCursorMut<'a>);
 
 impl<'a> CursorMut<'a> {
-    pub fn new_with_inner(cursor: OstdCursorMut<'a>) -> Self {
+    pub(crate) fn new_with_inner(cursor: OstdCursorMut<'a>) -> Self {
         Self(cursor)
+    }
+
+    /// Returns whether the current cursor slot is already mapped.
+    pub fn is_mapped(&mut self) -> Result<bool> {
+        let (_, item) = self.0.query()?;
+        Ok(item.is_some())
+    }
+
+    /// Jumps to a virtual address in the cursor range.
+    pub fn jump(&mut self, va: Vaddr) -> Result<()> {
+        Ok(self.0.jump(va)?)
     }
 
     /// Map a frame at the current cursor position.
     pub fn map(&mut self, frame: UFrame, prop: PageProperty) {
         self.0.map(frame.inner(), prop.inner());
     }
+
+    /// Unmaps pages from the current cursor position.
+    pub fn unmap(&mut self, len: usize) -> usize {
+        self.0.unmap(len)
+    }
+
+    /// Protects mapped pages from the current cursor position.
+    pub fn protect(&mut self, len: usize, flags: PageFlags, cache: CachePolicy) -> bool {
+        let start = self.0.virt_addr();
+        let end = start + len;
+        let mut protected = false;
+
+        while self.0.virt_addr() < end {
+            let remaining_len = end - self.0.virt_addr();
+            if self
+                .0
+                .protect_next(remaining_len, |page_flags, cache_policy| {
+                    *page_flags = flags;
+                    *cache_policy = cache;
+                })
+                .is_none()
+            {
+                break;
+            }
+            protected = true;
+        }
+
+        if protected {
+            self.0
+                .flusher()
+                .issue_tlb_flush(TlbFlushOp::for_range(start..end));
+            self.0.flusher().dispatch_tlb_flush();
+        }
+
+        protected
+    }
+}
+
+/// The result of a query over the VM space.
+pub enum VmQueriedItem<'a> {
+    /// The current slot is backed by allocated RAM.
+    MappedRam {
+        /// The mapped frame.
+        frame: FrameRef<'a, dyn crate::mm::frame::untyped::AnyUFrameMeta>,
+        /// The property of the slot.
+        prop: PageProperty,
+    },
+    /// The current slot is backed by I/O memory.
+    MappedIoMem {
+        /// The physical address of the I/O memory.
+        paddr: Paddr,
+        /// The property of the slot.
+        prop: PageProperty,
+    },
+}
+
+impl<'a> From<OstdVmQueriedItem<'a>> for VmQueriedItem<'a> {
+    fn from(item: OstdVmQueriedItem<'a>) -> Self {
+        match item {
+            OstdVmQueriedItem::MappedRam { frame, prop } => Self::MappedRam {
+                frame: FrameRef::new_with_inner(frame),
+                prop: PageProperty::new_with_inner(prop),
+            },
+            OstdVmQueriedItem::MappedIoMem { paddr, prop } => Self::MappedIoMem {
+                paddr,
+                prop: PageProperty::new_with_inner(prop),
+            },
+        }
+    }
 }
 
 /// Initialize the VM space subsystem.
-pub fn init_vm_space() {
-    // Perform a quick sanity check by creating and activating a VM space.
-    let vm_space = Arc::new(VmSpace::new());
-    vm_space.activate();
+pub(super) fn init_vm_space() {
+    fallback_vm_space().activate();
 }

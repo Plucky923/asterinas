@@ -17,7 +17,7 @@ use core::{
     cell::{Cell, SyncUnsafeCell},
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use kernel_stack::KernelStack;
@@ -89,6 +89,7 @@ pub struct Task {
     /// This is to enforce not context switching to an already running task.
     /// See [`processor::switch_to_task`] for more details.
     switched_to_cpu: AtomicBool,
+    completed: AtomicBool,
 
     schedule_info: TaskScheduleInfo,
 }
@@ -140,6 +141,9 @@ impl Task {
     /// Re-enqueues a parked task through the scheduler.
     #[track_caller]
     pub fn wake_up(self: &Arc<Self>) {
+        if self.completed.load(Ordering::Acquire) {
+            return;
+        }
         scheduler::unpark_target(self.clone());
     }
 
@@ -258,6 +262,7 @@ impl TaskOptions {
                 .take()
                 .expect("task function is `None` when trying to run");
             task_func();
+            current_task.completed.store(true, Ordering::Release);
 
             // Manually drop all the on-stack variables to prevent memory leakage!
             // This is needed because `scheduler::exit_current()` will never return.
@@ -296,6 +301,7 @@ impl TaskOptions {
                 cpu: AtomicCpuId::default(),
             },
             switched_to_cpu: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
         };
 
         Ok(new_task)

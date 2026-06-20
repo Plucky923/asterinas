@@ -8,9 +8,8 @@
 //!
 //! # Security Model
 //!
-//! Service stacks provide isolation between untrusted callers (e.g., FrameVM)
-//! and trusted callees (e.g., FrameVisor). When a caller has exhausted its
-//! stack (either legitimately or maliciously), the callee can safely execute
+//! Service stacks provide isolation between less-trusted callers and privileged
+//! callees. When a caller has exhausted its stack, the callee can safely execute
 //! on the service stack.
 
 use alloc::{boxed::Box, vec::Vec};

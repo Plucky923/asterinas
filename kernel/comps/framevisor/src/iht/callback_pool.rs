@@ -7,7 +7,7 @@
 
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 
-use ostd::sync::SpinLock;
+use host_ostd::sync::SpinLock;
 
 /// Default pool capacity per vCPU
 pub const DEFAULT_POOL_CAPACITY: usize = 256;

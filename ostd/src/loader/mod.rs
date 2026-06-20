@@ -1,19 +1,19 @@
 use alloc::{format, string::String};
 
 use spin::Once;
-use xmas_elf::{header::Type, program::ProgramHeader, ElfFile};
+use xmas_elf::{ElfFile, header::Type, program::ProgramHeader};
 
-use crate::{early_println, sync::SpinLock, Result};
+use crate::{Result, early_println, sync::SpinLock};
 
 mod memory;
 mod parser;
 mod relocation;
 mod symbol;
 
-use memory::{alloc_section_memory, caculate_section_size, SectionMemory};
+use memory::{SectionMemory, alloc_section_memory, caculate_section_size};
 use parser::load_section_data;
 use relocation::relocate_sections;
-use symbol::find_entry_point;
+use symbol::{EntryPoint, find_entry_point};
 
 static LOADER_LAST_ERROR: Once<SpinLock<Option<String>>> = Once::new();
 
@@ -40,20 +40,29 @@ pub(super) fn invalid_args(message: impl Into<String>) -> crate::Error {
     crate::Error::InvalidArgs
 }
 
-pub struct FrameVmInfo<'a> {
+/// A relocatable Rust service module loaded into kernel memory.
+pub struct ServiceModuleInfo<'a> {
     elf_file: ElfFile<'a>,
-    entry_point: Option<usize>,
+    entry_point: Option<EntryPoint>,
     section_memory: Option<SectionMemory>,
 }
 
-impl<'a> FrameVmInfo<'a> {
-    fn entry_point(&self) -> Option<usize> {
+impl<'a> ServiceModuleInfo<'a> {
+    fn entry_point(&self) -> Option<EntryPoint> {
         self.entry_point
     }
 
-    pub fn start_framevm(&self) -> Result<()> {
-        // 直接在当前 CPU 上调用，不创建新 Task
-        let start = self.entry_point().unwrap_or(0);
+    /// Starts the loaded service module by invoking its entry point.
+    pub fn start(&self) -> Result<()> {
+        let Some(entry_point) = self.entry_point() else {
+            return Err(invalid_args("entry point is missing, cannot proceed"));
+        };
+        let start = entry_point.addr();
+        early_println!(
+            "[Loader] Calling entry point: 0x{:x}, returns={}",
+            start,
+            entry_point.returns_to_loader()
+        );
         log::info!(
             "[Loader] Entry point called directly, entry point: 0x{:x}",
             start
@@ -63,72 +72,33 @@ impl<'a> FrameVmInfo<'a> {
             return Err(invalid_args("entry point is 0, cannot proceed"));
         }
 
-        // 移除 Hex dump
-        /*
-        unsafe {
-            early_println!("[Loader] Dumping code at entry point (first 128 bytes):");
-            let code_ptr = start as *const u8;
-            let mut line_buffer = alloc::string::String::new();
-            for i in 0..128 {
-                if i % 16 == 0 {
-                    if !line_buffer.is_empty() {
-                        early_println!("{}", line_buffer);
-                        line_buffer.clear();
-                    }
-                    line_buffer = alloc::format!("[Loader] 0x{:x}: ", start + i);
-                }
-                let mut byte = [0u8; 1];
-                let mut reader = VmReader::from_kernel_space(code_ptr.add(i), 1);
-                if reader.read(&mut VmWriter::from(&mut byte[..])) == 1 {
-                    line_buffer.push_str(&alloc::format!("{:02x} ", byte[0]));
-                } else {
-                    line_buffer.push_str("?? ");
-                }
-            }
-            if !line_buffer.is_empty() {
-                early_println!("{}", line_buffer);
-            }
-
-            // 尝试解析前几条指令
-            early_println!("[Loader] Attempting to disassemble first few instructions:");
-            let mut hex_buffer = alloc::string::String::new();
-            for i in 0..32.min(128) {
-                let mut byte = [0u8; 1];
-                let mut reader = VmReader::from_kernel_space(code_ptr.add(i), 1);
-                if reader.read(&mut VmWriter::from(&mut byte[..])) == 1 {
-                    hex_buffer.push_str(&alloc::format!("{:02x}", byte[0]));
-                } else {
-                    hex_buffer.push_str("??");
-                }
-            }
-            early_println!("{}", hex_buffer);
-        }
-        */
-
-        // 打印入口点函数的反汇编信息（前几条指令）
         log::info!("[Loader] About to call entry point at 0x{:x}", start);
 
-        let entry: extern "Rust" fn() = unsafe { core::mem::transmute(start) };
-        unsafe { entry() };
+        // SAFETY: `start` is resolved from a relocated entry symbol that was
+        // checked to lie inside the executable section of this loaded module.
+        if entry_point.returns_to_loader() {
+            let entry: extern "Rust" fn() = unsafe { core::mem::transmute(start) };
+            entry();
+        } else {
+            let entry: extern "Rust" fn() -> ! = unsafe { core::mem::transmute(start) };
+            entry();
+        }
 
-        log::info!("[Loader] FrameVM execution finished");
+        log::info!("[Loader] Service module execution finished");
         Ok(())
     }
 
-    pub fn load_framevm_file(elf_data: &'a [u8]) -> Result<FrameVmInfo<'a>> {
+    /// Loads a relocatable Rust service module from an ELF object.
+    pub fn load_service_module(elf_data: &'a [u8]) -> Result<Self> {
         clear_last_error();
-        log::info!("[Loader] Loading FrameVM module...");
+        log::info!("[Loader] Loading service module...");
         let elf_file = ElfFile::new(elf_data)
-            .map_err(|_| invalid_args("failed to parse FrameVM object as ELF"))?;
+            .map_err(|_| invalid_args("failed to parse service module object as ELF"))?;
 
-        // 简化日志
-        // early_println!("[Loader] ELF header: {:?}", elf_file.header);
-
-        // 检查是否是重定位文件
         let typ = elf_file.header.pt2.type_().as_type();
         if typ != Type::Relocatable {
             return Err(invalid_args(format!(
-                "FrameVM object is not relocatable: {:?}",
+                "service module object is not relocatable: {:?}",
                 typ
             )));
         }
@@ -137,7 +107,7 @@ impl<'a> FrameVmInfo<'a> {
             match ph {
                 ProgramHeader::Ph64(ph64) => {
                     if let Ok(ph_type) = ph64.get_type() {
-                        // 仅当 Program Header 非空时打印
+                        // Only non-empty program headers are relevant here.
                         if ph64.mem_size > 0 {
                             early_println!(
                                 "[Loader] Program header {}: type={:?}, offset=0x{:x}, vaddr=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
@@ -162,23 +132,15 @@ impl<'a> FrameVmInfo<'a> {
         let sections_metadata = load_section_data(&elf_file, &section_memory)?;
         relocate_sections(&elf_file, &sections_metadata)?;
 
-        // 打印代码段边界信息
-        /*
-        if let Some(ref exec_kvirt) = section_memory.exec_kvirt {
-            early_println!(
-                "[Loader] Executable code segment: start=0x{:x}, end=0x{:x}, size=0x{:x} bytes",
-                exec_kvirt.start(),
-                exec_kvirt.end(),
-                exec_kvirt.end() - exec_kvirt.start()
-            );
-        }
-        */
-
-        // 查找并记录入口点地址 (_start)
         let entry_point = find_entry_point(&elf_file, &sections_metadata)?;
-        if let Some(addr) = entry_point {
+        if let Some(entry_point) = entry_point {
+            let addr = entry_point.addr();
+            early_println!(
+                "[Loader] Entry point found: 0x{:x}, returns={}",
+                addr,
+                entry_point.returns_to_loader()
+            );
             log::info!("[Loader] Entry point found at: 0x{:x}", addr);
-            // 检查入口点是否在代码段内
             if let Some(ref exec_kvirt) = section_memory.exec_kvirt {
                 if addr < exec_kvirt.start() || addr >= exec_kvirt.end() {
                     return Err(invalid_args(format!(
@@ -190,10 +152,10 @@ impl<'a> FrameVmInfo<'a> {
                 }
             }
         } else {
-            log::warn!("[Loader] Warning: Entry point (_start) not found");
+            log::warn!("[Loader] Warning: service module entry point not found");
         }
 
-        Ok(FrameVmInfo {
+        Ok(Self {
             elf_file,
             entry_point,
             section_memory: Some(section_memory),

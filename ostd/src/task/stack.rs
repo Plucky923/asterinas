@@ -8,10 +8,10 @@
 //!
 //! # Security Model
 //!
-//! When an untrusted domain (e.g., FrameVM) calls a trusted domain's API
-//! (e.g., FrameVisor), the untrusted domain could maliciously exhaust its
-//! stack before making the call. The `ensure_stack!` macro protects against
-//! this by checking stack space and switching to a safe service stack if needed.
+//! When a less-trusted domain calls a privileged domain's API, it could
+//! exhaust its stack before making the call. The `ensure_stack!` macro protects
+//! against this by checking stack space and switching to a safe service stack
+//! if needed.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -160,6 +160,8 @@ pub use super::service_stack::with_service_stack;
 
 #[cfg(ktest)]
 mod test {
+    use ostd_macros::ktest;
+
     use super::*;
 
     #[ktest]

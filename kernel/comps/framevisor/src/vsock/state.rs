@@ -4,10 +4,9 @@
 
 use alloc::collections::BTreeSet;
 
-use ostd::sync::RwLock;
-use spin::Once;
+use host_ostd::sync::RwLock;
 
-use crate::vm::VmId;
+use crate::{sync::Once, vm::VmId};
 
 // ============================================================================
 // Guest Vsock Active State (Per-VM)

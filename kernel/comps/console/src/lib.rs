@@ -11,7 +11,10 @@ pub mod font;
 pub mod mode;
 
 use alloc::{collections::BTreeMap, fmt::Debug, string::String, sync::Arc, vec::Vec};
-use core::any::Any;
+use core::{
+    any::Any,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use component::{ComponentInitError, init_component};
 use ostd::{
@@ -21,6 +24,19 @@ use ostd::{
 use spin::Once;
 
 pub type ConsoleCallback = dyn Fn(VmReader<Infallible>) + Send + Sync;
+
+const DEFAULT_INPUT_OWNER_ID: usize = 0;
+
+/// Identifies a consumer that may own console input delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputOwner(usize);
+
+impl InputOwner {
+    /// Returns the default input owner used by the host kernel TTY path.
+    pub const fn default() -> Self {
+        Self(DEFAULT_INPUT_OWNER_ID)
+    }
+}
 
 /// An error returned by [`AnyConsoleDevice::set_font`].
 #[derive(Clone, Copy, Debug)]
@@ -100,6 +116,50 @@ pub fn all_devices_lock<'a>()
     COMPONENT.get().unwrap().console_device_table.lock()
 }
 
+/// Allocates a new console input owner.
+pub fn alloc_input_owner() -> InputOwner {
+    let id = COMPONENT
+        .get()
+        .unwrap()
+        .next_input_owner_id
+        .fetch_add(1, Ordering::Relaxed);
+    InputOwner(id)
+}
+
+/// Routes subsequent console input to `owner`.
+pub fn acquire_input(owner: InputOwner) {
+    COMPONENT
+        .get()
+        .unwrap()
+        .input_owner_id
+        .store(owner.0, Ordering::Release);
+}
+
+/// Releases console input if it is currently owned by `owner`.
+pub fn release_input(owner: InputOwner) {
+    let _ = COMPONENT.get().unwrap().input_owner_id.compare_exchange(
+        owner.0,
+        DEFAULT_INPUT_OWNER_ID,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// Returns whether console input is currently owned by `owner`.
+pub fn input_is_owned_by(owner: InputOwner) -> bool {
+    COMPONENT
+        .get()
+        .unwrap()
+        .input_owner_id
+        .load(Ordering::Acquire)
+        == owner.0
+}
+
+/// Returns whether console input is currently routed to the host kernel TTY path.
+pub fn input_is_owned_by_default() -> bool {
+    input_is_owned_by(InputOwner::default())
+}
+
 static COMPONENT: Once<Component> = Once::new();
 
 #[init_component]
@@ -112,12 +172,16 @@ fn component_init() -> Result<(), ComponentInitError> {
 #[derive(Debug)]
 struct Component {
     console_device_table: SpinLock<BTreeMap<String, Arc<dyn AnyConsoleDevice>>, LocalIrqDisabled>,
+    input_owner_id: AtomicUsize,
+    next_input_owner_id: AtomicUsize,
 }
 
 impl Component {
     pub fn init() -> Result<Self, ComponentInitError> {
         Ok(Self {
             console_device_table: SpinLock::new(BTreeMap::new()),
+            input_owner_id: AtomicUsize::new(DEFAULT_INPUT_OWNER_ID),
+            next_input_owner_id: AtomicUsize::new(DEFAULT_INPUT_OWNER_ID + 1),
         })
     }
 }

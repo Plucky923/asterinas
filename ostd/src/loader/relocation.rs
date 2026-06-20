@@ -1,26 +1,38 @@
-use alloc::{format, string::ToString, vec::Vec};
+use alloc::{format, string::ToString, vec, vec::Vec};
 
 use rustc_demangle::demangle;
 use xmas_elf::{
-    sections::{Rela, SectionData, ShType, SHF_ALLOC, SHN_UNDEF},
-    symbol_table::{Entry, Entry64},
     ElfFile,
+    sections::{Rela, SHF_ALLOC, SHN_UNDEF, SectionData, ShType},
+    symbol_table::{Entry, Entry64},
 };
 
 use super::{invalid_args, parser::SectionsMetadata, symbol::get_symbol_table};
-use crate::{early_println, mm::io::VmWriter, symbols::symbol_addr_by_name, Result};
+use crate::{Result, early_println, mm::io::VmWriter, symbols::symbol_addr_by_name};
 
 pub fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadata) -> Result<()> {
     let symbol_table = get_symbol_table(elf_file)?;
+    let mut symbol_addr_cache = vec![None; symbol_table.len()];
+    let loaded_section_bases = loaded_section_bases(elf_file, sections_metadata);
     log::info!("[Loader] Starting relocation...");
+    early_println!(
+        "[Loader] Starting relocation: symbols={}",
+        symbol_table.len()
+    );
 
     let mut total_relocations = 0;
+    let mut processed_relocations = 0usize;
 
-    // 遍历所有重定位section
+    // Iterate only relocation sections. Large Rust service objects contain many
+    // per-function sections with long symbol names, so name lookup on unrelated
+    // sections dominates boot time.
     for reloc_section in elf_file.section_iter() {
-        let Ok(_reloc_section_name) = reloc_section.get_name(elf_file) else {
+        let Ok(section_type) = reloc_section.get_type() else {
             continue;
         };
+        if !matches!(section_type, ShType::Rela | ShType::Rel) {
+            continue;
+        }
 
         let info = reloc_section.info();
         if info == 0 {
@@ -38,32 +50,23 @@ pub fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadat
             continue;
         }
 
-        let name = target_section
-            .get_name(elf_file)
-            .map_err(|_| invalid_args("failed to read relocation target section name"))?;
-
         match reloc_section.get_data(elf_file) {
             Ok(SectionData::Rela64(rela)) => {
                 apply_relocate_add(
                     rela,
                     info as usize,
                     elf_file,
-                    &sections_metadata,
+                    &loaded_section_bases,
                     symbol_table,
+                    &mut symbol_addr_cache,
+                    &mut processed_relocations,
                 )?;
-                log::info!(
-                    "[Loader] Applied {} RELA relocations to section '{}'",
-                    rela.len(),
-                    name
-                );
                 total_relocations += rela.len();
             }
             Ok(SectionData::Rel64(rel)) => {
-                // FrameVM usually uses RELA on x86_64
                 early_println!(
-                    "[Loader] Ignored {} REL relocations for section '{}' (not implemented)",
-                    rel.len(),
-                    name
+                    "[Loader] Ignored {} REL relocations (not implemented)",
+                    rel.len()
                 );
             }
             _ => {
@@ -75,7 +78,21 @@ pub fn relocate_sections(elf_file: &ElfFile, sections_metadata: &SectionsMetadat
         "[Loader] Relocation completed. Total applied: {}",
         total_relocations
     );
+    early_println!("[Loader] Relocation completed: total={}", total_relocations);
     Ok(())
+}
+
+fn loaded_section_bases(
+    elf_file: &ElfFile,
+    sections_metadata: &SectionsMetadata,
+) -> Vec<Option<usize>> {
+    let mut section_bases = vec![None; elf_file.section_iter().count()];
+    for (&index, section) in sections_metadata.loaded_sections.iter() {
+        if let Some(slot) = section_bases.get_mut(index) {
+            *slot = Some(section.base_addr);
+        }
+    }
+    section_bases
 }
 
 /// 应用 RELA 重定位
@@ -83,11 +100,13 @@ fn apply_relocate_add(
     rel: &[Rela<u64>],
     target_section_index: usize,
     elf_file: &ElfFile,
-    sections_metadata: &SectionsMetadata,
+    loaded_section_bases: &[Option<usize>],
     symbol_table: &[Entry64],
+    symbol_addr_cache: &mut [Option<u64>],
+    processed_relocations: &mut usize,
 ) -> Result<()> {
     let target_section_base =
-        get_target_section_base(target_section_index, sections_metadata, elf_file)?;
+        get_target_section_base(target_section_index, loaded_section_bases, elf_file)?;
 
     // 移除详细的每段重定位开始日志
     /*
@@ -105,8 +124,10 @@ fn apply_relocate_add(
             reloc,
             target_section_base,
             elf_file,
-            sections_metadata,
+            loaded_section_bases,
             symbol_table,
+            symbol_addr_cache,
+            processed_relocations,
         )?;
     }
 
@@ -115,21 +136,16 @@ fn apply_relocate_add(
 
 fn get_target_section_base(
     target_section_index: usize,
-    sections_metadata: &SectionsMetadata,
+    loaded_section_bases: &[Option<usize>],
     elf_file: &ElfFile,
 ) -> Result<usize> {
-    sections_metadata
-        .loaded_sections
-        .get(&target_section_index)
-        .map(|section| section.base_addr)
+    loaded_section_bases
+        .get(target_section_index)
+        .and_then(|base| *base)
         .ok_or_else(|| {
             early_println!(
                 "[Loader] Error: Target section index {} not found in loaded_sections!",
                 target_section_index
-            );
-            early_println!(
-                "[Loader] Available section indices: {:?}",
-                sections_metadata.loaded_sections.keys().collect::<Vec<_>>()
             );
             // 尝试获取 section 名称以便调试
             if let Ok(target_section) = elf_file.section_header(target_section_index as u16) {
@@ -154,13 +170,24 @@ fn process_relocation_entry(
     reloc: &Rela<u64>,
     target_section_base: usize,
     elf_file: &ElfFile,
-    sections_metadata: &SectionsMetadata,
+    loaded_section_bases: &[Option<usize>],
     symbol_table: &[Entry64],
+    symbol_addr_cache: &mut [Option<u64>],
+    processed_relocations: &mut usize,
 ) -> Result<()> {
+    *processed_relocations += 1;
+    if *processed_relocations % 50_000 == 0 {
+        early_println!("[Loader] Relocated {} entries", *processed_relocations);
+    }
+
     let symbol_idx = reloc.get_symbol_table_index() as usize;
     let offset = reloc.get_offset();
     let reloc_type = reloc.get_type();
     let addend = reloc.get_addend() as i64;
+
+    if reloc_type == 0 {
+        return Ok(());
+    }
 
     // 计算要修改的目标地址
     let loc = target_section_base + offset as usize;
@@ -173,10 +200,15 @@ fn process_relocation_entry(
         ))
     })?;
 
-    let symbol_name = symbol.get_name(elf_file).unwrap_or("");
-
     // 计算符号的实际地址
-    let symbol_addr = resolve_symbol_address(symbol, symbol_name, reloc_type, sections_metadata)?;
+    let symbol_addr = resolve_symbol_address(
+        symbol_idx,
+        symbol,
+        reloc_type,
+        elf_file,
+        loaded_section_bases,
+        symbol_addr_cache,
+    )?;
 
     // 基础值 = 符号地址 + addend
     let val = ((symbol_addr as i64).wrapping_add(addend)) as u64;
@@ -215,6 +247,7 @@ fn process_relocation_entry(
         // R_X86_64_PC64
         24 => handle_pc_relative(loc, val, reloc_type, symbol_addr, 8),
         _ => {
+            let symbol_name = symbol.get_name(elf_file).unwrap_or("");
             early_println!(
                 "[Loader] Error: Unsupported relocation type: {}, symbol '{}'",
                 reloc_type,
@@ -229,13 +262,20 @@ fn process_relocation_entry(
 }
 
 fn resolve_symbol_address(
+    symbol_idx: usize,
     symbol: &Entry64,
-    symbol_name: &str,
     reloc_type: u32,
-    sections_metadata: &SectionsMetadata,
+    elf_file: &ElfFile,
+    loaded_section_bases: &[Option<usize>],
+    symbol_addr_cache: &mut [Option<u64>],
 ) -> Result<u64> {
+    if let Some(addr) = symbol_addr_cache[symbol_idx] {
+        return Ok(addr);
+    }
+
     let shndx = symbol.shndx();
-    if shndx == SHN_UNDEF {
+    let resolved_addr = if shndx == SHN_UNDEF {
+        let symbol_name = symbol.get_name(elf_file).unwrap_or("");
         match symbol_addr_by_name(symbol_name) {
             Some(addr) => Ok(addr as u64),
             None => {
@@ -252,11 +292,14 @@ fn resolve_symbol_address(
                 )))
             }
         }
-    } else if let Some(section) = sections_metadata.loaded_sections.get(&(shndx as usize)) {
-        Ok((section.base_addr + symbol.value() as usize) as u64)
+    } else if let Some(Some(section_base)) = loaded_section_bases.get(shndx as usize) {
+        Ok((*section_base + symbol.value() as usize) as u64)
     } else {
         Ok(symbol.value() as u64)
-    }
+    }?;
+
+    symbol_addr_cache[symbol_idx] = Some(resolved_addr);
+    Ok(resolved_addr)
 }
 
 fn handle_pc_relative(
@@ -283,10 +326,7 @@ fn handle_pc_relative(
             );
             return Err(invalid_args(format!(
                 "PC-relative relocation type {} out of range: rel=0x{:x}, loc=0x{:x}, symbol=0x{:x}",
-                reloc_type,
-                rel_val,
-                loc,
-                symbol_addr
+                reloc_type, rel_val, loc, symbol_addr
             )));
         }
     }
@@ -319,7 +359,7 @@ fn write_val(loc: usize, val: u64, size: usize) -> Result<()> {
                 return Err(invalid_args(format!(
                     "unsupported relocation write size {} at 0x{:x}",
                     size, loc
-                )))
+                )));
             }
         }
     }

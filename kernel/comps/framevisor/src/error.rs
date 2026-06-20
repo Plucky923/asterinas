@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Error types for FrameVisor operations.
+//! Error types.
 
 use crate::mm::page_table::PageTableError;
 
-/// Error types for FrameVisor operations.
+/// Error types for kernel operations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
     /// Invalid arguments provided.
@@ -29,21 +29,21 @@ impl From<PageTableError> for Error {
     }
 }
 
-impl From<ostd::Error> for Error {
-    fn from(err: ostd::Error) -> Error {
+impl From<host_ostd::Error> for Error {
+    fn from(err: host_ostd::Error) -> Error {
         match err {
-            ostd::Error::InvalidArgs => Error::InvalidArgs,
-            ostd::Error::NoMemory => Error::NoMemory,
-            ostd::Error::PageFault => Error::PageFault,
-            ostd::Error::AccessDenied => Error::AccessDenied,
-            ostd::Error::IoError => Error::IoError,
-            ostd::Error::NotEnoughResources => Error::NotEnoughResources,
-            ostd::Error::Overflow => Error::Overflow,
+            host_ostd::Error::InvalidArgs => Error::InvalidArgs,
+            host_ostd::Error::NoMemory => Error::NoMemory,
+            host_ostd::Error::PageFault => Error::PageFault,
+            host_ostd::Error::AccessDenied => Error::AccessDenied,
+            host_ostd::Error::IoError => Error::IoError,
+            host_ostd::Error::NotEnoughResources => Error::NotEnoughResources,
+            host_ostd::Error::Overflow => Error::Overflow,
         }
     }
 }
 
 /// Initialize error module (no-op, kept for API compatibility).
-pub fn init_error() {
+pub(crate) fn init_error() {
     // Error types are statically defined, no runtime initialization needed.
 }

@@ -1,4 +1,4 @@
-//! Page-table error types used by FrameVisor abstractions.
+//! Page-table error types used by virtual memory abstractions.
 
 use crate::mm::Vaddr;
 

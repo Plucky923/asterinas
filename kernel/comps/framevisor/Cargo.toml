@@ -4,13 +4,26 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ostd = { workspace = true }
+host-ostd = { package = "ostd", path = "../../../ostd" }
+aster-console = { workspace = true, optional = true }
 component = { workspace = true }
 aster-framevisor-macros = { workspace = true }
-aster-framevisor-exchangeable = { workspace = true }
-aster-framevsock = { workspace = true }
+aster-framevisor-exchangeable = { workspace = true, optional = true }
+aster-console-transport = { workspace = true }
+aster-framevsock = { workspace = true, features = ["backend-api", "ostd-clock"], optional = true }
 log = { workspace = true }
 spin = { workspace = true }
 hashbrown = { workspace = true }
+
+[features]
+default = []
+host-api = [
+    "dep:aster-console",
+    "dep:aster-framevisor-exchangeable",
+    "dep:aster-framevsock",
+]
+service-payload = []
+cvm_guest = ["host-ostd/cvm_guest"]
+
 [lints]
 workspace = true

@@ -5,7 +5,7 @@
 use core::ops::Range;
 
 use self::allocator::{kvirt_area_allocator, module_kvirt_area_allocator};
-use super::{KERNEL_PAGE_TABLE, KernelPtConfig, MappedItem, MODULE_RANGE};
+use super::{KERNEL_PAGE_TABLE, KernelPtConfig, MODULE_RANGE, MappedItem};
 use crate::{
     irq,
     mm::{
@@ -18,7 +18,8 @@ use crate::{
 
 mod allocator {
     use crate::{
-        irq::DisabledLocalIrqGuard, mm::kspace::{MODULE_RANGE, VMALLOC_VADDR_RANGE},
+        irq::DisabledLocalIrqGuard,
+        mm::kspace::{MODULE_RANGE, VMALLOC_VADDR_RANGE},
         util::range_alloc::RangeAllocator,
     };
 
@@ -38,9 +39,7 @@ mod allocator {
         &KVIRT_AREA_ALLOCATOR
     }
 
-    pub(super) fn module_kvirt_area_allocator(
-        _guard: &DisabledLocalIrqGuard,
-    ) -> &RangeAllocator {
+    pub(super) fn module_kvirt_area_allocator(_guard: &DisabledLocalIrqGuard) -> &RangeAllocator {
         &MODULE_KVIRT_AREA_ALLOCATOR
     }
 }
@@ -201,9 +200,7 @@ impl KVirtArea {
         let cursor_range = range.start + map_offset..range.end;
 
         let page_table = KERNEL_PAGE_TABLE.get().unwrap();
-        let mut cursor = page_table
-            .cursor_mut(&irq_guard, &cursor_range)
-            .unwrap();
+        let mut cursor = page_table.cursor_mut(&irq_guard, &cursor_range).unwrap();
 
         for frame in frames.into_iter() {
             // SAFETY: The constructor of the `KVirtArea` has already ensured

@@ -19,13 +19,18 @@
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use ostd::{
+use host_ostd::{
     sync::{SpinLock, WaitQueue},
     task::Task,
 };
-use spin::Once;
+#[cfg(not(feature = "host-api"))]
+use vm::FrameTaskGroupId;
 
-use crate::vm;
+#[cfg(not(feature = "host-api"))]
+use crate::service_domain as vm;
+#[cfg(feature = "host-api")]
+use crate::vm::{self, FrameTaskGroupId};
+use crate::{error::Error, prelude::Result, sync::Once};
 
 // ============================================================================
 // Callback Type
@@ -56,35 +61,47 @@ const IRQ_LOG_CAPACITY: usize = 256;
 
 /// Per-vCPU IHT context with interrupt log.
 pub struct IhtContext {
+    /// Task group identity
+    task_group_id: FrameTaskGroupId,
     /// vCPU ID
     vcpu_id: usize,
     /// Interrupt log: queue of callbacks to execute
     irq_log: SpinLock<VecDeque<IrqCallback>>,
     /// Wait queue for sleeping
     wait_queue: WaitQueue,
+    /// Wait queue for task startup notification
+    start_wait_queue: WaitQueue,
     /// Wait queue for exit notification
     exit_wait_queue: WaitQueue,
+    /// Startup completion flag
+    started: AtomicBool,
     /// Exit flag
     should_exit: AtomicBool,
     /// Exit completion flag
     exited: AtomicBool,
     /// Pending callback count (fast path, avoids lock)
     pending_count: AtomicUsize,
+    /// Nested virtual local interrupt disable depth for this vCPU.
+    virtual_irq_disable_depth: AtomicUsize,
     /// Task handle
     task: SpinLock<Option<Arc<Task>>>,
 }
 
 impl IhtContext {
     /// Create a new IHT context.
-    pub fn new(vcpu_id: usize) -> Self {
+    pub fn new(task_group_id: FrameTaskGroupId) -> Self {
         Self {
-            vcpu_id,
+            task_group_id,
+            vcpu_id: task_group_id.vcpu_id(),
             irq_log: SpinLock::new(VecDeque::with_capacity(IRQ_LOG_CAPACITY)),
             wait_queue: WaitQueue::new(),
+            start_wait_queue: WaitQueue::new(),
             exit_wait_queue: WaitQueue::new(),
+            started: AtomicBool::new(false),
             should_exit: AtomicBool::new(false),
             exited: AtomicBool::new(false),
             pending_count: AtomicUsize::new(0),
+            virtual_irq_disable_depth: AtomicUsize::new(0),
             task: SpinLock::new(None),
         }
     }
@@ -93,6 +110,12 @@ impl IhtContext {
     #[inline]
     pub fn vcpu_id(&self) -> usize {
         self.vcpu_id
+    }
+
+    /// Get task group ID.
+    #[inline]
+    pub fn task_group_id(&self) -> FrameTaskGroupId {
+        self.task_group_id
     }
 
     /// Push a callback to the interrupt log.
@@ -122,19 +145,53 @@ impl IhtContext {
         cb
     }
 
-    /// Pop all callbacks in a batch.
-    #[inline]
-    pub fn pop_all_callbacks(&self) -> VecDeque<IrqCallback> {
-        let mut log = self.irq_log.lock();
-        let callbacks = core::mem::take(&mut *log);
-        self.pending_count.store(0, Ordering::Release);
-        callbacks
-    }
-
     /// Check if there are pending callbacks.
     #[inline]
     pub fn has_pending(&self) -> bool {
         self.pending_count.load(Ordering::Acquire) != 0
+    }
+
+    /// Check if there is pending virtual timer work.
+    #[inline]
+    pub fn has_pending_timer_work(&self) -> bool {
+        vm::get_task_group_by_id(self.task_group_id)
+            .is_some_and(|task_group| task_group.has_pending_timer_work())
+    }
+
+    /// Returns whether virtual local interrupts are enabled for this vCPU.
+    #[inline]
+    pub fn virtual_interrupts_enabled(&self) -> bool {
+        self.virtual_irq_disable_depth.load(Ordering::Acquire) == 0
+    }
+
+    /// Disables virtual local interrupts for this vCPU.
+    #[inline]
+    pub fn disable_virtual_interrupts(&self) {
+        self.virtual_irq_disable_depth
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Enables virtual local interrupts for this vCPU.
+    #[inline]
+    pub fn enable_virtual_interrupts(&self) {
+        let previous = self.virtual_irq_disable_depth.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |depth| depth.checked_sub(1),
+        );
+        if previous == Ok(1) && self.has_pending_work() {
+            self.force_wake();
+        }
+    }
+
+    fn drain_timer_ticks(&self) {
+        let Some(task_group) = vm::get_task_group_by_id(self.task_group_id) else {
+            return;
+        };
+        let ticks = task_group.take_pending_timer_ticks();
+        if ticks != 0 {
+            crate::task::scheduler::dispatch_timer_ticks(self.task_group_id, ticks);
+        }
     }
 
     /// Get pending callback count.
@@ -143,16 +200,48 @@ impl IhtContext {
         self.pending_count.load(Ordering::Acquire)
     }
 
+    fn has_pending_work(&self) -> bool {
+        self.has_pending() || self.has_pending_timer_work()
+    }
+
+    fn can_run_pending_work(&self) -> bool {
+        self.virtual_interrupts_enabled() && self.has_pending_work()
+    }
+
+    fn run_ready_callbacks(&self) {
+        while let Some(callback) = self.pop_callback() {
+            callback.call();
+            if self.should_exit.load(Ordering::Acquire) || !self.virtual_interrupts_enabled() {
+                break;
+            }
+        }
+    }
+
     /// Wake this IHT.
     #[inline]
     pub fn wake(&self) {
+        if !self.virtual_interrupts_enabled() {
+            return;
+        }
+        self.force_wake();
+    }
+
+    /// Wake this IHT even when virtual interrupts are disabled.
+    #[inline]
+    fn force_wake(&self) {
         self.wait_queue.wake_one();
     }
 
     /// Signal this IHT to exit.
     pub fn signal_exit(&self) {
         self.should_exit.store(true, Ordering::Release);
-        self.wake();
+        self.force_wake();
+    }
+
+    /// Wait until this IHT task has entered its main loop.
+    pub fn wait_until_started(&self) {
+        self.start_wait_queue
+            .wait_until(|| self.started.load(Ordering::Acquire).then_some(()));
     }
 
     /// Wait until this IHT task has exited.
@@ -172,9 +261,41 @@ impl IhtContext {
         self.exit_wait_queue.wake_all();
     }
 
+    /// Mark startup and wake any waiters.
+    fn mark_started(&self) {
+        self.started.store(true, Ordering::Release);
+        self.start_wait_queue.wake_all();
+    }
+
     /// Set the task handle.
     pub fn set_task(&self, task: Arc<Task>) {
         *self.task.lock() = Some(task);
+    }
+}
+
+/// Extension data attached to IHT backing tasks.
+pub struct IhtTaskData {
+    vcpu_id: usize,
+    task_group_id: FrameTaskGroupId,
+}
+
+impl IhtTaskData {
+    /// Creates IHT task data.
+    pub fn new(vcpu_id: usize, task_group_id: FrameTaskGroupId) -> Self {
+        Self {
+            vcpu_id,
+            task_group_id,
+        }
+    }
+
+    /// Returns the vCPU ID.
+    pub fn vcpu_id(&self) -> usize {
+        self.vcpu_id
+    }
+
+    /// Returns the task group ID.
+    pub fn task_group_id(&self) -> FrameTaskGroupId {
+        self.task_group_id
     }
 }
 
@@ -193,14 +314,15 @@ pub fn register_iht_creator(creator: IhtCreator) {
 }
 
 /// Start an IHT task for the given context.
-pub fn start_iht_task(ctx: Arc<IhtContext>) {
+pub fn start_iht_task(ctx: Arc<IhtContext>) -> Result<()> {
     let creator = match IHT_CREATOR.get() {
         Some(c) => c,
-        None => return,
+        None => return Err(Error::InvalidArgs),
     };
 
     let task = creator(ctx.clone());
     ctx.set_task(task);
+    Ok(())
 }
 
 // ============================================================================
@@ -215,19 +337,20 @@ pub fn start_iht_task(ctx: Arc<IhtContext>) {
 /// 3. Repeat until log is empty
 /// 4. Sleep until woken
 pub fn iht_main_loop(ctx: Arc<IhtContext>) {
+    ctx.mark_started();
+
     loop {
         // Check exit
         if ctx.should_exit.load(Ordering::Acquire) {
             break;
         }
 
-        // Process all callbacks in the interrupt log
-        let callbacks = ctx.pop_all_callbacks();
-        for callback in callbacks {
-            callback.call();
-            if ctx.should_exit.load(Ordering::Acquire) {
-                break;
-            }
+        if ctx.virtual_interrupts_enabled() {
+            // Scheduler ticks must be visible before ordinary virtual interrupts.
+            ctx.drain_timer_ticks();
+
+            // Process callbacks without moving out the interrupt-log buffer.
+            ctx.run_ready_callbacks();
         }
 
         // No callbacks, sleep until woken
@@ -235,13 +358,14 @@ pub fn iht_main_loop(ctx: Arc<IhtContext>) {
             if ctx.should_exit.load(Ordering::Acquire) {
                 return Some(());
             }
-            if ctx.has_pending() {
+            if ctx.can_run_pending_work() {
                 return Some(());
             }
             None
         });
     }
 
+    crate::task::clear_current_frame_task_group();
     ctx.mark_exited();
 }
 
@@ -262,11 +386,73 @@ where
     }
 }
 
+/// Coalesces a virtual timer tick for the owning vCPU.
+#[inline]
+pub fn inject_timer_tick(task_group_id: FrameTaskGroupId) {
+    let Some(task_group) = vm::get_task_group_by_id(task_group_id) else {
+        return;
+    };
+    task_group.inject_timer_tick();
+
+    if let Some(vm) = vm::get_vm_by_id(task_group_id.vm_id())
+        && let Some(ctx) = vm.iht_context(task_group_id.vcpu_id())
+    {
+        ctx.wake();
+    }
+}
+
+/// Disables virtual local interrupts for the owning IHT.
+#[inline]
+pub fn disable_virtual_interrupts(task_group_id: FrameTaskGroupId) {
+    if let Some(vm) = vm::get_vm_by_id(task_group_id.vm_id())
+        && let Some(ctx) = vm.iht_context(task_group_id.vcpu_id())
+    {
+        ctx.disable_virtual_interrupts();
+    }
+}
+
+/// Enables virtual local interrupts for the owning IHT.
+#[inline]
+pub fn enable_virtual_interrupts(task_group_id: FrameTaskGroupId) {
+    if let Some(vm) = vm::get_vm_by_id(task_group_id.vm_id())
+        && let Some(ctx) = vm.iht_context(task_group_id.vcpu_id())
+    {
+        ctx.enable_virtual_interrupts();
+    }
+}
+
+/// Returns whether virtual local interrupts are enabled for the task group.
+#[inline]
+pub fn virtual_interrupts_enabled(task_group_id: FrameTaskGroupId) -> bool {
+    let Some(vm) = vm::get_vm_by_id(task_group_id.vm_id()) else {
+        return true;
+    };
+    let Some(ctx) = vm.iht_context(task_group_id.vcpu_id()) else {
+        return true;
+    };
+    ctx.virtual_interrupts_enabled()
+}
+
+/// Returns whether the IHT for a task group has pending virtual work.
+#[inline]
+pub(crate) fn has_pending_work(task_group_id: FrameTaskGroupId) -> bool {
+    let Some(vm) = vm::get_vm_by_id(task_group_id.vm_id()) else {
+        return false;
+    };
+    let Some(ctx) = vm.iht_context(task_group_id.vcpu_id()) else {
+        return false;
+    };
+    ctx.has_pending_work()
+}
+
 /// Get current vCPU ID if running in an IHT task.
 #[inline]
 pub fn current_vcpu_id() -> Option<usize> {
     let current = Task::current()?;
-    current.extension().downcast_ref::<usize>().copied()
+    current
+        .extension()
+        .downcast_ref::<IhtTaskData>()
+        .map(IhtTaskData::vcpu_id)
 }
 
 /// Log a callback directly to a specific IHT context.
@@ -326,4 +512,64 @@ pub fn has_pending(vcpu_id: usize) -> bool {
         }
     }
     false
+}
+
+#[cfg(ktest)]
+mod tests {
+    use host_ostd::prelude::ktest;
+
+    use super::*;
+
+    fn empty_irq_callback() {}
+
+    #[ktest]
+    fn virtual_interrupt_disable_defers_pending_work() {
+        let ctx = IhtContext::new(FrameTaskGroupId::new(0, 0));
+
+        ctx.disable_virtual_interrupts();
+        ctx.push_callback(IrqCallback::FnPtr(empty_irq_callback));
+
+        assert!(ctx.has_pending());
+        assert!(!ctx.can_run_pending_work());
+
+        ctx.enable_virtual_interrupts();
+        assert!(ctx.can_run_pending_work());
+    }
+
+    #[ktest]
+    fn nested_virtual_interrupt_disable_requires_matching_enable() {
+        let ctx = IhtContext::new(FrameTaskGroupId::new(0, 0));
+
+        ctx.disable_virtual_interrupts();
+        ctx.disable_virtual_interrupts();
+        ctx.enable_virtual_interrupts();
+
+        assert!(!ctx.virtual_interrupts_enabled());
+
+        ctx.enable_virtual_interrupts();
+        assert!(ctx.virtual_interrupts_enabled());
+    }
+
+    #[ktest]
+    fn callback_drain_stops_when_virtual_interrupts_are_disabled() {
+        let ctx = Arc::new(IhtContext::new(FrameTaskGroupId::new(0, 0)));
+        let callback_ctx = ctx.clone();
+        ctx.push_callback(IrqCallback::Boxed(Box::new(move || {
+            callback_ctx.disable_virtual_interrupts();
+        })));
+        ctx.push_callback(IrqCallback::FnPtr(empty_irq_callback));
+
+        ctx.run_ready_callbacks();
+
+        assert!(!ctx.virtual_interrupts_enabled());
+        assert_eq!(ctx.pending_count(), 1);
+        assert!(ctx.has_pending());
+
+        ctx.enable_virtual_interrupts();
+        ctx.run_ready_callbacks();
+
+        assert!(ctx.virtual_interrupts_enabled());
+        assert_eq!(ctx.pending_count(), 0);
+        assert!(!ctx.has_pending());
+    }
 }

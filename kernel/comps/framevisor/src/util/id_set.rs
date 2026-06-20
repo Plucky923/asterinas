@@ -1,21 +1,5 @@
-//! Thin wrapper around OSTD ID-set utilities.
+// SPDX-License-Identifier: MPL-2.0
 
-use core::fmt::Debug;
+//! A fixed-size set of unique IDs.
 
-use ostd::util::id_set::{Id as OstdId, IdSet as OstdIdSet};
-
-pub trait Id {
-    type Inner: OstdId;
-}
-
-pub struct IdSet<I: Id>(OstdIdSet<I::Inner>);
-
-impl<I: Id> IdSet<I> {
-    pub fn new_full() -> Self {
-        Self(OstdIdSet::new_full())
-    }
-
-    pub fn new_empty() -> Self {
-        Self(OstdIdSet::new_empty())
-    }
-}
+pub use host_ostd::util::id_set::*;

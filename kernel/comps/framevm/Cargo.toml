@@ -7,23 +7,23 @@ edition = "2024"
 name = "framevm"
 path = "src/lib.rs"
 
-[[bin]]
-name = "framevm"
-path = "src/main.rs"
-
 [dependencies]
-ostd = { workspace = true }
-aster-framevisor = { workspace = true }
-aster-framevsock = { workspace = true }
-exchangeable = { workspace = true }
+ostd = { package = "aster-framevisor", path = "../framevisor", default-features = false, features = ["service-payload"] }
 align_ext = { workspace = true }
-spin = { workspace = true }
+aster-console = { package = "aster-console-service", path = "../framevm-console" }
+aster-framevsock = { workspace = true }
+bitflags = { workspace = true }
+cfg-if = { workspace = true }
+const_format = { workspace = true }
+cpio-decoder = { workspace = true }
+keyable-arc = { workspace = true }
+lending-iterator = { workspace = true }
+no_std_io2 = { workspace = true }
+rand = { workspace = true, features = ["std_rng"] }
 xmas-elf = { workspace = true }
 
 [features]
-default = ["cvm_guest"]
-cvm_guest = ["ostd/cvm_guest"]
-guest_payload = []
+default = []
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Error types for FrameVM.
+//! Error types for the kernel image.
 
 /// POSIX-compatible error numbers.
 #[repr(i32)]
@@ -11,30 +11,50 @@ pub enum Errno {
     ESRCH = 3,
     EIO = 5,
     EBADF = 9,
+    ECHILD = 10,
+    EACCES = 13,
     EAGAIN = 11,
     ENOMEM = 12,
     EFAULT = 14,
     EBUSY = 16,
+    EEXIST = 17,
+    ENOTDIR = 20,
+    EISDIR = 21,
     EINVAL = 22,
+    EMFILE = 24,
+    ENOTTY = 25,
+    EFBIG = 27,
+    ESPIPE = 29,
     EPIPE = 32,
+    ERANGE = 34,
     ENOSYS = 38,
+    ENOTEMPTY = 39,
+    ELOOP = 40,
+    ETIME = 62,
+    EOVERFLOW = 75,
     ENOTSOCK = 88,
+    EMSGSIZE = 90,
+    ENOPROTOOPT = 92,
     ESOCKTNOSUPPORT = 94,
-    ENOTSUP = 95,
+    EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97,
     EADDRINUSE = 98,
+    EADDRNOTAVAIL = 99,
+    ENETUNREACH = 101,
     ECONNRESET = 104,
     EISCONN = 106,
     ENOTCONN = 107,
     ETIMEDOUT = 110,
     ECONNREFUSED = 111,
+    EALREADY = 114,
     EINPROGRESS = 115,
 }
 
-/// Error type for FrameVM operations.
+/// Error type for kernel-image operations.
 #[derive(Debug, Clone, Copy)]
 pub struct Error {
     errno: Errno,
+    #[expect(dead_code)]
     msg: Option<&'static str>,
 }
 
@@ -61,28 +81,7 @@ impl From<Errno> for Error {
     }
 }
 
-/// Convert from `aster_framevisor::Error`.
-impl From<aster_framevisor::Error> for Error {
-    fn from(e: aster_framevisor::Error) -> Self {
-        let errno = match e {
-            aster_framevisor::Error::InvalidArgs => Errno::EINVAL,
-            aster_framevisor::Error::NoMemory => Errno::ENOMEM,
-            aster_framevisor::Error::PageFault => Errno::EFAULT,
-            aster_framevisor::Error::AccessDenied => Errno::EPERM,
-            aster_framevisor::Error::IoError => Errno::EIO,
-            aster_framevisor::Error::NotEnoughResources => Errno::EBUSY,
-            aster_framevisor::Error::Overflow => Errno::EINVAL,
-        };
-        Self::new(errno)
-    }
-}
-
-impl From<(aster_framevisor::Error, usize)> for Error {
-    fn from((e, _): (aster_framevisor::Error, usize)) -> Self {
-        Self::from(e)
-    }
-}
-
+/// Convert from `ostd::Error`.
 impl From<ostd::Error> for Error {
     fn from(e: ostd::Error) -> Self {
         let errno = match e {
@@ -92,7 +91,7 @@ impl From<ostd::Error> for Error {
             ostd::Error::AccessDenied => Errno::EPERM,
             ostd::Error::IoError => Errno::EIO,
             ostd::Error::NotEnoughResources => Errno::EBUSY,
-            ostd::Error::Overflow => Errno::EINVAL,
+            ostd::Error::Overflow => Errno::EOVERFLOW,
         };
         Self::new(errno)
     }
@@ -104,7 +103,7 @@ impl From<(ostd::Error, usize)> for Error {
     }
 }
 
-/// Result type for FrameVM operations.
+/// Result type for kernel-image operations.
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[macro_export]

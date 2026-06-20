@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! FrameVM - A lightweight virtual machine running on FrameVisor.
+//! Trimmed kernel image running on an OSTD-compatible object surface.
 
 #![no_std]
 #![no_main]
@@ -8,167 +8,213 @@
 
 extern crate alloc;
 
-// FrameVM output is captured by FrameVisor and surfaced via `/proc/framevm`.
-// Use a dedicated macro name here so call sites do not imply std-style console I/O.
-macro_rules! framevm_logln {
-    () => {
-        aster_framevisor::framevm_log(format_args!("\n"))
-    };
-    ($($arg:tt)*) => {{
-        aster_framevisor::framevm_log(format_args!("{}\n", format_args!($($arg)*)))
-    }};
-}
-
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::panic::PanicInfo;
 
-use aster_framevisor::sync::WaitQueue;
+use ostd::{cpu::CpuId, sync::WaitQueue};
 
-mod bench;
+mod console;
+mod context;
+mod cpu;
+mod device;
 mod error;
+mod events;
 mod fd_table;
+mod fs_context;
+mod futex;
+mod net;
 mod pollee;
+mod prelude;
+mod process;
+mod resource;
+mod robust_list;
+mod rootfs;
+mod scheduler;
+mod share_bench;
+mod signal;
 mod syscall;
 mod task;
+mod time;
 mod vm;
-mod vsock;
 
+use ostd::task::Task;
 use task::{
-    create_user_task, post_schedule_handler, user_page_fault_handler,
-    wait_for_all_user_tasks_to_exit,
+    create_user_task, post_schedule_handler, pre_schedule_handler, pre_user_run_handler,
+    user_page_fault_handler, wait_for_user_task_to_exit,
 };
-use vm::create_vm_space;
-
-/// Run benchmarks if enabled
-const SHOULD_RUN_BENCHMARKS: bool = true;
+use vm::{activate_kernel_vm_space, create_vm_space};
 
 /// The kernel's boot and initialization process is managed by OSTD.
-#[aster_framevisor::main]
+#[ostd::main]
 pub fn main() {
-    framevm_logln!("[FrameVM] Starting FrameVM...");
-
-    // Initialize vsock subsystem
-    vsock::init();
-    framevm_logln!("[FrameVM] Vsock subsystem initialized");
-
-    // Run benchmarks if enabled
-    if SHOULD_RUN_BENCHMARKS {
-        framevm_logln!("[FrameVM] Running benchmarks...");
-        bench::run_all_benchmarks();
-        framevm_logln!("[FrameVM] Benchmarks completed.");
-    }
-
-    aster_framevisor::task::inject_post_schedule_handler(post_schedule_handler);
-    aster_framevisor::task::inject_user_page_fault_handler(user_page_fault_handler);
-
-    // Load and align program binary
-    let program_binary = load_program_binary();
-    if program_binary.is_empty() {
-        framevm_logln!(
-            "[FrameVM] No guest payload embedded; enable `guest_payload` and set `FRAMEVM_GUEST_PAYLOAD`."
-        );
-        vsock::shutdown();
-        return;
-    }
-
-    // Create and activate VM space
-    let vm_info = match create_vm_space(&program_binary) {
-        Ok(info) => info,
+    ostd::early_println!("[kernel] service entry");
+    ostd::task::inject_pre_user_run_handler(pre_user_run_handler);
+    ostd::task::inject_pre_schedule_handler(pre_schedule_handler);
+    ostd::task::inject_post_schedule_handler(post_schedule_handler);
+    ostd::arch::trap::inject_user_page_fault_handler(user_page_fault_handler);
+    ostd::early_println!("[kernel] service hooks installed");
+    scheduler::init();
+    ostd::early_println!("[kernel] scheduler ready");
+    time::init();
+    device::init();
+    futex::init();
+    let rootfs = match rootfs::RootFs::install_from_boot_info() {
+        Ok(rootfs) => rootfs,
         Err(e) => {
-            framevm_logln!(
-                "[FrameVM] Critical Error: Failed to create VM space: {:?}",
-                e
-            );
-            vsock::shutdown();
+            ostd::early_println!("[kernel] critical error: failed to install rootfs: {:?}", e);
             return;
         }
     };
+    ostd::early_println!("[kernel] rootfs ready");
 
+    let boot_mode = boot_mode_from_cmdline();
+
+    let user_tasks = match boot_mode {
+        BootMode::InteractiveShell => run_init(rootfs.as_ref()),
+        BootMode::BusyBoxSmoke => run_busybox_smoke(rootfs.as_ref()),
+        BootMode::ShareBenchmark { duration_ms } => share_bench::run(rootfs.clone(), duration_ms),
+    };
+    let user_tasks = match user_tasks {
+        Ok(user_tasks) => user_tasks,
+        Err(e) => {
+            ostd::early_println!("[kernel] critical error: kernel run failed: {:?}", e);
+            Vec::new()
+        }
+    };
+
+    // Switch to a long-lived VM space before dropping guest address spaces.
+    activate_kernel_vm_space();
+    drop(user_tasks);
+}
+
+enum BootMode {
+    InteractiveShell,
+    BusyBoxSmoke,
+    ShareBenchmark { duration_ms: u64 },
+}
+
+fn boot_mode_from_cmdline() -> BootMode {
+    let boot_info = ostd::boot::boot_info();
+
+    if cmdline_has_value(&boot_info.kernel_cmdline, "kernel.mode", "busybox-smoke") {
+        return BootMode::BusyBoxSmoke;
+    }
+
+    if !cmdline_has_value(&boot_info.kernel_cmdline, "kernel.mode", "share-benchmark") {
+        return BootMode::InteractiveShell;
+    }
+
+    let duration_ms = cmdline_value(&boot_info.kernel_cmdline, "kernel.duration_ms")
+        .and_then(parse_u64)
+        .unwrap_or(3_000);
+    BootMode::ShareBenchmark { duration_ms }
+}
+
+fn cmdline_has_value(cmdline: &str, key: &str, value: &str) -> bool {
+    cmdline_value(cmdline, key).is_some_and(|found| found == value)
+}
+
+fn cmdline_value<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
+    cmdline.split_whitespace().find_map(|arg| {
+        let (arg_key, arg_value) = arg.split_once('=')?;
+        (arg_key == key).then_some(arg_value)
+    })
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    let mut number = 0u64;
+    for byte in value.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        let digit = u64::from(byte - b'0');
+        number = number.checked_mul(10)?.checked_add(digit)?;
+    }
+    Some(number)
+}
+
+fn run_init(rootfs: &rootfs::RootFs) -> error::Result<Vec<Arc<Task>>> {
+    let init_program = "/init";
+    let argv = Vec::from([String::from(init_program)]);
+    let envp = Vec::from([
+        String::from("PATH=/bin"),
+        String::from("HOME=/"),
+        String::from("TERM=linux"),
+    ]);
+
+    run_user_program(rootfs, init_program, argv, envp, true)
+}
+
+fn run_busybox_smoke(rootfs: &rootfs::RootFs) -> error::Result<Vec<Arc<Task>>> {
+    let shell_program = "/bin/sh";
+    let command = "set -e; pwd; ls /; cat /proc/mounts; \
+        test -x /bin/busybox; test -x /bin/sh; test -x /bin/vsock-probe; test -d /proc; \
+        cd /tmp; pwd; printf 'framevm-cwd-ok\\n' > cwd-file; cat cwd-file; \
+        rm cwd-file; test ! -e cwd-file; cd /; ls -l /linktmp; \
+        /bin/vsock-probe; \
+        echo kernel-busybox-rootfs ok; echo kernel-busybox-vfs ok; \
+        echo kernel-busybox-smoke passed";
+    let argv = Vec::from([
+        String::from(shell_program),
+        String::from("-c"),
+        String::from(command),
+    ]);
+    let envp = Vec::from([
+        String::from("PATH=/bin"),
+        String::from("HOME=/"),
+        String::from("TERM=linux"),
+    ]);
+
+    run_user_program(rootfs, shell_program, argv, envp, false)
+}
+
+fn run_user_program(
+    rootfs: &rootfs::RootFs,
+    program: &str,
+    argv: Vec<String>,
+    envp: Vec<String>,
+    acquire_console_input: bool,
+) -> error::Result<Vec<Arc<Task>>> {
+    let program_binary = rootfs.open_file(program)?.data();
+
+    let vm_info = create_vm_space(program_binary.as_ref(), &argv, &envp)?;
+    ostd::early_println!(
+        "[kernel] user ELF: program={}, entry=0x{:x}, stack=0x{:x}, heap=0x{:x}",
+        program,
+        vm_info.entry_point,
+        vm_info.stack_top,
+        vm_info.heap_base
+    );
     let vm_space = Arc::new(vm_info.vm_space);
-    vm_space.activate();
-    framevm_logln!("[FrameVM] VM space activated");
 
-    // Create and run user task
     let finish_queue = Arc::new(WaitQueue::new());
-    let user_task = match create_user_task(
+    let user_task = create_user_task(
+        program,
         vm_space.clone(),
         vm_info.entry_point,
         vm_info.stack_top,
+        vm_info.heap_base,
         Arc::new(vm_info.lazy_ranges),
-        finish_queue.clone(),
-    ) {
-        Ok(task) => task,
-        Err(e) => {
-            framevm_logln!(
-                "[FrameVM] Critical Error: Failed to create user task: {:?}",
-                e
-            );
-            vsock::shutdown();
-            return;
-        }
-    };
+        finish_queue,
+        CpuId::bsp(),
+    )?;
 
+    if acquire_console_input {
+        let _ = console::acquire_input();
+    }
     user_task.run();
-    framevm_logln!("[FrameVM] User task scheduled: {:?}", user_task);
 
-    // Wait for task completion
-    wait_for_all_user_tasks_to_exit();
-
-    // Switch to a long-lived VM space before dropping the guest address space.
-    aster_framevisor::mm::activate_safe_vm_space();
-    drop(user_task);
-
-    // Disable vsock IRQ handling and drain pending packets before exiting.
-    // This prevents callbacks from touching freed guest state.
-    vsock::disable_irq_and_drain();
-
-    // Shutdown vsock subsystem before exiting
-    // This prevents Host from calling Guest callbacks after Guest exits
-    vsock::shutdown();
-
-    // Stop all IHT tasks to prevent them from executing callbacks after exit.
-    // This is critical: IHT tasks run in background and may reference freed resources.
-    if let Some(vm) = aster_framevisor::vm::get_vm() {
-        let vm_id = vm.id();
-        vm.stop();
-        for vcpu_id in 0..vm.vcpu_count() {
-            if let Some(ctx) = vm.iht_context(vcpu_id) {
-                ctx.wait_for_exit();
-            }
-        }
-        // Drop the Arc reference before destroying the VM
-        drop(vm);
-        // Remove VM from registry to prevent access after exit
-        aster_framevisor::vm::destroy_vm(vm_id);
-        framevm_logln!("[FrameVM] IHT tasks stopped");
+    // PID 1 exiting tears down the kernel image.
+    wait_for_user_task_to_exit(&user_task);
+    if acquire_console_input {
+        let _ = console::release_input();
     }
 
-    // Clear handlers before returning - these point to FrameVM code which will be freed
-    aster_framevisor::task::clear_post_schedule_handler();
-    aster_framevisor::task::clear_user_page_fault_handler();
-
-    framevm_logln!("[FrameVM] User task finished. Exiting.");
-}
-
-fn load_program_binary() -> Vec<u8> {
-    #[cfg(feature = "guest_payload")]
-    let program_data: &[u8] = include_bytes!(env!("FRAMEVM_GUEST_PAYLOAD"));
-    #[cfg(not(feature = "guest_payload"))]
-    let program_data: &[u8] = &[];
-
-    // Copy to heap-allocated Vec to ensure basic alignment and mutability if needed
-    let mut program_binary_vec = vec![0u8; program_data.len()];
-    program_binary_vec.copy_from_slice(program_data);
-
-    framevm_logln!(
-        "[FrameVM] Loaded program binary ({} bytes)",
-        program_binary_vec.len()
-    );
-    program_binary_vec
+    Ok(Vec::from([user_task]))
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    framevm_logln!("[FrameVM] PANIC: {}", info);
+    ostd::early_println!("[kernel] panic: {}", info);
     loop {}
 }

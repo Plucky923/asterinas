@@ -7,15 +7,21 @@
 
 extern crate alloc;
 
+#[cfg(feature = "backend-api")]
 pub mod notify;
+#[cfg(feature = "backend-api")]
 pub mod ring;
+#[cfg(feature = "backend-api")]
 pub mod trace;
+#[cfg(feature = "backend-api")]
 pub mod tuning;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use exchangeable::{Exchangeable, RRef};
+#[cfg(feature = "backend-api")]
+use exchangeable::Exchangeable;
+#[cfg(feature = "backend-api")]
+use exchangeable::RRef;
 
 /// The vSocket equivalent of INADDR_ANY.
 pub const VMADDR_CID_ANY: u64 = u64::MAX;
@@ -24,22 +30,26 @@ pub const VMADDR_CID_LOCAL: u64 = 1;
 /// Use this as the destination CID in an address when referring to the host (any process other than the hypervisor).
 pub const HOST_CID: u64 = 2;
 pub const VMADDR_CID_HOST: u64 = 2;
-/// Guest (FrameVM) CID
+/// Default guest CID used by the first service instance.
 pub const VMADDR_CID_GUEST: u64 = 3;
-/// Base CID for guest VMs (VMs get CID = BASE + vm_id)
+
+/// Base CID used by the backend to route service guests.
+#[cfg(feature = "backend-api")]
 pub const GUEST_CID_BASE: u64 = VMADDR_CID_GUEST;
 /// Bind to any available port.
 pub const VMADDR_PORT_ANY: u32 = u32::MAX;
 
 // ========== CID / VM ID Conversion ==========
 
-/// Check if CID represents a guest VM.
+/// Checks if a CID is routed to a service guest.
+#[cfg(feature = "backend-api")]
 #[inline]
 pub const fn is_guest_cid(cid: u64) -> bool {
     cid >= GUEST_CID_BASE
 }
 
-/// Convert CID to VM ID (returns None if CID is not a guest CID).
+/// Converts a guest CID to the backend VM ID.
+#[cfg(feature = "backend-api")]
 #[inline]
 pub const fn cid_to_vm_id(cid: u64) -> Option<u32> {
     if cid >= GUEST_CID_BASE {
@@ -49,7 +59,8 @@ pub const fn cid_to_vm_id(cid: u64) -> Option<u32> {
     }
 }
 
-/// Convert VM ID to CID.
+/// Converts a backend VM ID to its guest CID.
+#[cfg(feature = "backend-api")]
 #[inline]
 pub const fn vm_id_to_cid(vm_id: u32) -> u64 {
     (vm_id as u64) + GUEST_CID_BASE
@@ -190,6 +201,7 @@ impl FrameVsockHeader {
     }
 }
 
+#[cfg(feature = "backend-api")]
 impl Exchangeable for FrameVsockHeader {}
 
 /// Zero-copy data buffer with offset tracking.
@@ -271,78 +283,21 @@ impl DataBuffer {
             self.data[self.offset..].to_vec()
         }
     }
-
-    /// Take the remaining data as a new DataBuffer without copying.
-    ///
-    /// This is more efficient than `take()` when you don't need a `Vec<u8>`,
-    /// as it avoids the O(n) copy for partial reads.
-    ///
-    /// # Performance
-    /// O(1) - just moves ownership, no data copying.
-    #[inline]
-    pub fn take_buffer(self) -> Self {
-        // Just return self - the offset is already tracked
-        self
-    }
-
-    /// Consume self and return the underlying data, resetting offset.
-    ///
-    /// This drains the front bytes that were consumed, returning
-    /// a new Vec containing only the remaining data.
-    ///
-    /// # Performance
-    /// - If offset == 0: O(1)
-    /// - If offset > 0: O(n) where n = remaining bytes
-    #[inline]
-    pub fn into_remaining(mut self) -> Vec<u8> {
-        if self.offset == 0 {
-            self.data
-        } else {
-            // drain(..offset) removes consumed bytes, leaving remaining
-            self.data.drain(..self.offset);
-            self.data
-        }
-    }
-
-    /// Get the current offset (for debugging/stats).
-    #[inline]
-    pub fn offset(&self) -> usize {
-        self.offset
-    }
-
-    /// Try to extend the buffer with new data (no reallocation).
-    ///
-    /// Returns `Ok(())` on success. If there is a non-zero offset (partial read
-    /// in progress) or there is not enough spare capacity, returns `Err(data)`
-    /// so the caller can fall back without data loss.
-    #[inline]
-    pub fn try_extend(&mut self, mut data: Vec<u8>) -> Result<(), Vec<u8>> {
-        if self.offset != 0 {
-            return Err(data);
-        }
-        let available = self.data.capacity().saturating_sub(self.data.len());
-        if available < data.len() {
-            return Err(data);
-        }
-        self.data.append(&mut data);
-        Ok(())
-    }
 }
 
+#[cfg(feature = "backend-api")]
 impl Exchangeable for DataBuffer {}
 
-/// Generic FrameVsock Buffer for zero-copy data transfer
+/// Generic FrameVsock Buffer for data transfer.
 ///
 /// # Type Parameter
 /// - `T = ()`: Control packet with no data payload
 /// - `T = DataBuffer`: Data packet with zero-copy partial read support
 ///
-/// # Zero-Copy Design
-/// The buffer owns its data. When transferred via RRef, ownership moves
-/// without copying the underlying data. Partial reads use offset tracking
-/// instead of data copying.
+/// The buffer owns its data. Backend code may transfer it across domains
+/// without copying, while service-visible code only sees the packet format.
 #[repr(C)]
-pub struct FrameVsockBuffer<T: Exchangeable = ()> {
+pub struct FrameVsockBuffer<T = ()> {
     /// Packet header
     pub header: FrameVsockHeader,
     /// Payload data (generic)
@@ -355,7 +310,7 @@ pub type ControlPacket = FrameVsockBuffer<()>;
 /// Type alias for data packets (with zero-copy DataBuffer payload)
 pub type DataPacket = FrameVsockBuffer<DataBuffer>;
 
-impl<T: Exchangeable> FrameVsockBuffer<T> {
+impl<T> FrameVsockBuffer<T> {
     /// Get the operation type
     pub fn operation(&self) -> VsockOp {
         self.header.operation()
@@ -546,8 +501,10 @@ impl Default for FrameVsockBuffer<DataBuffer> {
     }
 }
 
-// Implement Exchangeable for FrameVsockBuffer<T>
+// Backend-only RRef transfer markers.
+#[cfg(feature = "backend-api")]
 impl Exchangeable for FrameVsockBuffer<()> {}
+#[cfg(feature = "backend-api")]
 impl Exchangeable for FrameVsockBuffer<DataBuffer> {}
 
 /// Connection identifier
@@ -589,12 +546,12 @@ impl ConnectionId {
     }
 
     /// Create from a FrameVsockBuffer, treating local as destination
-    pub fn from_buffer_as_local<T: Exchangeable>(buf: &FrameVsockBuffer<T>) -> Self {
+    pub fn from_buffer_as_local<T>(buf: &FrameVsockBuffer<T>) -> Self {
         Self::from_header_as_local(&buf.header)
     }
 
     /// Create from a FrameVsockBuffer, treating local as source
-    pub fn from_buffer_as_peer<T: Exchangeable>(buf: &FrameVsockBuffer<T>) -> Self {
+    pub fn from_buffer_as_peer<T>(buf: &FrameVsockBuffer<T>) -> Self {
         Self::from_header_as_peer(&buf.header)
     }
 }
@@ -711,6 +668,7 @@ pub mod flow_control {
 // ========== Helper functions for creating packets ==========
 
 /// Create a connection request (control packet)
+#[cfg(feature = "backend-api")]
 pub fn create_request(
     src_cid: u64,
     src_port: u32,
@@ -727,6 +685,7 @@ pub fn create_request(
 }
 
 /// Create a connection request with credit info (control packet)
+#[cfg(feature = "backend-api")]
 pub fn create_request_with_credit(
     src_cid: u64,
     src_port: u32,
@@ -743,6 +702,7 @@ pub fn create_request_with_credit(
 }
 
 /// Create a connection response (control packet)
+#[cfg(feature = "backend-api")]
 pub fn create_response(
     src_cid: u64,
     src_port: u32,
@@ -759,6 +719,7 @@ pub fn create_response(
 }
 
 /// Create a connection response with credit info (control packet)
+#[cfg(feature = "backend-api")]
 pub fn create_response_with_credit(
     src_cid: u64,
     src_port: u32,
@@ -775,6 +736,7 @@ pub fn create_response_with_credit(
 }
 
 /// Create a reset packet (control packet)
+#[cfg(feature = "backend-api")]
 pub fn create_rst(src_cid: u64, src_port: u32, dst_cid: u64, dst_port: u32) -> RRef<ControlPacket> {
     RRef::new(ControlPacket::with_header(
         src_cid,
@@ -786,6 +748,7 @@ pub fn create_rst(src_cid: u64, src_port: u32, dst_cid: u64, dst_port: u32) -> R
 }
 
 /// Create a shutdown packet (control packet with flags)
+#[cfg(feature = "backend-api")]
 pub fn create_shutdown(
     src_cid: u64,
     src_port: u32,
@@ -800,6 +763,7 @@ pub fn create_shutdown(
 }
 
 /// Create a credit update packet (control packet with credit info)
+#[cfg(feature = "backend-api")]
 pub fn create_credit_update(
     src_cid: u64,
     src_port: u32,
@@ -816,6 +780,7 @@ pub fn create_credit_update(
 }
 
 /// Create a credit request packet (control packet)
+#[cfg(feature = "backend-api")]
 pub fn create_credit_request(
     src_cid: u64,
     src_port: u32,
@@ -832,6 +797,7 @@ pub fn create_credit_request(
 }
 
 /// Create a data packet with payload
+#[cfg(feature = "backend-api")]
 pub fn create_data_packet(
     src_cid: u64,
     src_port: u32,
@@ -845,6 +811,7 @@ pub fn create_data_packet(
 }
 
 /// Create a data packet with credit info
+#[cfg(feature = "backend-api")]
 pub fn create_data_packet_with_credit(
     src_cid: u64,
     src_port: u32,

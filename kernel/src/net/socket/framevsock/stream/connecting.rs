@@ -52,9 +52,9 @@ impl Connecting {
 
     fn check_io_events(&self) -> IoEvents {
         if self.is_connected.load(Ordering::Acquire) {
-            IoEvents::IN
+            IoEvents::OUT
         } else if self.is_failed.load(Ordering::Acquire) {
-            IoEvents::IN | IoEvents::ERR | IoEvents::HUP
+            IoEvents::OUT | IoEvents::ERR | IoEvents::HUP
         } else {
             IoEvents::empty()
         }
@@ -63,7 +63,7 @@ impl Connecting {
     pub fn set_failed(&self) {
         self.is_failed.store(true, Ordering::Release);
         self.pollee
-            .notify(IoEvents::IN | IoEvents::ERR | IoEvents::HUP);
+            .notify(IoEvents::OUT | IoEvents::ERR | IoEvents::HUP);
     }
 
     pub fn preserve_local_port(&self) {
@@ -82,7 +82,7 @@ impl Connecting {
         // Use Release ordering to ensure the above stores are visible
         // before is_connected is observed as true
         self.is_connected.store(true, Ordering::Release);
-        self.pollee.notify(IoEvents::IN);
+        self.pollee.notify(IoEvents::OUT);
     }
 
     /// Check if connection is established
@@ -91,6 +91,16 @@ impl Connecting {
     /// that were stored before is_connected was set to true.
     pub fn is_connected(&self) -> bool {
         self.is_connected.load(Ordering::Acquire)
+    }
+
+    /// Checks if the connection attempt has failed.
+    pub fn is_failed(&self) -> bool {
+        self.is_failed.load(Ordering::Acquire)
+    }
+
+    /// Checks if the connection attempt has completed.
+    pub fn has_result(&self) -> bool {
+        self.is_connected() || self.is_failed()
     }
 
     /// Get peer buffer allocation (for initializing Connected socket)

@@ -1,20 +1,28 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! FrameVsock module for communication between FrameVM (Guest) and Kernel (Host).
+//! Host-side AF_VSOCK sockets backed by the FrameVisor packet carrier.
 //!
-//! This module provides initialization and management for FrameVsock, which enables
-//! zero-copy communication between FrameVM and the kernel.
+//! FrameVsock deliberately follows the ordinary virtio-vsock socket layout in
+//! `crate::net::socket::vsock`: address conversion, stream socket states,
+//! listener lookup, connection lookup, shutdown, credit accounting, and polling
+//! stay in the socket/transport layers. The backend is the only carrier-specific
+//! boundary; it moves `RRef` packets through FrameVisor queues and must not grow
+//! Linux socket or syscall semantics.
 //!
 //! # Architecture
-//! - TX (Guest -> Host): Guest calls FrameVisor's submit_packet(), which calls our packet handler
-//! - RX (Host -> Guest): Host calls FrameVisor's deliver_packet() to send to Guest
+//!
+//! - RX from service: FrameVisor delivers service-owned packets to the host
+//!   handler registered by this module.
+//! - TX to service: the socket/transport layer builds protocol packets and hands
+//!   them to the backend for queue delivery.
 //!
 //! # Zero-Copy Design
-//! - Data packets are passed by RRef ownership (zero-copy)
-//! - Control packets are processed inline
-//! - The only copy happens at syscall boundary (user-space ↔ kernel-space)
+//!
+//! - Data packets are passed by `RRef` ownership.
+//! - Control packets use the same backend carrier, but are handled by the
+//!   transport state machine.
+//! - User memory is copied only at the normal socket syscall boundary.
 
-use aster_framevisor::vsock as framevisor_vsock;
 use aster_framevisor_exchangeable::RRef;
 use aster_framevsock::{ControlPacket, DataPacket};
 use spin::Once;
@@ -22,13 +30,15 @@ use spin::Once;
 use crate::prelude::*;
 
 pub mod addr;
-pub mod common;
+mod backend;
 pub mod stream;
+pub(in crate::net::socket::framevsock) mod transport;
 
-use common::FrameVsockSpace;
 pub use stream::socket::FrameVsockStreamSocket;
+use transport::FrameVsockSpace;
 
-pub static FRAME_VSOCK_GLOBAL: Once<Arc<FrameVsockSpace>> = Once::new();
+pub(in crate::net::socket::framevsock) static FRAME_VSOCK_GLOBAL: Once<Arc<FrameVsockSpace>> =
+    Once::new();
 
 /// Data packet handler callback for Guest -> Host data packets
 /// Zero-copy: packet ownership is transferred to the connected socket
@@ -66,9 +76,11 @@ pub(in crate::net) fn init() {
     FRAME_VSOCK_GLOBAL.call_once(|| Arc::new(FrameVsockSpace::new()));
 
     // Register the packet handlers for Guest -> Host packets
-    framevisor_vsock::register_host_data_handler(handle_guest_data_packet);
-    framevisor_vsock::register_host_control_handler(handle_guest_control_packet);
-    framevisor_vsock::register_host_queue_drain_handler(handle_host_queue_drain);
+    backend::register_host_handlers(
+        handle_guest_data_packet,
+        handle_guest_control_packet,
+        handle_host_queue_drain,
+    );
 
     info!("[FrameVsock] FrameVsock subsystem initialized successfully");
 }

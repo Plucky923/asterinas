@@ -120,6 +120,28 @@ impl ProcFileOps for FrameVsockFileOps {
         write_line(
             &mut output,
             format_args!(
+                "Service TX(data): attempts={} success={} err_bad_cid={} err_no_handler={} err_transfer={}",
+                backend_stats.data_submit_attempts,
+                backend_stats.data_submit_success,
+                backend_stats.data_submit_err_bad_cid,
+                backend_stats.data_submit_err_no_handler,
+                backend_stats.data_submit_err_transfer
+            ),
+        );
+        write_line(
+            &mut output,
+            format_args!(
+                "Service TX(ctrl): attempts={} success={} err_bad_cid={} err_no_handler={} err_transfer={}",
+                backend_stats.control_submit_attempts,
+                backend_stats.control_submit_success,
+                backend_stats.control_submit_err_bad_cid,
+                backend_stats.control_submit_err_no_handler,
+                backend_stats.control_submit_err_transfer
+            ),
+        );
+        write_line(
+            &mut output,
+            format_args!(
                 "Backend TX(data): attempts={} success={} err_bad_cid={} err_vm_inactive={} err_vm_missing={} err_queue_missing={} err_queue_full={} irq_full={} irq_policy={}",
                 backend_stats.data_send_attempts,
                 backend_stats.data_send_success,

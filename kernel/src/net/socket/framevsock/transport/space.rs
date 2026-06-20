@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! FrameVsock space management
+//! FrameVsock transport space management.
 //!
 //! # Zero-Copy Design
 //!
@@ -15,40 +15,38 @@
 
 use aster_framevisor_exchangeable::RRef;
 use aster_framevsock::{ConnectionId, ControlPacket, DataPacket, VsockOp};
-use hashbrown::{hash_map::Entry, HashMap};
+use hashbrown::{HashMap, hash_map::Entry};
 use ostd::sync::LocalIrqDisabled;
 
-use super::{
-    addr::FrameVsockAddr,
-    stream::{connected::Connected, connecting::Connecting, listen::Listen},
+use super::{Connected, Listener, PortTable};
+use crate::{
+    net::socket::framevsock::{addr::FrameVsockAddr, backend, stream::connecting::Connecting},
+    prelude::*,
 };
-use crate::prelude::*;
 
 /// Manage all active sockets
-pub struct FrameVsockSpace {
+pub(in crate::net::socket::framevsock) struct FrameVsockSpace {
     // (key, value) = (local_addr, connecting)
     // Using HashMap for O(1) lookup - connecting sockets are looked up during connection setup
     connecting_sockets: SpinLock<HashMap<FrameVsockAddr, Arc<Connecting>>>,
     // (key, value) = (local_addr, listen)
     // Using HashMap for O(1) lookup - listen sockets are looked up when handling connection requests
-    listen_sockets: SpinLock<HashMap<FrameVsockAddr, Arc<Listen>>>,
+    listen_sockets: SpinLock<HashMap<FrameVsockAddr, Arc<Listener>>>,
     // (key, value) = (id(local_addr,peer_addr), connected)
     // Using HashMap for O(1) lookup - connected sockets are looked up for EVERY data packet
     // This is the most critical path for throughput
     connected_sockets: RwLock<HashMap<ConnectionId, Arc<Connected>>, LocalIrqDisabled>,
-    // Per-vCPU index: vcpu_id → set of ConnectionIds mapped to that vCPU.
+    // Per-vCPU index from vCPU ID to the set of ConnectionIds mapped to it.
     // Maintained alongside connected_sockets so notify_tx_queue_drained only
-    // iterates connections on the target vCPU — O(k) instead of O(n).
+    // iterates connections on the target vCPU in O(k) instead of O(n).
     vcpu_connections: SpinLock<Vec<hashbrown::HashSet<ConnectionId>>>,
-    // Used ports - keeping BTreeSet for ordered iteration in alloc_ephemeral_port
-    used_ports: SpinLock<BTreeSet<u32>>,
+    ports: SpinLock<PortTable>,
 }
 
 impl FrameVsockSpace {
     /// Create a new global FrameVsockSpace
-    pub fn new() -> Self {
-        use aster_framevisor::vsock as framevisor_vsock;
-        let vcpu_count = framevisor_vsock::get_vcpu_count().max(1);
+    pub(in crate::net::socket::framevsock) fn new() -> Self {
+        let vcpu_count = backend::vcpu_count();
         let mut vcpu_conns = Vec::with_capacity(vcpu_count);
         for _ in 0..vcpu_count {
             vcpu_conns.push(hashbrown::HashSet::new());
@@ -58,36 +56,27 @@ impl FrameVsockSpace {
             listen_sockets: SpinLock::new(HashMap::new()),
             connected_sockets: RwLock::new(HashMap::new()),
             vcpu_connections: SpinLock::new(vcpu_conns),
-            used_ports: SpinLock::new(BTreeSet::new()),
+            ports: SpinLock::new(PortTable::new()),
         }
     }
 
     /// Alloc an unused port range
-    pub fn alloc_ephemeral_port(&self) -> Result<u32> {
-        let mut used_ports = self.used_ports.disable_irq().lock();
-        for port in 1024..u32::MAX {
-            if !used_ports.contains(&port) {
-                used_ports.insert(port);
-                return Ok(port);
-            }
-        }
-        return_errno_with_message!(Errno::EAGAIN, "cannot find unused high port");
+    pub(in crate::net::socket::framevsock) fn alloc_ephemeral_port(&self) -> Result<u32> {
+        self.ports.disable_irq().lock().alloc_ephemeral_port()
     }
 
     /// Bind a port
-    pub fn bind_port(&self, port: u32) -> bool {
-        let mut used_ports = self.used_ports.disable_irq().lock();
-        used_ports.insert(port)
+    pub(in crate::net::socket::framevsock) fn bind_port(&self, port: u32) -> bool {
+        self.ports.disable_irq().lock().bind_exclusive(port)
     }
 
     /// Recycle a port
-    pub fn recycle_port(&self, port: &u32) -> bool {
-        let mut used_ports = self.used_ports.disable_irq().lock();
-        used_ports.remove(port)
+    pub(in crate::net::socket::framevsock) fn recycle_port(&self, port: &u32) -> bool {
+        self.ports.disable_irq().lock().recycle(*port)
     }
 
     /// Insert a connected socket.
-    pub fn insert_connected_socket(
+    pub(in crate::net::socket::framevsock) fn insert_connected_socket(
         &self,
         id: ConnectionId,
         connected: Arc<Connected>,
@@ -108,7 +97,10 @@ impl FrameVsockSpace {
     }
 
     /// Remove a connected socket
-    pub fn remove_connected_socket(&self, id: &ConnectionId) -> Option<Arc<Connected>> {
+    pub(in crate::net::socket::framevsock) fn remove_connected_socket(
+        &self,
+        id: &ConnectionId,
+    ) -> Option<Arc<Connected>> {
         let mut connected_sockets = self.connected_sockets.write();
         let removed = connected_sockets.remove(id);
 
@@ -125,7 +117,10 @@ impl FrameVsockSpace {
     }
 
     /// Get a connected socket by connection ID
-    pub fn get_connected_socket(&self, id: &ConnectionId) -> Option<Arc<Connected>> {
+    pub(in crate::net::socket::framevsock) fn get_connected_socket(
+        &self,
+        id: &ConnectionId,
+    ) -> Option<Arc<Connected>> {
         self.connected_sockets.read().get(id).cloned()
     }
 
@@ -135,12 +130,16 @@ impl FrameVsockSpace {
     /// When Guest pops from a vCPU queue, any connection mapped to the same
     /// vCPU may become sendable again, even if the popped packet belongs to a
     /// different connection.
-    pub fn notify_tx_queue_drained(&self, vcpu_id: usize, queue_reserved_len_before_pop: usize) {
-        // Notify on every data-pop signal from FrameVisor and rely on per-connection
+    pub(in crate::net::socket::framevsock) fn notify_tx_queue_drained(
+        &self,
+        vcpu_id: usize,
+        queue_reserved_len_before_pop: usize,
+    ) {
+        // Notify on every queue-pop signal from FrameVisor and rely on per-connection
         // blocked-state filtering below. This avoids missing wakeups when queue
         // reservation snapshots race with producers around the full edge.
 
-        // Use per-vCPU index to only iterate connections on this vCPU — O(k)
+        // Use the per-vCPU index to only iterate connections on this vCPU.
         let conn_ids: Vec<ConnectionId> = {
             let vcpu_conns = self.vcpu_connections.disable_irq().lock();
             if vcpu_id < vcpu_conns.len() {
@@ -161,7 +160,7 @@ impl FrameVsockSpace {
     }
 
     /// Insert a connecting socket.
-    pub fn insert_connecting_socket(
+    pub(in crate::net::socket::framevsock) fn insert_connecting_socket(
         &self,
         addr: FrameVsockAddr,
         connecting: Arc<Connecting>,
@@ -175,13 +174,19 @@ impl FrameVsockSpace {
     }
 
     /// Remove a connecting socket
-    pub fn remove_connecting_socket(&self, addr: &FrameVsockAddr) -> Option<Arc<Connecting>> {
+    pub(in crate::net::socket::framevsock) fn remove_connecting_socket(
+        &self,
+        addr: &FrameVsockAddr,
+    ) -> Option<Arc<Connecting>> {
         let mut connecting_sockets = self.connecting_sockets.disable_irq().lock();
         connecting_sockets.remove(addr)
     }
 
     /// Get a connecting socket
-    pub fn get_connecting_socket(&self, addr: &FrameVsockAddr) -> Option<Arc<Connecting>> {
+    pub(in crate::net::socket::framevsock) fn get_connecting_socket(
+        &self,
+        addr: &FrameVsockAddr,
+    ) -> Option<Arc<Connecting>> {
         self.connecting_sockets
             .disable_irq()
             .lock()
@@ -190,7 +195,11 @@ impl FrameVsockSpace {
     }
 
     /// Insert a listening socket.
-    pub fn insert_listen_socket(&self, addr: FrameVsockAddr, listen: Arc<Listen>) -> Result<()> {
+    pub(in crate::net::socket::framevsock) fn insert_listen_socket(
+        &self,
+        addr: FrameVsockAddr,
+        listen: Arc<Listener>,
+    ) -> Result<()> {
         let mut listen_sockets = self.listen_sockets.disable_irq().lock();
         let Entry::Vacant(entry) = listen_sockets.entry(addr) else {
             return_errno_with_message!(Errno::EADDRINUSE, "the FrameVsock listener exists");
@@ -200,13 +209,19 @@ impl FrameVsockSpace {
     }
 
     /// Remove a listening socket
-    pub fn remove_listen_socket(&self, addr: &FrameVsockAddr) -> Option<Arc<Listen>> {
+    pub(in crate::net::socket::framevsock) fn remove_listen_socket(
+        &self,
+        addr: &FrameVsockAddr,
+    ) -> Option<Arc<Listener>> {
         let mut listen_sockets = self.listen_sockets.disable_irq().lock();
         listen_sockets.remove(addr)
     }
 
     /// Get a listening socket
-    pub fn get_listen_socket(&self, addr: &FrameVsockAddr) -> Option<Arc<Listen>> {
+    pub(in crate::net::socket::framevsock) fn get_listen_socket(
+        &self,
+        addr: &FrameVsockAddr,
+    ) -> Option<Arc<Listener>> {
         self.listen_sockets.disable_irq().lock().get(addr).cloned()
     }
 
@@ -214,7 +229,10 @@ impl FrameVsockSpace {
     /// This is called when Guest sends a data packet to Host
     ///
     /// Zero-copy: The packet RRef is passed by ownership to the connected socket
-    pub fn on_data_packet_received(&self, packet: RRef<DataPacket>) -> Result<()> {
+    pub(in crate::net::socket::framevsock) fn on_data_packet_received(
+        &self,
+        packet: RRef<DataPacket>,
+    ) -> Result<()> {
         let src_addr = FrameVsockAddr::new(packet.header.src_cid, packet.header.src_port);
         let dst_addr = FrameVsockAddr::new(packet.header.dst_cid, packet.header.dst_port);
         let conn_id = ConnectionId::from_addrs(dst_addr, src_addr);
@@ -229,7 +247,10 @@ impl FrameVsockSpace {
 
     /// Dispatch incoming control packet to the appropriate socket
     /// This is called when Guest sends a control packet to Host
-    pub fn on_control_packet_received(&self, packet: RRef<ControlPacket>) -> Result<()> {
+    pub(in crate::net::socket::framevsock) fn on_control_packet_received(
+        &self,
+        packet: RRef<ControlPacket>,
+    ) -> Result<()> {
         let src_addr = FrameVsockAddr::new(packet.header.src_cid, packet.header.src_port);
         let dst_addr = FrameVsockAddr::new(packet.header.dst_cid, packet.header.dst_port);
         let conn_id = ConnectionId::from_addrs(dst_addr, src_addr);
@@ -314,7 +335,6 @@ impl FrameVsockSpace {
         local_addr: FrameVsockAddr,
         peer_addr: FrameVsockAddr,
     ) {
-        use aster_framevisor::vsock as framevisor_vsock;
         use aster_framevsock::create_response_with_credit;
 
         let packet = create_response_with_credit(
@@ -326,13 +346,12 @@ impl FrameVsockSpace {
             connected.fwd_cnt(),
         );
 
-        // Deliver to Guest via FrameVisor (use vCPU 0 for now)
-        let _ = framevisor_vsock::deliver_control_packet(0, packet);
+        // Deliver to the peer through the packet backend.
+        let _ = backend::send_control(0, packet);
     }
 
     /// Send a RST packet to Guest
     fn send_rst_to_guest(&self, local_addr: FrameVsockAddr, peer_addr: FrameVsockAddr) {
-        use aster_framevisor::vsock as framevisor_vsock;
         use aster_framevsock::create_rst;
 
         let packet = create_rst(
@@ -342,8 +361,8 @@ impl FrameVsockSpace {
             peer_addr.port,
         );
 
-        // Deliver to Guest via FrameVisor (use vCPU 0 for now)
-        let _ = framevisor_vsock::deliver_control_packet(0, packet);
+        // Deliver to the peer through the packet backend.
+        let _ = backend::send_control(0, packet);
     }
 
     /// Handle connection response
@@ -364,7 +383,13 @@ impl FrameVsockSpace {
     /// Handle shutdown request
     fn handle_shutdown(&self, packet: &ControlPacket, conn_id: ConnectionId) -> Result<()> {
         if let Some(connected) = self.get_connected_socket(&conn_id) {
-            connected.on_shutdown_received(packet.header.flags as u32)?;
+            let should_remove = connected.on_shutdown_received(packet.header.flags as u32)?;
+            if should_remove {
+                self.remove_connected_socket(&conn_id);
+                let src_addr = FrameVsockAddr::new(packet.header.src_cid, packet.header.src_port);
+                let dst_addr = FrameVsockAddr::new(packet.header.dst_cid, packet.header.dst_port);
+                self.send_rst_to_guest(dst_addr, src_addr);
+            }
         }
         Ok(())
     }

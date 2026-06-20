@@ -13,6 +13,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+#[cfg(feature = "ostd-clock")]
 use ostd::arch::{read_tsc, tsc_freq};
 
 #[derive(Debug)]
@@ -124,6 +125,8 @@ impl Drop for TraceGuard {
 
 static TRACE_SAMPLE_RATE: AtomicU32 = AtomicU32::new(1);
 static TRACE_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "ostd-clock"))]
+static FALLBACK_CYCLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Set trace sampling rate.
 /// 0 = disabled, 1 = sample all, N = 1/N sampling.
@@ -136,14 +139,28 @@ pub fn sample_rate() -> u32 {
     TRACE_SAMPLE_RATE.load(Ordering::Relaxed)
 }
 
+#[cfg(feature = "ostd-clock")]
 #[inline]
 pub fn now_cycles() -> u64 {
     read_tsc()
 }
 
+#[cfg(feature = "ostd-clock")]
 #[inline]
 pub fn tsc_freq_hz() -> u64 {
     tsc_freq()
+}
+
+#[cfg(not(feature = "ostd-clock"))]
+#[inline]
+pub fn now_cycles() -> u64 {
+    FALLBACK_CYCLE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(not(feature = "ostd-clock"))]
+#[inline]
+pub fn tsc_freq_hz() -> u64 {
+    0
 }
 
 #[inline]
@@ -225,7 +242,6 @@ pub static RING_PUSH: TracePoint = TracePoint::new("ring.push");
 pub static RING_POP: TracePoint = TracePoint::new("ring.pop");
 pub static RING_POP_CAS: TracePoint = TracePoint::new("ring.pop.cas");
 pub static RING_POP_LOCK: TracePoint = TracePoint::new("ring.pop.lock");
-pub static RING_PUSH_BATCH: TracePoint = TracePoint::new("ring.push_batch");
 pub static RING_POP_BATCH: TracePoint = TracePoint::new("ring.pop_batch");
 
 // Host socket layer
@@ -245,7 +261,7 @@ pub static HOST_SEND_CREDIT_REQUEST: TracePoint =
 pub static HOST_SHUTDOWN: TracePoint = TracePoint::new("host.connected.shutdown");
 pub static HOST_RESET: TracePoint = TracePoint::new("host.connected.reset");
 
-pub static TRACE_POINTS: [&TracePoint; 43] = [
+pub static TRACE_POINTS: [&TracePoint; 42] = [
     &GUEST_SYS_SENDTO,
     &GUEST_SYS_RECVFROM,
     &GUEST_SOCKET_SEND_PACKET,
@@ -274,7 +290,6 @@ pub static TRACE_POINTS: [&TracePoint; 43] = [
     &RING_POP,
     &RING_POP_CAS,
     &RING_POP_LOCK,
-    &RING_PUSH_BATCH,
     &RING_POP_BATCH,
     &HOST_TRY_SEND,
     &HOST_TRY_SEND_LOCK,

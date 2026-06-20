@@ -4,11 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ostd = { workspace = true }
+ostd = { workspace = true, optional = true }
 component = { workspace = true }
-exchangeable = { workspace = true }
+exchangeable = { package = "aster-framevisor-exchangeable", path = "../framevisor/exchangeable", optional = true, default-features = false }
 log = { workspace = true }
 spin = { workspace = true }
+
+[features]
+default = []
+backend-api = ["dep:exchangeable"]
+ostd-clock = ["dep:ostd"]
 
 [lints]
 workspace = true

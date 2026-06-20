@@ -18,9 +18,9 @@ use crate::{
         framevsock::{
             FRAME_VSOCK_GLOBAL,
             addr::{self, FrameVsockAddr},
-            common::FrameVsockSpace,
+            transport::{DEFAULT_CONNECT_TIMEOUT, FrameVsockSpace},
         },
-        options::SocketOption,
+        options::{Error as SocketError, SocketOption, macros::sock_option_mut},
         private::SocketPrivate,
         util::{
             MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr,
@@ -42,10 +42,12 @@ pub struct FrameVsockStreamSocket {
 
 enum Status {
     Init(Arc<Init>),
+    Connecting(ConnectAttempt),
     Listen(Arc<Listen>),
     Connected(Arc<Connected>),
 }
 
+#[derive(Clone)]
 struct ConnectAttempt {
     init: Arc<Init>,
     connecting: Arc<Connecting>,
@@ -86,6 +88,9 @@ impl FrameVsockStreamSocket {
     fn start_connect(&self, remote_addr: FrameVsockAddr) -> Result<ConnectAttempt> {
         let init = match &*self.status.read() {
             Status::Init(init) => init.clone(),
+            Status::Connecting(_) => {
+                return_errno_with_message!(Errno::EALREADY, "the socket is connecting");
+            }
             Status::Listen(_) => {
                 return_errno_with_message!(Errno::EINVAL, "the socket is listening");
             }
@@ -140,14 +145,71 @@ impl FrameVsockStreamSocket {
         }
     }
 
+    fn send_connect_request(
+        &self,
+        attempt: &ConnectAttempt,
+        remote_addr: FrameVsockAddr,
+    ) -> Result<()> {
+        use aster_framevsock::create_request_with_credit;
+
+        use crate::net::socket::framevsock::backend;
+
+        let local_addr = attempt.connecting.local_addr();
+        let request_packet = create_request_with_credit(
+            local_addr.cid,
+            local_addr.port,
+            remote_addr.cid,
+            remote_addr.port,
+            DEFAULT_BUF_ALLOC,
+            0,
+        );
+
+        if backend::send_control(0, request_packet).is_err() {
+            self.fail_connect(attempt);
+            return_errno_with_message!(Errno::EIO, "failed to send connection request");
+        }
+
+        Ok(())
+    }
+
+    fn wait_for_connect(&self, attempt: ConnectAttempt) -> Result<()> {
+        let connecting = attempt.connecting.clone();
+        let mut poller = Poller::new(Some(&DEFAULT_CONNECT_TIMEOUT));
+        if !connecting
+            .poll(IoEvents::OUT, Some(poller.as_handle_mut()))
+            .contains(IoEvents::OUT)
+        {
+            match poller.wait() {
+                Ok(_) => {}
+                Err(e) if e.error() == Errno::ETIME => {
+                    self.fail_connect(&attempt);
+                    self.restore_init_after_failed_connect(&attempt);
+                    return_errno_with_message!(Errno::ETIMEDOUT, "connection timed out");
+                }
+                Err(e) => {
+                    self.fail_connect(&attempt);
+                    self.restore_init_after_failed_connect(&attempt);
+                    return Err(e);
+                }
+            }
+        }
+
+        self.finish_connect(attempt)
+    }
+
+    fn restore_init_after_failed_connect(&self, attempt: &ConnectAttempt) {
+        let mut status = self.status.write();
+        if matches!(&*status, Status::Connecting(current) if Arc::ptr_eq(&current.connecting, &attempt.connecting))
+        {
+            *status = Status::Init(attempt.init.clone());
+        }
+    }
+
     fn finish_connect(&self, attempt: ConnectAttempt) -> Result<()> {
-        let connecting = attempt.connecting;
+        let connecting = attempt.connecting.clone();
         if !connecting.is_connected() {
-            self.fail_connect(&ConnectAttempt {
-                init: attempt.init,
-                connecting,
-                auto_bound: attempt.auto_bound,
-            });
+            self.fail_connect(&attempt);
+            self.restore_init_after_failed_connect(&attempt);
             return_errno_with_message!(Errno::ECONNREFUSED, "connection refused");
         }
 
@@ -168,6 +230,7 @@ impl FrameVsockStreamSocket {
             } else {
                 connecting.preserve_local_port();
             }
+            self.restore_init_after_failed_connect(&attempt);
             return Err(error);
         }
         *self.status.write() = Status::Connected(connected);
@@ -178,15 +241,14 @@ impl FrameVsockStreamSocket {
     fn try_accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
         let listen = match &*self.status.read() {
             Status::Listen(listen) => listen.clone(),
-            Status::Init(_) | Status::Connected(_) => {
+            Status::Init(_) | Status::Connecting(_) | Status::Connected(_) => {
                 return_errno_with_message!(Errno::EINVAL, "the socket is not listening");
             }
         };
 
         let connected = listen.try_accept()?;
 
-        // Return the real peer address (vsock-compatible behavior).
-        let peer_addr = SocketAddr::FrameVsock(connected.peer_addr());
+        let peer_addr = addr::to_socketaddr(connected.peer_addr())?;
 
         let socket = Arc::new(FrameVsockStreamSocket::new_from_connected(connected));
         Ok((socket, peer_addr))
@@ -195,7 +257,7 @@ impl FrameVsockStreamSocket {
     fn send(&self, reader: &mut dyn MultiRead, flags: SendRecvFlags) -> Result<usize> {
         let connected = match &*self.status.read() {
             Status::Connected(connected) => connected.clone(),
-            Status::Init(_) | Status::Listen(_) => {
+            Status::Init(_) | Status::Connecting(_) | Status::Listen(_) => {
                 return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected");
             }
         };
@@ -271,7 +333,7 @@ impl FrameVsockStreamSocket {
     ) -> Result<(usize, SocketAddr)> {
         let connected = match &*self.status.read() {
             Status::Connected(connected) => connected.clone(),
-            Status::Init(_) | Status::Listen(_) => {
+            Status::Init(_) | Status::Connecting(_) | Status::Listen(_) => {
                 return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected");
             }
         };
@@ -289,12 +351,20 @@ impl FrameVsockStreamSocket {
 
         Ok((read_size, peer_addr))
     }
+
+    fn test_and_clear_error(&self) -> Option<Error> {
+        match &*self.status.read() {
+            Status::Connected(connected) => connected.test_and_clear_error(),
+            Status::Init(_) | Status::Connecting(_) | Status::Listen(_) => None,
+        }
+    }
 }
 
 impl Pollable for FrameVsockStreamSocket {
     fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
         match &*self.status.read() {
             Status::Init(init) => init.poll(mask, poller),
+            Status::Connecting(attempt) => attempt.connecting.poll(mask, poller),
             Status::Listen(listen) => listen.poll(mask, poller),
             Status::Connected(connected) => connected.poll(mask, poller),
         }
@@ -325,68 +395,44 @@ impl Socket for FrameVsockStreamSocket {
         let inner = self.status.read();
         match &*inner {
             Status::Init(init) => init.bind(addr),
-            Status::Listen(_) | Status::Connected(_) => {
+            Status::Connecting(_) | Status::Listen(_) | Status::Connected(_) => {
                 return_errno_with_message!(
                     Errno::EINVAL,
-                    "cannot bind a listening or connected socket"
+                    "cannot bind a connecting, listening, or connected socket"
                 )
             }
         }
     }
 
     fn connect(&self, sockaddr: SocketAddr) -> Result<()> {
-        use aster_framevisor::vsock as framevisor_vsock;
-        use aster_framevsock::create_request_with_credit;
-
         let remote_addr = addr::try_from_socketaddr(sockaddr)?;
-        let attempt = self.start_connect(remote_addr)?;
-        let connecting = attempt.connecting.clone();
-        let local_addr = connecting.local_addr();
-
-        // Send connection request to Guest with our credit info
-        let request_packet = create_request_with_credit(
-            local_addr.cid,
-            local_addr.port,
-            remote_addr.cid,
-            remote_addr.port,
-            DEFAULT_BUF_ALLOC,
-            0, // Initial fwd_cnt is 0
-        );
-
-        // Select vCPU 0 for connection request (Guest will handle it)
-        if framevisor_vsock::deliver_control_packet(0, request_packet).is_err() {
-            self.fail_connect(&attempt);
-            return_errno_with_message!(Errno::EIO, "failed to send connection request");
-        }
-
-        // Wait for response from Guest with timeout
-        // Use a short timeout since the virtual IRQ handler runs synchronously
-        const CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
-        let mut poller = Poller::new(Some(&CONNECT_TIMEOUT));
-        if !connecting
-            .poll(IoEvents::IN, Some(poller.as_handle_mut()))
-            .contains(IoEvents::IN)
-        {
-            // Block waiting for response with timeout
-            match poller.wait() {
-                Ok(_) => {}
-                Err(e) if e.error() == Errno::ETIME => {
-                    self.fail_connect(&attempt);
-                    return_errno_with_message!(Errno::ETIMEDOUT, "connection timed out");
-                }
-                Err(e) => {
-                    self.fail_connect(&attempt);
-                    return Err(e);
-                }
+        if let Status::Connecting(attempt) = &*self.status.read() {
+            if attempt.connecting.has_result() {
+                return self.finish_connect(attempt.clone());
             }
+            if self.is_nonblocking() {
+                return_errno_with_message!(Errno::EALREADY, "the socket is connecting");
+            }
+            return self.wait_for_connect(attempt.clone());
         }
 
-        self.finish_connect(attempt)
+        let attempt = self.start_connect(remote_addr)?;
+        self.send_connect_request(&attempt, remote_addr)?;
+
+        if self.is_nonblocking() {
+            *self.status.write() = Status::Connecting(attempt);
+            return_errno_with_message!(Errno::EINPROGRESS, "the socket is connecting");
+        }
+
+        self.wait_for_connect(attempt)
     }
 
     fn listen(&self, backlog: usize) -> Result<()> {
         let init = match &*self.status.read() {
             Status::Init(init) => init.clone(),
+            Status::Connecting(_) => {
+                return_errno_with_message!(Errno::EINVAL, "the socket is connecting");
+            }
             Status::Listen(listen) => {
                 listen.set_backlog(backlog);
                 return Ok(());
@@ -415,13 +461,21 @@ impl Socket for FrameVsockStreamSocket {
     fn shutdown(&self, cmd: SockShutdownCmd) -> Result<()> {
         match &*self.status.read() {
             Status::Connected(connected) => connected.shutdown(cmd),
-            Status::Init(_) | Status::Listen(_) => {
+            Status::Init(_) | Status::Connecting(_) | Status::Listen(_) => {
                 return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected");
             }
         }
     }
 
     fn get_option(&self, option: &mut dyn SocketOption) -> Result<()> {
+        sock_option_mut!(match option {
+            socket_errors @ SocketError => {
+                socket_errors.set(self.test_and_clear_error());
+                return Ok(());
+            }
+            _ => {}
+        });
+
         self.options.read().get_option(option, self)
     }
 
@@ -449,7 +503,7 @@ impl Socket for FrameVsockStreamSocket {
         if addr.is_some() {
             let status = self.status.read();
             match &*status {
-                Status::Init(_) | Status::Listen(_) => {
+                Status::Init(_) | Status::Connecting(_) | Status::Listen(_) => {
                     return_errno_with_message!(
                         Errno::EOPNOTSUPP,
                         "sending to a specific address is not allowed on FrameVsock stream sockets"
@@ -492,16 +546,17 @@ impl Socket for FrameVsockStreamSocket {
         let inner = self.status.read();
         let addr = match &*inner {
             Status::Init(init) => init.bound_addr(),
+            Status::Connecting(attempt) => Some(attempt.connecting.local_addr()),
             Status::Listen(listen) => Some(listen.addr()),
             Status::Connected(connected) => Some(connected.local_addr().into()),
         };
-        Ok(addr.unwrap_or_else(FrameVsockAddr::any).into())
+        addr::to_socketaddr(addr.unwrap_or_else(FrameVsockAddr::any))
     }
 
     fn peer_addr(&self) -> Result<SocketAddr> {
         let inner = self.status.read();
         if let Status::Connected(connected) = &*inner {
-            Ok(Into::<FrameVsockAddr>::into(connected.peer_addr()).into())
+            addr::to_socketaddr(connected.peer_addr())
         } else {
             return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected");
         }
@@ -524,14 +579,14 @@ impl Drop for FrameVsockStreamSocket {
                     vsockspace.recycle_port(&addr.port);
                 }
             }
+            Status::Connecting(_) => {}
             Status::Listen(listen) => {
                 vsockspace.recycle_port(&listen.addr().port);
                 vsockspace.remove_listen_socket(&listen.addr());
             }
             Status::Connected(connected) => {
                 if !connected.is_closed() {
-                    // Send RST to peer to reset the connection
-                    let _ = connected.reset();
+                    let _ = connected.shutdown(SockShutdownCmd::SHUT_RDWR);
                 }
                 vsockspace.remove_connected_socket(&connected.id());
                 if connected.owns_local_port() {

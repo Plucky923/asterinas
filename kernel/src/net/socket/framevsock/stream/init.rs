@@ -45,13 +45,9 @@ impl Init {
 
         // check and assign a port
         if addr.port == VMADDR_PORT_ANY {
-            if let Ok(port) = vsockspace.alloc_ephemeral_port() {
-                new_addr.port = port;
-            } else {
-                return_errno_with_message!(Errno::EAGAIN, "cannot find unused high port");
-            }
+            new_addr.port = vsockspace.alloc_ephemeral_port()?;
         } else if !vsockspace.bind_port(new_addr.port) {
-            return_errno_with_message!(Errno::EADDRNOTAVAIL, "the port in address is occupied");
+            return_errno_with_message!(Errno::EADDRINUSE, "the port in address is occupied");
         }
 
         *self.bound_addr.lock() = Some(new_addr);
@@ -73,7 +69,7 @@ impl Init {
     }
 
     pub fn poll(&self, _mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
-        IoEvents::empty()
+        IoEvents::OUT
     }
 }
 

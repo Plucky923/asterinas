@@ -11,7 +11,12 @@
 //! or used standalone for time tracking and elapsed time measurements.
 
 use alloc::sync::Arc;
-use core::{cmp::max, ops::Add, time::Duration};
+use core::{
+    cmp::max,
+    ops::Add,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use aster_util::coeff::Coeff;
 use ostd::sync::{LocalIrqDisabled, RwLock};
@@ -57,6 +62,7 @@ pub struct ClockSource {
     coeff: Coeff,
     /// A record to an `Instant` and the corresponding cycles of this `ClockSource`.
     last_record: RwLock<(Instant, u64), LocalIrqDisabled>,
+    unreliable_warning_reported: AtomicBool,
 }
 
 impl ClockSource {
@@ -81,6 +87,7 @@ impl ClockSource {
             base,
             coeff,
             last_record: RwLock::new((Instant::zero(), 0)),
+            unreliable_warning_reported: AtomicBool::new(false),
         }
     }
 
@@ -111,12 +118,17 @@ impl ClockSource {
         if cycles <= max_cycles {
             self.coeff * cycles
         } else {
-            ostd::warn!(
-                "The clock source becomes not reliable since an \
-                interval of {} cycles exceeds the maximum delay {}(s)",
-                cycles,
-                max_cycles
-            );
+            if !self
+                .unreliable_warning_reported
+                .swap(true, Ordering::Relaxed)
+            {
+                ostd::warn!(
+                    "The clock source becomes not reliable since an \
+                    interval of {} cycles exceeds the maximum delay {} cycles",
+                    cycles,
+                    max_cycles
+                );
+            }
             self.coeff * max_cycles
         }
     }

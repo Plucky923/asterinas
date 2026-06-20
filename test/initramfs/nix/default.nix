@@ -27,6 +27,9 @@ let
 in rec {
   # Packages needed by initramfs
   busybox = pkgs.busybox;
+  framevm-rootfs-image = pkgs.callPackage ./framevm-rootfs-image.nix {
+    busybox = pkgs.pkgsStatic.busybox;
+  };
   benchmark = pkgs.callPackage ./benchmark { };
   conformance = pkgs.callPackage ./conformance {
     inherit smp;
@@ -44,6 +47,7 @@ in rec {
     dnsServer = dnsServer;
     framevmObjPath = framevmObjPath;
     framevmInstallPath = framevmInstallPath;
+    framevmRootfs = framevm-rootfs-image;
   };
   initramfs-image = pkgs.callPackage ./initramfs-image.nix {
     inherit initramfs;

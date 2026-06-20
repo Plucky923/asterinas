@@ -10,6 +10,7 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use aster_framevisor::FrameTaskGroupId;
 use ostd::{
     cpu::{self, CpuId},
     sync::SpinLock,
@@ -227,8 +228,16 @@ impl FairAttr {
         (old_weight, new_weight)
     }
 
+    pub(super) fn debug_weight(&self) -> u64 {
+        self.fetch_weight().1
+    }
+
     fn vruntime(&self) -> u64 {
         self.vruntime.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn debug_vruntime(&self) -> u64 {
+        self.vruntime()
     }
 
     fn update_vruntime_at_least(&self, vruntime: u64) -> u64 {
@@ -255,13 +264,22 @@ impl FairAttr {
 enum FairEntity {
     Thread(Arc<Task>),
     Group(Arc<TaskGroup>),
+    FrameGroup(Arc<TaskGroup>),
 }
 
 impl FairEntity {
+    fn from_task_group(task_group: Arc<TaskGroup>) -> Self {
+        if task_group.is_frame_entity() {
+            Self::FrameGroup(task_group)
+        } else {
+            Self::Group(task_group)
+        }
+    }
+
     fn fair_attr(&self, cpu: CpuId) -> Option<&FairAttr> {
         match self {
             Self::Thread(task) => Some(&task.as_thread()?.sched_attr().fair),
-            Self::Group(task_group) => task_group.fair_attr(cpu),
+            Self::Group(task_group) | Self::FrameGroup(task_group) => task_group.fair_attr(cpu),
         }
     }
 }
@@ -542,6 +560,11 @@ impl FairClassRq {
         self.update_queued_task_count_upwards(task_group, Self::remove_queued_task);
 
         if leaf_is_empty {
+            if let Some(task_group_id) = task_group.frame_task_group_id() {
+                crate::thread::framevm_task::record_frame_task_group_queued_dequeue_empty(
+                    task_group_id,
+                );
+            }
             let mut current_group = task_group.clone();
             while let Some(parent_group) = current_group.parent() {
                 if !current_group
@@ -599,12 +622,19 @@ impl FairClassRq {
             return true;
         }
 
+        let Some(min_queued_vruntime) = min_queued_vruntime else {
+            return false;
+        };
+        if vruntime <= min_queued_vruntime {
+            return false;
+        }
+
         let queued_entity_count = self.len().saturating_sub(usize::from(was_queued));
         let queued_weight = self
             .total_weight
             .saturating_sub(if was_queued { weight } else { 0 });
         rt.period_delta > self.time_slice(weight, queued_weight, queued_entity_count)
-            || vruntime > self.min_vruntime + self.vtime_slice(queued_entity_count)
+            || vruntime > min_queued_vruntime.saturating_add(self.vtime_slice(queued_entity_count))
     }
 
     /// Enqueues `child_group`'s entity into this runqueue.
@@ -618,8 +648,10 @@ impl FairClassRq {
         }
 
         let was_empty = self.entities.is_empty();
-        group_attr.update_vruntime_at_least(self.min_vruntime);
-        self.enqueue_entity(group_attr, FairEntity::Group(child_group.clone()));
+        if !child_group.is_frame_entity() {
+            group_attr.update_vruntime_at_least(self.min_vruntime);
+        }
+        self.enqueue_entity(group_attr, FairEntity::from_task_group(child_group.clone()));
 
         was_empty
     }
@@ -629,7 +661,283 @@ impl FairClassRq {
         let Some(group_attr) = child_group.fair_attr(self.cpu) else {
             return; // root has no group entity attributes
         };
+        if let Some(task_group_id) = child_group.frame_task_group_id() {
+            crate::thread::framevm_task::record_frame_task_group_parent_entity_dequeue(
+                task_group_id,
+            );
+        }
         self.remove_entity_by_id(group_attr.id);
+    }
+
+    pub(super) fn ensure_group_entity_queued(&mut self, task_group: &Arc<TaskGroup>) {
+        if task_group
+            .fair_queue(self.cpu)
+            .disable_irq()
+            .lock()
+            .is_empty()
+        {
+            let Some(task_group_id) = task_group.frame_task_group_id() else {
+                return;
+            };
+            if self
+                .virtual_current_task_for_frame_group(task_group_id, task_group)
+                .is_none()
+                && !crate::thread::framevm_task::frame_task_group_should_run_iht(task_group_id)
+            {
+                return;
+            }
+        }
+
+        let Some(self_group) = self.task_group() else {
+            return;
+        };
+
+        let mut child_group = task_group.clone();
+        while let Some(parent_group) = child_group.parent() {
+            if Arc::ptr_eq(&parent_group, &self_group) {
+                self.enqueue_group_entity(&child_group);
+                break;
+            }
+
+            parent_group
+                .fair_queue(self.cpu)
+                .disable_irq()
+                .lock()
+                .enqueue_group_entity(&child_group);
+            child_group = parent_group;
+        }
+    }
+
+    pub(super) fn dequeue_group_entity_if_empty(&mut self, task_group: &Arc<TaskGroup>) {
+        if !task_group
+            .fair_queue(self.cpu)
+            .disable_irq()
+            .lock()
+            .is_empty()
+        {
+            return;
+        }
+        if let Some(task_group_id) = task_group.frame_task_group_id() {
+            crate::thread::framevm_task::record_frame_task_group_current_dequeue_empty(
+                task_group_id,
+            );
+            // A FrameTaskGroup is a host-visible vCPU scheduling entity. When
+            // its current backing task parks, a timer tick may already be
+            // pending to run its IHT and choose the next guest task. Keep the
+            // parent entity visible and let the parent pick path remove it if
+            // there is truly no runnable child.
+            self.enqueue_group_entity(task_group);
+            return;
+        }
+
+        let Some(self_group) = self.task_group() else {
+            return;
+        };
+
+        let mut child_group = task_group.clone();
+        while let Some(parent_group) = child_group.parent() {
+            if !child_group
+                .fair_queue(self.cpu)
+                .disable_irq()
+                .lock()
+                .is_empty()
+            {
+                break;
+            }
+
+            if Arc::ptr_eq(&parent_group, &self_group) {
+                self.dequeue_group_entity(&child_group);
+                break;
+            }
+
+            parent_group
+                .fair_queue(self.cpu)
+                .disable_irq()
+                .lock()
+                .dequeue_group_entity(&child_group);
+            child_group = parent_group;
+        }
+    }
+
+    fn refresh_frame_group_entities(&mut self) {
+        let Some(self_group) = self.task_group() else {
+            return;
+        };
+        if self_group.parent().is_some() {
+            return;
+        }
+
+        for task_group in crate::thread::framevm_task::active_frame_scheduler_task_groups() {
+            if !task_group
+                .parent()
+                .is_some_and(|parent| Arc::ptr_eq(&parent, &self_group))
+            {
+                continue;
+            }
+
+            self.enqueue_group_entity(&task_group);
+        }
+    }
+
+    fn pick_frame_group_by_normalized_runtime(&mut self) -> Option<Arc<Task>> {
+        let self_group = self.task_group()?;
+        if self_group.parent().is_some() {
+            return None;
+        }
+
+        let mut candidate_count = 0usize;
+        let mut best = None;
+        for item in &self.entities {
+            let FairEntity::FrameGroup(task_group) = item.entity() else {
+                continue;
+            };
+            if !self.frame_group_has_runnable_candidate(task_group) {
+                continue;
+            }
+            let task_group_id = task_group.frame_task_group_id()?;
+            let normalized_runtime =
+                aster_framevisor::frame_task_group_normalized_runtime_cycles(task_group_id)?;
+            candidate_count += 1;
+
+            let candidate = (normalized_runtime, item.key(), task_group.clone());
+            if best.as_ref().is_none_or(|(best_runtime, best_key, _)| {
+                (normalized_runtime, item.key()) < (*best_runtime, *best_key)
+            }) {
+                best = Some(candidate);
+            }
+        }
+
+        if candidate_count < 2 {
+            return None;
+        }
+
+        let (_, key, task_group) = best?;
+        self.pick_frame_group_entity(key, task_group)
+    }
+
+    fn frame_group_has_runnable_candidate(&self, task_group: &Arc<TaskGroup>) -> bool {
+        if !task_group
+            .fair_queue(self.cpu)
+            .disable_irq()
+            .lock()
+            .is_empty()
+        {
+            return true;
+        }
+
+        let Some(task_group_id) = task_group.frame_task_group_id() else {
+            return false;
+        };
+        crate::thread::framevm_task::frame_task_group_should_run_iht(task_group_id)
+            || self
+                .virtual_current_task_for_frame_group(task_group_id, task_group)
+                .is_some()
+    }
+
+    fn pick_frame_iht_next(&mut self, child_group: &Arc<TaskGroup>) -> Option<Arc<Task>> {
+        let task_group_id = child_group.frame_task_group_id()?;
+        if !crate::thread::framevm_task::frame_task_group_should_run_iht(task_group_id) {
+            return self.pick_next();
+        }
+
+        let Some(key) = self.entities.iter().find_map(|item| match item.entity() {
+            FairEntity::Thread(task)
+                if crate::thread::framevm_task::is_iht_task_for_frame_task_group(
+                    task,
+                    task_group_id,
+                ) =>
+            {
+                Some(item.key())
+            }
+            _ => None,
+        }) else {
+            return self.pick_next();
+        };
+
+        let Some(FairEntity::Thread(task)) = self.remove_entity(key) else {
+            return self.pick_next();
+        };
+        self.remove_queued_task();
+        Some(task)
+    }
+
+    fn pick_frame_group_entity(
+        &mut self,
+        key: (u64, u64),
+        child_group: Arc<TaskGroup>,
+    ) -> Option<Arc<Task>> {
+        let task_group_id = child_group.frame_task_group_id();
+        if let Some(task_group_id) = task_group_id {
+            let group_attr_id = child_group.fair_attr(self.cpu).map(|attr| attr.id);
+            let has_any_peer = self.entities.iter().any(|item| {
+                item.entity()
+                    .fair_attr(self.cpu)
+                    .is_some_and(|attr| Some(attr.id) != group_attr_id)
+            });
+            let has_frame_group_peer = self.entities.iter().any(|item| match item.entity() {
+                FairEntity::FrameGroup(peer_group) => {
+                    peer_group.frame_task_group_id() != Some(task_group_id)
+                }
+                _ => false,
+            });
+            crate::thread::framevm_task::record_frame_task_group_parent_pick(
+                task_group_id,
+                has_any_peer,
+                has_frame_group_peer,
+            );
+        }
+
+        let (task, child_is_empty) = {
+            let mut child_rq = child_group.fair_queue(self.cpu).disable_irq().lock();
+            let task = child_rq.pick_frame_iht_next(&child_group);
+            let child_is_empty = child_rq.is_empty();
+            (task, child_is_empty)
+        };
+
+        let Some(task) = task else {
+            if let Some(task_group_id) = task_group_id {
+                if let Some(task) =
+                    self.virtual_current_task_for_frame_group(task_group_id, &child_group)
+                {
+                    self.enqueue_group_entity(&child_group);
+                    return Some(task);
+                }
+                crate::thread::framevm_task::record_frame_task_group_parent_pick_empty_no_task(
+                    task_group_id,
+                );
+            }
+            self.remove_entity(key);
+            return None;
+        };
+        if let Some(task_group_id) = task_group_id {
+            crate::thread::framevm_task::record_frame_task_group_parent_pick_result(
+                task_group_id,
+                child_is_empty,
+            );
+        }
+
+        self.remove_queued_task();
+        if child_is_empty {
+            if task_group_id.is_some() {
+                self.enqueue_group_entity(&child_group);
+            } else {
+                self.remove_entity(key);
+            }
+        }
+
+        Some(task)
+    }
+
+    fn virtual_current_task_for_frame_group(
+        &self,
+        task_group_id: FrameTaskGroupId,
+        _child_group: &Arc<TaskGroup>,
+    ) -> Option<Arc<Task>> {
+        let task = aster_framevisor::frame_task_group_current_ostd_task(task_group_id)?;
+        if crate::thread::framevm_task::is_iht_task_for_frame_task_group(&task, task_group_id) {
+            return None;
+        }
+        Some(task)
     }
 }
 
@@ -643,6 +951,7 @@ impl SchedClassRq for FairClassRq {
         if let Some(current_tg) = self.task_group()
             && Arc::ptr_eq(&task_group, &current_tg)
         {
+            let was_queued = self.has_entity(fair_attr.id);
             if let Some(lag) = fair_attr.take_migration_lag() {
                 fair_attr.set_vruntime(self.min_vruntime.saturating_add(lag));
             } else {
@@ -653,17 +962,31 @@ impl SchedClassRq for FairClassRq {
                 fair_attr.update_vruntime_at_least(vruntime);
             }
             self.enqueue_entity(fair_attr, FairEntity::Thread(task.clone()));
-            self.add_queued_task();
+            if !was_queued {
+                self.add_queued_task();
+            }
             return;
         }
 
-        let was_empty = {
+        let (was_empty, was_queued) = {
             let mut leaf_rq = task_group.fair_queue(self.cpu).disable_irq().lock();
             let was_empty = leaf_rq.is_empty();
+            let was_queued = leaf_rq.has_entity(fair_attr.id);
             leaf_rq.enqueue(task, flags);
-            was_empty
+            (was_empty, was_queued)
         };
+        if was_queued {
+            if task_group.is_frame_entity() {
+                self.ensure_group_entity_queued(&task_group);
+            }
+            return;
+        }
         self.update_queued_task_count_upwards(&task_group, Self::add_queued_task);
+
+        if !was_empty && task_group.is_frame_entity() {
+            self.ensure_group_entity_queued(&task_group);
+            return;
+        }
 
         if was_empty {
             let Some(self_group) = self.task_group() else {
@@ -699,6 +1022,11 @@ impl SchedClassRq for FairClassRq {
     }
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
+        self.refresh_frame_group_entities();
+        if let Some(task) = self.pick_frame_group_by_normalized_runtime() {
+            return Some(task);
+        }
+
         loop {
             let item = self.entities.iter().next()?.clone();
             let key = item.key();
@@ -729,6 +1057,11 @@ impl SchedClassRq for FairClassRq {
                     }
 
                     return Some(task);
+                }
+                FairEntity::FrameGroup(child_group) => {
+                    if let Some(task) = self.pick_frame_group_entity(key, child_group) {
+                        return Some(task);
+                    }
                 }
             }
         }

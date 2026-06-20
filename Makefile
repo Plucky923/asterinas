@@ -26,10 +26,18 @@ FRAMEVM_OBJ_OUTPUT ?= build/framevm/framevm.o
 FRAMEVM_TARGET ?= x86_64-unknown-none
 FRAMEVM_INITRAMFS_PATH ?= /framevm/framevm.o
 FRAMEVM_INIT_SCRIPT ?= /test/framevm_start.sh
+FRAMEVM_INTERACTIVE_INIT ?= /test/framevm_shell.sh
+FRAMEVM_FOREGROUND_SMOKE_INIT ?= /test/framevm_foreground_smoke.sh
 FRAMEVM_FEATURES ?=
 FRAMEVM_NO_DEFAULT_FEATURES ?= 0
 FRAMEVM_VCPU_COUNT ?= 1
 FRAMEVM_WAIT_LOOPS ?= 60
+FRAMEVM_TASK_GROUP_SHARE ?= 1024
+FRAMEVM_SHARE_TEST_GROUP0_SHARE ?= 1024
+FRAMEVM_SHARE_TEST_GROUP1_SHARE ?= 4096
+FRAMEVM_SHARE_TEST_DURATION_MS ?= 10000
+FRAMEVM_BUSYBOX_SMOKE_INIT ?= /test/framevm_busybox_smoke.sh
+FRAMEVM_TEST_TIMEOUT_SECS ?= 900
 
 # Specify the primary system console (supported: tty0, ttyS0, hvc0).
 # - tty0: The active virtual terminal (VT).
@@ -110,11 +118,11 @@ SHELL := /bin/bash
 CARGO_OSDK := ~/.cargo/bin/cargo-osdk
 
 # Common arguments for `cargo osdk` `build`, `run` and `test` commands.
-CARGO_OSDK_COMMON_ARGS :=
+CARGO_OSDK_COMMON_ARGS =
 # The build arguments also apply to the `cargo osdk run` command.
-CARGO_OSDK_BUILD_ARGS := --kcmd-args="ostd.log_level=$(LOG_LEVEL)"
+CARGO_OSDK_BUILD_ARGS = --kcmd-args="ostd.log_level=$(LOG_LEVEL)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
-CARGO_OSDK_TEST_ARGS :=
+CARGO_OSDK_TEST_ARGS =
 
 ifeq ($(AUTO_TEST), conformance)
 ENABLE_CONFORMANCE_TEST := true
@@ -243,6 +251,8 @@ FRAMEVM_RUSTFLAGS += -C force-unwind-tables=yes
 FRAMEVM_RUSTFLAGS += --check-cfg cfg(ktest)
 FRAMEVM_RUSTFLAGS += -C no-redzone=y
 FRAMEVM_RUSTFLAGS += -C target-feature=+ermsb
+FRAMEVM_RUSTFLAGS += -Zshare-generics=no
+FRAMEVM_BUNDLED_RLIBS := aster_console cpio_decoder no_std_io2 xmas_elf zero
 
 # Pass make variables to all subdirectory makes
 export
@@ -483,14 +493,22 @@ clean:
 	@echo "Uninstalling OSDK"
 	@rm -f $(CARGO_OSDK)
 
-.PHONY: framevm_obj
-framevm_obj:
+.PHONY: framevm_boundary_check
+framevm_boundary_check:
+	@./tools/check_framevm_boundary.sh
+
+.PHONY: framevm_obj __framevm_obj_locked
+framevm_obj: framevm_boundary_check
+	@mkdir -p $(dir $(FRAMEVM_OBJ_OUTPUT))
+	@flock "$(dir $(FRAMEVM_OBJ_OUTPUT))/.framevm_obj.lock" \
+		$(MAKE) --no-print-directory __framevm_obj_locked
+
+__framevm_obj_locked:
 	@if [ "$(TARGET_ARCH)" != "x86_64" ]; then \
 		echo "Error: FrameVM object build currently supports TARGET_ARCH=x86_64 only."; \
 		exit 1; \
 	fi
 	@echo "[make] Building FrameVM object for dynamic loading"
-	@mkdir -p $(dir $(FRAMEVM_OBJ_OUTPUT))
 	@rm -f $(dir $(FRAMEVM_OBJ_OUTPUT))/framevm-*.o
 	@env \
 		'RUSTFLAGS=$(FRAMEVM_RUSTFLAGS)' \
@@ -501,12 +519,64 @@ framevm_obj:
 			-Zbuild-std=core,alloc,compiler_builtins \
 			-Zbuild-std-features=compiler-builtins-mem \
 			-- --emit=obj -o $(FRAMEVM_OBJ_OUTPUT)
-	@obj="$$(ls -t $(dir $(FRAMEVM_OBJ_OUTPUT))/framevm-*.o 2>/dev/null | head -n1)"; \
+	@set -e; \
+	obj="$$(ls -t $(dir $(FRAMEVM_OBJ_OUTPUT))/framevm-*.o 2>/dev/null | head -n1)"; \
 	if [ -z "$$obj" ]; then \
 		echo "Error: FrameVM object not found in $(dir $(FRAMEVM_OBJ_OUTPUT))"; \
 		exit 1; \
 	fi; \
-	cp "$$obj" "$(FRAMEVM_OBJ_OUTPUT)"; \
+	deps_dir="$(dir $(FRAMEVM_OBJ_OUTPUT))/bundled-deps"; \
+	deps_obj="$(dir $(FRAMEVM_OBJ_OUTPUT))/framevm-bundled-deps.o"; \
+	target_dir="$${CARGO_TARGET_DIR:-target}"; \
+	case "$$target_dir" in \
+		/*) ;; \
+		*) target_dir="$$(pwd)/$$target_dir";; \
+	esac; \
+	rm -rf "$$deps_dir" "$$deps_obj"; \
+	mkdir -p "$$deps_dir"; \
+	undef_symbols="$$deps_dir/framevm.undefined"; \
+	nm -u "$$obj" | awk '{print $$2}' | sort -u > "$$undef_symbols"; \
+	for crate in $(FRAMEVM_BUNDLED_RLIBS); do \
+		found_rlib=0; \
+		matched_rlib=0; \
+		only_rlib=""; \
+		for rlib in "$$target_dir/$(FRAMEVM_TARGET)/debug/deps/lib$${crate}-"*.rlib; do \
+			if [ ! -e "$$rlib" ]; then \
+				continue; \
+			fi; \
+			if [ "$$crate" = "aster_console" ] && ! strings "$$rlib" | grep -q 'kernel/comps/framevm-console/src/lib.rs'; then \
+				continue; \
+			fi; \
+			found_rlib=1; \
+			only_rlib="$$rlib"; \
+			defs_file="$$deps_dir/$$(basename "$$rlib" .rlib).defined"; \
+			nm --defined-only "$$rlib" 2>/dev/null | awk '{print $$3}' | sort -u > "$$defs_file"; \
+			if [ "$$matched_rlib" -eq 0 ] && grep -F -x -q -f "$$undef_symbols" "$$defs_file"; then \
+				matched_rlib=1; \
+				extract_dir="$$deps_dir/$$(basename "$$rlib" .rlib)"; \
+				mkdir -p "$$extract_dir"; \
+				(cd "$$extract_dir" && ar x "$$rlib" && rm -f lib.rmeta); \
+			fi; \
+		done; \
+		if [ "$$found_rlib" -eq 0 ]; then \
+			echo "Error: FrameVM dependency rlib not found for $$crate"; \
+			exit 1; \
+		fi; \
+		if [ "$$matched_rlib" -eq 0 ]; then \
+			extract_dir="$$deps_dir/$$(basename "$$only_rlib" .rlib)"; \
+			mkdir -p "$$extract_dir"; \
+			(cd "$$extract_dir" && ar x "$$only_rlib" && rm -f lib.rmeta); \
+		fi; \
+	done; \
+	find "$$deps_dir" -name '*.o' -print0 | xargs -0 ld -r -o "$$deps_obj"; \
+	ld -r -o "$(FRAMEVM_OBJ_OUTPUT)" "$$obj" "$$deps_obj"; \
+	rm -rf "$$deps_dir" "$$deps_obj"; \
+	if nm -u -C "$(FRAMEVM_OBJ_OUTPUT)" | grep -Eq 'aster_console::|cpio_decoder::|xmas_elf::|no_std_io2::|(^|[^[:alnum:]_])zero::'; then \
+		echo "Error: FrameVM object still has unresolved ordinary dependency symbols"; \
+		nm -u -C "$(FRAMEVM_OBJ_OUTPUT)" | grep -E 'aster_console::|cpio_decoder::|xmas_elf::|no_std_io2::|(^|[^[:alnum:]_])zero::'; \
+		exit 1; \
+	fi; \
+	FRAMEVM_CHECK_OBJECT=1 FRAMEVM_OBJ_PATH="$(abspath $(FRAMEVM_OBJ_OUTPUT))" ./tools/check_framevm_boundary.sh; \
 	echo "[make] FrameVM object copied to $(FRAMEVM_OBJ_OUTPUT)"
 
 .PHONY: framevm_initramfs
@@ -517,7 +587,62 @@ framevm_initramfs: check_vdso framevm_obj
 		FRAMEVM_INSTALL_PATH=$(FRAMEVM_INITRAMFS_PATH)
 
 .PHONY: framevm
+framevm: CONSOLE = ttyS0
 framevm: framevm_initramfs $(CARGO_OSDK)
-	@echo "[make] Running Asterinas and starting FrameVM through /proc/framevm"
+	@echo "[make] Running Asterinas with FrameVM artifacts"
+	@echo "[make] Start FrameVM from Asterinas with: echo 1 > /proc/framevm"
+	@cd kernel && STDIO_SERIAL_ONLY=on cargo osdk run $(CARGO_OSDK_BUILD_ARGS) \
+		--init-args="--no-script $(FRAMEVM_INTERACTIVE_INIT)"
+
+.PHONY: framevm_background
+framevm_background: CONSOLE = ttyS0
+framevm_background: framevm_initramfs $(CARGO_OSDK)
+	@echo "[make] Running Asterinas and starting FrameVM through /proc/framevm in background"
 	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) \
-		--init-args="$(FRAMEVM_INIT_SCRIPT) $(FRAMEVM_VCPU_COUNT) $(FRAMEVM_WAIT_LOOPS)"
+		--init-args="$(FRAMEVM_INIT_SCRIPT) $(FRAMEVM_VCPU_COUNT) $(FRAMEVM_WAIT_LOOPS) $(FRAMEVM_TASK_GROUP_SHARE)"
+
+.PHONY: framevm_share_test
+framevm_share_test: CONSOLE = ttyS0
+framevm_share_test: SMP = 1
+framevm_share_test: framevm_initramfs $(CARGO_OSDK)
+	@echo "[make] Running FrameVM CPU share isolation test"
+	@sh tools/run_until_qemu_marker.sh "share_test: passed=1" $(FRAMEVM_TEST_TIMEOUT_SECS) -- \
+		sh -c 'cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --qemu-args="-smp $(SMP)" --init-args="/test/framevm_share_test.sh $(FRAMEVM_SHARE_TEST_GROUP0_SHARE) $(FRAMEVM_SHARE_TEST_GROUP1_SHARE) $(FRAMEVM_SHARE_TEST_DURATION_MS)"'
+	@grep -q "share_test: passed=1" qemu.log kernel/qemu.log 2>/dev/null \
+		|| (echo "FrameVM share test failed" && exit 1)
+
+.PHONY: framevm_foreground_smoke
+framevm_foreground_smoke: CONSOLE = ttyS0
+framevm_foreground_smoke: framevm_initramfs $(CARGO_OSDK)
+	@echo "[make] Running FrameVM foreground /proc control smoke test"
+	@sh tools/run_until_qemu_marker.sh "FrameVM foreground smoke test passed." $(FRAMEVM_TEST_TIMEOUT_SECS) -- \
+		sh -c 'cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --init-args="$(FRAMEVM_FOREGROUND_SMOKE_INIT)"'
+	@grep -q "FrameVM foreground smoke test passed." qemu.log kernel/qemu.log 2>/dev/null \
+		|| (echo "FrameVM foreground smoke test failed" && exit 1)
+
+.PHONY: framevm_busybox_smoke
+framevm_busybox_smoke: CONSOLE = ttyS0
+framevm_busybox_smoke: framevm_initramfs $(CARGO_OSDK)
+	@echo "[make] Running FrameVM BusyBox/rootfs smoke test"
+	@sh tools/run_until_qemu_marker.sh "busybox_smoke: passed=1" $(FRAMEVM_TEST_TIMEOUT_SECS) -- \
+		sh -c 'cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --init-args="$(FRAMEVM_BUSYBOX_SMOKE_INIT)"'
+	@grep -q "busybox_smoke: passed=1" qemu.log kernel/qemu.log 2>/dev/null \
+		|| (echo "FrameVM BusyBox smoke test failed" && exit 1)
+
+.PHONY: framevm_smoke
+framevm_smoke: CONSOLE = ttyS0
+framevm_smoke: SMP = 1
+framevm_smoke: framevm_initramfs $(CARGO_OSDK)
+	@echo "[make] Running complete FrameVM smoke suite"
+	@sh tools/run_until_qemu_marker.sh "FrameVM foreground smoke test passed." $(FRAMEVM_TEST_TIMEOUT_SECS) -- \
+		sh -c 'cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --init-args="$(FRAMEVM_FOREGROUND_SMOKE_INIT)"'
+	@grep -q "FrameVM foreground smoke test passed." qemu.log kernel/qemu.log 2>/dev/null \
+		|| (echo "FrameVM foreground smoke test failed" && exit 1)
+	@sh tools/run_until_qemu_marker.sh "busybox_smoke: passed=1" $(FRAMEVM_TEST_TIMEOUT_SECS) -- \
+		sh -c 'cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --init-args="$(FRAMEVM_BUSYBOX_SMOKE_INIT)"'
+	@grep -q "busybox_smoke: passed=1" qemu.log kernel/qemu.log 2>/dev/null \
+		|| (echo "FrameVM BusyBox smoke test failed" && exit 1)
+	@sh tools/run_until_qemu_marker.sh "share_test: passed=1" $(FRAMEVM_TEST_TIMEOUT_SECS) -- \
+		sh -c 'cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --qemu-args="-smp $(SMP)" --init-args="/test/framevm_share_test.sh $(FRAMEVM_SHARE_TEST_GROUP0_SHARE) $(FRAMEVM_SHARE_TEST_GROUP1_SHARE) $(FRAMEVM_SHARE_TEST_DURATION_MS)"'
+	@grep -q "share_test: passed=1" qemu.log kernel/qemu.log 2>/dev/null \
+		|| (echo "FrameVM share test failed" && exit 1)

@@ -36,13 +36,54 @@ fi
 VIRTIOFS_TAG=${VIRTIOFS_TAG:-"aster-virtiofs"}
 VIRTIOFS_SOCKET=${VIRTIOFS_SOCKET:-"/tmp/vhostqemu/vfs.sock"}
 
-SSH_RAND_PORT=${SSH_PORT:-$(shuf -i 1024-65535 -n 1)}
-NGINX_RAND_PORT=${NGINX_PORT:-$(shuf -i 1024-65535 -n 1)}
-REDIS_RAND_PORT=${REDIS_PORT:-$(shuf -i 1024-65535 -n 1)}
-IPERF_RAND_PORT=${IPERF_PORT:-$(shuf -i 1024-65535 -n 1)}
-LMBENCH_TCP_LAT_RAND_PORT=${LMBENCH_TCP_LAT_PORT:-$(shuf -i 1024-65535 -n 1)}
-LMBENCH_TCP_BW_RAND_PORT=${LMBENCH_TCP_BW_PORT:-$(shuf -i 1024-65535 -n 1)}
-MEMCACHED_RAND_PORT=${MEMCACHED_PORT:-$(shuf -i 1024-65535 -n 1)}
+USED_HOST_PORTS=""
+
+is_host_port_unavailable() {
+    local port=$1
+    case " $USED_HOST_PORTS " in
+        *" $port "*) return 0 ;;
+    esac
+
+    if command -v ss >/dev/null 2>&1 \
+        && ss -ltn "sport = :$port" 2>/dev/null | grep -q ":$port"; then
+        return 0
+    fi
+
+    return 1
+}
+
+alloc_host_port() {
+    local env_name=$1
+    local specified_port=$2
+    local port
+
+    if [ -n "$specified_port" ]; then
+        if is_host_port_unavailable "$specified_port"; then
+            echo "Configured $env_name=$specified_port is duplicated or already in use" 1>&2
+            exit 1
+        fi
+        USED_HOST_PORTS="$USED_HOST_PORTS $specified_port"
+        echo "$specified_port"
+        return
+    fi
+
+    while true; do
+        port=$(shuf -i 1024-65535 -n 1)
+        if ! is_host_port_unavailable "$port"; then
+            USED_HOST_PORTS="$USED_HOST_PORTS $port"
+            echo "$port"
+            return
+        fi
+    done
+}
+
+SSH_RAND_PORT=$(alloc_host_port SSH_PORT "${SSH_PORT:-}")
+NGINX_RAND_PORT=$(alloc_host_port NGINX_PORT "${NGINX_PORT:-}")
+REDIS_RAND_PORT=$(alloc_host_port REDIS_PORT "${REDIS_PORT:-}")
+IPERF_RAND_PORT=$(alloc_host_port IPERF_PORT "${IPERF_PORT:-}")
+LMBENCH_TCP_LAT_RAND_PORT=$(alloc_host_port LMBENCH_TCP_LAT_PORT "${LMBENCH_TCP_LAT_PORT:-}")
+LMBENCH_TCP_BW_RAND_PORT=$(alloc_host_port LMBENCH_TCP_BW_PORT "${LMBENCH_TCP_BW_PORT:-}")
+MEMCACHED_RAND_PORT=$(alloc_host_port MEMCACHED_PORT "${MEMCACHED_PORT:-}")
 
 # Optional QEMU arguments. Opt in them manually if needed.
 # QEMU_OPT_ARG_DUMP_PACKETS="-object filter-dump,id=filter0,netdev=net01,file=virtio-net.pcap"
@@ -62,11 +103,24 @@ else
     NETDEV_ARGS="-nic none"
 fi
 
-if [ "$CONSOLE" = "hvc0" ]; then
-    # Kernel logs are printed to all consoles. Redirect serial output to a file to avoid duplicate logs.
-    CONSOLE_ARGS="-device virtconsole,chardev=mux -serial file:qemu-serial.log"
+if [ "${STDIO_SERIAL_ONLY:-off}" = "on" ]; then
+    STDIO_CHARDEV_ARGS="-chardev stdio,id=serial0,signal=off,logfile=qemu.log"
+    MONITOR_ARGS="-monitor none"
+    if [ "$CONSOLE" = "hvc0" ]; then
+        # Kernel logs are printed to all consoles. Redirect serial output to a file to avoid duplicate logs.
+        CONSOLE_ARGS="-device virtconsole,chardev=serial0 -serial file:qemu-serial.log"
+    else
+        CONSOLE_ARGS="-serial chardev:serial0"
+    fi
 else
-    CONSOLE_ARGS="-serial chardev:mux"
+    STDIO_CHARDEV_ARGS="-chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log"
+    MONITOR_ARGS="-monitor chardev:mux"
+    if [ "$CONSOLE" = "hvc0" ]; then
+        # Kernel logs are printed to all consoles. Redirect serial output to a file to avoid duplicate logs.
+        CONSOLE_ARGS="-device virtconsole,chardev=mux -serial file:qemu-serial.log"
+    else
+        CONSOLE_ARGS="-serial chardev:mux"
+    fi
 fi
 
 if [ "$1" = "riscv" ]; then
@@ -81,8 +135,8 @@ if [ "$1" = "riscv" ]; then
         --no-reboot \
         -nographic \
         -display none \
-        -monitor chardev:mux \
-        -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
+        $MONITOR_ARGS \
+        $STDIO_CHARDEV_ARGS \
         -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
         -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
         -device virtio-blk-device,drive=x1 \
@@ -126,11 +180,11 @@ if [ "$1" = "tdx" ]; then
         -device virtio-keyboard-pci,disable-legacy=on,disable-modern=off \
         $NETDEV_ARGS \
         $QEMU_OPT_ARG_DUMP_PACKETS \
-        -chardev stdio,id=mux,mux=on,logfile=qemu.log \
+        $STDIO_CHARDEV_ARGS \
         -device virtio-serial,romfile= \
         $CONSOLE_ARGS \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-        -monitor chardev:mux \
+        $MONITOR_ARGS \
         -d guest_errors \
     "
     echo $QEMU_ARGS
@@ -144,8 +198,8 @@ COMMON_QEMU_ARGS="\
     --no-reboot \
     -nographic \
     -vnc 0.0.0.0:${VNC_PORT:-42} \
-    -monitor chardev:mux \
-    -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
+    $MONITOR_ARGS \
+    $STDIO_CHARDEV_ARGS \
     $NETDEV_ARGS \
     $QEMU_OPT_ARG_DUMP_PACKETS \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \

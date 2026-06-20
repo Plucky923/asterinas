@@ -90,6 +90,9 @@ struct PerCpuClassRqSet {
     fair: Arc<SpinLock<fair::FairClassRq>>,
     idle: idle::IdleClassRq,
     current: Option<(SchedEntity, CurrentRuntime)>,
+    current_can_compete_on_pick: bool,
+    current_needs_runtime_update_on_pick: bool,
+    current_runtime_updated_since_pick: bool,
 }
 
 /// Stores the runtime information of the current task.
@@ -106,11 +109,11 @@ struct CurrentRuntime {
 }
 
 impl CurrentRuntime {
-    fn new() -> Self {
+    fn new_with_period_delta(period_delta: u64) -> Self {
         CurrentRuntime {
             start: sched_clock(),
             delta: 0,
-            period_delta: 0,
+            period_delta,
         }
     }
 
@@ -242,16 +245,31 @@ impl Scheduler for ClassScheduler {
 
         // Note: call set_if_is_none again to prevent a race condition.
         if still_in_rq && task.cpu().set_if_is_none(cpu).is_err() {
-            return None;
+            let is_current = rq
+                .current
+                .as_ref()
+                .is_some_and(|((current_task, _), _)| Arc::ptr_eq(current_task, &task));
+            if is_current || !thread.task_group().is_frame_entity() {
+                return None;
+            }
         }
 
         // Preempt if the new task has a higher priority.
-        let should_preempt = rq
-            .current
-            .as_ref()
-            .is_none_or(|((_, rq_current_thread), _)| {
-                thread.sched_attr().policy() < rq_current_thread.sched_attr().policy()
-            });
+        let (should_preempt, current_can_compete_on_pick) = rq.current.as_ref().map_or(
+            (true, false),
+            |((rq_current_task, rq_current_thread), _)| {
+                Self::enqueue_preemption_decision(
+                    &task,
+                    &thread,
+                    rq_current_task,
+                    rq_current_thread,
+                )
+            },
+        );
+        if current_can_compete_on_pick {
+            rq.current_can_compete_on_pick = true;
+            rq.current_needs_runtime_update_on_pick = true;
+        }
 
         thread.sched_attr().set_last_cpu(cpu);
         rq.enqueue_entity((task, thread), Some(flags));
@@ -281,6 +299,9 @@ impl ClassScheduler {
                 fair: root_task_group.fair_queue(cpu).clone(),
                 idle: idle::IdleClassRq::new(),
                 current: None,
+                current_can_compete_on_pick: false,
+                current_needs_runtime_update_on_pick: false,
+                current_runtime_updated_since_pick: false,
             })
         };
         ClassScheduler {
@@ -343,18 +364,83 @@ impl ClassScheduler {
             .iter_in((Bound::Excluded(cpu), Bound::Unbounded))
             .chain(cpu_set.iter_in(..=cpu))
     }
+
+    fn enqueue_preemption_decision(
+        new_task: &Arc<Task>,
+        new_thread: &Thread,
+        current_task: &Arc<Task>,
+        current_thread: &Thread,
+    ) -> (bool, bool) {
+        let new_policy = new_thread.sched_attr().policy();
+        let current_policy = current_thread.sched_attr().policy();
+        if new_policy.kind() == SchedPolicyKind::Fair
+            && current_policy.kind() == SchedPolicyKind::Fair
+        {
+            let new_task_group = new_thread.task_group();
+            let current_task_group = current_thread.task_group();
+            if new_task_group.is_frame_entity() || current_task_group.is_frame_entity() {
+                if !Arc::ptr_eq(&new_task_group, &current_task_group) {
+                    return (false, false);
+                }
+
+                let Some(task_group_id) = new_task_group.frame_task_group_id() else {
+                    return (new_policy < current_policy, false);
+                };
+                let new_is_iht = crate::thread::framevm_task::is_iht_task_for_frame_task_group(
+                    new_task,
+                    task_group_id,
+                );
+                let current_is_iht = crate::thread::framevm_task::is_iht_task_for_frame_task_group(
+                    current_task,
+                    task_group_id,
+                );
+                if new_is_iht && !current_is_iht {
+                    return (true, true);
+                }
+
+                return (new_policy < current_policy, false);
+            }
+        }
+
+        (new_policy < current_policy, false)
+    }
 }
 
 impl PerCpuClassRqSet {
+    fn sched_entity_from_task(task: Arc<Task>) -> Option<SchedEntity> {
+        let thread = task.as_thread()?.clone();
+        Some((task, thread))
+    }
+
     fn pick_next_entity(&mut self) -> Option<SchedEntity> {
-        (self.stop.pick_next())
-            .or_else(|| self.real_time.pick_next())
-            .or_else(|| self.fair.lock().pick_next())
-            .or_else(|| self.idle.pick_next())
-            .and_then(|task| {
-                let thread = task.as_thread()?.clone();
-                Some((task, thread))
-            })
+        if let Some(task) = self.stop.pick_next() {
+            return Self::sched_entity_from_task(task);
+        }
+        if let Some(task) = self.real_time.pick_next() {
+            return Self::sched_entity_from_task(task);
+        }
+        if let Some(task) = self.fair.lock().pick_next() {
+            return Self::sched_entity_from_task(task);
+        }
+        self.idle.pick_next().and_then(Self::sched_entity_from_task)
+    }
+
+    fn inherited_period_delta(
+        previous: Option<&(SchedEntity, CurrentRuntime)>,
+        next: &SchedEntity,
+    ) -> u64 {
+        let Some(((_, previous_thread), previous_runtime)) = previous else {
+            return 0;
+        };
+        let previous_task_group = previous_thread.task_group();
+        let next_task_group = next.1.task_group();
+        if previous_task_group.is_frame_entity()
+            && Arc::ptr_eq(&previous_task_group, &next_task_group)
+        {
+            previous_runtime.period_delta
+        } else {
+            0
+        }
     }
 
     fn enqueue_entity(&mut self, (task, thread): SchedEntity, flags: Option<EnqueueFlags>) {
@@ -364,6 +450,47 @@ impl PerCpuClassRqSet {
             SchedPolicyKind::Fair => self.fair.lock().enqueue(task, flags),
             SchedPolicyKind::Idle => self.idle.enqueue(task, flags),
         }
+    }
+
+    fn update_previous_before_competing(&mut self, previous: &mut (SchedEntity, CurrentRuntime)) {
+        let ((_, previous_thread), previous_runtime) = previous;
+        previous_runtime.update();
+
+        match previous_thread.sched_attr().policy_kind() {
+            SchedPolicyKind::Stop => {
+                let _ =
+                    self.stop
+                        .update_current(previous_runtime, previous_thread, UpdateFlags::Tick);
+            }
+            SchedPolicyKind::RealTime => {
+                let _ = self.real_time.update_current(
+                    previous_runtime,
+                    previous_thread,
+                    UpdateFlags::Tick,
+                );
+            }
+            SchedPolicyKind::Fair => {
+                let _ = self.fair.lock().update_current(
+                    previous_runtime,
+                    previous_thread,
+                    UpdateFlags::Tick,
+                );
+            }
+            SchedPolicyKind::Idle => {
+                let _ =
+                    self.idle
+                        .update_current(previous_runtime, previous_thread, UpdateFlags::Tick);
+            }
+        }
+    }
+
+    fn frame_current_can_compete_on_pick(task: &Arc<Task>, thread: &Thread) -> bool {
+        let task_group = thread.task_group();
+        let Some(task_group_id) = task_group.frame_task_group_id() else {
+            return false;
+        };
+
+        !crate::thread::framevm_task::is_iht_task_for_frame_task_group(task, task_group_id)
     }
 
     fn load_stats(&self) -> PerCpuLoadStats {
@@ -383,44 +510,133 @@ impl LocalRunQueue for PerCpuClassRqSet {
     }
 
     fn try_pick_next(&mut self) -> Option<&Arc<Task>> {
-        self.pick_next_entity().and_then(|next| {
-            // We guarantee that a task can appear at once in a `PerCpuClassRqSet`. So, the `next` cannot be the same
-            // as the current task here.
-            if let Some((old, _)) = self.current.replace((next, CurrentRuntime::new())) {
-                self.enqueue_entity(old, None);
+        let requested_current_can_compete = self.current_can_compete_on_pick;
+        let current_needs_runtime_update = self.current_needs_runtime_update_on_pick;
+        let current_runtime_updated_since_pick = self.current_runtime_updated_since_pick;
+        self.current_can_compete_on_pick = false;
+        self.current_needs_runtime_update_on_pick = false;
+        self.current_runtime_updated_since_pick = false;
+
+        let mut previous = self.current.take();
+        let current_can_compete_on_pick = requested_current_can_compete;
+        let previous_frame_task_group_id = previous.as_ref().and_then(|((_, thread), _)| {
+            thread
+                .task_group()
+                .is_frame_entity()
+                .then(|| thread.task_group().frame_task_group_id())
+                .flatten()
+        });
+        if current_needs_runtime_update
+            && !current_runtime_updated_since_pick
+            && let Some(previous) = &mut previous
+        {
+            self.update_previous_before_competing(previous);
+        }
+        if current_can_compete_on_pick && let Some((previous_entity, _)) = &previous {
+            let previous_task_group = previous_entity.1.task_group();
+            if previous_task_group.is_frame_entity() {
+                self.fair
+                    .lock()
+                    .ensure_group_entity_queued(&previous_task_group);
+            } else {
+                self.enqueue_entity(previous_entity.clone(), None);
             }
-            self.current.as_ref().map(|((task, _), _)| task)
-        })
+            if let Some(task_group_id) = previous_frame_task_group_id {
+                crate::thread::framevm_task::record_frame_task_group_current_compete(
+                    task_group_id,
+                    true,
+                );
+            }
+        } else if let Some(task_group_id) = previous_frame_task_group_id {
+            crate::thread::framevm_task::record_frame_task_group_current_compete(
+                task_group_id,
+                false,
+            );
+        }
+
+        let Some(next) = self.pick_next_entity() else {
+            debug_assert!(previous.is_none() || !current_can_compete_on_pick);
+            self.current = previous;
+            return None;
+        };
+        let picked_previous = previous
+            .as_ref()
+            .is_some_and(|((previous_task, _), _)| Arc::ptr_eq(previous_task, &next.0));
+        let period_delta = Self::inherited_period_delta(previous.as_ref(), &next);
+
+        self.current = Some((next, CurrentRuntime::new_with_period_delta(period_delta)));
+        self.current_runtime_updated_since_pick = false;
+        if !current_can_compete_on_pick && let Some((old, _)) = previous {
+            self.enqueue_entity(old, None);
+        }
+
+        if picked_previous {
+            return None;
+        }
+        self.current.as_ref().map(|((task, _), _)| task)
     }
 
     fn update_current(&mut self, flags: UpdateFlags) -> bool {
-        let (should_preempt, mut lookahead) = if let Some(((_, cur), rt)) = &mut self.current {
-            rt.update();
-            let attr = &cur.sched_attr();
+        self.current_can_compete_on_pick = false;
+        self.current_needs_runtime_update_on_pick = false;
+        self.current_runtime_updated_since_pick = false;
 
-            match attr.policy_kind() {
-                SchedPolicyKind::Stop => (self.stop.update_current(rt, cur, flags), 0),
-                SchedPolicyKind::RealTime => (self.real_time.update_current(rt, cur, flags), 1),
-                SchedPolicyKind::Fair => (self.fair.lock().update_current(rt, cur, flags), 2),
-                SchedPolicyKind::Idle => (self.idle.update_current(rt, cur, flags), 3),
-            }
-        } else {
-            (false, 4)
-        };
+        let mut current_can_compete_after_update = false;
+        let mut current_frame_task_group_id = None;
+        let (should_preempt, mut lookahead) =
+            if let Some(((current_task, cur), rt)) = &mut self.current {
+                rt.update();
+                self.current_runtime_updated_since_pick = true;
+                let attr = &cur.sched_attr();
+                let policy_kind = attr.policy_kind();
+                current_frame_task_group_id = cur.task_group().frame_task_group_id();
+                current_can_compete_after_update =
+                    Self::frame_current_can_compete_on_pick(current_task, cur);
+
+                let (should_preempt, lookahead) = match policy_kind {
+                    SchedPolicyKind::Stop => (self.stop.update_current(rt, cur, flags), 0),
+                    SchedPolicyKind::RealTime => (self.real_time.update_current(rt, cur, flags), 1),
+                    SchedPolicyKind::Fair => (self.fair.lock().update_current(rt, cur, flags), 2),
+                    SchedPolicyKind::Idle => (self.idle.update_current(rt, cur, flags), 3),
+                };
+                (should_preempt, lookahead)
+            } else {
+                (false, 4)
+            };
 
         if matches!(flags, UpdateFlags::Wait | UpdateFlags::Exit) {
             lookahead = 4;
         }
 
-        should_preempt
+        let frame_group_needs_iht = current_frame_task_group_id
+            .is_some_and(crate::thread::framevm_task::frame_task_group_should_run_iht);
+        let should_pick_next = should_preempt
+            || frame_group_needs_iht
             || (lookahead >= 1 && !self.stop.is_empty())
             || (lookahead >= 2 && !self.real_time.is_empty())
             || (lookahead >= 3 && !self.fair.lock().is_empty())
-            || (lookahead >= 4 && !self.idle.is_empty())
+            || (lookahead >= 4 && !self.idle.is_empty());
+        self.current_can_compete_on_pick = false;
+        self.current_needs_runtime_update_on_pick = false;
+        if should_pick_next
+            && matches!(flags, UpdateFlags::Tick)
+            && current_can_compete_after_update
+        {
+            self.current_can_compete_on_pick = true;
+        }
+        should_pick_next
     }
 
     fn dequeue_current(&mut self) -> Option<Arc<Task>> {
         self.current.take().map(|((cur_task, _), _)| {
+            if let Some(thread) = cur_task.as_thread() {
+                let task_group = thread.task_group();
+                if task_group.frame_task_group_id().is_some() {
+                    let mut fair = self.fair.lock();
+                    fair.ensure_group_entity_queued(&task_group);
+                    fair.dequeue_group_entity_if_empty(&task_group);
+                }
+            }
             cur_task.schedule_info().cpu.set_to_none();
             cur_task
         })

@@ -26,6 +26,14 @@ mount -t configfs none /sys/kernel/config
 mount -t ext2 /dev/vda /ext2
 mount -t exfat /dev/vdb /exfat
 
+if [ "${1:-}" = "--no-script" ]; then
+    shift
+    if [ "$#" -eq 0 ]; then
+        set -- /bin/sh
+    fi
+    exec "$@"
+fi
+
 # When the init process starts,
 # it does not have a process group, session, or controlling terminal.
 # The `script` tool is a standard Linux utility

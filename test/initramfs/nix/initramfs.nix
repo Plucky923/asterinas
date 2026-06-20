@@ -1,10 +1,15 @@
 { lib, pkgs, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox
 , benchmark, conformance, regression, dnsServer
 , framevmObjPath ? ""
-, framevmInstallPath ? "/framevm/framevm.o" }:
+, framevmInstallPath ? "/framevm/framevm.o"
+, framevmRootfs ? null }:
 let
   boot_hello = builtins.path { path = ./../src/boot_hello.sh; };
   framevm_start = builtins.path { path = ./../src/framevm_start.sh; };
+  framevm_shell = builtins.path { path = ./../src/framevm_shell.sh; };
+  framevm_foreground_smoke = builtins.path { path = ./../src/framevm_foreground_smoke.sh; };
+  framevm_share_test = builtins.path { path = ./../src/framevm_share_test.sh; };
+  framevm_busybox_smoke = builtins.path { path = ./../src/framevm_busybox_smoke.sh; };
   init = builtins.path { path = ./../src/init; };
   etc = lib.fileset.toSource {
     root = ./../etc;
@@ -48,6 +53,14 @@ in stdenvNoCC.mkDerivation {
     cp ${boot_hello} $out/test/boot_hello.sh
     cp ${framevm_start} $out/test/framevm_start.sh
     chmod +x $out/test/framevm_start.sh
+    cp ${framevm_shell} $out/test/framevm_shell.sh
+    chmod +x $out/test/framevm_shell.sh
+    cp ${framevm_foreground_smoke} $out/test/framevm_foreground_smoke.sh
+    chmod +x $out/test/framevm_foreground_smoke.sh
+    cp ${framevm_share_test} $out/test/framevm_share_test.sh
+    chmod +x $out/test/framevm_share_test.sh
+    cp ${framevm_busybox_smoke} $out/test/framevm_busybox_smoke.sh
+    chmod +x $out/test/framevm_busybox_smoke.sh
     cp ${init} $out/init
 
     cp -r ${etc}/* $out/etc/
@@ -79,6 +92,10 @@ in stdenvNoCC.mkDerivation {
 
     ${lib.optionalString (framevmObj != null) ''
       install -Dm644 ${framevmObj} $out${framevmInstallPath}
+    ''}
+
+    ${lib.optionalString (framevmRootfs != null) ''
+      install -Dm644 ${framevmRootfs} $out/framevm/rootfs.cpio.gz
     ''}
 
     # Use `writeClosure` to retrieve all dependencies of the specified packages.

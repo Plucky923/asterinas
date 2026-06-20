@@ -83,6 +83,10 @@ pub(super) fn init_in_first_process() -> Result<()> {
 
         virtio_console.register_callback(Box::leak(Box::new(
             move |mut reader: VmReader<Infallible>| {
+                if !aster_console::input_is_owned_by_default() {
+                    return;
+                }
+
                 let mut chs = vec![0u8; reader.remain()];
                 reader.read(&mut VmWriter::from(chs.as_mut_slice()));
                 let _ = hvc0.push_input(chs.as_slice());

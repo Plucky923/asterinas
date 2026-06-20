@@ -36,6 +36,7 @@ fn pre_schedule_handler(irq_guard: &DisabledLocalIrqGuard) {
         return;
     };
     let Some(thread_local) = task.as_thread_local() else {
+        let _ = aster_framevisor::task::dispatch_pre_schedule(irq_guard);
         return;
     };
 
@@ -51,6 +52,12 @@ fn post_schedule_handler() -> bool {
 
     let task = Task::current().unwrap();
     let Some(thread_local) = task.as_thread_local() else {
+        if let Some(task_group_id) = aster_framevisor::current_frame_task_group_id() {
+            framevm_task::record_frame_task_group_schedule_in_binding(
+                &task.cloned(),
+                task_group_id,
+            );
+        }
         return aster_framevisor::task::dispatch_post_schedule();
     };
 
@@ -63,8 +70,13 @@ fn post_schedule_handler() -> bool {
 }
 
 fn pre_user_run_handler(guard: &DisabledLocalIrqGuard) {
-    let task = Task::current().unwrap();
-    let thread_local = task.as_thread_local().unwrap();
+    let Some(task) = Task::current() else {
+        return;
+    };
+    let Some(thread_local) = task.as_thread_local() else {
+        let _ = aster_framevisor::task::dispatch_pre_user_run(guard);
+        return;
+    };
 
     thread_local.supp_user_context().before_user_exec(guard);
 }

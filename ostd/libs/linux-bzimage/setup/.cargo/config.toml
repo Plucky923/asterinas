@@ -6,6 +6,7 @@ PAYLOAD_FILE = "/dev/null"
 rustflags = [
     "-Ccode-model=kernel",
     "-Crelocation-model=pie",
+    "-Clink-dead-code",
     "-Ctarget-feature=+crt-static",
     "-Zplt=yes",
     "-Zrelax-elf-relocations=yes",

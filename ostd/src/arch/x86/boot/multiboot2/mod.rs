@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::arch::global_asm;
+use core::{arch::global_asm, cell::UnsafeCell, mem::MaybeUninit, ptr, slice};
 
-use multiboot2::{BootInformation, BootInformationHeader, MemoryAreaType};
+use multiboot2::{BootInformation, BootInformationHeader, MemoryAreaType, ModuleTag};
 
 use crate::{
     boot::{
@@ -13,6 +13,50 @@ use crate::{
 };
 
 global_asm!(include_str!("header.S"));
+
+const MAX_FRAMEVM_SYMBOLS_BOOT_PAYLOAD_SIZE: usize = 1024 * 1024;
+
+struct FrameVmSymbolsBootStorage {
+    bytes: UnsafeCell<MaybeUninit<[u8; MAX_FRAMEVM_SYMBOLS_BOOT_PAYLOAD_SIZE]>>,
+}
+
+impl FrameVmSymbolsBootStorage {
+    const fn new() -> Self {
+        Self {
+            bytes: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    fn copy_from(&self, source: &[u8]) -> Option<&'static [u8]> {
+        if source.len() > MAX_FRAMEVM_SYMBOLS_BOOT_PAYLOAD_SIZE {
+            crate::early_println!(
+                "[ostd] FrameVM symbol-table module is too large: len={}, max={}",
+                source.len(),
+                MAX_FRAMEVM_SYMBOLS_BOOT_PAYLOAD_SIZE
+            );
+            return None;
+        }
+
+        // SAFETY: Multiboot2 parsing runs on the boot CPU before concurrent
+        // access to this storage is possible. The destination is OSTD-owned
+        // static storage and does not overlap the bootloader-owned source.
+        let destination = unsafe { (*self.bytes.get()).as_mut_ptr().cast::<u8>() };
+        // SAFETY: The destination has at least MAX_FRAMEVM_SYMBOLS_BOOT_PAYLOAD_SIZE
+        // bytes and the source length was checked above.
+        unsafe {
+            ptr::copy_nonoverlapping(source.as_ptr(), destination, source.len());
+        }
+        // SAFETY: The copied prefix is initialized by copy_nonoverlapping and the
+        // static storage lives for the rest of the kernel lifetime.
+        Some(unsafe { slice::from_raw_parts(destination.cast_const(), source.len()) })
+    }
+}
+
+// SAFETY: The storage is written once during single-threaded boot before it is
+// published through EarlyBootInfo, and is immutable afterwards.
+unsafe impl Sync for FrameVmSymbolsBootStorage {}
+
+static FRAMEVM_SYMBOLS_BOOT_STORAGE: FrameVmSymbolsBootStorage = FrameVmSymbolsBootStorage::new();
 
 fn parse_bootloader_name(mb2_info: &BootInformation) -> Option<&'static str> {
     let name = mb2_info.boot_loader_name_tag()?.name().ok()?;
@@ -38,15 +82,85 @@ unsafe fn make_str_vaddr_static(str: &str) -> &'static str {
 }
 
 fn parse_initramfs(mb2_info: &BootInformation) -> Option<&'static [u8]> {
-    let module_tag = mb2_info.module_tags().next()?;
+    let module_tag = mb2_info
+        .module_tags()
+        .find(|module| {
+            is_initramfs_module(module)
+                && !is_kernel_binary_module(module)
+                && !is_framevm_symbols_module(module)
+        })
+        .or_else(|| {
+            mb2_info.module_tags().find(|module| {
+                !is_kernel_binary_module(module) && !is_framevm_symbols_module(module)
+            })
+        })?;
 
-    let initramfs_ptr = paddr_to_vaddr(module_tag.start_address() as usize);
-    let initramfs_len = module_tag.module_size() as usize;
-    // SAFETY: The initramfs is safe to read because of the contract with the loader.
-    let initramfs =
-        unsafe { core::slice::from_raw_parts(initramfs_ptr as *const u8, initramfs_len) };
+    module_bytes(module_tag)
+}
 
-    Some(initramfs)
+const MODULE_ARG_TYPE_INITRAMFS: &str = "type=initramfs";
+const MODULE_ARG_TYPE_KERNEL_BIN: &str = "type=kernel-bin";
+const MODULE_ARG_TYPE_FRAMEVM_SYMBOL_TABLE: &str = "type=framevm-symbol-table";
+const MODULE_ARG_NAME_PREFIX: &str = "name=";
+
+fn module_contains_arg(module: &ModuleTag, arg: &str) -> bool {
+    module
+        .cmdline()
+        .is_ok_and(|cmd| cmd.split_whitespace().any(|token| token == arg))
+}
+
+fn is_kernel_binary_module(module: &ModuleTag) -> bool {
+    module_contains_arg(module, MODULE_ARG_TYPE_KERNEL_BIN)
+}
+
+fn is_framevm_symbols_module(module: &ModuleTag) -> bool {
+    module_contains_arg(module, MODULE_ARG_TYPE_FRAMEVM_SYMBOL_TABLE)
+        && module_name(module) == Some("framevm.symbols")
+}
+
+fn is_initramfs_module(module: &ModuleTag) -> bool {
+    module_contains_arg(module, MODULE_ARG_TYPE_INITRAMFS)
+}
+
+fn module_name(module: &ModuleTag) -> Option<&str> {
+    module.cmdline().ok().and_then(|cmd| {
+        cmd.split_whitespace()
+            .find_map(|token| token.strip_prefix(MODULE_ARG_NAME_PREFIX))
+    })
+}
+
+fn parse_symbols(mb2_info: &BootInformation) -> Option<&'static [u8]> {
+    let module_tag = mb2_info
+        .module_tags()
+        .find(|module| is_kernel_binary_module(module))?;
+
+    let symbols = module_bytes(module_tag)?;
+    crate::early_println!("[ostd] Kernel symbols module found: len={}", symbols.len());
+    Some(symbols)
+}
+
+fn parse_framevm_symbols_module(mb2_info: &BootInformation) -> Option<&'static [u8]> {
+    let module_tag = mb2_info
+        .module_tags()
+        .find(|module| is_framevm_symbols_module(module))?;
+
+    let symbols = module_bytes(module_tag)?;
+    crate::early_println!(
+        "[ostd] FrameVM symbol-table module found: len={}",
+        symbols.len()
+    );
+    Some(symbols)
+}
+
+fn stabilize_framevm_symbols(symbols: &'static [u8]) -> Option<&'static [u8]> {
+    FRAMEVM_SYMBOLS_BOOT_STORAGE.copy_from(symbols)
+}
+
+fn module_bytes(module_tag: &ModuleTag) -> Option<&'static [u8]> {
+    let module_ptr = paddr_to_vaddr(module_tag.start_address() as usize);
+    let module_len = module_tag.module_size() as usize;
+    // SAFETY: The module bytes are resident and immutable according to the bootloader contract.
+    Some(unsafe { core::slice::from_raw_parts(module_ptr as *const u8, module_len) })
 }
 
 fn parse_acpi_arg(mb2_info: &BootInformation) -> BootloaderAcpiArg {
@@ -96,7 +210,11 @@ impl From<MemoryAreaType> for MemoryRegionType {
     }
 }
 
-fn parse_memory_regions(mb2_info: &BootInformation) -> MemoryRegionArray {
+fn parse_memory_regions(
+    mb2_info: &BootInformation,
+    symbols: Option<&'static [u8]>,
+    framevm_symbols_module: Option<&'static [u8]>,
+) -> MemoryRegionArray {
     let mut regions = MemoryRegionArray::new();
 
     // Add the regions returned by Grub.
@@ -126,6 +244,15 @@ fn parse_memory_regions(mb2_info: &BootInformation) -> MemoryRegionArray {
     // Add the initramfs region.
     if let Some(initramfs) = parse_initramfs(mb2_info) {
         regions.push(MemoryRegion::module(initramfs)).unwrap();
+    }
+
+    if let Some(symbols) = symbols {
+        regions.push(MemoryRegion::module(symbols)).unwrap();
+    }
+    if let Some(framevm_symbols_module) = framevm_symbols_module {
+        regions
+            .push(MemoryRegion::module(framevm_symbols_module))
+            .unwrap();
     }
 
     // Add the AP boot code region that will be copied into by the BSP.
@@ -164,13 +291,32 @@ unsafe extern "sysv64" fn __multiboot2_entry(boot_magic: u32, boot_params: u64) 
 
     use crate::boot::{EARLY_INFO, EarlyBootInfo, start_kernel};
 
+    let module_iter = mb2_info.module_tags();
+    for module_tag in module_iter {
+        let name = module_name(module_tag);
+        crate::early_println!(
+            "[ostd] Multiboot2 Module Found! name={:?}, cmdline='{}', start=0x{:x}, end=0x{:x}",
+            name,
+            module_tag.cmdline().unwrap_or("<invalid utf8>"),
+            module_tag.start_address(),
+            module_tag.end_address(),
+        );
+        crate::early_println!("[ostd] Module {:?}", module_tag);
+    }
+
+    let symbols = parse_symbols(&mb2_info);
+    let framevm_symbols_module = parse_framevm_symbols_module(&mb2_info);
+    let framevm_symbols = framevm_symbols_module.and_then(stabilize_framevm_symbols);
+
     EARLY_INFO.call_once(|| EarlyBootInfo {
         bootloader_name: parse_bootloader_name(&mb2_info).unwrap_or("Unknown Multiboot2 Loader"),
         kernel_cmdline: parse_kernel_commandline(&mb2_info).unwrap_or(""),
         initramfs: parse_initramfs(&mb2_info),
+        symbols,
+        framevm_symbols,
         acpi_arg: parse_acpi_arg(&mb2_info),
         framebuffer_arg: parse_framebuffer_info(&mb2_info),
-        memory_regions: parse_memory_regions(&mb2_info),
+        memory_regions: parse_memory_regions(&mb2_info, symbols, framevm_symbols_module),
     });
 
     // SAFETY: The safety is guaranteed by the safety preconditions and the fact that we call it

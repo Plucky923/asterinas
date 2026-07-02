@@ -99,7 +99,8 @@ fn efi_phase_boot(boot_params: &mut BootParams) {
     uefi::println!("[EFI stub] Decoding the kernel payload");
     let kernel = decode_payload(crate::x86::payload());
     uefi::println!("[EFI stub] Loading the payload as an ELF file");
-    crate::loader::load_elf(&kernel);
+    let total_symbols = crate::loader::load_elf(&kernel);
+    uefi::println!("[EFI stub] Symbols found in ELF file: {}", total_symbols);
 }
 
 fn load_cmdline() -> Option<&'static CStr> {

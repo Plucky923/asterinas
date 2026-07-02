@@ -361,6 +361,11 @@ pub trait LocalRunQueue<T = Task> {
     /// Gets the current runnable task.
     fn current(&self) -> Option<&Arc<T>>;
 
+    /// Returns whether this runqueue has runnable work.
+    fn has_runnable(&self) -> bool {
+        self.current().is_some()
+    }
+
     /// Updates the current runnable task's scheduling statistics and
     /// potentially its position in the runqueue.
     ///
@@ -550,7 +555,7 @@ pub(super) fn exit_current() -> ! {
 pub(super) fn yield_now() {
     reschedule(|local_rq| {
         let should_pick_next = local_rq.update_current(UpdateFlags::Yield);
-        let next_task_opt = should_pick_next.then(|| local_rq.pick_next());
+        let next_task_opt = should_pick_next.then(|| local_rq.try_pick_next()).flatten();
         if let Some(next_task) = next_task_opt {
             ReschedAction::SwitchTo(next_task.clone())
         } else {

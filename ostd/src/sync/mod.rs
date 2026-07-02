@@ -11,6 +11,8 @@ mod rwmutex;
 mod spin;
 mod wait;
 
+pub use ::spin::Once;
+
 pub(crate) use self::rcu::finish_grace_period;
 pub use self::{
     guard::{GuardTransfer, LocalIrqDisabled, PreemptDisabled, SpinGuardian, WriteIrqDisabled},

@@ -82,7 +82,6 @@ impl RawUserContext {
     /// otherwise it will use `iret`.
     pub(in crate::arch) fn run(&mut self) {
         let guard = crate::irq::disable_local();
-
         crate::task::call_pre_user_run_handler(&guard);
 
         // Return to userspace with interrupts disabled. Otherwise, interrupts

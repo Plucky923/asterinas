@@ -1382,6 +1382,7 @@ dependencies = [
  "ostd-pod",
  "ostd-test",
  "riscv",
+ "rustc-demangle",
  "sbi-rt",
  "smallvec",
  "spin",
@@ -1390,6 +1391,7 @@ dependencies = [
  "volatile 0.6.1",
  "x86",
  "x86_64",
+ "xmas-elf",
  "zerocopy",
 ]
 
@@ -1673,6 +1675,12 @@ name = "rle-decode-fast"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
+
+[[package]]
+name = "rustc-demangle"
+version = "0.1.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
 
 [[package]]
 name = "rustc_version"

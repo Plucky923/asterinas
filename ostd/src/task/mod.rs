@@ -7,6 +7,8 @@ mod kernel_stack;
 mod preempt;
 mod processor;
 pub mod scheduler;
+pub mod service_stack;
+pub mod stack;
 mod utils;
 
 use core::{
@@ -15,7 +17,7 @@ use core::{
     cell::{Cell, SyncUnsafeCell},
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use kernel_stack::KernelStack;
@@ -35,7 +37,7 @@ use crate::{
 
 static PRE_SCHEDULE_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 
-static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
+static POST_SCHEDULE_HANDLER: Once<fn() -> bool> = Once::new();
 
 static PRE_USER_RUN_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 
@@ -45,7 +47,7 @@ pub fn inject_pre_schedule_handler(handler: fn(&DisabledLocalIrqGuard)) {
 }
 
 /// Injects a handler to be executed after scheduling.
-pub fn inject_post_schedule_handler(handler: fn()) {
+pub fn inject_post_schedule_handler(handler: fn() -> bool) {
     POST_SCHEDULE_HANDLER.call_once(|| handler);
 }
 
@@ -75,6 +77,7 @@ pub struct Task {
     func: ForceSync<Cell<Option<Box<dyn FnOnce() + Send>>>>,
 
     data: Box<dyn Any + Send + Sync>,
+    extension: Box<dyn Any + Send + Sync>,
     local_data: ForceSync<Box<dyn Any + Send>>,
 
     ctx: SyncUnsafeCell<TaskContext>,
@@ -86,6 +89,7 @@ pub struct Task {
     /// This is to enforce not context switching to an already running task.
     /// See [`processor::switch_to_task`] for more details.
     switched_to_cpu: AtomicBool,
+    completed: AtomicBool,
 
     schedule_info: TaskScheduleInfo,
 }
@@ -103,6 +107,18 @@ impl Task {
 
     pub(super) fn ctx(&self) -> &SyncUnsafeCell<TaskContext> {
         &self.ctx
+    }
+
+    /// Returns the bottom address (low address) of the kernel stack.
+    ///
+    /// This is useful for checking remaining stack space.
+    pub fn stack_bottom(&self) -> usize {
+        self.kstack.bottom_vaddr()
+    }
+
+    /// Returns the top address (high address) of the kernel stack.
+    pub fn stack_top(&self) -> usize {
+        self.kstack.end_vaddr()
     }
 
     /// Yields execution so that another task may be scheduled.
@@ -125,12 +141,19 @@ impl Task {
     /// Re-enqueues a parked task through the scheduler.
     #[track_caller]
     pub fn wake_up(self: &Arc<Self>) {
+        if self.completed.load(Ordering::Acquire) {
+            return;
+        }
         scheduler::unpark_target(self.clone());
     }
 
     /// Returns the task data.
     pub fn data(&self) -> &Box<dyn Any + Send + Sync> {
         &self.data
+    }
+
+    pub fn extension(&self) -> &Box<dyn Any + Send + Sync> {
+        &self.extension
     }
 
     /// Get the attached scheduling information.
@@ -143,6 +166,7 @@ impl Task {
 pub struct TaskOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
     data: Option<Box<dyn Any + Send + Sync>>,
+    extension: Option<Box<dyn Any + Send + Sync>>,
     local_data: Option<Box<dyn Any + Send>>,
 }
 
@@ -155,6 +179,7 @@ impl TaskOptions {
         Self {
             func: Some(Box::new(func)),
             data: None,
+            extension: None,
             local_data: None,
         }
     }
@@ -169,20 +194,44 @@ impl TaskOptions {
     }
 
     /// Sets the data associated with the task.
-    pub fn data<T>(mut self, data: T) -> Self
+    pub fn data<T>(self, data: T) -> Self
     where
         T: Any + Send + Sync,
     {
-        self.data = Some(Box::new(data));
+        self.data_any(Box::new(data))
+    }
+
+    /// Sets the data associated with the task, but with an already-boxed value.
+    pub fn data_any(mut self, data: Box<dyn Any + Send + Sync>) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// Sets the extension data associated with the task.
+    pub fn extension<T>(self, extension: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        self.extension_any(Box::new(extension))
+    }
+
+    /// Sets the extension data associated with the task, but with an already-boxed value.
+    pub fn extension_any(mut self, extension: Box<dyn Any + Send + Sync>) -> Self {
+        self.extension = Some(extension);
         self
     }
 
     /// Sets the local data associated with the task.
-    pub fn local_data<T>(mut self, data: T) -> Self
+    pub fn local_data<T>(self, data: T) -> Self
     where
         T: Any + Send,
     {
-        self.local_data = Some(Box::new(data));
+        self.local_data_any(Box::new(data))
+    }
+
+    /// Sets the local data associated with the task, but with an already-boxed value.
+    pub fn local_data_any(mut self, data: Box<dyn Any + Send>) -> Self {
+        self.local_data = Some(data);
         self
     }
 
@@ -213,6 +262,7 @@ impl TaskOptions {
                 .take()
                 .expect("task function is `None` when trying to run");
             task_func();
+            current_task.completed.store(true, Ordering::Release);
 
             // Manually drop all the on-stack variables to prevent memory leakage!
             // This is needed because `scheduler::exit_current()` will never return.
@@ -243,10 +293,12 @@ impl TaskOptions {
         let new_task = Task {
             func: ForceSync::new(Cell::new(self.func)),
             data: self.data.unwrap_or_else(|| Box::new(())),
+            extension: self.extension.unwrap_or_else(|| Box::new(())),
             local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),
             ctx: SyncUnsafeCell::new(ctx),
             kstack,
             switched_to_cpu: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },

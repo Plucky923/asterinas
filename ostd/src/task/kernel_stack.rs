@@ -37,7 +37,8 @@ const STACK_SIZE_IN_PAGES: u32 =
 /// The default kernel stack size of a task, specified in pages.
 const DEFAULT_STACK_SIZE_IN_PAGES: u32 = 128;
 
-const KERNEL_STACK_SIZE: usize = STACK_SIZE_IN_PAGES as usize * PAGE_SIZE;
+/// The kernel stack size in bytes.
+pub(crate) const KERNEL_STACK_SIZE: usize = STACK_SIZE_IN_PAGES as usize * PAGE_SIZE;
 
 #[derive(Debug)]
 pub(super) struct KernelStack {
@@ -95,5 +96,10 @@ impl KernelStack {
 
     pub(super) fn end_vaddr(&self) -> Vaddr {
         self.end_vaddr
+    }
+
+    /// Returns the bottom address (low address) of the kernel stack.
+    pub(super) fn bottom_vaddr(&self) -> Vaddr {
+        self.end_vaddr - KERNEL_STACK_SIZE
     }
 }

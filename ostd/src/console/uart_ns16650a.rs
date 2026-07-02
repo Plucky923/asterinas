@@ -99,11 +99,16 @@ impl<A: Ns16550aAccess> Ns16550aUart<A> {
     ///
     /// If no byte is available, it will return `None`.
     pub fn recv(&mut self) -> Option<u8> {
-        if !self.line_stat().contains(LineStat::DR) {
+        if !self.has_data() {
             return None;
         }
 
         Some(self.access.read(Ns16550aRegister::DataOrDivisorLo))
+    }
+
+    /// Returns whether a byte is ready to be received.
+    pub fn has_data(&self) -> bool {
+        self.line_stat().contains(LineStat::DR)
     }
 
     fn line_stat(&self) -> LineStat {

@@ -1,0 +1,495 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Completely Fair Scheduler (CFS).
+
+#![warn(unused)]
+
+use alloc::{boxed::Box, sync::Arc};
+use core::{fmt, sync::atomic::Ordering};
+
+use ostd::{
+    arch::read_tsc as sched_clock,
+    cpu::{self, CpuId, CpuSet, PinCurrentCpu, all_cpus},
+    irq::disable_local,
+    sync::{LocalIrqDisabled, SpinLock},
+    task::{
+        AtomicCpuId, Task,
+        scheduler::{
+            EnqueueFlags, LocalRunQueue, Scheduler, UpdateFlags, enable_preemption_on_cpu,
+            info::CommonSchedInfo, inject_scheduler,
+        },
+    },
+    util::id_set::Id,
+};
+
+use super::{
+    nice::Nice,
+    stats::{SchedulerStats, set_stats_from_scheduler},
+};
+use crate::thread::{AsThread, Thread};
+
+mod policy;
+mod task_group;
+mod time;
+
+pub(crate) mod fair;
+mod idle;
+mod real_time;
+mod stop;
+
+pub(crate) use self::{
+    fair::DEFAULT_CGROUP_WEIGHT,
+    task_group::{TaskGroup, root_task_group},
+};
+pub use self::{
+    policy::{LinuxSchedPolicy, SchedPolicy},
+    real_time::{RealTimePolicy, RealTimePriority},
+};
+use self::{
+    policy::{SchedPolicyKind, SchedPolicyState},
+    task_group::init_root_task_group,
+};
+
+type SchedEntity = (Arc<Task>, Arc<Thread>);
+
+fn local_runqueue_cpu() -> CpuId {
+    cpu::current_cpu()
+}
+
+pub fn init() {
+    let scheduler = Box::leak(Box::new(ClassScheduler::new()));
+
+    // Inject the scheduler into the ostd for actual scheduling work.
+    inject_scheduler(scheduler);
+
+    // Set the scheduler into the system for statistics.
+    // We set this after injecting the scheduler into ostd,
+    // so that the loadavg statistics are updated after the scheduler is used.
+    set_stats_from_scheduler(scheduler);
+}
+
+pub fn init_on_each_cpu() {
+    enable_preemption_on_cpu();
+}
+
+/// Represents the middle layer between scheduling classes and generic scheduler
+/// traits. It consists of all the sets of run queues for CPU cores. Other global
+/// information may also be stored here.
+pub struct ClassScheduler {
+    /// The per-CPU runqueues.
+    ///
+    /// We use the `LocalIrqDisabled` marker for this spinlock to ensure local IRQs are always disabled,
+    /// preventing potential deadlocks due to the fact that
+    /// the runqueues may be accessed in both the task and interrupt context (L1 and L2).
+    rqs: Box<[SpinLock<PerCpuClassRqSet, LocalIrqDisabled>]>,
+    last_chosen_cpu: AtomicCpuId,
+}
+
+/// Represents the run queue for each CPU core. It stores a list of run queues for
+/// scheduling classes in its corresponding CPU core. The current task of this CPU
+/// core is also stored in this structure.
+struct PerCpuClassRqSet {
+    stop: stop::StopClassRq,
+    real_time: real_time::RealTimeClassRq,
+    fair: Arc<SpinLock<fair::FairClassRq>>,
+    idle: idle::IdleClassRq,
+    current: Option<(SchedEntity, CurrentRuntime)>,
+}
+
+/// Stores the runtime information of the current task.
+///
+/// This is used to calculate the time slice of the current task.
+///
+/// This struct is independent of the current `Arc<Task>` instead encapsulating the
+/// task, because the scheduling class implementations use `CurrentRuntime` and
+/// `SchedAttr` only.
+struct CurrentRuntime {
+    start: u64,
+    delta: u64,
+    period_delta: u64,
+}
+
+impl CurrentRuntime {
+    fn new() -> Self {
+        CurrentRuntime {
+            start: sched_clock(),
+            delta: 0,
+            period_delta: 0,
+        }
+    }
+
+    fn update(&mut self) {
+        let now = sched_clock();
+        self.delta = now - core::mem::replace(&mut self.start, now);
+        self.period_delta += self.delta;
+    }
+}
+
+/// The run queue for scheduling classes (the main trait). Scheduling classes
+/// should implement this trait to function as expected.
+trait SchedClassRq: Send + fmt::Debug {
+    /// Enqueues a task into the run queue.
+    fn enqueue(&mut self, task: Arc<Task>, flags: Option<EnqueueFlags>);
+
+    /// Returns the number of threads in the run queue.
+    fn len(&self) -> usize;
+
+    /// Checks if the run queue is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Picks the next task for running.
+    fn pick_next(&mut self) -> Option<Arc<Task>>;
+
+    /// Update the information of the current task.
+    ///
+    /// The return value of this method indicates whether there is another task
+    /// **in this run queue** to replace the current one.
+    fn update_current(&mut self, rt: &CurrentRuntime, thread: &Thread, flags: UpdateFlags) -> bool;
+}
+
+/// The scheduling attribute for a thread.
+///
+/// This is used to store the scheduling policy and runtime parameters for each
+/// scheduling class.
+#[derive(Debug)]
+pub struct SchedAttr {
+    policy: SchedPolicyState,
+    last_cpu: AtomicCpuId,
+    real_time: real_time::RealTimeAttr,
+    fair: fair::FairAttr,
+}
+
+impl SchedAttr {
+    /// Constructs a new `SchedAttr` with the given scheduling policy.
+    pub fn new(policy: SchedPolicy) -> Self {
+        Self {
+            policy: SchedPolicyState::new(policy),
+            last_cpu: AtomicCpuId::default(),
+            real_time: {
+                let (prio, policy) = match policy {
+                    SchedPolicy::RealTime { rt_prio, rt_policy } => (rt_prio.get(), rt_policy),
+                    _ => (RealTimePriority::MAX.get(), Default::default()),
+                };
+                real_time::RealTimeAttr::new(prio, policy)
+            },
+            fair: fair::FairAttr::new(match policy {
+                SchedPolicy::Fair(nice) => nice,
+                _ => Nice::default(),
+            }),
+        }
+    }
+
+    /// Retrieves the current scheduling policy of the thread.
+    pub fn policy(&self) -> SchedPolicy {
+        self.policy.get()
+    }
+
+    fn policy_kind(&self) -> SchedPolicyKind {
+        self.policy.kind()
+    }
+
+    /// Updates the scheduling policy of the thread.
+    ///
+    /// Specifically for real-time policies, if the new policy doesn't
+    /// specify a base slice factor for RR, the old one will be kept.
+    pub fn set_policy(&self, policy: SchedPolicy) {
+        self.policy.set(policy, |policy| match policy {
+            SchedPolicy::RealTime { rt_prio, rt_policy } => {
+                self.real_time.update(rt_prio.get(), rt_policy);
+            }
+            SchedPolicy::Fair(nice) => self.fair.update(nice),
+            _ => {}
+        });
+    }
+
+    pub fn update_policy<T>(&self, f: impl FnOnce(&mut SchedPolicy) -> T) -> T {
+        self.policy.update(|policy| {
+            let ret = f(policy);
+            match *policy {
+                SchedPolicy::RealTime { rt_prio, rt_policy } => {
+                    self.real_time.update(rt_prio.get(), rt_policy);
+                }
+                SchedPolicy::Fair(nice) => self.fair.update(nice),
+                _ => {}
+            }
+            ret
+        })
+    }
+
+    pub fn last_cpu(&self) -> Option<CpuId> {
+        self.last_cpu.get()
+    }
+
+    fn set_last_cpu(&self, cpu_id: CpuId) {
+        self.last_cpu.set_anyway(cpu_id);
+    }
+}
+
+impl Scheduler for ClassScheduler {
+    fn enqueue(&self, task: Arc<Task>, flags: EnqueueFlags) -> Option<CpuId> {
+        let thread = task.as_thread()?.clone();
+
+        let (still_in_rq, cpu) = {
+            let selected_cpu_id = self.select_cpu(&thread, flags);
+
+            if let Err(task_cpu_id) = task.cpu().set_if_is_none(selected_cpu_id) {
+                if flags == EnqueueFlags::Spawn {
+                    (false, task_cpu_id)
+                } else {
+                    (true, task_cpu_id)
+                }
+            } else {
+                (false, selected_cpu_id)
+            }
+        };
+
+        let mut rq = self.rqs[cpu.as_usize()].lock();
+
+        // Note: call set_if_is_none again to prevent a race condition.
+        if still_in_rq && task.cpu().set_if_is_none(cpu).is_err() {
+            return None;
+        }
+
+        // Preempt if the new task has a higher priority.
+        let should_preempt = rq
+            .current
+            .as_ref()
+            .is_none_or(|((_, rq_current_thread), _)| {
+                thread.sched_attr().policy() < rq_current_thread.sched_attr().policy()
+            });
+
+        thread.sched_attr().set_last_cpu(cpu);
+        rq.enqueue_entity((task, thread), Some(flags));
+
+        should_preempt.then_some(cpu)
+    }
+
+    fn mut_local_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue)) {
+        let mut lock = self.rqs[local_runqueue_cpu().as_usize()].lock();
+        f(&mut *lock)
+    }
+
+    fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
+        f(&*self.rqs[local_runqueue_cpu().as_usize()].lock())
+    }
+
+    fn mut_local_rq_on_cpu_with(&self, cpu_id: CpuId, f: &mut dyn FnMut(&mut dyn LocalRunQueue)) {
+        let mut lock = self.rqs[cpu_id.as_usize()].lock();
+        f(&mut *lock)
+    }
+
+    fn local_rq_on_cpu_with(&self, cpu_id: CpuId, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
+        f(&*self.rqs[cpu_id.as_usize()].lock())
+    }
+}
+
+impl ClassScheduler {
+    pub fn new() -> Self {
+        let root_task_group = init_root_task_group(ostd::cpu::num_cpus());
+        let class_rq = |cpu| {
+            SpinLock::new(PerCpuClassRqSet {
+                stop: stop::StopClassRq::new(),
+                real_time: real_time::RealTimeClassRq::new(cpu),
+                fair: root_task_group.fair_queue(cpu).clone(),
+                idle: idle::IdleClassRq::new(),
+                current: None,
+            })
+        };
+        ClassScheduler {
+            rqs: all_cpus().map(class_rq).collect(),
+            last_chosen_cpu: AtomicCpuId::default(),
+        }
+    }
+
+    // TODO: Implement a better algorithm and replace the current naive implementation.
+    fn select_cpu(&self, thread: &Thread, flags: EnqueueFlags) -> CpuId {
+        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
+        let last_cpu = thread.sched_attr().last_cpu();
+        if let Some(last_cpu) = last_cpu
+            && affinity.contains(last_cpu)
+        {
+            return last_cpu;
+        }
+        debug_assert!(flags == EnqueueFlags::Spawn || last_cpu.is_some());
+
+        let guard = disable_local();
+
+        let mut selected = guard.current_cpu();
+        let mut minimum_load = u32::MAX;
+
+        // Set `selected` as `candidate` if the candidate's load is smaller.
+        let test_candidate = |candidate: CpuId| {
+            let PerCpuLoadStats { queue_len, .. } =
+                self.rqs[candidate.as_usize()].lock().load_stats();
+            let load = queue_len;
+            if load < minimum_load {
+                minimum_load = load;
+                selected = candidate;
+            }
+        };
+
+        match self.last_chosen_cpu.get() {
+            Some(cpu) => {
+                // Perform a round-robin selection starting after the last chosen CPU.
+                //
+                // It still checks every CPU in the affinity set to find the one with the
+                // minimum load, but avoids selecting the same CPU again in case of a tie.
+                Self::cycle_after(cpu, &affinity).for_each(test_candidate)
+            }
+            None => affinity.iter().for_each(test_candidate),
+        }
+
+        self.last_chosen_cpu.set_anyway(selected);
+        selected
+    }
+
+    /// Returns a cycling iterator over the CPUs in the [`CpuSet`], starting *after*
+    /// the given [`CpuId`].
+    ///
+    /// The iteration order is ascending up to the wrapping point, after which it
+    /// continues from the first CPU in the set in ascending order again.
+    ///
+    /// If the given [`CpuId`] is in the set, it will be the last element yielded.
+    fn cycle_after(cpu: CpuId, cpu_set: &CpuSet) -> impl Iterator<Item = CpuId> + '_ {
+        cpu_set
+            .iter()
+            .filter(move |candidate| *candidate > cpu)
+            .chain(cpu_set.iter().filter(move |candidate| *candidate <= cpu))
+    }
+}
+
+impl PerCpuClassRqSet {
+    fn pick_next_entity(&mut self) -> Option<SchedEntity> {
+        (self.stop.pick_next())
+            .or_else(|| self.real_time.pick_next())
+            .or_else(|| self.fair.lock().pick_next())
+            .or_else(|| self.idle.pick_next())
+            .and_then(|task| {
+                let thread = task.as_thread()?.clone();
+                Some((task, thread))
+            })
+    }
+
+    fn has_not_switched_to(entity: &SchedEntity) -> bool {
+        Task::current().is_some_and(|current| !Arc::ptr_eq(&current.cloned(), &entity.0))
+    }
+
+    fn enqueue_entity(&mut self, (task, thread): SchedEntity, flags: Option<EnqueueFlags>) {
+        match thread.sched_attr().policy_kind() {
+            SchedPolicyKind::Stop => self.stop.enqueue(task, flags),
+            SchedPolicyKind::RealTime => self.real_time.enqueue(task, flags),
+            SchedPolicyKind::Fair => self.fair.lock().enqueue(task, flags),
+            SchedPolicyKind::Idle => self.idle.enqueue(task, flags),
+        }
+    }
+
+    fn load_stats(&self) -> PerCpuLoadStats {
+        let fair_queue_len = self.fair.lock().total_queued_task_count();
+        let queue_len = (self.stop.len() + self.real_time.len() + fair_queue_len) as u32;
+        let is_idle = match &self.current {
+            Some(((_, thread), _)) => thread.sched_attr().policy_kind() == SchedPolicyKind::Idle,
+            None => true,
+        };
+        PerCpuLoadStats { queue_len, is_idle }
+    }
+}
+
+impl LocalRunQueue for PerCpuClassRqSet {
+    fn current(&self) -> Option<&Arc<Task>> {
+        self.current.as_ref().map(|((task, _), _)| task)
+    }
+
+    fn has_runnable(&self) -> bool {
+        self.current.is_some()
+            || !self.stop.is_empty()
+            || !self.real_time.is_empty()
+            || !self.fair.lock().is_empty()
+            || !self.idle.is_empty()
+    }
+
+    fn try_pick_next(&mut self) -> Option<&Arc<Task>> {
+        if let Some((current, _)) = &self.current
+            && Self::has_not_switched_to(current)
+        {
+            return self.current.as_ref().map(|((task, _), _)| task);
+        }
+
+        self.pick_next_entity().and_then(|next| {
+            // We guarantee that a task can appear at once in a `PerCpuClassRqSet`. So, the `next` cannot be the same
+            // as the current task here.
+            if let Some((old, _)) = self.current.replace((next, CurrentRuntime::new())) {
+                self.enqueue_entity(old, None);
+            }
+            self.current.as_ref().map(|((task, _), _)| task)
+        })
+    }
+
+    fn update_current(&mut self, flags: UpdateFlags) -> bool {
+        let (should_preempt, mut lookahead) = if let Some(((_, cur), rt)) = &mut self.current {
+            rt.update();
+            let attr = &cur.sched_attr();
+
+            match attr.policy_kind() {
+                SchedPolicyKind::Stop => (self.stop.update_current(rt, cur, flags), 0),
+                SchedPolicyKind::RealTime => (self.real_time.update_current(rt, cur, flags), 1),
+                SchedPolicyKind::Fair => (self.fair.lock().update_current(rt, cur, flags), 2),
+                SchedPolicyKind::Idle => (self.idle.update_current(rt, cur, flags), 3),
+            }
+        } else {
+            (false, 4)
+        };
+
+        if matches!(flags, UpdateFlags::Wait | UpdateFlags::Exit) {
+            lookahead = 4;
+        }
+
+        should_preempt
+            || (lookahead >= 1 && !self.stop.is_empty())
+            || (lookahead >= 2 && !self.real_time.is_empty())
+            || (lookahead >= 3 && !self.fair.lock().is_empty())
+            || (lookahead >= 4 && !self.idle.is_empty())
+    }
+
+    fn dequeue_current(&mut self) -> Option<Arc<Task>> {
+        self.current.take().map(|((cur_task, _), _)| {
+            cur_task.schedule_info().cpu.set_to_none();
+            cur_task
+        })
+    }
+}
+
+/// Holds per-CPU load information.
+struct PerCpuLoadStats {
+    /// The length of the run queue (excluding the idle task).
+    queue_len: u32,
+    /// If the CPU is currently idle.
+    ///
+    /// A CPU is said to be idle when it is running the idle task, or it is not
+    /// running any task at all. The latter case is very unlikely to happen
+    /// (almost a bug if it happens) as the idle task should always be runnable.
+    is_idle: bool,
+}
+
+impl SchedulerStats for ClassScheduler {
+    fn nr_queued_and_running(&self) -> (u32, u32) {
+        let mut queued = 0u32;
+        let mut running = 0u32;
+        for rq in self.rqs.iter() {
+            let rq = rq.lock();
+            let load_stats = rq.load_stats();
+            queued += load_stats.queue_len;
+            if !load_stats.is_idle {
+                running += 1;
+            }
+        }
+        (queued, running)
+    }
+}
+
+impl Default for ClassScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}

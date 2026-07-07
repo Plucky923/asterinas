@@ -18,6 +18,16 @@ Notes:
 - If omitted, Asterinas will try to execute from the following paths in order:
   `/sbin/init`, `/etc/init`, `/bin/init`, `/bin/sh`.
 
+### `/proc/sys/kernel/yama/ptrace_scope`
+
+When the Yama Linux Security Module is enabled,
+Asterinas exposes `/proc/sys/kernel/yama/ptrace_scope`.
+The file reports and updates the active Yama ptrace policy as an integer.
+
+Access:
+- Readable by all users.
+- Writable by the file owner.
+
 ### `console`
 
 Select console devices for kernel messages.

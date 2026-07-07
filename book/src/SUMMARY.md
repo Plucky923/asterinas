@@ -45,6 +45,7 @@
     * [File System Coverage]()
     * [Kernel Parameters](kernel/linux-compatibility/kernel-parameters.md)
 * [VM-based Containers](kernel/vm-based-containers/README.md)
+    * [FrameVM Control Device](kernel/vm-based-containers/framevm.md)
     * [Kata Containers](kernel/vm-based-containers/kata.md)
     * [Confidential Containers (CoCo)](kernel/vm-based-containers/coco.md)
 * [Roadmap](kernel/roadmap.md)

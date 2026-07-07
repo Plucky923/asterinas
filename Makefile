@@ -21,6 +21,13 @@ FEATURES ?=
 NO_DEFAULT_FEATURES ?= 0
 COVERAGE ?= 0
 
+# FrameVM development options.
+FRAMEVM_OBJ_OUTPUT ?= build/framevm/framevm.o
+FRAMEVM_TARGET ?= x86_64-unknown-none
+FRAMEVM_INITRAMFS_PATH ?= /framevm/framevm.o
+FRAMEVM_FEATURES ?=
+FRAMEVM_NO_DEFAULT_FEATURES ?= 0
+
 # Specify the primary system console (supported: tty0, ttyS0, hvc0).
 # - tty0: The active virtual terminal (VT).
 # - ttyS0: The serial (UART) terminal.
@@ -97,14 +104,14 @@ export OSDK_TARGET_ARCH=$(TARGET_ARCH)
 
 SHELL := /bin/bash
 
-CARGO_OSDK := ~/.cargo/bin/cargo-osdk
+CARGO_OSDK := $(HOME)/.cargo/bin/cargo-osdk
 
 # Common arguments for `cargo osdk` `build`, `run` and `test` commands.
-CARGO_OSDK_COMMON_ARGS :=
+CARGO_OSDK_COMMON_ARGS =
 # The build arguments also apply to the `cargo osdk run` command.
-CARGO_OSDK_BUILD_ARGS := --kcmd-args="ostd.log_level=$(LOG_LEVEL)"
+CARGO_OSDK_BUILD_ARGS = --kcmd-args="ostd.log_level=$(LOG_LEVEL)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
-CARGO_OSDK_TEST_ARGS :=
+CARGO_OSDK_TEST_ARGS =
 
 ifeq ($(AUTO_TEST), conformance)
 ENABLE_CONFORMANCE_TEST := true
@@ -214,6 +221,44 @@ endif
 CARGO_OSDK_BUILD_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 CARGO_OSDK_TEST_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 
+FRAMEVM_FEATURE_ARGS :=
+ifneq ($(strip $(FRAMEVM_FEATURES)),)
+FRAMEVM_FEATURE_ARGS += $(addprefix --framevm-features=,$(FRAMEVM_FEATURES))
+endif
+ifeq ($(FRAMEVM_NO_DEFAULT_FEATURES), 1)
+FRAMEVM_FEATURE_ARGS += --framevm-no-default-features
+endif
+
+FRAMEVM_OSDK_ARGS := --framevm-target="$(FRAMEVM_TARGET)"
+FRAMEVM_OSDK_ARGS += --framevm-object-output="$(abspath $(FRAMEVM_OBJ_OUTPUT))"
+FRAMEVM_OSDK_ARGS += --framevm-install-path="$(FRAMEVM_INITRAMFS_PATH)"
+FRAMEVM_OSDK_ARGS += $(FRAMEVM_FEATURE_ARGS)
+
+FRAMEVM_LOAD_INIT ?= /test/framevm/shell.sh
+FRAMEVM_MARKERS ?=
+ifeq ($(AUTO_TEST), load)
+FRAMEVM_LOAD_INIT := /test/framevm/load.sh
+FRAMEVM_MARKERS := FRAMEVM_LOAD_OK
+else ifeq ($(AUTO_TEST), boot)
+FRAMEVM_LOAD_INIT := /test/framevm/boot.sh
+FRAMEVM_MARKERS := FRAMEVM_BOOT_OK
+else ifeq ($(AUTO_TEST), regression)
+FRAMEVM_LOAD_INIT := /test/framevm/regression.sh
+FRAMEVM_MARKERS := FRAMEVM_REGRESSION_OK
+else ifeq ($(AUTO_TEST), device)
+FRAMEVM_LOAD_INIT := /test/framevm/device.sh
+FRAMEVM_MARKERS := FRAMEVM_DEVICE_OK
+else ifeq ($(AUTO_TEST), rootfs)
+FRAMEVM_LOAD_INIT := /test/framevm/rootfs.sh
+FRAMEVM_MARKERS := FRAMEVM_ROOTFS_OK
+else ifeq ($(AUTO_TEST), lifecycle)
+FRAMEVM_LOAD_INIT := /test/framevm/lifecycle.sh
+FRAMEVM_MARKERS := FRAMEVM_LIFECYCLE_OK
+else ifeq ($(AUTO_TEST), all)
+FRAMEVM_LOAD_INIT := /test/framevm/all.sh
+FRAMEVM_MARKERS := FRAMEVM_BOOT_OK FRAMEVM_REGRESSION_OK FRAMEVM_DEVICE_OK FRAMEVM_ROOTFS_OK
+endif
+
 # Pass make variables to all subdirectory makes
 export
 
@@ -231,7 +276,7 @@ install_osdk:
 	@# The `OSDK_LOCAL_DEV` environment variable is used for local development
 	@# without the need to publish the changes of OSDK's self-hosted
 	@# dependencies to `crates.io`.
-	@OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk
+	@OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk --locked
 
 # This will install and update OSDK automatically
 $(CARGO_OSDK): $(OSDK_SRC_FILES)
@@ -259,18 +304,18 @@ check_vdso:
 	fi
 
 .PHONY: initramfs
-initramfs: check_vdso
-	@$(MAKE) --no-print-directory -C test/initramfs
+initramfs: check_vdso $(INITRAMFS_EXTRA_DEPS)
+	@$(MAKE) --no-print-directory -C test/initramfs $(INITRAMFS_EXTRA_ARGS)
 
 # Build the kernel with an initramfs
 .PHONY: kernel
 kernel: initramfs $(CARGO_OSDK)
-	@cd kernel && cargo osdk build $(CARGO_OSDK_BUILD_ARGS)
+	@cd kernel && $(CARGO_OSDK) osdk build $(CARGO_OSDK_BUILD_ARGS)
 
 # Build the kernel with an initramfs and then run it
 .PHONY: run_kernel
 run_kernel: initramfs $(CARGO_OSDK)
-	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS)
+	@cd kernel && $(CARGO_OSDK) osdk run $(CARGO_OSDK_BUILD_ARGS)
 # Check the running status of auto tests from the QEMU log
 ifeq ($(AUTO_TEST), conformance)
 	@tail --lines 100 qemu.log | grep -q "^All conformance tests passed." \
@@ -340,19 +385,19 @@ endif
 
 .PHONY: gdb_server
 gdb_server: initramfs $(CARGO_OSDK)
-	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --gdb-server wait-client,vscode,addr=:$(GDB_TCP_PORT)
+	@cd kernel && $(CARGO_OSDK) osdk run $(CARGO_OSDK_BUILD_ARGS) --gdb-server wait-client,vscode,addr=:$(GDB_TCP_PORT)
 
 .PHONY: gdb_client
 gdb_client: initramfs $(CARGO_OSDK)
-	@cd kernel && cargo osdk debug $(CARGO_OSDK_BUILD_ARGS) --remote :$(GDB_TCP_PORT)
+	@cd kernel && $(CARGO_OSDK) osdk debug $(CARGO_OSDK_BUILD_ARGS) --remote :$(GDB_TCP_PORT)
 
 .PHONY: profile_server
 profile_server: initramfs $(CARGO_OSDK)
-	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --gdb-server addr=:$(GDB_TCP_PORT)
+	@cd kernel && $(CARGO_OSDK) osdk run $(CARGO_OSDK_BUILD_ARGS) --gdb-server addr=:$(GDB_TCP_PORT)
 
 .PHONY: profile_client
 profile_client: initramfs $(CARGO_OSDK)
-	@cd kernel && cargo osdk profile $(CARGO_OSDK_BUILD_ARGS) --remote :$(GDB_TCP_PORT) \
+	@cd kernel && $(CARGO_OSDK) osdk profile $(CARGO_OSDK_BUILD_ARGS) --remote :$(GDB_TCP_PORT) \
 		--samples $(GDB_PROFILE_COUNT) --interval $(GDB_PROFILE_INTERVAL) --format $(GDB_PROFILE_FORMAT)
 
 .PHONY: test
@@ -371,7 +416,7 @@ ktest: initramfs $(CARGO_OSDK)
 	@# cargo-osdk tests default workspace members.
 	@# `linux-bzimage-setup` is left out of `default-members`
 	@# because it is hard to unit test.
-	@cargo osdk test $(CARGO_OSDK_TEST_ARGS)
+	@$(CARGO_OSDK) osdk test $(CARGO_OSDK_TEST_ARGS)
 
 .PHONY: docs
 docs: private DEFAULT_PACKAGE_NAMES = \
@@ -384,7 +429,7 @@ docs: private DOC_NON_DEFAULT_PACKAGE_NAMES = \
     $(filter-out linux-bzimage-setup,$(NON_DEFAULT_PACKAGE_NAMES))
 docs: $(CARGO_OSDK)
 	@if [ -n "$(DEFAULT_NON_KERNEL_PACKAGE_NAMES)" ]; then \
-		RUSTDOCFLAGS="-Dwarnings" cargo osdk doc $(addprefix -p ,$(DEFAULT_NON_KERNEL_PACKAGE_NAMES)) --no-deps; \
+		RUSTDOCFLAGS="-Dwarnings" $(CARGO_OSDK) osdk doc $(addprefix -p ,$(DEFAULT_NON_KERNEL_PACKAGE_NAMES)) --no-deps; \
 	fi
 	@if [ -n "$(DOC_NON_DEFAULT_PACKAGE_NAMES)" ]; then \
 		RUSTDOCFLAGS="-Dwarnings" cargo doc $(addprefix -p ,$(DOC_NON_DEFAULT_PACKAGE_NAMES)) --no-deps; \
@@ -392,9 +437,9 @@ docs: $(CARGO_OSDK)
 	@# The kernel crate is primarily composed of private items.
 	@# Include --document-private-items to fully check internal documentation.
 	@RUSTDOCFLAGS="-Dwarnings --document-private-items -Arustdoc::private_intra_doc_links" \
-		cargo osdk doc -p aster-kernel --no-deps
+		$(CARGO_OSDK) osdk doc -p aster-kernel --no-deps
 	@if [ "$(TARGET_ARCH)" = "x86_64" ]; then \
-		cd ostd/libs/linux-bzimage/setup && RUSTDOCFLAGS="-Dwarnings" cargo osdk doc --no-deps; \
+		cd ostd/libs/linux-bzimage/setup && RUSTDOCFLAGS="-Dwarnings" $(CARGO_OSDK) osdk doc --no-deps; \
 	fi
 
 .PHONY: book
@@ -417,6 +462,9 @@ check: private WORKSPACE_MEMBER_DIRS = \
 check: $(CARGO_OSDK)
 	@# Check formatting issues of the Rust code
 	@./tools/format_all.sh --check
+	@
+	@# Check FrameVM service boundary and facade shape
+	@$(MAKE) --no-print-directory framevm_service_check
 	@
 	@# Check if all workspace members enable workspace lints
 	@for dir in $(WORKSPACE_MEMBER_DIRS); do \
@@ -452,3 +500,39 @@ clean:
 	@$(MAKE) --no-print-directory -C test/initramfs clean
 	@echo "Uninstalling OSDK"
 	@rm -f $(CARGO_OSDK)
+
+.PHONY: framevm_service_check
+framevm_service_check:
+	@cargo run --quiet -p framevm-service-check -- tools/framevm-service-check/config.toml
+
+.PHONY: framevm
+framevm: CONSOLE = ttyS0
+framevm: $(CARGO_OSDK)
+	@cd kernel && $(CARGO_OSDK) osdk framevm build $(CARGO_OSDK_BUILD_ARGS) $(FRAMEVM_OSDK_ARGS)
+
+.PHONY: run_framevm
+run_framevm: CONSOLE = ttyS0
+run_framevm: $(CARGO_OSDK)
+	@cd kernel && STDIO_SERIAL_ONLY=on $(CARGO_OSDK) osdk framevm run $(CARGO_OSDK_BUILD_ARGS) \
+		$(FRAMEVM_OSDK_ARGS) --framevm-load-init $(FRAMEVM_LOAD_INIT)
+	@for marker in $(FRAMEVM_MARKERS); do \
+		if ! tr -d '\r' < qemu.log | grep -qx "$${marker}"; then \
+			echo "framevm test marker $${marker} missing"; \
+			tail --lines 200 qemu.log | tr -d '\r' | grep "FrameVM terminal status:" | tail --lines 1 || true; \
+			echo "qemu.log tail:"; \
+			tail --lines 80 qemu.log | tr -d '\r'; \
+			exit 1; \
+		fi; \
+	done
+
+.PHONY: run_framev
+run_framev: run_framevm
+
+FRAMEVM_BOOT_STABILITY_RUNS ?= 3
+
+.PHONY: run_framevm_boot_stability
+run_framevm_boot_stability:
+	@for run in $$(seq 1 $(FRAMEVM_BOOT_STABILITY_RUNS)); do \
+		echo "FrameVM boot stability run $${run}/$(FRAMEVM_BOOT_STABILITY_RUNS)"; \
+		$(MAKE) --no-print-directory run_framevm AUTO_TEST=boot FRAMEV_VSOCK_VCPUS=$(FRAMEV_VSOCK_VCPUS); \
+	done

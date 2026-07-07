@@ -14,6 +14,7 @@ set -e
 
 ./devtmpfs_mode
 ./evdev
+./framevm
 ./framebuffer
 ./full
 ./hwrng

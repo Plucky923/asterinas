@@ -12,6 +12,20 @@ VSOCK_DIR=/test/network/vsock
 cd ${VSOCK_DIR}
 
 echo "Start vsock test......"
-./vsock_client
-./vsock_server
+case "${FRAMEV_VSOCK_ROLE:-legacy}" in
+guest-client)
+	sh ./framev_vsock_guest_client.sh
+	;;
+guest-server)
+	sh ./framev_vsock_guest_server.sh
+	;;
+legacy)
+	./vsock_client
+	./vsock_server
+	;;
+*)
+	echo "unknown FRAMEV_VSOCK_ROLE: ${FRAMEV_VSOCK_ROLE}" >&2
+	exit 1
+	;;
+esac
 echo "Vsock test passed."

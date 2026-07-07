@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Provides ASCII art representations of the Asterinas logo.
+//! Provides ASCII art representations of Asterinas project logos.
 //!
 //! This crate offers two static string slices containing the logo:
 //! a classic black-and-white version and
@@ -43,4 +43,17 @@ pub fn get_gradient_color_version() -> &'static str {
     // ```
     static LOGO_ASCII_ART: &str = include_str!("logo_ascii_art_gradient.txt");
     LOGO_ASCII_ART
+}
+
+/// Returns the ASCII art of the FrameVM logo.
+pub fn get_framevm_gradient_color_version() -> &'static str {
+    r#"  ______                         __      ____  __
+ |  ____|                        \ \    / /  \/  |
+ | |__ _ __ __ _ _ __ ___   ___   \ \  / /| \  / |
+ |  __| '__/ _` | '_ ` _ \ / _ \   \ \/ / | |\/| |
+ | |  | | | (_| | | | | | |  __/    \  /  | |  | |
+ |_|  |_|  \__,_|_| |_| |_|\___|     \/   |_|  |_|
+
+        FrameVM
+        Released under Mozilla Public License v2.0"#
 }

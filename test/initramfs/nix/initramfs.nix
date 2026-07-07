@@ -1,7 +1,15 @@
 { lib, pkgs, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox
-, benchmark, conformance, regression, dnsServer, }:
+, benchmark, conformance, regression, dnsServer
+, framevmObjPath ? ""
+, framevmInstallPath ? "/framevm/framevm.o"
+, framevmRootfs ? null
+, framevmctl }:
 let
   boot_hello = builtins.path { path = ./../src/boot_hello.sh; };
+  framevVsockEchoSource = builtins.path {
+    path = ./../src/regression/network/vsock/framev_vsock_echo.c;
+  };
+  framevm_tests = builtins.path { path = ./../src/framevm; };
   init = builtins.path { path = ./../src/init; };
   etc = lib.fileset.toSource {
     root = ./../etc;
@@ -17,8 +25,21 @@ let
   resolv_conf = pkgs.callPackage ./resolv_conf.nix { dnsServer = dnsServer; };
   # Whether the initramfs should include evtest, a common tool to debug input devices (`/dev/input/eventX`)
   is_evtest_included = false;
-
-  all_pkgs = [ busybox etc resolv_conf ]
+  framevmObj =
+    if framevmObjPath == "" then null else builtins.path {
+      name = "framevm-object";
+      path = framevmObjPath;
+    };
+  framevVsockHostEcho = stdenvNoCC.mkDerivation {
+    name = "framev-vsock-host-echo";
+    nativeBuildInputs = [ pkgs.pkgsStatic.stdenv.cc ];
+    buildCommand = ''
+      mkdir -p $out/bin
+      $CC -O2 -static -Wall -Werror -D__asterinas__ \
+        -o $out/bin/framev_vsock_echo ${framevVsockEchoSource}
+    '';
+  };
+  all_pkgs = [ busybox etc resolv_conf framevmctl ]
     ++ lib.optionals (benchmark != null) [ benchmark.package ]
     ++ lib.optionals (conformance != null) [ conformance.package ]
     ++ lib.optionals (regression != null) [ regression.package ]
@@ -39,7 +60,12 @@ in stdenvNoCC.mkDerivation {
     ''}
 
     cp ${boot_hello} $out/test/boot_hello.sh
+    install -Dm755 ${framevVsockHostEcho}/bin/framev_vsock_echo \
+      $out/test/network/vsock/framev_vsock_echo
+    cp -r ${framevm_tests} $out/test/framevm
+    chmod +x $out/test/framevm/*.sh
     cp ${init} $out/init
+    cp -r ${framevmctl}/bin/* $out/bin/
 
     cp -r ${etc}/* $out/etc/
 
@@ -66,6 +92,14 @@ in stdenvNoCC.mkDerivation {
       cp -L ${gvisor_libs}/libgcc_s.so.1 $out/lib/x86_64-linux-gnu/libgcc_s.so.1
       cp -L ${gvisor_libs}/libc.so.6 $out/lib/x86_64-linux-gnu/libc.so.6
       cp -L ${gvisor_libs}/libm.so.6 $out/lib/x86_64-linux-gnu/libm.so.6
+    ''}
+
+    ${lib.optionalString (framevmObj != null) ''
+      install -Dm644 ${framevmObj} $out${framevmInstallPath}
+    ''}
+
+    ${lib.optionalString (framevmRootfs != null) ''
+      install -Dm644 ${framevmRootfs} $out/framevm/rootfs.ext2
     ''}
 
     # Use `writeClosure` to retrieve all dependencies of the specified packages.

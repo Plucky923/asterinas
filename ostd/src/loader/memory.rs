@@ -134,32 +134,6 @@ pub fn alloc_section_memory(
     let ro_kvirt = alloc_pages(ro_pages, PageFlags::RWX)?; // Temporarily RWX for loading
     let rw_kvirt = alloc_pages(rw_pages, PageFlags::RWX)?;
 
-    // 简化内存分配日志，改为表格形式或单行汇总（此处用单行汇总）
-    if let Some(ref kvirt) = exec_kvirt {
-        early_println!(
-            "[Loader] Text segment: 0x{:x} - 0x{:x} ({} pages)",
-            kvirt.start(),
-            kvirt.end(),
-            exec_pages
-        );
-    }
-    if let Some(ref kvirt) = ro_kvirt {
-        early_println!(
-            "[Loader] RoData segment: 0x{:x} - 0x{:x} ({} pages)",
-            kvirt.start(),
-            kvirt.end(),
-            ro_pages
-        );
-    }
-    if let Some(ref kvirt) = rw_kvirt {
-        early_println!(
-            "[Loader] RwData segment: 0x{:x} - 0x{:x} ({} pages)",
-            kvirt.start(),
-            kvirt.end(),
-            rw_pages
-        );
-    }
-
     Ok(SectionMemory {
         exec_kvirt,
         ro_kvirt,

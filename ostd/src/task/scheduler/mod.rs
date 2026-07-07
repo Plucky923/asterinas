@@ -126,7 +126,6 @@ pub fn enable_preemption_on_cpu() {
 /// Use [`scheduler_singleton`] instead, which returns the current scheduler
 /// and falls back to a default FIFO scheduler if none has been injected.
 static SCHEDULER: Once<&'static dyn Scheduler<Task>> = Once::new();
-
 /// Returns the global scheduler.
 ///
 /// If a scheduler has already been injected (e.g., by a custom scheduler),
@@ -492,6 +491,10 @@ where
 
 /// Unblocks a target task.
 pub(crate) fn unpark_target(runnable: Arc<Task>) {
+    if runnable.is_completed() {
+        return;
+    }
+
     let preempt_cpu = scheduler_singleton().enqueue(runnable, EnqueueFlags::Wake);
     if let Some(preempt_cpu_id) = preempt_cpu {
         set_need_preempt(preempt_cpu_id);

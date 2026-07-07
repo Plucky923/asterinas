@@ -141,10 +141,15 @@ impl Task {
     /// Re-enqueues a parked task through the scheduler.
     #[track_caller]
     pub fn wake_up(self: &Arc<Self>) {
-        if self.completed.load(Ordering::Acquire) {
+        if self.is_completed() {
             return;
         }
         scheduler::unpark_target(self.clone());
+    }
+
+    /// Returns whether this task has finished its task function.
+    pub fn is_completed(&self) -> bool {
+        self.completed.load(Ordering::Acquire)
     }
 
     /// Returns the task data.

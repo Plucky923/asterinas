@@ -11,7 +11,7 @@ use super::{
     memory::{SectionMemory, SectionMemoryType, align_up, select_section_bucket},
 };
 use crate::{
-    Result, early_println,
+    Result,
     mm::io::{Infallible, VmReader, VmWriter},
 };
 
@@ -19,7 +19,7 @@ pub struct SectionsMetadata<'a> {
     pub loaded_sections: BTreeMap<usize, Arc<LoadSection<'a>>>,
 }
 
-/// 记录加载到映射页里的section的基地址，偏移量等信息
+/// Records a loaded section's mapped base address and source metadata.
 pub struct LoadSection<'a> {
     pub base_addr: usize,
     pub offset: usize,
@@ -63,10 +63,6 @@ pub fn load_section_data<'a>(
         }
 
         let size = sh.size() as usize;
-        if size == 0 {
-            continue;
-        }
-
         let align = cmp::max(sh.align() as usize, 1);
 
         let bucket = select_section_bucket(flags);
@@ -115,45 +111,48 @@ pub fn load_section_data<'a>(
             )));
         }
 
-        let section_data = if sh_type == ShType::NoBits {
+        let section_data = if size == 0 || sh_type == ShType::NoBits {
             None
         } else {
             Some(sh.raw_data(elf_file))
         };
 
-        unsafe {
-            let mut writer = VmWriter::from_kernel_space((kvirt.start() + offset) as *mut u8, size);
-            if section_data.is_none() {
-                let filled = writer.fill_zeros(size);
-                if filled != size {
+        if size != 0 {
+            unsafe {
+                let mut writer =
+                    VmWriter::from_kernel_space((kvirt.start() + offset) as *mut u8, size);
+                if section_data.is_none() {
+                    let filled = writer.fill_zeros(size);
+                    if filled != size {
+                        return Err(invalid_args(format!(
+                            "failed to zero-fill section `{}`: expected {}, wrote {}",
+                            name, size, filled
+                        )));
+                    }
+                } else if let Some(data) = section_data {
+                    if data.len() != size {
+                        return Err(invalid_args(format!(
+                            "section `{}` size mismatch: section header={}, raw_data={}",
+                            name,
+                            size,
+                            data.len()
+                        )));
+                    }
+                    let written = writer.write(&mut VmReader::from(data));
+                    if written != data.len() {
+                        return Err(invalid_args(format!(
+                            "failed to copy section `{}` into module memory: expected {}, wrote {}",
+                            name,
+                            data.len(),
+                            written
+                        )));
+                    }
+                } else {
                     return Err(invalid_args(format!(
-                        "failed to zero-fill section `{}`: expected {}, wrote {}",
-                        name, size, filled
+                        "section `{}` is expected to have raw data",
+                        name
                     )));
                 }
-            } else if let Some(data) = section_data {
-                if data.len() != size {
-                    return Err(invalid_args(format!(
-                        "section `{}` size mismatch: section header={}, raw_data={}",
-                        name,
-                        size,
-                        data.len()
-                    )));
-                }
-                let written = writer.write(&mut VmReader::from(data));
-                if written != data.len() {
-                    return Err(invalid_args(format!(
-                        "failed to copy section `{}` into module memory: expected {}, wrote {}",
-                        name,
-                        data.len(),
-                        written
-                    )));
-                }
-            } else {
-                return Err(invalid_args(format!(
-                    "section `{}` is expected to have raw data",
-                    name
-                )));
             }
         }
 
@@ -186,13 +185,6 @@ pub fn load_section_data<'a>(
             }),
         );
     }
-
-    early_println!(
-        "[Loader] Loaded sections summary: Text={} bytes, RoData={} bytes, RwData={} bytes",
-        exec_cursor,
-        ro_cursor,
-        rw_cursor
-    );
 
     Ok(sections_metadata)
 }

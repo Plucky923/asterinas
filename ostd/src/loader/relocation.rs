@@ -51,10 +51,6 @@ pub fn relocate_sections(
     let symbol_table = get_symbol_table(elf_file)?;
     let loaded_section_bases = loaded_section_bases(elf_file, sections_metadata);
     log::info!("[Loader] Starting relocation...");
-    early_println!(
-        "[Loader] Starting relocation: symbols={}",
-        symbol_table.len()
-    );
 
     let relocation_plan =
         build_relocation_plan(service_object, &loaded_section_bases, symbol_table)?;
@@ -62,10 +58,6 @@ pub fn relocate_sections(
 
     log::info!(
         "[Loader] Relocation completed. Total applied: {}",
-        relocation_plan.total_relocations
-    );
-    early_println!(
-        "[Loader] Relocation completed: total={}",
         relocation_plan.total_relocations
     );
     Ok(())
@@ -280,10 +272,17 @@ fn apply_relocation_plan(plan: &RelocationPlan) -> Result<()> {
     let mut processed_relocations = 0usize;
     for work_item in &plan.work_items {
         processed_relocations += 1;
-        if processed_relocations % 50_000 == 0 {
-            early_println!("[Loader] Relocated {} entries", processed_relocations);
+        if let Err(error) = apply_relocation_work_item(work_item) {
+            early_println!(
+                "[Loader] ERROR: relocation item {} failed: type={}, loc=0x{:x}, symbol=0x{:x}, addend={}",
+                processed_relocations,
+                work_item.reloc_type,
+                work_item.loc,
+                work_item.symbol_addr,
+                work_item.addend
+            );
+            return Err(error);
         }
-        apply_relocation_work_item(work_item)?;
     }
     Ok(())
 }
@@ -351,6 +350,10 @@ fn resolve_symbol_address_for_plan(
     missing_imports: &mut Vec<MissingImport>,
     missing_import_keys: &mut BTreeSet<Vec<u8>>,
 ) -> Result<Option<u64>> {
+    if symbol_idx == 0 {
+        return Ok(Some(0));
+    }
+
     if let Some(addr) = resolved_symbols[symbol_idx] {
         return Ok(Some(addr));
     }

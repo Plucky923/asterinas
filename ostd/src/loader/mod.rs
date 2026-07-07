@@ -27,6 +27,7 @@ fn loader_last_error_slot() -> &'static SpinLock<Option<String>> {
 
 fn remember_loader_error(message: impl Into<String>) {
     let message = message.into();
+    early_println!("[Loader] ERROR: {}", message);
     log::error!("[Loader] ERROR: {}", message);
     *loader_last_error_slot().lock() = Some(message);
 }
@@ -62,11 +63,6 @@ impl<'a> ServiceModuleInfo<'a> {
             return Err(invalid_args("entry point is missing, cannot proceed"));
         };
         let start = entry_point.addr();
-        early_println!(
-            "[Loader] Calling entry point: 0x{:x}, returns={}",
-            start,
-            entry_point.returns_to_loader()
-        );
         log::info!(
             "[Loader] Entry point called directly, entry point: 0x{:x}",
             start
@@ -133,16 +129,13 @@ impl<'a> ServiceModuleInfo<'a> {
         let section_memory = alloc_section_memory(exec_bytes, ro_bytes, rw_bytes)?;
         let sections_metadata = load_section_data(&elf_file, &section_memory)?;
         relocate_sections(&service_object, &sections_metadata)?;
-        section_memory.protect_final_permissions()?;
+        section_memory
+            .protect_final_permissions()
+            .map_err(|_| invalid_args("failed to protect service module section permissions"))?;
 
         let entry_point = find_entry_point(&service_object, &sections_metadata)?;
         if let Some(entry_point) = entry_point {
             let addr = entry_point.addr();
-            early_println!(
-                "[Loader] Entry point found: 0x{:x}, returns={}",
-                addr,
-                entry_point.returns_to_loader()
-            );
             log::info!("[Loader] Entry point found at: 0x{:x}", addr);
             if let Some(ref exec_kvirt) = section_memory.exec_kvirt {
                 if addr < exec_kvirt.start() || addr >= exec_kvirt.end() {

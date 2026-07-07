@@ -15,12 +15,14 @@ use crate::{
     util::{MultiRead, MultiWrite},
 };
 
+pub mod framevsock;
 pub mod ip;
 pub mod netlink;
 pub mod options;
 pub mod unix;
 pub mod util;
 pub mod vsock;
+pub mod vsock_mux;
 
 mod private {
     use crate::{events::IoEvents, prelude::*, process::signal::Pollable};

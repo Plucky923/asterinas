@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! Initial host-side state for a newly created FrameVsock stream socket.
+
+use crate::{
+    events::IoEvents,
+    net::socket::framevsock::{
+        FRAME_VSOCK_GLOBAL,
+        addr::{FrameVsockAddr, VMADDR_CID_ANY, VMADDR_PORT_ANY},
+    },
+    prelude::*,
+    process::signal::PollHandle,
+};
+
+pub struct Init {
+    bound_addr: Mutex<Option<FrameVsockAddr>>,
+}
+
+impl Init {
+    pub fn new() -> Self {
+        Self {
+            bound_addr: Mutex::new(None),
+        }
+    }
+
+    pub fn bind(&self, addr: FrameVsockAddr) -> Result<()> {
+        use crate::net::socket::framevsock::addr::VMADDR_CID_HOST;
+
+        let mut bound_addr = self.bound_addr.lock();
+        if bound_addr.is_some() {
+            return_errno_with_message!(Errno::EINVAL, "the socket is already bound");
+        }
+        let vsockspace = FRAME_VSOCK_GLOBAL
+            .get()
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "FrameVsock is not initialized"))?;
+
+        // Host side uses CID 2 (VMADDR_CID_HOST)
+        // Guest (FrameVM) uses CID 3 (VMADDR_CID_GUEST)
+        let local_cid = VMADDR_CID_HOST;
+
+        if addr.cid != VMADDR_CID_ANY && addr.cid != local_cid {
+            return_errno_with_message!(Errno::EADDRNOTAVAIL, "the cid in address is incorrect");
+        }
+        let mut new_addr = addr;
+        new_addr.cid = local_cid;
+
+        // check and assign a port
+        if addr.port == VMADDR_PORT_ANY {
+            new_addr.port = vsockspace.alloc_ephemeral_port()?;
+        } else if !vsockspace.bind_port(new_addr.port) {
+            return_errno_with_message!(Errno::EADDRINUSE, "the port in address is occupied");
+        }
+
+        *bound_addr = Some(new_addr);
+        Ok(())
+    }
+
+    pub fn bound_addr(&self) -> Option<FrameVsockAddr> {
+        *self.bound_addr.lock()
+    }
+
+    pub fn clear_bound_addr_if(&self, addr: FrameVsockAddr) -> bool {
+        let mut bound_addr = self.bound_addr.lock();
+        if bound_addr.is_some_and(|bound_addr| bound_addr == addr) {
+            *bound_addr = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn poll(&self, _mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
+        IoEvents::OUT
+    }
+}
+
+impl Default for Init {
+    fn default() -> Self {
+        Self::new()
+    }
+}

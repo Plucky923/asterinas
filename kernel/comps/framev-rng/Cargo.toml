@@ -1,0 +1,10 @@
+[package]
+name = "framev-rng-common"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+framev-device = { workspace = true }
+
+[lints]
+workspace = true

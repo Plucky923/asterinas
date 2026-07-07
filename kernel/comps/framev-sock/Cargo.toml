@@ -1,0 +1,14 @@
+[package]
+name = "framev-sock-common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+exchangeable.workspace = true
+framev-device = { workspace = true }
+
+[features]
+default = []
+
+[lints]
+workspace = true

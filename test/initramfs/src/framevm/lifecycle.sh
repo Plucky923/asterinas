@@ -9,18 +9,34 @@ set -eu
 FRAMEVM_LIFECYCLE_MARKER=FRAMEVM_LIFECYCLE_OK
 FRAMEVM_CASE_TIMEOUT=${FRAMEVM_CASE_TIMEOUT:-60}
 
-run_framevmctl_input() {
+run_framevmctl_test() {
     case_name="$1"
-    commands="$2"
+    test_name="$2"
     drive="$3"
     log_file="$4"
-    input_file="/tmp/framevm-${case_name}.in"
-    framevm_register_cleanup_path "$input_file"
 
-    printf '%s\n' "$commands" >"$input_file"
     timeout -s TERM "$FRAMEVM_CASE_TIMEOUT" \
         framevmctl run --vcpus "${FRAMEVM_VCPUS:-1}" --drive "file=$drive" \
-        <"$input_file" >"$log_file" 2>&1
+        --append "init=/bin/framevm-test-runner FRAMEVM_TEST=${test_name}" \
+        >"$log_file" 2>&1
+}
+
+wait_for_framevmctl_exit() {
+    pid="$1"
+    timeout_seconds="$2"
+    elapsed_seconds=0
+
+    while [ "$elapsed_seconds" -lt "$timeout_seconds" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+
+        sleep 1
+        elapsed_seconds=$((elapsed_seconds + 1))
+    done
+
+    return 1
 }
 
 run_expect_success() {
@@ -32,7 +48,7 @@ run_expect_success() {
     framevm_register_cleanup_path "$log_file"
 
     echo "[framevm-lifecycle] running ${case_name}"
-    if ! run_framevmctl_input "$case_name" "$commands" "$drive" "$log_file"; then
+    if ! run_framevmctl_test "$case_name" "$commands" "$drive" "$log_file"; then
         echo "[framevm-lifecycle] ${case_name} unexpectedly failed"
         framevm_dump_log_tail "$log_file"
         return 1
@@ -56,7 +72,7 @@ run_expect_failure() {
 
     echo "[framevm-lifecycle] running ${case_name}"
     set +e
-    run_framevmctl_input "$case_name" "$commands" "$drive" "$log_file"
+    run_framevmctl_test "$case_name" "$commands" "$drive" "$log_file"
     exit_status=$?
     set -e
 
@@ -79,7 +95,7 @@ run_marker_missing_case() {
     framevm_register_cleanup_path "$log_file"
 
     echo "[framevm-lifecycle] running marker-missing"
-    if ! run_framevmctl_input marker-missing "exit" "$drive" "$log_file"; then
+    if ! run_framevmctl_test marker-missing marker-missing "$drive" "$log_file"; then
         echo "[framevm-lifecycle] marker-missing guest did not exit successfully"
         framevm_dump_log_tail "$log_file"
         return 1
@@ -111,7 +127,13 @@ run_console_eof_before_terminal_case() {
     fi
 
     kill -TERM "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    if ! wait_for_framevmctl_exit "$pid" 5; then
+        echo "[framevm-lifecycle] framevmctl did not exit after host TERM"
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        framevm_dump_log_tail "$log_file"
+        return 1
+    fi
 }
 
 run_host_stop_case() {
@@ -134,9 +156,19 @@ run_host_stop_case() {
 
     kill -TERM "$pid" 2>/dev/null || true
     set +e
+    wait_for_framevmctl_exit "$pid" 5
+    wait_result=$?
     wait "$pid"
     exit_status=$?
     set -e
+
+    if [ "$wait_result" -ne 0 ]; then
+        echo "[framevm-lifecycle] host-stop framevmctl did not exit after host TERM"
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        framevm_dump_log_tail "$log_file"
+        return 1
+    fi
 
     if [ "$exit_status" -eq 0 ]; then
         echo "[framevm-lifecycle] host-stop framevmctl returned success"
@@ -145,19 +177,19 @@ run_host_stop_case() {
     fi
 }
 
-if ! run_expect_success exit-zero "exit" "FrameVM terminal status: exited-success code=0"; then
+if ! run_expect_success exit-zero exit-zero "FrameVM terminal status: exited-success code=0"; then
     printf '\nFRAMEVM_LIFECYCLE_FAILED\n'
     framevm_finish_host
     exit 1
 fi
 
-if ! run_expect_failure exit-nonzero "exit 7" 7 "FrameVM terminal status: exited-failure code=7"; then
+if ! run_expect_failure exit-nonzero exit-nonzero 7 "FrameVM terminal status: exited-failure code=7"; then
     printf '\nFRAMEVM_LIFECYCLE_FAILED\n'
     framevm_finish_host
     exit 1
 fi
 
-if ! run_expect_failure restart-requested "/bin/framevm_reboot restart" 1 "FrameVM terminal status: restart-requested"; then
+if ! run_expect_failure restart-requested restart-requested 1 "FrameVM terminal status: restart-requested"; then
     printf '\nFRAMEVM_LIFECYCLE_FAILED\n'
     framevm_finish_host
     exit 1

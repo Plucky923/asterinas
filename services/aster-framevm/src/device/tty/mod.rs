@@ -1,286 +1,399 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Console endpoint used by the kernel image.
-
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec};
-
 use device_id::{DeviceId, MajorId, MinorId};
-use ostd::{
-    mm::{FallibleVmRead, FallibleVmWrite, VmReader, VmWriter},
-    sync::{Once, SpinLock, WaitQueue},
-};
+use ostd::sync::LocalIrqDisabled;
+use spin::Once;
 
+use self::{line_discipline::LineDiscipline, termio::CFontOp};
 use crate::{
-    device::{Device, DeviceType, DevtmpfsInodeMeta, registry::char},
-    error::{Errno, Error, Result},
+    device::{Device, DeviceType, DevtmpfsInodeMeta},
     events::IoEvents,
-    fs::{
-        file::{PerOpenFileOps, StatusFlags},
-        vfs::inode::FileOps,
+    fs::file::{PerOpenFileOps, StatusFlags},
+    prelude::*,
+    process::{
+        broadcast_signal_async,
+        signal::{PollHandle, Pollable, Pollee},
+        JobControl, Terminal,
     },
-    pollee::{PollHandle, Pollee},
+    util::ioctl::{dispatch_ioctl, RawIoctl},
 };
 
-const INPUT_CAPACITY: usize = 4096;
-static INSTALLING_CONSOLE_ENDPOINT: Once<SpinLock<Option<Arc<ConsoleEndpoint>>>> = Once::new();
-static CONSOLE_ENDPOINT: Once<Option<Arc<ConsoleEndpoint>>> = Once::new();
+mod device;
+mod driver;
+mod file;
+mod flags;
+pub(super) mod ioctl_defs;
+mod line_discipline;
+pub(super) mod termio;
 
-struct ConsoleEndpoint {
-    input: SpinLock<VecDeque<u8>>,
-    input_wait: WaitQueue,
-    pollee: Pollee,
-}
+pub(super) use driver::TtyDriver;
+pub(super) use flags::TtyFlags;
 
-impl ConsoleEndpoint {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            input: SpinLock::new(VecDeque::with_capacity(INPUT_CAPACITY)),
-            input_wait: WaitQueue::new(),
-            pollee: Pollee::new(),
-        })
-    }
-
-    fn push_input(&self, bytes: &[u8]) {
-        let mut input = self.input.lock();
-        let mut accepted_len = 0;
-        for byte in bytes {
-            if input.len() == INPUT_CAPACITY {
-                break;
-            }
-
-            let byte = if *byte == b'\r' { b'\n' } else { *byte };
-            input.push_back(byte);
-            accepted_len += 1;
-        }
-        drop(input);
-
-        if accepted_len != 0 {
-            self.input_wait.wake_all();
-            self.pollee.notify(IoEvents::IN | IoEvents::RDNORM);
-        }
-    }
-
-    fn read(&self, output: &mut [u8], nonblocking: bool) -> Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-
-        if nonblocking {
-            let mut input = self.input.lock();
-            if input.is_empty() {
-                return Err(Error::new(Errno::EAGAIN));
-            }
-            let read_len = self.drain_input(&mut input, output);
-            return Ok(read_len);
-        }
-
-        let read_len = self.input_wait.wait_until(|| {
-            let mut input = self.input.lock();
-            if input.is_empty() {
-                return None;
-            }
-
-            let read_len = self.drain_input(&mut input, output);
-            Some(read_len)
-        });
-        Ok(read_len)
-    }
-
-    fn drain_input(&self, input: &mut VecDeque<u8>, output: &mut [u8]) -> usize {
-        let mut read_len = 0;
-        for slot in &mut *output {
-            let Some(byte) = input.pop_front() else {
-                break;
-            };
-            *slot = byte;
-            read_len += 1;
-        }
-        if input.is_empty() {
-            self.pollee.invalidate();
-        }
-        read_len
-    }
-
-    fn has_input(&self) -> bool {
-        !self.input.lock().is_empty()
-    }
-
-    fn input_len(&self) -> usize {
-        self.input.lock().len()
-    }
-
-    fn check_io_events(&self) -> IoEvents {
-        let mut events = IoEvents::OUT;
-        if self.has_input() {
-            events |= IoEvents::IN | IoEvents::RDNORM;
-        }
-        events
-    }
-
-    fn poll_revents(&self, events: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
-        self.pollee
-            .poll_with(events, poller, || self.check_io_events())
-    }
-}
-
-fn endpoint() -> Result<Arc<ConsoleEndpoint>> {
-    let endpoint = CONSOLE_ENDPOINT.call_once(|| {
-        let endpoint = ConsoleEndpoint::new();
-        *installing_endpoint().lock() = Some(endpoint.clone());
-        if framev_console_frontend::register_input_callback(dispatch_console_input).is_err() {
-            *installing_endpoint().lock() = None;
-            return None;
-        }
-
-        Some(endpoint)
-    });
-
-    endpoint
-        .clone()
-        .ok_or_else(|| Error::with_message(Errno::EIO, "console device is unavailable"))
-}
-
-fn dispatch_console_input(bytes: &[u8]) {
-    if let Some(endpoint) = current_or_installing_endpoint() {
-        endpoint.push_input(bytes);
-    }
-}
-
-fn current_or_installing_endpoint() -> Option<Arc<ConsoleEndpoint>> {
-    CONSOLE_ENDPOINT
-        .get()
-        .and_then(|endpoint| endpoint.as_ref())
-        .cloned()
-        .or_else(|| installing_endpoint().lock().clone())
-}
-
-fn installing_endpoint() -> &'static SpinLock<Option<Arc<ConsoleEndpoint>>> {
-    INSTALLING_CONSOLE_ENDPOINT.call_once(|| SpinLock::new(None))
-}
-
-/// Initializes the default `framev-console` frontend.
 pub fn init() -> Result<()> {
+    init_framev_console()
+}
+
+pub(super) fn init_in_first_process() -> Result<()> {
+    device::init_in_first_process()?;
+
+    Ok(())
+}
+
+/// The driver for the FrameV console device.
+#[derive(Clone, Copy)]
+struct FrameVConsoleDriver;
+
+impl TtyDriver for FrameVConsoleDriver {
+    // Reference: <https://elixir.bootlin.com/linux/v6.17/source/Documentation/admin-guide/devices.txt#L2936>.
+    const DEVICE_MAJOR_ID: u32 = 229;
+
+    fn devtmpfs_meta(&self, _index: u32) -> Option<DevtmpfsInodeMeta<'_>> {
+        None
+    }
+
+    fn open(tty: Arc<Tty<Self>>) -> Result<Box<dyn PerOpenFileOps>> {
+        Ok(Box::new(file::TtyFile::new(tty)))
+    }
+
+    fn push_output(&self, chs: &[u8]) -> Result<usize> {
+        framev_console_frontend::write(chs)
+            .map_err(|err| Error::with_message(Errno::EIO, err.message()))
+    }
+
+    fn echo_callback(&self) -> impl FnMut(&[u8]) + '_ {
+        |chs| {
+            let _ = framev_console_frontend::write(chs);
+        }
+    }
+
+    fn can_push(&self) -> bool {
+        true
+    }
+
+    fn notify_input(&self) {}
+
+    fn on_termios_change(&self, _old_termios: &termio::CTermios, _new_termios: &termio::CTermios) {}
+}
+
+static FRAMEV_CONSOLE: Once<Arc<Tty<FrameVConsoleDriver>>> = Once::new();
+
+fn init_framev_console() -> Result<()> {
     let console =
         framev_bus::console().map_err(|err| Error::with_message(Errno::EINVAL, err.message()))?;
-    endpoint()?;
+    FRAMEV_CONSOLE.call_once(|| Tty::new(0, FrameVConsoleDriver));
+    framev_console_frontend::register_input_callback(dispatch_framev_console_input)
+        .map_err(|err| Error::with_message(Errno::EIO, err.message()))?;
+
     ostd::early_println!("use console provided by FrameV device {:?}", console.id());
     Ok(())
 }
 
-pub(super) fn init_in_first_process() -> Result<()> {
-    char::register(SystemConsole::singleton().clone())?;
-    Ok(())
+fn dispatch_framev_console_input(chs: &[u8]) {
+    if let Some(console) = FRAMEV_CONSOLE.get() {
+        let _ = console.push_input(chs);
+    }
 }
 
-pub fn read(output: &mut [u8], nonblocking: bool) -> Result<usize> {
-    endpoint()?.read(output, nonblocking)
-}
-
-pub fn write(input: &[u8]) -> Result<usize> {
-    endpoint()?;
-    framev_console_frontend::write(input)
-        .map_err(|err| Error::with_message(Errno::EIO, err.message()))
-}
-
-pub fn input_len() -> Result<usize> {
-    Ok(endpoint()?.input_len())
-}
-
-pub fn poll_revents(events: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
-    match CONSOLE_ENDPOINT
+fn framev_console_device() -> Result<Arc<dyn Device>> {
+    let console = FRAMEV_CONSOLE
         .get()
-        .and_then(|endpoint| endpoint.as_ref())
-    {
-        Some(endpoint) => endpoint.poll_revents(events, poller),
-        None => events & IoEvents::OUT,
+        .ok_or_else(|| Error::with_message(Errno::ENODEV, "the FrameV console is unavailable"))?;
+
+    Ok(console.clone())
+}
+
+const IO_CAPACITY: usize = 4096;
+
+/// A teletyper (TTY).
+///
+/// This abstracts the general functionality of a TTY in a way that
+///  - Any input device driver can use [`Tty::push_input`] to push input characters, and users can
+///    [`Tty::read`] from the TTY;
+///  - Users can also [`Tty::write`] output characters to the TTY and the output device driver will
+///    receive the characters from [`TtyDriver::push_output`] where the generic parameter `D` is
+///    the [`TtyDriver`].
+///
+/// ```text
+/// +------------+     +-------------+
+/// |input device|     |output device|
+/// |   driver   |     |   driver    |
+/// +-----+------+     +------^------+
+///       |                   |
+///       |     +-------+     |
+///       +----->  TTY  +-----+
+///             +-------+
+/// Tty::push_input   D::push_output
+/// ```
+pub struct Tty<D> {
+    index: u32,
+    driver: D,
+    ldisc: SpinLock<LineDiscipline, LocalIrqDisabled>,
+    job_control: JobControl,
+    pollee: Pollee,
+    tty_flags: TtyFlags,
+    weak_self: Weak<Self>,
+}
+
+impl<D> Tty<D> {
+    pub(super) fn new(index: u32, driver: D) -> Arc<Self> {
+        Arc::new_cyclic(move |weak_ref| Tty {
+            index,
+            driver,
+            ldisc: SpinLock::new(LineDiscipline::new()),
+            job_control: JobControl::new(),
+            pollee: Pollee::new(),
+            tty_flags: TtyFlags::new(),
+            weak_self: weak_ref.clone(),
+        })
+    }
+
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    pub(super) fn driver(&self) -> &D {
+        &self.driver
+    }
+
+    /// Returns whether new characters can be pushed into the input buffer.
+    ///
+    /// This method should return `false` if the input buffer is full.
+    pub(super) fn can_push(&self) -> bool {
+        !self.ldisc.lock().is_full()
+    }
+
+    /// Notifies that the output buffer now has room for new characters.
+    ///
+    /// This method should be called when the state of [`TtyDriver::can_push`] changes from `false`
+    /// to `true`.
+    pub(super) fn notify_output(&self) {
+        self.pollee.notify(IoEvents::OUT);
+    }
+
+    /// Notifies that the other end has been closed.
+    pub(super) fn notify_hup(&self) {
+        self.pollee.notify(IoEvents::ERR | IoEvents::HUP);
+    }
+
+    /// Returns the TTY flags.
+    pub(super) fn tty_flags(&self) -> &TtyFlags {
+        &self.tty_flags
     }
 }
 
-struct SystemConsole;
+impl<D: TtyDriver> Tty<D> {
+    /// Pushes characters into the output buffer.
+    ///
+    /// This method returns the number of bytes pushed or fails with an error if no bytes can be
+    /// pushed because the buffer is full.
+    pub fn push_input(&self, chs: &[u8]) -> Result<usize> {
+        let mut ldisc = self.ldisc.lock();
+        let mut echo = self.driver.echo_callback();
 
-impl SystemConsole {
-    fn singleton() -> &'static Arc<SystemConsole> {
-        static INSTANCE: Once<Arc<SystemConsole>> = Once::new();
-        INSTANCE.call_once(|| Arc::new(Self))
+        let mut len = 0;
+        for ch in chs {
+            let res = ldisc.push_char(
+                *ch,
+                |signum| {
+                    if let Some(foreground) = self.job_control.foreground() {
+                        broadcast_signal_async(Arc::downgrade(&foreground), signum);
+                    }
+                },
+                &mut echo,
+            );
+            if res.is_err() && len == 0 {
+                return_errno_with_message!(Errno::EAGAIN, "the line discipline is full");
+            } else if res.is_err() {
+                break;
+            } else {
+                len += 1;
+            }
+        }
+
+        self.pollee.notify(IoEvents::IN | IoEvents::RDNORM);
+        Ok(len)
+    }
+
+    fn check_io_events(&self) -> IoEvents {
+        let mut events = IoEvents::empty();
+
+        if self.ldisc.lock().buffer_len() > 0 {
+            events |= IoEvents::IN | IoEvents::RDNORM;
+        }
+
+        if self.driver.can_push() {
+            events |= IoEvents::OUT;
+        }
+
+        if self.tty_flags.is_other_closed() {
+            events |= IoEvents::ERR | IoEvents::HUP;
+        }
+
+        events
     }
 }
 
-impl Device for SystemConsole {
+impl<D: TtyDriver> Pollable for Tty<D> {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        self.pollee
+            .poll_with(mask, poller, || self.check_io_events())
+    }
+}
+
+impl<D: TtyDriver> Tty<D> {
+    pub fn read(&self, writer: &mut VmWriter, status_flags: StatusFlags) -> Result<usize> {
+        if self.tty_flags.is_other_closed() {
+            return Ok(0);
+        }
+
+        self.job_control.wait_until_in_foreground()?;
+
+        // TODO: Add support for timeout.
+        let mut buf = vec![0u8; writer.avail().min(IO_CAPACITY)];
+        let is_nonblocking = status_flags.contains(StatusFlags::O_NONBLOCK);
+        let read_len = if is_nonblocking {
+            self.ldisc.lock().try_read(&mut buf)?
+        } else {
+            self.wait_events(IoEvents::IN, None, || self.ldisc.lock().try_read(&mut buf))?
+        };
+        self.pollee.invalidate();
+        self.driver.notify_input();
+
+        // TODO: Confirm what we should do if `write_fallible` fails in the middle.
+        writer.write_fallible(&mut buf[..read_len].into())?;
+        Ok(read_len)
+    }
+
+    pub fn write(&self, reader: &mut VmReader, status_flags: StatusFlags) -> Result<usize> {
+        if self.tty_flags.is_other_closed() {
+            return_errno_with_message!(Errno::EIO, "the TTY is closed");
+        }
+
+        let mut buf = vec![0u8; reader.remain().min(IO_CAPACITY)];
+        let write_len = reader.read_fallible(&mut buf.as_mut_slice().into())?;
+
+        // TODO: Add support for timeout.
+        let is_nonblocking = status_flags.contains(StatusFlags::O_NONBLOCK);
+        let len = if is_nonblocking {
+            self.driver.push_output(&buf[..write_len])?
+        } else {
+            self.wait_events(IoEvents::OUT, None, || {
+                self.driver.push_output(&buf[..write_len])
+            })?
+        };
+        self.pollee.invalidate();
+        Ok(len)
+    }
+
+    pub fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
+        use ioctl_defs::*;
+
+        use crate::util::ioctl::common_defs::GetNumBytesToRead;
+
+        dispatch_ioctl!(match raw_ioctl {
+            cmd @ GetTermios => {
+                let termios = *self.ldisc.lock().termios();
+
+                cmd.write(&termios)?;
+            }
+            cmd @ SetTermios => {
+                let termios = cmd.read()?;
+
+                let mut ldisc = self.ldisc.lock();
+                let old_termios = ldisc.termios();
+                self.driver().on_termios_change(old_termios, &termios);
+                ldisc.set_termios(termios);
+            }
+            cmd @ SetTermiosWait => {
+                let termios = cmd.read()?;
+
+                // TODO: If applicable, wait for the output buffer to drain. For now, we don't need
+                // to do anything here because:
+                //  - Linux does not consider a pty to have an output buffer, so it does not drain
+                //    it. See
+                //    <https://elixir.bootlin.com/linux/v5.10.247/source/drivers/tty/pty.c#L137-L148>.
+                //  - We don't currently have an output buffer for other TTYs.
+                let mut ldisc = self.ldisc.lock();
+                let old_termios = ldisc.termios();
+                self.driver().on_termios_change(old_termios, &termios);
+                ldisc.set_termios(termios);
+            }
+            cmd @ SetTermiosFlush => {
+                let termios = cmd.read()?;
+
+                // TODO: If applicable, wait for the output buffer to drain. (See comments above.)
+                let mut ldisc = self.ldisc.lock();
+                let old_termios = ldisc.termios();
+                self.driver().on_termios_change(old_termios, &termios);
+                ldisc.set_termios(termios);
+                ldisc.drain_input();
+
+                self.pollee.invalidate();
+            }
+            cmd @ GetWinSize => {
+                let winsize = self.ldisc.lock().window_size();
+
+                cmd.write(&winsize)?;
+            }
+            cmd @ SetWinSize => {
+                let winsize = cmd.read()?;
+
+                self.ldisc.lock().set_window_size(winsize);
+            }
+            cmd @ GetNumBytesToRead => {
+                if self.tty_flags.is_other_closed() {
+                    return_errno_with_message!(Errno::EIO, "the TTY is closed");
+                }
+
+                let buffer_len = self.ldisc.lock().buffer_len() as i32;
+
+                cmd.write(&buffer_len)?;
+            }
+
+            _ => {
+                let terminal = self.weak_self.upgrade().unwrap() as Arc<dyn Terminal>;
+
+                // Process job-control ioctls.
+                if terminal.job_ioctl(raw_ioctl, false)? {
+                    return Ok(0);
+                }
+
+                // Process driver-specific ioctls.
+                if self.driver.ioctl(self, raw_ioctl)? {
+                    return Ok(0);
+                }
+
+                return_errno_with_message!(Errno::ENOTTY, "the ioctl command is unknown");
+            }
+        });
+
+        Ok(0)
+    }
+}
+
+impl<D: TtyDriver> Terminal for Tty<D> {
+    fn job_control(&self) -> &JobControl {
+        &self.job_control
+    }
+}
+
+impl<D: TtyDriver> Device for Tty<D> {
     fn type_(&self) -> DeviceType {
         DeviceType::Char
     }
 
     fn id(&self) -> DeviceId {
-        DeviceId::new(MajorId::new(5), MinorId::new(1))
+        DeviceId::new(
+            MajorId::new(D::DEVICE_MAJOR_ID as u16),
+            MinorId::new(self.index),
+        )
     }
 
     fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
-        Some(DevtmpfsInodeMeta::new("console"))
+        self.driver.devtmpfs_meta(self.index)
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
-        endpoint()?;
-        Ok(Box::new(ConsoleFile))
-    }
-}
-
-struct ConsoleFile;
-
-impl FileOps for ConsoleFile {
-    fn read_at(
-        &self,
-        _offset: usize,
-        writer: &mut VmWriter,
-        status_flags: StatusFlags,
-    ) -> Result<usize> {
-        let mut buffer = vec![0; writer.avail().min(INPUT_CAPACITY)];
-        let read_len = read(&mut buffer, status_flags.contains(StatusFlags::O_NONBLOCK))?;
-        let mut reader = VmReader::from(&buffer[..read_len]);
-        writer
-            .write_fallible(&mut reader)
-            .map(|len| len)
-            .map_err(|(err, _)| err.into())
-    }
-
-    fn write_at(
-        &self,
-        _offset: usize,
-        reader: &mut VmReader,
-        _status_flags: StatusFlags,
-    ) -> Result<usize> {
-        let mut total = 0;
-        let mut buffer = vec![0; reader.remain().min(INPUT_CAPACITY)];
-        while reader.has_remain() {
-            let read_len = reader.remain().min(INPUT_CAPACITY);
-            let mut writer = VmWriter::from(&mut buffer[..read_len]);
-            let copied = reader
-                .read_fallible(&mut writer)
-                .map_err(|(err, _)| Error::from(err))?;
-            if copied == 0 {
-                break;
-            }
-            write(&buffer[..copied])?;
-            total += copied;
-        }
-        Ok(total)
-    }
-}
-
-impl crate::process::signal::Pollable for ConsoleFile {
-    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
-        poll_revents(mask, poller)
-    }
-}
-
-impl PerOpenFileOps for ConsoleFile {
-    fn check_seekable(&self) -> Result<()> {
-        Err(Error::with_message(
-            Errno::ESPIPE,
-            "console is not seekable",
-        ))
-    }
-
-    fn is_offset_aware(&self) -> bool {
-        false
+        D::open(self.weak_self.upgrade().unwrap())
     }
 }

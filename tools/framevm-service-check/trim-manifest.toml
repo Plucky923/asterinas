@@ -81,6 +81,12 @@ kind = "provider-substitution"
 reason = "FrameVM keeps the kernel TTY device path while substituting the console backend with the FrameV-console frontend."
 
 [[entries]]
+service_path = "services/aster-framevm/src/device/tty/device.rs"
+kernel_path = "kernel/src/device/tty/device.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps /dev/tty and /dev/console registration while substituting VT/serial/HVC console selection with the singleton FrameV-console-backed TTY."
+
+[[entries]]
 service_path = "services/aster-framevm/src/error.rs"
 kernel_path = "kernel/src/error.rs"
 kind = "provider-substitution"
@@ -103,6 +109,24 @@ service_path = "services/aster-framevm/src/fs/fs_impls/mod.rs"
 kernel_path = "kernel/src/fs/fs_impls/mod.rs"
 kind = "unsupported-feature-trim"
 reason = "FrameVM retains only the filesystem implementations required by the ext2 rootfs target and trims unsupported host filesystems."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/fs_impls/procfs/mod.rs"
+kernel_path = "kernel/src/fs/fs_impls/procfs/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps procfs registration and PID directory discovery while exposing only self and per-process entries required by the reference guest shell tests."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/fs_impls/procfs/pid/mod.rs"
+kernel_path = "kernel/src/fs/fs_impls/procfs/pid/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps procfs PID directory semantics while trimming task, fd, cgroup, maps, namespace, and host-only process surfaces."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/fs_impls/procfs/self_.rs"
+kernel_path = "kernel/src/fs/fs_impls/procfs/self_.rs"
+kind = "mechanical-adaptation"
+reason = "FrameVM keeps /proc/self symlink semantics while formatting the PID through an import-allowlisted integer formatter."
 
 [[entries]]
 service_path = "services/aster-framevm/src/fs/fs_impls/pseudofs/nsfs.rs"

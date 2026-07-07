@@ -24,5 +24,7 @@ run_child boot /test/framevm/boot.sh
 run_child regression /test/framevm/regression.sh
 run_child device /test/framevm/device.sh
 run_child rootfs /test/framevm/rootfs.sh
+run_child lifecycle /test/framevm/lifecycle.sh
+run_child shell /test/framevm/shell_test.sh
 
 poweroff -f

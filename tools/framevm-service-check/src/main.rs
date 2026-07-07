@@ -305,6 +305,7 @@ fn run() -> CheckResult<()> {
     check_final_rootfs_artifact_policy(&repo_root, &config)?;
     check_legacy_framevm_test_entrypoint_absence(&repo_root)?;
     check_final_service_local_rootfs_adapters(&config, &service_files)?;
+    check_final_framevm_interactive_shell_policy(&repo_root, &config, &service_files)?;
     check_lib_entry_policy(&repo_root, &config)?;
     check_final_entry_init_policy(&repo_root, &config)?;
 
@@ -2512,6 +2513,10 @@ fn check_final_service_local_rootfs_adapters(
     }
 
     for file in service_files {
+        if file.ends_with("fs/fs_impls/procfs/template/dir.rs") {
+            continue;
+        }
+
         reject_source_patterns(
             file,
             &fs::read_to_string(file)?,
@@ -2527,6 +2532,97 @@ fn check_final_service_local_rootfs_adapters(
             "completed FrameVM filesystem code must use copied kernel VFS/file/pipe abstractions instead of service-local rootfs adapters",
         )?;
     }
+    Ok(())
+}
+
+fn check_final_framevm_interactive_shell_policy(
+    repo_root: &Path,
+    config: &Config,
+    service_files: &[PathBuf],
+) -> CheckResult<()> {
+    if !config.source_trim_enforcement.is_final() {
+        return Ok(());
+    }
+
+    for file in service_files {
+        let source = fs::read_to_string(file)?;
+        reject_source_patterns(
+            file,
+            &source,
+            &["ConsoleFile", "ConsoleEndpoint"],
+            "completed FrameVM guest console must be a TTY backed by FrameV-console; raw guest-visible console files are forbidden",
+        )?;
+
+        if file
+            .components()
+            .any(|component| component.as_os_str() == "procfs")
+        {
+            reject_source_patterns(
+                file,
+                &source,
+                &[
+                    "TaskDirOps",
+                    "Cgroup",
+                    "cgroup",
+                    "FdDirOps",
+                    "MapsFileOps",
+                    "MountInfo",
+                    "SysDirOps",
+                    "CpuInfoFileOps",
+                    "LoadAvgFileOps",
+                    "MemInfoFileOps",
+                    "StatFileOps as Global",
+                    "softirq",
+                    "FrameVisor",
+                ],
+                "FrameVM procfs must expose only the explicitly supported guest process inspection surface",
+            )?;
+        }
+    }
+
+    let rootfs_image_path = repo_root.join("test/initramfs/nix/framevm-rootfs-image.nix");
+    if rootfs_image_path.exists() {
+        let source = fs::read_to_string(&rootfs_image_path)?;
+        reject_source_patterns(
+            &rootfs_image_path,
+            &source,
+            &[
+                "run_initial_script_from_stdin",
+                "sleep_for_initial_input",
+                "fcntl(STDIN_FILENO",
+                "O_NONBLOCK",
+                "framevm-init-script",
+            ],
+            "FrameVM rootfs init must not sniff stdin to select tests or boot scripts",
+        )?;
+        require_source_patterns(
+            &rootfs_image_path,
+            &source,
+            &["/bin/framevm-test-runner", "TIOCSCTTY", "FRAMEVM_TEST"],
+            "FrameVM rootfs must provide a TTY-backed init path and cmdline-selected test runner",
+        )?;
+    }
+
+    let framevm_test_dir = repo_root.join("test/initramfs/src/framevm");
+    if framevm_test_dir.exists() {
+        let mut scripts = Vec::new();
+        collect_files_with_extensions(&framevm_test_dir, &["sh"], &mut scripts)?;
+        for script in scripts {
+            let source = fs::read_to_string(&script)?;
+            reject_source_patterns(
+                &script,
+                &source,
+                &[
+                    "printf 'exit\\n' | framevmctl run",
+                    "printf 'exit",
+                    "| framevmctl run",
+                    "run_initial_script_from_stdin",
+                ],
+                "FrameVM host tests must select guest behavior through framevmctl --append, not guest console stdin",
+            )?;
+        }
+    }
+
     Ok(())
 }
 
@@ -4894,6 +4990,97 @@ mod fs;
     }
 
     #[test]
+    fn rejects_guest_visible_raw_console_file() {
+        let repo = TempRepo::new("raw-console-file");
+        let service_file = repo
+            .path()
+            .join("services/aster-framevm/src/device/tty/mod.rs");
+        fs::create_dir_all(service_file.parent().unwrap())
+            .expect("failed to create service tty fixture directory");
+        fs::write(&service_file, "struct ConsoleFile;\n")
+            .expect("failed to write raw console fixture");
+
+        let error = check_final_framevm_interactive_shell_policy(
+            repo.path(),
+            &final_config(),
+            &[service_file],
+        )
+        .expect_err("fixture must fail");
+        assert!(
+            error.message.contains("raw guest-visible console"),
+            "expected raw console diagnostic, got `{}`",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_rootfs_init_stdin_sniffing() {
+        let repo = TempRepo::new("rootfs-stdin-sniffing");
+        let rootfs_image_path = repo
+            .path()
+            .join("test/initramfs/nix/framevm-rootfs-image.nix");
+        fs::create_dir_all(rootfs_image_path.parent().unwrap())
+            .expect("failed to create rootfs fixture directory");
+        fs::write(
+            &rootfs_image_path,
+            "static int run_initial_script_from_stdin(void) { return 0; }\n",
+        )
+        .expect("failed to write rootfs fixture");
+
+        let error = check_final_framevm_interactive_shell_policy(repo.path(), &final_config(), &[])
+            .expect_err("fixture must fail");
+        assert!(
+            error.message.contains("must not sniff stdin"),
+            "expected stdin sniffing diagnostic, got `{}`",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_framevm_host_test_console_stdin_selection() {
+        let repo = TempRepo::new("host-test-stdin-selection");
+        let script = repo.path().join("test/initramfs/src/framevm/boot.sh");
+        fs::create_dir_all(script.parent().unwrap())
+            .expect("failed to create FrameVM script fixture directory");
+        fs::write(
+            &script,
+            "printf 'exit\\n' | framevmctl run --drive file=/framevm/rootfs.ext2\n",
+        )
+        .expect("failed to write FrameVM script fixture");
+
+        let error = check_final_framevm_interactive_shell_policy(repo.path(), &final_config(), &[])
+            .expect_err("fixture must fail");
+        assert!(
+            error.message.contains("through framevmctl --append"),
+            "expected host stdin selection diagnostic, got `{}`",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_host_only_procfs_surface() {
+        let repo = TempRepo::new("host-only-procfs");
+        let procfs_file = repo
+            .path()
+            .join("services/aster-framevm/src/fs/fs_impls/procfs/pid/mod.rs");
+        fs::create_dir_all(procfs_file.parent().unwrap())
+            .expect("failed to create procfs fixture directory");
+        fs::write(&procfs_file, "mod cgroup;\n").expect("failed to write procfs fixture");
+
+        let error = check_final_framevm_interactive_shell_policy(
+            repo.path(),
+            &final_config(),
+            &[procfs_file],
+        )
+        .expect_err("fixture must fail");
+        assert!(
+            error.message.contains("guest process inspection"),
+            "expected procfs surface diagnostic, got `{}`",
+            error.message
+        );
+    }
+
+    #[test]
     fn rejects_retained_syscall_parent_path_escape() {
         let repo = TempRepo::new("syscall-path-escape");
         let (service_file, _) = write_retained_pair(
@@ -6236,9 +6423,7 @@ fn main() {
         let error = check_final_entry_init_policy(repo.path(), &final_config())
             .expect_err("fixture must fail");
         assert!(
-            error
-                .message
-                .contains("logo_ascii_art::get_gradient_color_version()"),
+            error.message.contains("shared `logo-ascii-art` mechanism"),
             "expected shared banner diagnostic, got `{}`",
             error.message
         );

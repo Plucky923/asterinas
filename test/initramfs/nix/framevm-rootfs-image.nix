@@ -15,141 +15,227 @@ in stdenvNoCC.mkDerivation {
     #include <errno.h>
     #include <fcntl.h>
     #include <stdio.h>
-    #include <string.h>
-    #include <time.h>
+    #include <sys/ioctl.h>
+    #include <sys/mount.h>
+    #include <sys/stat.h>
+    #include <termios.h>
     #include <unistd.h>
 
-    static char *const envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
+    static char *const envp[] = {
+        "PATH=/bin",
+        "HOME=/",
+        "TERM=linux",
+        "USER=root",
+        "LOGNAME=root",
+        "PS1=~ # ",
+        NULL
+    };
 
-    static int write_all(int fd, const char *buf, ssize_t len) {
-        while (len > 0) {
-            ssize_t written = write(fd, buf, len);
-            if (written < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return -1;
-            }
-            if (written == 0) {
-                errno = EIO;
-                return -1;
-            }
-            buf += written;
-            len -= written;
+    static int setup_console(void) {
+        if (setsid() < 0 && errno != EPERM) {
+            perror("setsid");
+            return errno == 0 ? 127 : errno;
         }
+
+        int console_fd = open("/dev/console", O_RDWR);
+        if (console_fd < 0) {
+            perror("open /dev/console");
+            return errno == 0 ? 127 : errno;
+        }
+
+        if (ioctl(console_fd, TIOCSCTTY, 0) < 0 && errno != EPERM) {
+            perror("TIOCSCTTY");
+            close(console_fd);
+            return errno == 0 ? 127 : errno;
+        }
+
+        for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+            if (dup2(console_fd, fd) < 0) {
+                perror("dup2 /dev/console");
+                close(console_fd);
+                return errno == 0 ? 127 : errno;
+            }
+        }
+        if (console_fd > STDERR_FILENO) {
+            close(console_fd);
+        }
+
         return 0;
     }
 
-    static int sleep_for_initial_input(void) {
-        const struct timespec delay = {
-            .tv_sec = 0,
-            .tv_nsec = 50 * 1000 * 1000,
-        };
-
-        for (;;) {
-            if (nanosleep(&delay, NULL) == 0) {
-                return 0;
-            }
-            if (errno != EINTR) {
-                perror("nanosleep");
-                return errno == 0 ? 127 : errno;
-            }
+    static void mount_proc_if_available(void) {
+        mkdir("/proc", 0555);
+        if (mount("proc", "/proc", "proc", 0, NULL) < 0 &&
+            errno != EBUSY && errno != ENODEV && errno != ENOSYS) {
+            perror("mount /proc");
         }
-    }
-
-    static int run_initial_script_from_stdin(void) {
-        static const char script_path[] = "/tmp/framevm-init-script";
-        char buf[4096];
-        ssize_t total = 0;
-        int old_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-        if (old_flags < 0) {
-            perror("fcntl stdin");
-            return errno == 0 ? 127 : errno;
-        }
-        if (fcntl(STDIN_FILENO, F_SETFL, old_flags | O_NONBLOCK) < 0) {
-            perror("fcntl stdin nonblock");
-            return errno == 0 ? 127 : errno;
-        }
-
-        int script_fd = open(script_path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
-        if (script_fd < 0) {
-            perror("open init script");
-            fcntl(STDIN_FILENO, F_SETFL, old_flags);
-            return errno == 0 ? 127 : errno;
-        }
-
-        for (int idle_rounds = 0; idle_rounds < 30;) {
-            ssize_t read_len = read(STDIN_FILENO, buf, sizeof(buf));
-            if (read_len < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    if (total != 0) {
-                        break;
-                    }
-                    int ret = sleep_for_initial_input();
-                    if (ret != 0) {
-                        close(script_fd);
-                        fcntl(STDIN_FILENO, F_SETFL, old_flags);
-                        return ret;
-                    }
-                    idle_rounds++;
-                    continue;
-                }
-                perror("read stdin");
-                close(script_fd);
-                fcntl(STDIN_FILENO, F_SETFL, old_flags);
-                return errno == 0 ? 127 : errno;
-            }
-            if (read_len == 0) {
-                break;
-            }
-            idle_rounds = 0;
-            if (write_all(script_fd, buf, read_len) < 0) {
-                perror("write init script");
-                close(script_fd);
-                fcntl(STDIN_FILENO, F_SETFL, old_flags);
-                return errno == 0 ? 127 : errno;
-            }
-            total += read_len;
-        }
-
-        if (fcntl(STDIN_FILENO, F_SETFL, old_flags) < 0) {
-            perror("fcntl stdin restore");
-            close(script_fd);
-            return errno == 0 ? 127 : errno;
-        }
-        if (total == 0) {
-            close(script_fd);
-            return 0;
-        }
-        if (write_all(script_fd, "\n", 1) < 0) {
-            perror("write init script terminator");
-            close(script_fd);
-            return errno == 0 ? 127 : errno;
-        }
-        close(script_fd);
-
-        char *const argv[] = { "/bin/sh", (char *)script_path, NULL };
-        execve("/bin/sh", argv, envp);
-        perror("execve /bin/sh script");
-        return errno == 0 ? 127 : errno;
     }
 
     int main(void) {
-        int ret = run_initial_script_from_stdin();
+        int ret = setup_console();
         if (ret != 0) {
             return ret;
         }
+        mount_proc_if_available();
 
-        char *const argv[] = { "/bin/sh", NULL };
+        char *const argv[] = { "/bin/sh", "-i", NULL };
         execve("/bin/sh", argv, envp);
         perror("execve /bin/sh");
         return errno == 0 ? 127 : errno;
     }
     EOF
     $CC -O2 -static -o "$root/init" framevm-init.c
+    cat > framevm-test-runner.c <<'EOF'
+    #include <errno.h>
+    #include <fcntl.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <sys/ioctl.h>
+    #include <sys/mount.h>
+    #include <sys/stat.h>
+    #include <termios.h>
+    #include <unistd.h>
+
+    static char *const envp[] = {
+        "PATH=/bin",
+        "HOME=/",
+        "TERM=linux",
+        "USER=root",
+        "LOGNAME=root",
+        "PS1=~ # ",
+        NULL
+    };
+
+    static int setup_console(void) {
+        if (setsid() < 0 && errno != EPERM) {
+            perror("setsid");
+            return errno == 0 ? 127 : errno;
+        }
+
+        int console_fd = open("/dev/console", O_RDWR);
+        if (console_fd < 0) {
+            perror("open /dev/console");
+            return errno == 0 ? 127 : errno;
+        }
+
+        if (ioctl(console_fd, TIOCSCTTY, 0) < 0 && errno != EPERM) {
+            perror("TIOCSCTTY");
+            close(console_fd);
+            return errno == 0 ? 127 : errno;
+        }
+
+        for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+            if (dup2(console_fd, fd) < 0) {
+                perror("dup2 /dev/console");
+                close(console_fd);
+                return errno == 0 ? 127 : errno;
+            }
+        }
+        if (console_fd > STDERR_FILENO) {
+            close(console_fd);
+        }
+
+        return 0;
+    }
+
+    static void mount_proc_if_available(void) {
+        mkdir("/proc", 0555);
+        if (mount("proc", "/proc", "proc", 0, NULL) < 0 &&
+            errno != EBUSY && errno != ENODEV && errno != ENOSYS) {
+            perror("mount /proc");
+        }
+    }
+
+    static int run_shell_command(const char *command) {
+        char *const argv[] = { "/bin/sh", "-c", (char *)command, NULL };
+        execve("/bin/sh", argv, envp);
+        perror("execve /bin/sh");
+        return errno == 0 ? 127 : errno;
+    }
+
+    static int run_shell_parity_test(void) {
+        if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+            fprintf(stderr, "standard streams are not attached to a TTY\n");
+            return 1;
+        }
+
+        int tty_fd = open("/dev/tty", O_RDWR);
+        if (tty_fd < 0) {
+            perror("open /dev/tty");
+            return errno == 0 ? 127 : errno;
+        }
+        close(tty_fd);
+
+        int ret = system("ps >/tmp/framevm-ps.out && grep -q framevm-test-runner /tmp/framevm-ps.out");
+        if (ret != 0) {
+            fprintf(stderr, "guest ps did not report framevm-test-runner\n");
+            return 1;
+        }
+
+        puts("FRAMEVM_SHELL_OK");
+        return 0;
+    }
+
+    int main(int argc, char **argv) {
+        int ret = setup_console();
+        if (ret != 0) {
+            return ret;
+        }
+        mount_proc_if_available();
+
+        const char *test = getenv("FRAMEVM_TEST");
+        if ((test == NULL || test[0] == '\0') && argc > 1) {
+            test = argv[1];
+        }
+        if (test == NULL || test[0] == '\0') {
+            fprintf(stderr, "FRAMEVM_TEST is required\n");
+            return 127;
+        }
+
+        if (strcmp(test, "load") == 0) {
+            puts("FRAMEVM_LOAD_OK");
+            return 0;
+        }
+        if (strcmp(test, "boot") == 0) {
+            puts("FRAMEVM_BOOT_OK");
+            return 0;
+        }
+        if (strcmp(test, "regression") == 0) {
+            puts("FRAMEVM_REGRESSION_OK");
+            return 0;
+        }
+        if (strcmp(test, "exit-zero") == 0 || strcmp(test, "marker-missing") == 0) {
+            return 0;
+        }
+        if (strcmp(test, "exit-nonzero") == 0) {
+            return 7;
+        }
+        if (strcmp(test, "restart-requested") == 0) {
+            char *const reboot_argv[] = { "/bin/framevm_reboot", "restart", NULL };
+            execve("/bin/framevm_reboot", reboot_argv, envp);
+            perror("execve /bin/framevm_reboot");
+            return errno == 0 ? 127 : errno;
+        }
+        if (strcmp(test, "rootfs-write") == 0) {
+            return run_shell_command("printf 'framevm-rootfs-1111\\n' > /tmp/framevm-persist && sync");
+        }
+        if (strcmp(test, "rootfs") == 0) {
+            puts("FRAMEVM_ROOTFS_OK");
+            return 0;
+        }
+        if (strcmp(test, "device") == 0) {
+            return run_shell_command("echo FRAMEV_VSOCK_GUEST_CLIENT_SMALL_START && /bin/framev_vsock_echo client 2 1234 4096 shutdown && echo FRAMEV_VSOCK_GUEST_CLIENT_SMALL_DONE && echo FRAMEV_VSOCK_GUEST_CLIENT_LARGE_START && /bin/framev_vsock_echo client 2 1234 131072 shutdown && echo FRAMEV_VSOCK_GUEST_CLIENT_LARGE_DONE && echo FRAMEV_VSOCK_GUEST_CLIENT_DONE && echo FRAMEV_VSOCK_GUEST_SERVER_START && /bin/framev_vsock_echo server any 4321 2 FRAMEV_VSOCK_GUEST_SERVER_DONE || echo FRAMEV_VSOCK_FAILED");
+        }
+        if (strcmp(test, "shell") == 0) {
+            return run_shell_parity_test();
+        }
+
+        fprintf(stderr, "unknown FRAMEVM_TEST=%s\n", test);
+        return 127;
+    }
+    EOF
+    $CC -O2 -static -o "$root/bin/framevm-test-runner" framevm-test-runner.c
     $CC -O2 -static -o "$root/bin/framev_vsock_echo" ${framevVsockEcho}
     cat > framevm-reboot.c <<'EOF'
     #include <linux/reboot.h>
@@ -188,7 +274,7 @@ in stdenvNoCC.mkDerivation {
     printf 'framevm-rootfs-0000\n' > "$root/tmp/framevm-persist"
 
     chmod 0755 "$root/bin/busybox" "$root/bin/framev_vsock_echo" \
-      "$root/bin/framevm_reboot" "$root/init"
+      "$root/bin/framevm-test-runner" "$root/bin/framevm_reboot" "$root/init"
     chmod 1777 "$root/tmp"
 
     dd if=/dev/zero of="$out" bs=1M count=32 status=none

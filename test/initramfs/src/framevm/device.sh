@@ -105,15 +105,14 @@ framevm_guest_cid_from_log() {
 
 run_framevm_command() {
     log_file="$1"
-    command="$2"
     framevm_register_cleanup_path "$log_file"
     drive=$(framevm_prepare_drive device)
 
     (
         : >"$log_file"
-        (
-            printf '%s\n' "$command"
-        ) | framevmctl run --vcpus "$VCPUS" --drive "file=$drive" >"$log_file" 2>&1 &
+        framevmctl run --vcpus "$VCPUS" --drive "file=$drive" \
+            --append "init=/bin/framevm-test-runner FRAMEVM_TEST=device" \
+            >"$log_file" 2>&1 &
         framevm_pid=$!
 
         tail -f "$log_file" &
@@ -141,8 +140,7 @@ tail -f /tmp/framev_vsock_host_server.log &
 host_server_tail_pid=$!
 framevm_register_cleanup_pid "$host_server_tail_pid"
 
-run_framevm_command /tmp/framev_vsock_guest.log \
-    "echo FRAMEV_VSOCK_GUEST_CLIENT_SMALL_START && $GUEST_BIN client $HOST_CID $HOST_PORT $SMALL_PAYLOAD shutdown && echo FRAMEV_VSOCK_GUEST_CLIENT_SMALL_DONE && echo FRAMEV_VSOCK_GUEST_CLIENT_LARGE_START && $GUEST_BIN client $HOST_CID $HOST_PORT $LARGE_PAYLOAD shutdown && echo FRAMEV_VSOCK_GUEST_CLIENT_LARGE_DONE && echo FRAMEV_VSOCK_GUEST_CLIENT_DONE && echo FRAMEV_VSOCK_GUEST_SERVER_START && $GUEST_BIN server any $GUEST_PORT 2 FRAMEV_VSOCK_GUEST_SERVER_DONE || echo FRAMEV_VSOCK_FAILED"
+run_framevm_command /tmp/framev_vsock_guest.log
 guest_pid="$FRAMEVMCTL_PID"
 echo "[framev-vsock] guest framevmctl pid=${guest_pid}"
 if ! wait_for_log /tmp/framev_vsock_guest.log FRAMEV_VSOCK_GUEST_CLIENT_DONE 180; then

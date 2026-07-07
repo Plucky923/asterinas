@@ -10,7 +10,7 @@ pub(crate) mod thread_info;
 pub(crate) mod utils;
 pub(crate) mod vfs;
 
-pub use fs_impls::{ext2, pseudofs, ramfs, sysfs, tmpfs};
+pub use fs_impls::{ext2, procfs, pseudofs, ramfs, sysfs, tmpfs};
 
 pub use crate::prelude::Result;
 use crate::{

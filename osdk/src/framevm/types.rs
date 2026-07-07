@@ -16,12 +16,14 @@ pub const REGRESSION_LOAD_INIT_PATH: &str = "/test/framevm/regression.sh";
 pub const DEVICE_LOAD_INIT_PATH: &str = "/test/framevm/device.sh";
 pub const ROOTFS_LOAD_INIT_PATH: &str = "/test/framevm/rootfs.sh";
 pub const LIFECYCLE_LOAD_INIT_PATH: &str = "/test/framevm/lifecycle.sh";
+pub const SHELL_LOAD_INIT_PATH: &str = "/test/framevm/shell_test.sh";
 pub const ALL_LOAD_INIT_PATH: &str = "/test/framevm/all.sh";
 pub const BOOT_SUCCESS_MARKER: &str = "FRAMEVM_BOOT_OK";
 pub const REGRESSION_SUCCESS_MARKER: &str = "FRAMEVM_REGRESSION_OK";
 pub const DEVICE_SUCCESS_MARKER: &str = "FRAMEVM_DEVICE_OK";
 pub const ROOTFS_SUCCESS_MARKER: &str = "FRAMEVM_ROOTFS_OK";
 pub const LIFECYCLE_SUCCESS_MARKER: &str = "FRAMEVM_LIFECYCLE_OK";
+pub const SHELL_SUCCESS_MARKER: &str = "FRAMEVM_SHELL_OK";
 
 #[derive(Clone, Debug)]
 pub struct FrameVmBuildConfig {
@@ -69,11 +71,13 @@ impl FrameVmLoadAction {
             path if path == Path::new(DEVICE_LOAD_INIT_PATH) => &[DEVICE_SUCCESS_MARKER],
             path if path == Path::new(ROOTFS_LOAD_INIT_PATH) => &[ROOTFS_SUCCESS_MARKER],
             path if path == Path::new(LIFECYCLE_LOAD_INIT_PATH) => &[LIFECYCLE_SUCCESS_MARKER],
+            path if path == Path::new(SHELL_LOAD_INIT_PATH) => &[SHELL_SUCCESS_MARKER],
             path if path == Path::new(ALL_LOAD_INIT_PATH) => &[
                 BOOT_SUCCESS_MARKER,
                 REGRESSION_SUCCESS_MARKER,
                 DEVICE_SUCCESS_MARKER,
                 ROOTFS_SUCCESS_MARKER,
+                SHELL_SUCCESS_MARKER,
             ],
             _ => &[DEFAULT_LOAD_SUCCESS_MARKER],
         }
@@ -164,12 +168,17 @@ mod tests {
             &[ROOTFS_SUCCESS_MARKER]
         );
         assert_eq!(
+            FrameVmLoadAction::Script(PathBuf::from(SHELL_LOAD_INIT_PATH)).success_markers(),
+            &[SHELL_SUCCESS_MARKER]
+        );
+        assert_eq!(
             FrameVmLoadAction::Script(PathBuf::from(ALL_LOAD_INIT_PATH)).success_markers(),
             &[
                 BOOT_SUCCESS_MARKER,
                 REGRESSION_SUCCESS_MARKER,
                 DEVICE_SUCCESS_MARKER,
-                ROOTFS_SUCCESS_MARKER
+                ROOTFS_SUCCESS_MARKER,
+                SHELL_SUCCESS_MARKER
             ]
         );
         assert_eq!(

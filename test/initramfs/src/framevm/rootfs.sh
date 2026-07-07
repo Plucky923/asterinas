@@ -9,8 +9,8 @@ run_write_flush_smoke() {
     log_file=/tmp/framevm-rootfs-write.log
     framevm_register_cleanup_path "$log_file"
 
-    if ! printf 'printf "framevm-rootfs-1111\\n" > /tmp/framevm-persist\nsync\nexit\n' \
-        | framevmctl run --vcpus "${FRAMEVM_VCPUS:-1}" --drive "file=$drive" \
+    if ! framevmctl run --vcpus "${FRAMEVM_VCPUS:-1}" --drive "file=$drive" \
+        --append "init=/bin/framevm-test-runner FRAMEVM_TEST=rootfs-write" \
         >"$log_file" 2>&1; then
         echo "[framevm-rootfs] writable drive run failed"
         framevm_dump_log_tail "$log_file"

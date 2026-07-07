@@ -83,7 +83,7 @@ framevm_run_load() {
     marker="$1"
     case_name="${2:-load}"
     drive=$(framevm_prepare_drive "$case_name")
-    if ! framevm_run_with_drive_arg "file=$drive"; then
+    if ! framevm_run_with_drive_arg "file=$drive" "$case_name"; then
         printf '\nFRAMEVM_LOAD_FAILED\n'
         return 1
     fi
@@ -94,8 +94,9 @@ framevm_run_load() {
 
 framevm_run_with_drive_arg() {
     drive_arg="$1"
-    printf 'exit\n' | framevmctl run --vcpus "${FRAMEVM_VCPUS:-1}" \
-        --drive "$drive_arg"
+    test_name="$2"
+    framevmctl run --vcpus "${FRAMEVM_VCPUS:-1}" --drive "$drive_arg" \
+        --append "init=/bin/framevm-test-runner FRAMEVM_TEST=${test_name}"
 }
 
 framevm_install_cleanup_trap

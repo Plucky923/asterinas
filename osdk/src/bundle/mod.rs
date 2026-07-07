@@ -5,13 +5,13 @@ pub mod file;
 pub mod vm_image;
 
 use bin::{AsterBin, AsterBinType};
-use file::{BundleFile, Initramfs};
+use file::{BundleFile, FrameVmSymbols, Initramfs};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
-    process::{self, ExitStatus},
-    time::Duration,
+    process::{self, Command, ExitStatus},
+    time::{Duration, Instant},
 };
 use tempfile::NamedTempFile;
 use vm_image::{AsterVmImage, AsterVmImageType};
@@ -47,11 +47,36 @@ pub struct Bundle {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BundleManifest {
     pub initramfs: Option<Initramfs>,
+    #[serde(default)]
+    pub framevm_symbols: Option<FrameVmSymbols>,
+    #[serde(default)]
+    pub framevm_artifact_set: Option<FrameVmArtifactSet>,
     pub aster_bin: Option<AsterBin>,
     pub vm_image: Option<AsterVmImage>,
     pub config: Config,
     pub action: ActionChoice,
     pub last_modified: SystemTime,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FrameVmArtifactSet {
+    pub transaction_id: String,
+    pub host_elf_hash: String,
+    pub actual_imports_hash: String,
+    #[serde(default)]
+    pub framevm_source_hash: Option<String>,
+    #[serde(default)]
+    pub framevm_service_object_hash: Option<String>,
+    #[serde(default)]
+    pub framevm_host_symbol_hash: Option<String>,
+    #[serde(default)]
+    pub framevm_service_check_hash: Option<String>,
+    #[serde(default)]
+    pub framevm_boot_carrier_hash: Option<String>,
+    pub framevm_export_manifest_hash: String,
+    pub framevm_o_hash: String,
+    pub framevm_symbols_hash: String,
+    pub framevm_metadata_hash: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +132,8 @@ impl Bundle {
         let mut created = Self {
             manifest: BundleManifest {
                 initramfs,
+                framevm_symbols: None,
+                framevm_artifact_set: None,
                 aster_bin: None,
                 vm_image: None,
                 config: config.clone(),
@@ -171,6 +198,18 @@ impl Bundle {
                     return None;
                 } else {
                     warn_msg!("Initramfs validation failed, but proceeding in non-strict mode");
+                }
+            }
+        }
+        if let Some(framevm_symbols) = &manifest.framevm_symbols {
+            if !framevm_symbols.validate() {
+                if strict {
+                    warn_msg!("FrameVM symbol table validation failed");
+                    return None;
+                } else {
+                    warn_msg!(
+                        "FrameVM symbol table validation failed, but proceeding in non-strict mode"
+                    );
                 }
             }
         }
@@ -272,6 +311,10 @@ impl Bundle {
         self.manifest.last_modified
     }
 
+    pub(crate) fn config(&self) -> &Config {
+        &self.manifest.config
+    }
+
     pub fn run(&self, config: &Config, action: ActionChoice) {
         let exit_status = self.run_qemu_and_wait(config, action);
         // FIXME: When panicking it sometimes returns success, why?
@@ -303,6 +346,138 @@ impl Bundle {
                 }
             }
         }
+        let action_config = match action {
+            ActionChoice::Run => &config.run,
+            ActionChoice::Test => &config.test,
+        };
+        let mut qemu_cmd = self.build_qemu_command(config, action);
+
+        let exit_status = if action_config.qemu.with_monitor {
+            let qemu_monitor_socket_path = NamedTempFile::new().unwrap().into_temp_path();
+            qemu_cmd.arg("-monitor").arg(format!(
+                "unix:{},server,nowait",
+                qemu_monitor_socket_path.to_string_lossy()
+            ));
+
+            info!("Running QEMU: {qemu_cmd:#?}");
+            let mut qemu_child = qemu_cmd.spawn().unwrap();
+            std::thread::sleep(Duration::from_secs(1)); // Wait for QEMU to start
+            let mut qemu_monitor_stream = UnixStream::connect(&qemu_monitor_socket_path).unwrap();
+            wait_until_guest_kernel_shutdown(config, &mut qemu_monitor_stream);
+            info!("VM is paused (shutdown)");
+
+            self.post_run_action(config, Some(&mut qemu_monitor_stream));
+
+            let _ = qemu_monitor_stream.write_all(b"quit\n");
+            qemu_child.wait().unwrap()
+        } else {
+            info!("Running QEMU: {qemu_cmd:#?}");
+            let exit_status = qemu_cmd.status().unwrap();
+            self.post_run_action(config, None);
+            exit_status
+        };
+
+        fn wait_until_guest_kernel_shutdown(config: &Config, qemu_monitor_stream: &mut UnixStream) {
+            let log_file = std::fs::File::open(config.work_dir.join("qemu.log")).unwrap();
+
+            // Check VM status every 0.1 seconds and break the loop if the VM is stopped or hanging.
+            while qemu_monitor_stream.write_all(b"info status\n").is_ok() {
+                let status = BufReader::new(&mut *qemu_monitor_stream)
+                    .lines()
+                    .find(|line| line.as_ref().is_ok_and(|s| s.starts_with("VM status:")));
+                if status.is_some_and(|msg| msg.unwrap() == "VM status: paused (shutdown)") {
+                    break;
+                }
+
+                if config.target_arch == Arch::RiscV64 {
+                    let log = rev_buf_reader::RevBufReader::new(&log_file);
+                    if log.lines().next().is_some_and(|line| {
+                        line.as_ref().is_ok_and(|s| {
+                            s.contains("SBI system_reset cannot shut down the underlying machine")
+                        })
+                    }) {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        exit_status
+    }
+
+    pub(crate) fn run_qemu_until_log_match(
+        &self,
+        config: &Config,
+        action: ActionChoice,
+        timeout: Duration,
+        is_log_match: impl Fn(&str) -> bool,
+        describe_log_failure: impl Fn(&str) -> String,
+    ) -> Result<ExitStatus, String> {
+        self.can_run_with_config(config, action)?;
+
+        let qemu_log = config.work_dir.join("qemu.log");
+        let _ = std::fs::remove_file(&qemu_log);
+        let mut qemu_cmd = self.build_qemu_command(config, action);
+        info!("Running QEMU: {qemu_cmd:#?}");
+        let mut qemu_child = qemu_cmd
+            .spawn()
+            .map_err(|error| format!("failed to spawn QEMU: {error}"))?;
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            if let Ok(content) = std::fs::read_to_string(&qemu_log)
+                && is_log_match(&content)
+            {
+                let _ = qemu_child.kill();
+                let exit_status = qemu_child
+                    .wait()
+                    .map_err(|error| format!("failed to wait for QEMU after success: {error}"))?;
+                self.post_run_action(config, None);
+                return Ok(exit_status);
+            }
+
+            match qemu_child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    self.post_run_action(config, None);
+                    let log_summary = std::fs::read_to_string(&qemu_log)
+                        .map(|content| describe_log_failure(&content))
+                        .unwrap_or_else(|error| {
+                            format!("failed to read {}: {error}", qemu_log.display())
+                        });
+                    return Err(format!(
+                        "qemu exited before framevm success was observed: status={:?}; {}",
+                        exit_status.code(),
+                        log_summary
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = qemu_child.kill();
+                    return Err(format!("failed to poll QEMU status: {error}"));
+                }
+            }
+
+            if Instant::now() >= deadline {
+                let _ = qemu_child.kill();
+                let _ = qemu_child.wait();
+                self.post_run_action(config, None);
+                let log_summary = std::fs::read_to_string(&qemu_log)
+                    .map(|content| describe_log_failure(&content))
+                    .unwrap_or_else(|error| {
+                        format!("failed to read {}: {error}", qemu_log.display())
+                    });
+                return Err(format!(
+                    "timed out waiting for framevm success in {}; {}",
+                    qemu_log.display(),
+                    log_summary
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn build_qemu_command(&self, config: &Config, action: ActionChoice) -> Command {
         let action = match action {
             ActionChoice::Run => &config.run,
             ActionChoice::Test => &config.test,
@@ -367,57 +542,7 @@ impl Bundle {
             }
         }
 
-        let exit_status = if action.qemu.with_monitor {
-            let qemu_monitor_socket_path = NamedTempFile::new().unwrap().into_temp_path();
-            qemu_cmd.arg("-monitor").arg(format!(
-                "unix:{},server,nowait",
-                qemu_monitor_socket_path.to_string_lossy()
-            ));
-
-            info!("Running QEMU: {qemu_cmd:#?}");
-            let mut qemu_child = qemu_cmd.spawn().unwrap();
-            std::thread::sleep(Duration::from_secs(1)); // Wait for QEMU to start
-            let mut qemu_monitor_stream = UnixStream::connect(&qemu_monitor_socket_path).unwrap();
-            wait_until_guest_kernel_shutdown(config, &mut qemu_monitor_stream);
-            info!("VM is paused (shutdown)");
-
-            self.post_run_action(config, Some(&mut qemu_monitor_stream));
-
-            let _ = qemu_monitor_stream.write_all(b"quit\n");
-            qemu_child.wait().unwrap()
-        } else {
-            info!("Running QEMU: {qemu_cmd:#?}");
-            let exit_status = qemu_cmd.status().unwrap();
-            self.post_run_action(config, None);
-            exit_status
-        };
-
-        fn wait_until_guest_kernel_shutdown(config: &Config, qemu_monitor_stream: &mut UnixStream) {
-            let log_file = std::fs::File::open(config.work_dir.join("qemu.log")).unwrap();
-
-            // Check VM status every 0.1 seconds and break the loop if the VM is stopped or hanging.
-            while qemu_monitor_stream.write_all(b"info status\n").is_ok() {
-                let status = BufReader::new(&mut *qemu_monitor_stream)
-                    .lines()
-                    .find(|line| line.as_ref().is_ok_and(|s| s.starts_with("VM status:")));
-                if status.is_some_and(|msg| msg.unwrap() == "VM status: paused (shutdown)") {
-                    break;
-                }
-
-                if config.target_arch == Arch::RiscV64 {
-                    let log = rev_buf_reader::RevBufReader::new(&log_file);
-                    if log.lines().next().is_some_and(|line| {
-                        line.as_ref().is_ok_and(|s| {
-                            s.contains("SBI system_reset cannot shut down the underlying machine")
-                        })
-                    }) {
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        exit_status
+        qemu_cmd
     }
 
     pub fn vm_image_path(&self) -> Option<PathBuf> {
@@ -434,6 +559,21 @@ impl Bundle {
             .map(|bin| self.path.join(bin.path()))
     }
 
+    pub(crate) fn framevm_symbols_path(&self) -> Option<PathBuf> {
+        self.manifest
+            .framevm_symbols
+            .as_ref()
+            .map(|symbols| self.path.join(symbols.path()))
+    }
+
+    pub(crate) fn framevm_artifact_set(&self) -> Option<&FrameVmArtifactSet> {
+        self.manifest.framevm_artifact_set.as_ref()
+    }
+
+    pub(crate) fn aster_bin_metadata(&self) -> Option<&AsterBin> {
+        self.manifest.aster_bin.as_ref()
+    }
+
     /// Move the vm_image into the bundle.
     pub fn consume_vm_image(&mut self, vm_image: AsterVmImage) {
         if self.manifest.vm_image.is_some() {
@@ -443,12 +583,48 @@ impl Bundle {
         self.write_manifest_to_fs();
     }
 
+    pub(crate) fn replace_vm_image(&mut self, vm_image: AsterVmImage) {
+        self.manifest.vm_image = Some(vm_image.copy_to(&self.path));
+        self.write_manifest_to_fs();
+    }
+
+    pub(crate) fn replace_initramfs(&mut self, initramfs: Initramfs) {
+        self.manifest.initramfs = Some(initramfs.copy_to(&self.path));
+        self.write_manifest_to_fs();
+    }
+
     /// Move the aster_bin into the bundle.
     pub fn consume_aster_bin(&mut self, aster_bin: AsterBin) {
         if self.manifest.aster_bin.is_some() {
             panic!("aster_bin already exists");
         }
         self.manifest.aster_bin = Some(aster_bin.copy_to(&self.path));
+        self.write_manifest_to_fs();
+    }
+
+    pub(crate) fn replace_framevm_symbols(&mut self, framevm_symbols: FrameVmSymbols) {
+        self.manifest.framevm_symbols = Some(framevm_symbols.copy_to(&self.path));
+        self.write_manifest_to_fs();
+    }
+
+    pub(crate) fn replace_framevm_artifact_set(&mut self, artifact_set: FrameVmArtifactSet) {
+        self.manifest.framevm_artifact_set = Some(artifact_set);
+        self.write_manifest_to_fs();
+    }
+
+    pub fn refresh_aster_bin_metadata(&mut self) {
+        let Some(ref mut aster_bin) = self.manifest.aster_bin else {
+            return;
+        };
+        let bin_rel = aster_bin.path().clone();
+        let _guard = DirGuard::change_dir(&self.path);
+        *aster_bin = AsterBin::new(
+            bin_rel,
+            aster_bin.arch(),
+            aster_bin.typ().clone(),
+            aster_bin.version().clone(),
+            aster_bin.stripped(),
+        );
         self.write_manifest_to_fs();
     }
 

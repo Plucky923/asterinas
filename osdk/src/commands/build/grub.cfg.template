@@ -11,5 +11,6 @@ menuentry 'asterinas' {
     #GRUB_CMD_KERNEL# #KERNEL# #KERNEL_COMMAND_LINE#
     #GRUB_CMD_INITRAMFS#
     #GRUB_CMD_BINARY#
+    #GRUB_CMD_FRAMEVM_SYMBOLS#
     boot
 }

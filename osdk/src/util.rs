@@ -397,7 +397,9 @@ impl Drop for DirGuard {
 /// - `Ok(size)` where `size` is the number of bytes copied if the hard link failed and a copy was performed.
 /// - `Err(error)` if an error occurred during the copy operation.
 pub fn hard_link_or_copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Result<u64> {
-    let from_metadata = fs::metadata(&from)?;
+    let from_path = from.as_ref();
+    let resolved_from = fs::canonicalize(from_path).unwrap_or_else(|_| from_path.to_path_buf());
+    let from_metadata = fs::metadata(&resolved_from)?;
     // If the destination is already a hard link to the source, creating another hard link will
     // fail because the destination exists, and falling back to `fs::copy` would truncate the file.
     if let Ok(to_metadata) = fs::metadata(&to)
@@ -412,10 +414,10 @@ pub fn hard_link_or_copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Resu
         return Ok(0);
     }
 
-    if fs::hard_link(&from, &to).is_err() {
-        info!("Copying {:?} -> {:?}", from.as_ref(), to.as_ref());
-        return fs::copy(from, to);
+    if fs::hard_link(&resolved_from, &to).is_err() {
+        info!("Copying {:?} -> {:?}", resolved_from, to.as_ref());
+        return fs::copy(resolved_from, to);
     }
-    info!("Linking {:?} -> {:?}", from.as_ref(), to.as_ref());
+    info!("Linking {:?} -> {:?}", resolved_from, to.as_ref());
     Ok(0)
 }

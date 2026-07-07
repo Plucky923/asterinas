@@ -53,7 +53,7 @@ pub fn execute_run_command(config: &Config, args: &RunArgs) {
 
 fn load_existing_bundle_for_run(bundle_dir: &Path, config: &mut Config) -> Bundle {
     // Use non-strict loading here to allow minor mtime/size drifts of files that still exist.
-    let mut bundle = match Bundle::load(bundle_dir, false) {
+    let bundle = match Bundle::load(bundle_dir, false) {
         Some(b) => b,
         None => {
             error_msg!(
@@ -87,16 +87,11 @@ fn load_existing_bundle_for_run(bundle_dir: &Path, config: &mut Config) -> Bundl
     match bundle.can_run_with_config(config, ActionChoice::Run) {
         Ok(()) => bundle,
         Err(e) => {
-            warn_msg!(
-                "Existing bundle incompatible ({}), refreshing bundle metadata to match current config...",
+            error_msg!(
+                "Existing bundle incompatible ({}). Please rebuild without --no-build.",
                 e
             );
-            bundle.update_config(config, ActionChoice::Run);
-            if let Err(e2) = bundle.can_run_with_config(config, ActionChoice::Run) {
-                error_msg!("Failed to refresh existing bundle: {}", e2);
-                std::process::exit(Errno::RunBundle as _);
-            }
-            bundle
+            std::process::exit(Errno::RunBundle as _);
         }
     }
 }

@@ -8,7 +8,8 @@ use crate::{
     arch::Arch,
     commands::{
         execute_build_command, execute_debug_command, execute_forwarded_command,
-        execute_new_command, execute_profile_command, execute_run_command, execute_test_command,
+        execute_framevm_command, execute_new_command, execute_profile_command, execute_run_command,
+        execute_test_command,
     },
     config::{
         Config,
@@ -40,6 +41,15 @@ pub fn main() {
         }
         OsdkSubcommand::Run(run_args) => {
             execute_run_command(&load_config(&run_args.common_args), run_args);
+        }
+        OsdkSubcommand::Framevm(framevm_args) => {
+            let manifest = TomlManifest::load();
+            let scheme = manifest.get_scheme(framevm_args.common_args().scheme.as_ref());
+            let mut config = Config::new_framevm(scheme, framevm_args.common_args());
+            config
+                .build
+                .append_rustflags(&std::env::var("RUSTFLAGS").unwrap_or_default());
+            execute_framevm_command(&config, framevm_args);
         }
         OsdkSubcommand::Debug(debug_args) => {
             execute_debug_command(
@@ -86,6 +96,8 @@ pub enum OsdkSubcommand {
     Build(BuildArgs),
     #[command(about = "Run the kernel with a VMM")]
     Run(RunArgs),
+    #[command(about = "Build or run the FrameVM service artifact set")]
+    Framevm(FrameVmArgs),
     #[command(about = "Debug a remote target via GDB")]
     Debug(DebugArgs),
     #[command(about = "Profile a remote GDB debug target to collect stack traces for flame graph")]
@@ -200,6 +212,97 @@ pub struct RunArgs {
         help = "Skip the build process and run the existing binary directly"
     )]
     pub no_build: bool,
+    #[command(flatten)]
+    pub common_args: CommonArgs,
+}
+
+#[derive(Debug, Parser)]
+pub struct FrameVmArgs {
+    #[command(subcommand)]
+    pub command: FrameVmCommand,
+}
+
+impl FrameVmArgs {
+    pub fn common_args(&self) -> &CommonArgs {
+        match &self.command {
+            FrameVmCommand::Build(args) => &args.common_args,
+            FrameVmCommand::Run(args) => &args.common_args,
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+pub enum FrameVmCommand {
+    #[command(about = "Build and validate FrameVM artifacts without launching QEMU")]
+    Build(FrameVmBuildArgs),
+    #[command(about = "Build or reuse FrameVM artifacts, launch QEMU, and load FrameVM")]
+    Run(FrameVmRunArgs),
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct FrameVmBuildOptions {
+    #[arg(
+        long = "framevm-target",
+        help = "Target triple for the FrameVM service object",
+        default_value = "x86_64-unknown-none"
+    )]
+    pub target: String,
+    #[arg(
+        long = "framevm-object-output",
+        help = "Path for the final loadable FrameVM object",
+        value_name = "PATH"
+    )]
+    pub object_output: Option<PathBuf>,
+    #[arg(
+        long = "framevm-install-path",
+        help = "Absolute initramfs path where the FrameVM object is installed",
+        default_value = "/framevm/framevm.o"
+    )]
+    pub install_path: PathBuf,
+    #[arg(
+        id = "framevm_features",
+        long = "framevm-features",
+        help = "Comma-separated features enabled for aster-framevm",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    pub features: Vec<String>,
+    #[arg(
+        id = "framevm_no_default_features",
+        long = "framevm-no-default-features",
+        help = "Disable default features for aster-framevm"
+    )]
+    pub no_default_features: bool,
+    #[arg(
+        long = "framevm-skip-service-check",
+        help = "Skip the FrameVM service boundary checker"
+    )]
+    pub skip_service_check: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct FrameVmBuildArgs {
+    #[command(flatten)]
+    pub framevm: FrameVmBuildOptions,
+    #[command(flatten)]
+    pub common_args: CommonArgs,
+}
+
+#[derive(Debug, Parser)]
+pub struct FrameVmRunArgs {
+    #[command(flatten)]
+    pub framevm: FrameVmBuildOptions,
+    #[arg(
+        long = "no-build",
+        help = "Launch an existing FrameVM bundle without rebuilding artifacts"
+    )]
+    pub no_build: bool,
+    #[arg(
+        long = "framevm-load-init",
+        help = "Initramfs script used by the default FrameVM load action",
+        default_value = "/test/framevm/shell.sh"
+    )]
+    pub load_init: PathBuf,
     #[command(flatten)]
     pub common_args: CommonArgs,
 }

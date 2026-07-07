@@ -4,6 +4,7 @@
 
 mod build;
 mod debug;
+mod framevm;
 mod new;
 mod profile;
 mod run;
@@ -11,9 +12,16 @@ mod test;
 mod util;
 
 pub use self::{
-    build::execute_build_command, debug::execute_debug_command, new::execute_new_command,
-    profile::execute_profile_command, run::execute_run_command, test::execute_test_command,
+    build::execute_build_command, debug::execute_debug_command, framevm::execute_framevm_command,
+    new::execute_new_command, profile::execute_profile_command, run::execute_run_command,
+    test::execute_test_command,
 };
+
+pub(crate) use self::build::{
+    BundleBuildOptions, FinalCrateRetention, KernelSymbolsModule,
+    create_base_and_cached_build_with_options, refresh_grub_bootdev_image_with_framevm_symbols,
+};
+pub(crate) use util::{COMMON_CARGO_ARGS, DEFAULT_TARGET_RELPATH};
 
 use crate::{arch::get_default_arch, error_msg};
 

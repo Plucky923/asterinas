@@ -36,6 +36,15 @@ static int create_vm_fd(struct framevm_create_vm request)
 	return ioctl(controller_fd, FRAMEVM_CREATE_VM, &request);
 }
 
+static struct framevm_cmdline cmdline_request(const char *text)
+{
+	return (struct framevm_cmdline){
+		.ptr = (uint64_t)(uintptr_t)text,
+		.len = (uint32_t)strlen(text),
+		.flags = 0,
+	};
+}
+
 FN_SETUP(open_controller)
 {
 	controller_fd = CHECK(open(FRAMEVM_PATH, O_RDWR));
@@ -169,6 +178,8 @@ FN_TEST(ioctl_role_errors)
 	TEST_ERRNO(ioctl(controller_fd, FRAMEVM_GET_CONSOLE_FD), ENOTTY);
 	struct framevm_status status = { 0 };
 	TEST_ERRNO(ioctl(controller_fd, FRAMEVM_GET_STATUS, &status), ENOTTY);
+	struct framevm_cmdline cmdline = cmdline_request("init=/bin/sh");
+	TEST_ERRNO(ioctl(controller_fd, FRAMEVM_SET_CMDLINE, &cmdline), ENOTTY);
 	TEST_ERRNO(ioctl(controller_fd, FRAMEVM_SET_SHARE, &request.share),
 		   ENOTTY);
 	TEST_ERRNO(ioctl(controller_fd, FRAMEVM_UNKNOWN_IOCTL), ENOTTY);
@@ -176,6 +187,61 @@ FN_TEST(ioctl_role_errors)
 	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_CREATE_VM, &request), ENOTTY);
 	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_SET_SHARE, &request.share), ENOTTY);
 	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_UNKNOWN_IOCTL), ENOTTY);
+
+	close(vm_fd);
+}
+END_TEST()
+
+FN_TEST(cmdline_append_validation)
+{
+	struct framevm_create_vm request = valid_create_request();
+	int vm_fd = TEST_RES(create_vm_fd(request), _ret >= 0);
+	if (vm_fd < 0) {
+		return;
+	}
+
+	struct framevm_cmdline cmdline = cmdline_request("init=/bin/sh");
+	TEST_RES(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), _ret == 0);
+
+	cmdline.ptr = 0;
+	cmdline.len = 0;
+	cmdline.flags = 0;
+	TEST_RES(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), _ret == 0);
+
+	cmdline = cmdline_request("init=/bin/framevm-test-runner framevm.test=boot");
+	TEST_RES(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), _ret == 0);
+
+	cmdline = cmdline_request("init=/bin/sh");
+	cmdline.flags = 1;
+	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), EINVAL);
+
+	cmdline = cmdline_request("init=/bin/sh");
+	cmdline.ptr = 0;
+	cmdline.len = 1;
+	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), EFAULT);
+
+	static char long_cmdline[FRAMEVM_CMDLINE_MAX_LEN + 1];
+	memset(long_cmdline, 'a', sizeof(long_cmdline));
+	cmdline.ptr = (uint64_t)(uintptr_t)long_cmdline;
+	cmdline.len = sizeof(long_cmdline);
+	cmdline.flags = 0;
+	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), EINVAL);
+
+	char nul_cmdline[] = { 'i', 'n', 'i', 't', '=', 0, 'x' };
+	cmdline.ptr = (uint64_t)(uintptr_t)nul_cmdline;
+	cmdline.len = sizeof(nul_cmdline);
+	cmdline.flags = 0;
+	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), EINVAL);
+
+	cmdline = cmdline_request("ostd.vcpu_count=2");
+	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), EINVAL);
+
+	cmdline = cmdline_request("framev.devices=bad");
+	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), EINVAL);
+
+	TEST_RES(ioctl(vm_fd, FRAMEVM_STOP), _ret == 0);
+	cmdline = cmdline_request("init=/bin/sh");
+	TEST_ERRNO(ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &cmdline), EINVAL);
 
 	close(vm_fd);
 }

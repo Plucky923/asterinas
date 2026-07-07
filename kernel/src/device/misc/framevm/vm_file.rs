@@ -27,6 +27,7 @@ struct VmInner {
     vcpu_count: usize,
     share: u32,
     drive_file: Option<FrameVmDriveFile>,
+    cmdline_append: Option<String>,
     lifecycle: Arc<FrameVmLifecycle>,
 }
 
@@ -98,6 +99,7 @@ impl FrameVmFile {
                 vcpu_count,
                 share,
                 drive_file,
+                cmdline_append: None,
                 lifecycle: FrameVmLifecycle::new(),
             }),
             pseudo_path: AnonInodeFs::new_path(|_| "anon_inode:[framevm-vm]".to_string()),
@@ -149,6 +151,7 @@ impl FrameVmFile {
             inner.share,
             drive_file.raw_image(),
         )?
+        .with_cmdline_append(inner.cmdline_append.clone())
         .with_lifecycle(inner.lifecycle.clone());
         match crate::vmm::start_framevm(request) {
             Ok(()) => Ok(0),
@@ -159,31 +162,60 @@ impl FrameVmFile {
         }
     }
 
-    fn stop(&self) -> Result<i32> {
-        let inner = self.try_lock_inner()?;
+    fn set_cmdline(&self, request: ioctl_defs::FrameVmCmdline) -> Result<i32> {
+        let append = request.read_append()?;
+        let mut inner = self.try_lock_inner()?;
         match inner.lifecycle.status() {
-            FrameVmLifecycleStatus::Created => {
-                inner
-                    .lifecycle
-                    .record_terminal(FrameVmLifecycleStatus::StoppedByHost {
-                        vm_id: None,
-                        reason: FrameVmTerminalReason::HostStop,
-                    });
-                return Ok(0);
-            }
-            FrameVmLifecycleStatus::Running { .. } => {}
+            FrameVmLifecycleStatus::Created => {}
             FrameVmLifecycleStatus::Starting { .. } => {
                 return_errno_with_message!(Errno::EBUSY, "FrameVM lifecycle transition is active")
+            }
+            FrameVmLifecycleStatus::Running { .. } => {
+                return_errno_with_message!(Errno::EBUSY, "FrameVM is already running")
             }
             FrameVmLifecycleStatus::ExitedSuccess { .. }
             | FrameVmLifecycleStatus::ExitedFailure { .. }
             | FrameVmLifecycleStatus::RestartRequested { .. }
             | FrameVmLifecycleStatus::StoppedByHost { .. }
             | FrameVmLifecycleStatus::PanicFailure { .. }
-            | FrameVmLifecycleStatus::Destroyed { .. } => return Ok(0),
+            | FrameVmLifecycleStatus::Destroyed { .. } => {
+                return_errno_with_message!(Errno::EINVAL, "FrameVM is already terminal")
+            }
         }
 
-        let lifecycle = inner.lifecycle.clone();
+        inner.cmdline_append = append;
+        Ok(0)
+    }
+
+    fn stop(&self) -> Result<i32> {
+        let lifecycle = {
+            let inner = self.try_lock_inner()?;
+            match inner.lifecycle.status() {
+                FrameVmLifecycleStatus::Created => {
+                    inner
+                        .lifecycle
+                        .record_terminal(FrameVmLifecycleStatus::StoppedByHost {
+                            vm_id: None,
+                            reason: FrameVmTerminalReason::HostStop,
+                        });
+                    return Ok(0);
+                }
+                FrameVmLifecycleStatus::Running { .. } => inner.lifecycle.clone(),
+                FrameVmLifecycleStatus::Starting { .. } => {
+                    return_errno_with_message!(
+                        Errno::EBUSY,
+                        "FrameVM lifecycle transition is active"
+                    )
+                }
+                FrameVmLifecycleStatus::ExitedSuccess { .. }
+                | FrameVmLifecycleStatus::ExitedFailure { .. }
+                | FrameVmLifecycleStatus::RestartRequested { .. }
+                | FrameVmLifecycleStatus::StoppedByHost { .. }
+                | FrameVmLifecycleStatus::PanicFailure { .. }
+                | FrameVmLifecycleStatus::Destroyed { .. } => return Ok(0),
+            }
+        };
+
         crate::vmm::stop_framevm(FrameVmStopRequest::new());
         lifecycle.record_terminal(FrameVmLifecycleStatus::StoppedByHost {
             vm_id: None,
@@ -241,30 +273,35 @@ impl FrameVmFile {
     }
 
     fn stop_on_close(&self) {
-        let inner = self.inner.lock();
-        match inner.lifecycle.status() {
-            FrameVmLifecycleStatus::Created => {
-                inner
-                    .lifecycle
-                    .record_terminal(FrameVmLifecycleStatus::StoppedByHost {
-                        vm_id: None,
-                        reason: FrameVmTerminalReason::FdClose,
-                    });
+        let lifecycle = {
+            let inner = self.inner.lock();
+            match inner.lifecycle.status() {
+                FrameVmLifecycleStatus::Created => {
+                    inner
+                        .lifecycle
+                        .record_terminal(FrameVmLifecycleStatus::StoppedByHost {
+                            vm_id: None,
+                            reason: FrameVmTerminalReason::FdClose,
+                        });
+                    return;
+                }
+                FrameVmLifecycleStatus::Starting { .. }
+                | FrameVmLifecycleStatus::Running { .. } => Some(inner.lifecycle.clone()),
+                FrameVmLifecycleStatus::ExitedSuccess { .. }
+                | FrameVmLifecycleStatus::ExitedFailure { .. }
+                | FrameVmLifecycleStatus::RestartRequested { .. }
+                | FrameVmLifecycleStatus::StoppedByHost { .. }
+                | FrameVmLifecycleStatus::PanicFailure { .. }
+                | FrameVmLifecycleStatus::Destroyed { .. } => None,
             }
-            FrameVmLifecycleStatus::Starting { .. } | FrameVmLifecycleStatus::Running { .. } => {
-                let lifecycle = inner.lifecycle.clone();
-                crate::vmm::stop_framevm(FrameVmStopRequest::new());
-                lifecycle.record_terminal(FrameVmLifecycleStatus::StoppedByHost {
-                    vm_id: None,
-                    reason: FrameVmTerminalReason::FdClose,
-                });
-            }
-            FrameVmLifecycleStatus::ExitedSuccess { .. }
-            | FrameVmLifecycleStatus::ExitedFailure { .. }
-            | FrameVmLifecycleStatus::RestartRequested { .. }
-            | FrameVmLifecycleStatus::StoppedByHost { .. }
-            | FrameVmLifecycleStatus::PanicFailure { .. }
-            | FrameVmLifecycleStatus::Destroyed { .. } => {}
+        };
+
+        if let Some(lifecycle) = lifecycle {
+            crate::vmm::stop_framevm(FrameVmStopRequest::new());
+            lifecycle.record_terminal(FrameVmLifecycleStatus::StoppedByHost {
+                vm_id: None,
+                reason: FrameVmTerminalReason::FdClose,
+            });
         }
     }
 }
@@ -319,6 +356,9 @@ impl FileLike for FrameVmFile {
             }
             GetConsoleFd => {
                 return self.get_console_fd();
+            }
+            cmd @ SetCmdline => {
+                return self.set_cmdline(cmd.read()?);
             }
             cmd @ GetStatus => {
                 cmd.write(&self.status())?;

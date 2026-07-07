@@ -38,11 +38,19 @@ pub(super) fn exit_process(current_process: &Process) {
     send_child_death_signal(current_process);
 
     if current_process.is_init_process() {
-        ostd::power::poweroff(power_exit_code(current_process.status().exit_code() as i32));
+        ostd::power::poweroff(power_exit_code(current_process.status().exit_code()));
     }
 }
 
-fn power_exit_code(exit_code: i32) -> ostd::power::ExitCode {
+fn power_exit_code(wait_status: u32) -> ostd::power::ExitCode {
+    const NORMAL_EXIT_MASK: u32 = 0xff;
+
+    let exit_code = if (wait_status & NORMAL_EXIT_MASK) == 0 {
+        (wait_status >> 8) as i32
+    } else {
+        wait_status as i32
+    };
+
     if exit_code == 0 {
         ostd::power::ExitCode::Success
     } else {

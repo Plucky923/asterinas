@@ -17,6 +17,7 @@
 
 #define FRAMEVM_DEVICE_PATH "/dev/framevm"
 #define FRAMEVMCTL_POLL_TIMEOUT_MS 50
+#define FRAMEVMCTL_TERMINAL_DRAIN_MS 250
 #define FRAMEVMCTL_IO_CHUNK 4096
 #define FRAMEVMCTL_PENDING_CAPACITY 8192
 #define FRAMEVMCTL_SCRIPT_INPUT_LIMIT 65536
@@ -365,7 +366,8 @@ static int signal_bridge_start(int fd) {
 static void usage(FILE *stream) {
   fprintf(stream,
           "usage: framevmctl run --vcpus N [--share X] "
-          "[--drive file=PATH[,readonly|writable]]\n"
+          "[--drive file=PATH[,readonly|writable]] "
+          "[--append CMDLINE]\n"
                   "       framevmctl --help\n");
 }
 
@@ -474,6 +476,30 @@ static void close_drive(struct drive_config *drive) {
   }
   free((void *)drive->path);
   drive->path = NULL;
+}
+
+static int set_guest_cmdline(int vm_fd, const char *append) {
+  struct framevm_cmdline request;
+  size_t length;
+
+  if (append == NULL) {
+    return 0;
+  }
+
+  length = strlen(append);
+  if (length > FRAMEVM_CMDLINE_MAX_LEN) {
+    fprintf(stderr, "FrameVM guest cmdline append is too long\n");
+    return -1;
+  }
+
+  request.ptr = (uint64_t)(uintptr_t)append;
+  request.len = (uint32_t)length;
+  request.flags = 0;
+  if (ioctl(vm_fd, FRAMEVM_SET_CMDLINE, &request) < 0) {
+    perror("FRAMEVM_SET_CMDLINE");
+    return -1;
+  }
+  return 0;
 }
 
 static const char *framevm_state_name(uint32_t state) {
@@ -601,6 +627,22 @@ static int reap_bridge_if_exited(pid_t bridge_pid, int *bridge_waited,
   return 0;
 }
 
+static void drain_bridge_after_terminal(pid_t bridge_pid, int *bridge_waited) {
+  int bridge_status = 0;
+  int elapsed_ms = 0;
+
+  while (!*bridge_waited && elapsed_ms < FRAMEVMCTL_TERMINAL_DRAIN_MS) {
+    if (reap_bridge_if_exited(bridge_pid, bridge_waited, &bridge_status) < 0) {
+      return;
+    }
+    if (*bridge_waited) {
+      return;
+    }
+    usleep(FRAMEVMCTL_POLL_TIMEOUT_MS * 1000);
+    elapsed_ms += FRAMEVMCTL_POLL_TIMEOUT_MS;
+  }
+}
+
 static int wait_for_vm_terminal(int vm_fd, pid_t bridge_pid,
                                 int *bridge_waited,
                                 struct framevm_status *status) {
@@ -612,6 +654,10 @@ static int wait_for_vm_terminal(int vm_fd, pid_t bridge_pid,
         .events = POLLIN | POLLHUP | POLLERR,
         .revents = 0,
     };
+
+    if (should_exit) {
+      return 130;
+    }
 
     if (get_framevm_status(vm_fd, status) < 0) {
       return 1;
@@ -637,6 +683,9 @@ static int wait_for_vm_terminal(int vm_fd, pid_t bridge_pid,
       }
       perror("poll vm");
       return 1;
+    }
+    if (should_exit) {
+      return 130;
     }
   }
 }
@@ -666,6 +715,7 @@ static int run_framevm(int argc, char **argv) {
       .present = 0,
       .fd = -1,
   };
+  const char *guest_cmdline_append = NULL;
 
   for (int i = 2; i < argc; i++) {
     if (strcmp(argv[i], "--vcpus") == 0 && i + 1 < argc) {
@@ -683,6 +733,13 @@ static int run_framevm(int argc, char **argv) {
         close_drive(&drive);
         return 2;
       }
+    } else if (strcmp(argv[i], "--append") == 0 && i + 1 < argc) {
+      if (guest_cmdline_append != NULL) {
+        fprintf(stderr, "multiple --append options are not supported\n");
+        close_drive(&drive);
+        return 2;
+      }
+      guest_cmdline_append = argv[++i];
     } else {
       usage(stderr);
       close_drive(&drive);
@@ -722,6 +779,13 @@ static int run_framevm(int argc, char **argv) {
   close_drive(&drive);
   if (vm_fd < 0) {
     perror("FRAMEVM_CREATE_VM");
+    close(controller_fd);
+    free_scripted_input(&scripted_input);
+    return 1;
+  }
+
+  if (set_guest_cmdline(vm_fd, guest_cmdline_append) < 0) {
+    close(vm_fd);
     close(controller_fd);
     free_scripted_input(&scripted_input);
     return 1;
@@ -786,6 +850,7 @@ static int run_framevm(int argc, char **argv) {
     status = wait_for_vm_terminal(vm_fd, bridge_pid, &bridge_waited,
                                   &vm_status);
     if (status != 130) {
+      drain_bridge_after_terminal(bridge_pid, &bridge_waited);
       fprintf(stderr, "FrameVM terminal status: %s code=%d reason=%u\n",
               framevm_state_name(vm_status.state), vm_status.status_code,
               vm_status.terminal_reason);

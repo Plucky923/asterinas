@@ -77,6 +77,15 @@ inventory::collect!(KernelParam);
 
 pub static INIT_PROC_ARGS: Once<InitprocArgs> = Once::new();
 
+/// The executable path used for the init process.
+pub static INIT_PATH: Once<String> = Once::new();
+
+static INIT_PARAM: KernelParam = KernelParam::new("init", setup_init_param, false);
+
+fn setup_init_param(occurrences: &[Option<&str>]) {
+    crate::parse::setup_kv_param(&INIT_PATH, occurrences, "init");
+}
+
 #[init_component]
 fn init() -> Result<(), ComponentInitError> {
     init_for_framevm_component_profile()
@@ -113,6 +122,7 @@ fn dispatch_params(cmdline: &str) -> InitprocArgs {
 
     // Step 1: Build lookup from registered param name to handler.
     let mut registry = BTreeMap::new();
+    registry.insert(INIT_PARAM.name, &INIT_PARAM);
     for p in inventory::iter::<KernelParam> {
         if let Some(prev) = registry.insert(p.name, p) {
             ostd::warn!(

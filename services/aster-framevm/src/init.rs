@@ -2,11 +2,8 @@
 
 //! FrameVM boot and initialization flow.
 
-use alloc::string::String;
-
-use aster_cmdline::INIT_PROC_ARGS;
+use aster_cmdline::{INIT_PATH, INIT_PROC_ARGS};
 use component::InitStage;
-use spin::once::Once;
 
 use crate::{
     device, net,
@@ -93,7 +90,7 @@ fn print_banner() {
 
 fn run_init_process() {
     let init_args = INIT_PROC_ARGS.get().unwrap();
-    let init_path = INIT_PATH.get().map(String::as_str);
+    let init_path = INIT_PATH.get().map(|path| path.as_str());
     spawn_init_process(
         init_path,
         init_args.argv().to_vec(),
@@ -111,6 +108,3 @@ pub(super) fn on_first_process_startup(ctx: &Context) {
     crate::fs::init_in_first_process(ctx);
     ostd::early_println!("[kernel] process init: done");
 }
-
-static INIT_PATH: Once<String> = Once::new();
-aster_cmdline::define_kv_param!("init", INIT_PATH);

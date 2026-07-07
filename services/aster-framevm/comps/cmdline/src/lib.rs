@@ -66,7 +66,7 @@ mod unimplemented;
 
 #[doc(hidden)]
 pub use dispatch::KernelParam;
-pub use dispatch::{INIT_PROC_ARGS, init_for_framevm_component_profile};
+pub use dispatch::{INIT_PATH, INIT_PROC_ARGS, init_for_framevm_component_profile};
 #[doc(hidden)]
 pub use inventory::submit;
 #[doc(hidden)]

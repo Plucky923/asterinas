@@ -442,7 +442,7 @@ pub fn get_vm_by_cid(cid: u64) -> Option<Arc<FrameVm>> {
 /// Destroy a FrameVM by ID.
 pub fn destroy_vm(id: VmId) -> Option<Arc<FrameVm>> {
     let vm = get_registry().write().vms.remove(&id)?;
-    vm.stop();
+    vm.request_stop();
     Some(vm)
 }
 

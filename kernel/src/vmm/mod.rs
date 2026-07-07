@@ -404,6 +404,7 @@ pub struct FrameVmStartRequest {
     vcpu_count: usize,
     share: u32,
     drive_image: Option<Arc<dyn aster_framevisor::device::BlockImage>>,
+    cmdline_append: Option<String>,
     lifecycle: Option<Arc<FrameVmLifecycle>>,
 }
 
@@ -420,8 +421,15 @@ impl FrameVmStartRequest {
             vcpu_count,
             share,
             drive_image: Some(drive_image),
+            cmdline_append: None,
             lifecycle: None,
         })
+    }
+
+    /// Appends validated user-provided guest command-line text.
+    pub fn with_cmdline_append(mut self, cmdline_append: Option<String>) -> Self {
+        self.cmdline_append = cmdline_append;
+        self
     }
 
     /// Associates the start request with a VM-fd lifecycle observer.
@@ -442,6 +450,10 @@ impl FrameVmStartRequest {
 
     fn drive_image(&self) -> Option<Arc<dyn aster_framevisor::device::BlockImage>> {
         self.drive_image.clone()
+    }
+
+    fn cmdline_append(&self) -> Option<String> {
+        self.cmdline_append.clone()
     }
 
     fn lifecycle(&self) -> Option<Arc<FrameVmLifecycle>> {
@@ -777,6 +789,7 @@ pub fn start_framevm(request: FrameVmStartRequest) -> Result<()> {
             request.vcpu_count(),
             request.share(),
             request.drive_image(),
+            request.cmdline_append(),
             request.lifecycle(),
             elf_data,
         )
@@ -803,6 +816,7 @@ fn start_framevm_loader_thread(
     vcpu_count: usize,
     share: u32,
     drive_image: Option<Arc<dyn aster_framevisor::device::BlockImage>>,
+    cmdline_append: Option<String>,
     lifecycle: Option<Arc<FrameVmLifecycle>>,
     elf_data: Vec<u8>,
 ) -> Result<()> {
@@ -813,6 +827,7 @@ fn start_framevm_loader_thread(
             vcpu_count,
             share,
             drive_image,
+            cmdline_append,
             lifecycle,
             elf_data,
             loader_setup_completion,
@@ -842,6 +857,7 @@ fn run_framevm_loader(
     vcpu_count: usize,
     share: u32,
     drive_image: Option<Arc<dyn aster_framevisor::device::BlockImage>>,
+    cmdline_append: Option<String>,
     lifecycle: Option<Arc<FrameVmLifecycle>>,
     elf_data: Vec<u8>,
     setup_completion: Arc<FrameVmSetupCompletion>,
@@ -869,7 +885,11 @@ fn run_framevm_loader(
         bind_loader_to_default_frame_vcpu()?;
         let framev_devices = aster_framevisor::framev_device_descriptor_boot_arg(framevm_id)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "missing FrameV descriptor"))?;
-        boot::set_boot_info_without_initramfs(framevm_boot_cmdline(vcpu_count, &framev_devices)?);
+        boot::set_boot_info_without_initramfs(framevm_boot_cmdline(
+            vcpu_count,
+            &framev_devices,
+            cmdline_append.as_deref(),
+        )?);
         Ok(())
     })();
     if let Err(error) = setup_result {
@@ -907,7 +927,11 @@ fn run_framevm_loader(
     Ok(())
 }
 
-fn framevm_boot_cmdline(vcpu_count: usize, framev_devices: &str) -> Result<String> {
+fn framevm_boot_cmdline(
+    vcpu_count: usize,
+    framev_devices: &str,
+    append: Option<&str>,
+) -> Result<String> {
     let realtime_ns = duration_to_ns(
         SystemTime::now()
             .duration_since(&SystemTime::UNIX_EPOCH)
@@ -915,9 +939,17 @@ fn framevm_boot_cmdline(vcpu_count: usize, framev_devices: &str) -> Result<Strin
     )?;
     let monotonic_ns = read_host_monotonic_ns()?;
 
-    Ok(format!(
+    let mut cmdline = format!(
         "kernel.realtime_base_ns={realtime_ns} kernel.monotonic_base_ns={monotonic_ns} ostd.vcpu_count={vcpu_count} framev.devices={framev_devices}"
-    ))
+    );
+    if let Some(append) = append {
+        if !append.is_empty() {
+            cmdline.push(' ');
+            cmdline.push_str(append);
+        }
+    }
+
+    Ok(cmdline)
 }
 
 fn read_host_monotonic_ns() -> Result<u64> {
@@ -1008,7 +1040,7 @@ fn spawn_framevm_service_task(
     elf_data: Vec<u8>,
     lifecycle: Option<Arc<FrameVmLifecycle>>,
 ) -> Result<()> {
-    let frame_vcpu_id = aster_framevisor::default_frame_vcpu_id()
+    aster_framevisor::default_frame_vcpu_id()
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "missing FrameVM vCPU"))?;
     let service_task_fn = move || {
         let result = run_framevm_service(&elf_data);
@@ -1046,7 +1078,12 @@ fn spawn_framevm_service_task(
         }
     };
 
-    let _service_task = aster_framevisor::task::TaskOptions::new(service_task_fn).spawn()?;
+    let service_task = aster_framevisor::task::TaskOptions::new(service_task_fn).spawn()?;
+    // The service scheduler is installed by the service itself. Until then,
+    // the first service task is runnable through the FrameSchedGroup bootstrap
+    // slot, so give the group a scheduling boundary immediately after spawn.
+    service_task.wake_up();
+    Task::yield_now();
     set_framevm_load_state(FrameVmLoadState::Running);
     Ok(())
 }

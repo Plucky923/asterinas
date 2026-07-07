@@ -15,6 +15,7 @@
 #define FRAMEVM_CREATE_HAS_DRIVE (1U << 0)
 #define FRAMEVM_CREATE_DRIVE_READONLY (1U << 1)
 #define FRAMEVM_STATUS_VM_ID_NONE UINT64_MAX
+#define FRAMEVM_CMDLINE_MAX_LEN 4096U
 
 #define FRAMEVM_STATE_CREATED 0U
 #define FRAMEVM_STATE_STARTING 1U
@@ -48,6 +49,12 @@ struct framevm_create_vm {
 	uint32_t reserved;
 };
 
+struct framevm_cmdline {
+	uint64_t ptr;
+	uint32_t len;
+	uint32_t flags;
+};
+
 struct framevm_status {
 	uint32_t state;
 	uint32_t terminal_reason;
@@ -64,11 +71,17 @@ struct framevm_status {
 #define FRAMEVM_GET_CONSOLE_FD _IO(FRAMEVM_IOCTL_MAGIC, 0x04)
 #define FRAMEVM_GET_STATUS \
 	_IOR(FRAMEVM_IOCTL_MAGIC, 0x06, struct framevm_status)
+#define FRAMEVM_SET_CMDLINE \
+	_IOW(FRAMEVM_IOCTL_MAGIC, 0x07, struct framevm_cmdline)
 
 _Static_assert(sizeof(struct framevm_create_vm) == 16,
 	       "framevm_create_vm must stay ABI-stable");
 _Static_assert(_Alignof(struct framevm_create_vm) == 4,
 	       "framevm_create_vm alignment must stay ABI-stable");
+_Static_assert(sizeof(struct framevm_cmdline) == 16,
+	       "framevm_cmdline must stay ABI-stable");
+_Static_assert(_Alignof(struct framevm_cmdline) == 8,
+	       "framevm_cmdline alignment must stay ABI-stable");
 _Static_assert(sizeof(struct framevm_status) == 32,
 	       "framevm_status must stay ABI-stable");
 _Static_assert(_Alignof(struct framevm_status) == 8,
@@ -84,5 +97,8 @@ _Static_assert(FRAMEVM_GET_CONSOLE_FD == _IO('F', 0x04),
 _Static_assert(FRAMEVM_GET_STATUS ==
 		       _IOR('F', 0x06, struct framevm_status),
 	       "FRAMEVM_GET_STATUS command must stay ABI-stable");
+_Static_assert(FRAMEVM_SET_CMDLINE ==
+		       _IOW('F', 0x07, struct framevm_cmdline),
+	       "FRAMEVM_SET_CMDLINE command must stay ABI-stable");
 
 #endif /* ASTERINAS_FRAMEVM_IOCTL_H */

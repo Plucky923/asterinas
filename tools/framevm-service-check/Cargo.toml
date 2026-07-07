@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MPL-2.0
+
+[package]
+name = "framevm-service-check"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true, features = ["visit"] }
+toml = { workspace = true }
+
+[lints]
+workspace = true

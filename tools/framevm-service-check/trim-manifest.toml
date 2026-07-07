@@ -1,0 +1,459 @@
+# SPDX-License-Identifier: MPL-2.0
+
+# Each entry records one intentional retained-source difference.
+# Required fields:
+# - service_path: concrete repo-relative FrameVM source file
+# - kernel_path: concrete repo-relative kernel source counterpart
+# - kind: entry-trim, unsupported-feature-trim, mechanical-adaptation,
+#   provider-substitution, or test-only-or-doc
+# - reason: non-empty explanation for the difference
+
+[[entries]]
+service_path = "services/aster-framevm/src/lib.rs"
+kernel_path = "kernel/src/lib.rs"
+kind = "entry-trim"
+reason = "FrameVM keeps the kernel crate entry shape with a non-returning OSTD main entry while omitting host-only kernel registration attributes."
+
+[[entries]]
+service_path = "services/aster-framevm/src/init.rs"
+kernel_path = "kernel/src/init.rs"
+kind = "entry-trim"
+reason = "FrameVM follows the kernel initialization order while replacing global component metadata dispatch, SMP AP boot, idle-thread handoff, and panic-on-init-exit with the single-VM service entry and service-originated poweroff path."
+
+[[entries]]
+service_path = "services/aster-framevm/src/arch/loongarch/mod.rs"
+kernel_path = "kernel/src/arch/loongarch/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps the kernel arch module path but supports the current x86 service target only; non-x86 arch entry details are trimmed from the loadable service."
+
+[[entries]]
+service_path = "services/aster-framevm/src/arch/riscv/mod.rs"
+kernel_path = "kernel/src/arch/riscv/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps the kernel arch module path but supports the current x86 service target only; non-x86 arch entry details are trimmed from the loadable service."
+
+[[entries]]
+service_path = "services/aster-framevm/src/arch/x86/cpu.rs"
+kernel_path = "kernel/src/arch/x86/cpu.rs"
+kind = "provider-substitution"
+reason = "FrameVM retains the x86 CPU source shape while substituting host CPU state with FrameVisor-provided vCPU and service CPU identity."
+
+[[entries]]
+service_path = "services/aster-framevm/src/arch/x86/mod.rs"
+kernel_path = "kernel/src/arch/x86/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the x86 arch module path while substituting host boot and interrupt entry assumptions with the FrameVisor service entry environment."
+
+[[entries]]
+service_path = "services/aster-framevm/src/cpu.rs"
+kernel_path = "kernel/src/cpu.rs"
+kind = "provider-substitution"
+reason = "FrameVM preserves kernel CPU-facing APIs while deriving CPU identity and CPU count from FrameVisor vCPU context instead of host OSTD CPU topology."
+
+[[entries]]
+service_path = "services/aster-framevm/src/device/misc/hwrng.rs"
+kernel_path = "kernel/src/device/misc/hwrng.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel misc hwrng device boundary while substituting the entropy provider with the FrameV-rng frontend component."
+
+[[entries]]
+service_path = "services/aster-framevm/src/device/misc/mod.rs"
+kernel_path = "kernel/src/device/misc/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel misc device module shape while retaining only service-supported misc devices backed by FrameV frontends."
+
+[[entries]]
+service_path = "services/aster-framevm/src/device/mod.rs"
+kernel_path = "kernel/src/device/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM retains the kernel device subsystem path while trimming host-only device providers that are replaced by FrameV frontend components."
+
+[[entries]]
+service_path = "services/aster-framevm/src/device/registry/block.rs"
+kernel_path = "kernel/src/device/registry/block.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel block registry contract while substituting host block providers with the FrameV-blk frontend whole-device provider."
+
+[[entries]]
+service_path = "services/aster-framevm/src/device/tty/mod.rs"
+kernel_path = "kernel/src/device/tty/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel TTY device path while substituting the console backend with the FrameV-console frontend."
+
+[[entries]]
+service_path = "services/aster-framevm/src/error.rs"
+kernel_path = "kernel/src/error.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel errno/error contract while adapting imports and conversions to the service crate and FrameVisor OSTD facade."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/file/mod.rs"
+kernel_path = "kernel/src/fs/file/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps copied kernel file abstractions while trimming file implementations outside the reference service rootfs and device scope."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/fs_impls/ext2/fs.rs"
+kernel_path = "kernel/src/fs/fs_impls/ext2/fs.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel ext2 implementation while adapting block-device discovery and unsupported mount behavior to the FrameV-blk rootfs provider."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/fs_impls/mod.rs"
+kernel_path = "kernel/src/fs/fs_impls/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM retains only the filesystem implementations required by the ext2 rootfs target and trims unsupported host filesystems."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/fs_impls/pseudofs/nsfs.rs"
+kernel_path = "kernel/src/fs/fs_impls/pseudofs/nsfs.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps the kernel-shaped pseudofs module dependency while trimming namespace filesystem behavior outside the reference service target."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/mod.rs"
+kernel_path = "kernel/src/fs/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps the kernel filesystem module structure while retaining only VFS, pipe, ext2, and device-file behavior required by the service."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/rootfs.rs"
+kernel_path = "kernel/src/fs/rootfs.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel rootfs module path while substituting host rootfs selection with FrameV-blk-backed ext2 whole-device mounting."
+
+[[entries]]
+service_path = "services/aster-framevm/src/fs/vfs/path/mount_namespace.rs"
+kernel_path = "kernel/src/fs/vfs/path/mount_namespace.rs"
+kind = "provider-substitution"
+reason = "FrameVM preserves mount namespace semantics while adapting singleton root initialization for the service-owned ext2 rootfs."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/mod.rs"
+kernel_path = "kernel/src/net/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps the kernel net module path while trimming unsupported network families and retaining the socket stack required by FrameV-sock."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/mod.rs"
+kernel_path = "kernel/src/net/socket/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel socket module structure while substituting virtio-vsock transport with FrameV-sock frontend transport."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/unix/ctrl_msg.rs"
+kernel_path = "kernel/src/net/socket/unix/ctrl_msg.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps copied Unix socket support only where needed by retained tests and trims host-only credential/control-message behavior."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/util/message_header.rs"
+kernel_path = "kernel/src/net/socket/util/message_header.rs"
+kind = "mechanical-adaptation"
+reason = "FrameVM keeps kernel socket message header parsing while adapting imports and unsupported ancillary behavior to the service trim."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/util/mod.rs"
+kernel_path = "kernel/src/net/socket/util/mod.rs"
+kind = "mechanical-adaptation"
+reason = "FrameVM keeps kernel socket utility module shape while adapting retained utility exports to the service trim."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/util/options.rs"
+kernel_path = "kernel/src/net/socket/util/options.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps kernel socket option helpers while trimming unsupported options outside the reference service socket target."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/util/send_recv_flags.rs"
+kernel_path = "kernel/src/net/socket/util/send_recv_flags.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps kernel send/recv flag parsing while trimming unsupported flag combinations outside the retained socket target."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/util/socket_addr.rs"
+kernel_path = "kernel/src/net/socket/util/socket_addr.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel socket address conversion while substituting retained address-family support around FrameV-sock."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/vsock/addr.rs"
+kernel_path = "kernel/src/net/socket/vsock/addr.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps vsock address semantics while binding local CID and transport identity to FrameV-sock frontend discovery."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/vsock/mod.rs"
+kernel_path = "kernel/src/net/socket/vsock/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel vsock module structure while substituting virtio-vsock device callbacks with FrameV-sock frontend initialization."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/vsock/stream/connected.rs"
+kernel_path = "kernel/src/net/socket/vsock/stream/connected.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel stream socket semantics while substituting packet send/receive transport with FrameV-sock service-side queues."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/vsock/stream/connecting.rs"
+kernel_path = "kernel/src/net/socket/vsock/stream/connecting.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel connecting-state semantics while substituting connect request delivery through FrameV-sock transport."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/vsock/stream/init.rs"
+kernel_path = "kernel/src/net/socket/vsock/stream/init.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel stream initialization semantics while substituting listener and connection setup through FrameV-sock frontend queues."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/vsock/stream/listen.rs"
+kernel_path = "kernel/src/net/socket/vsock/stream/listen.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel listen-state semantics while substituting inbound connection draining through service-side FrameV-sock deferred work."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/vsock/stream/mod.rs"
+kernel_path = "kernel/src/net/socket/vsock/stream/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel vsock stream state structure while replacing direct backend callbacks with FrameV-sock Taskless scheduling."
+
+[[entries]]
+service_path = "services/aster-framevm/src/thread/mod.rs"
+kernel_path = "kernel/src/thread/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel thread hook structure while activating the current process VM space at the pre-user boundary because FrameVisor service task switching is not identical to host OSTD thread scheduling."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/vsock/transport/mod.rs"
+kernel_path = "kernel/src/net/socket/vsock/transport/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the virtio-vsock socket semantics while substituting the kernel virtio-vsock device callbacks with the FrameV-sock frontend transport queues and service-runtime packet draining."
+
+[[entries]]
+service_path = "services/aster-framevm/src/net/socket/vsock/transport/port.rs"
+kernel_path = "kernel/src/net/socket/vsock/transport/port.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel vsock port allocation semantics while substituting transport registration with FrameV-sock frontend state."
+
+[[entries]]
+service_path = "services/aster-framevm/src/prelude.rs"
+kernel_path = "kernel/src/prelude.rs"
+kind = "mechanical-adaptation"
+reason = "FrameVM keeps the kernel prelude surface while adapting the OSTD dependency to the FrameVisor facade."
+
+[[entries]]
+service_path = "services/aster-framevm/src/process/clone.rs"
+kernel_path = "kernel/src/process/clone.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel clone behavior while adapting task creation and service scheduling to FrameVisor-backed tasks."
+
+[[entries]]
+service_path = "services/aster-framevm/src/process/exit.rs"
+kernel_path = "kernel/src/process/exit.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel process exit flow while recording service terminal status and returning control to FrameVisor instead of host power management."
+
+[[entries]]
+service_path = "services/aster-framevm/src/process/namespace/nsproxy.rs"
+kernel_path = "kernel/src/process/namespace/nsproxy.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps the kernel namespace module path while trimming namespace providers outside the reference service target."
+
+[[entries]]
+service_path = "services/aster-framevm/src/process/process/init_proc.rs"
+kernel_path = "kernel/src/process/process/init_proc.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel init-process setup while adapting init program execution to the FrameVM rootfs and terminal-status lifecycle."
+
+[[entries]]
+service_path = "services/aster-framevm/src/process/process/mod.rs"
+kernel_path = "kernel/src/process/process/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel process ownership semantics while adapting lifecycle hooks to FrameVisor service shutdown and VM terminal status."
+
+[[entries]]
+service_path = "services/aster-framevm/src/process/process/timer_manager.rs"
+kernel_path = "kernel/src/process/process/timer_manager.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps process timer-manager semantics while substituting timer delivery through the FrameVisor virtual timer boundary."
+
+[[entries]]
+service_path = "services/aster-framevm/src/process/program_loader/elf/load_elf.rs"
+kernel_path = "kernel/src/process/program_loader/elf/load_elf.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel ELF loading semantics while adapting supported loader inputs to the service rootfs and FrameVisor memory facade."
+
+[[entries]]
+service_path = "services/aster-framevm/src/process/signal/pause.rs"
+kernel_path = "kernel/src/process/signal/pause.rs"
+kind = "mechanical-adaptation"
+reason = "FrameVM keeps kernel signal pause behavior while adapting scheduler waits to FrameVisor-backed service tasks."
+
+[[entries]]
+service_path = "services/aster-framevm/src/process/stats.rs"
+kernel_path = "kernel/src/process/stats.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel process statistics APIs while substituting the shared host per-CPU counter with the FrameVM service counter provider."
+
+[[entries]]
+service_path = "services/aster-framevm/src/sched/mod.rs"
+kernel_path = "kernel/src/sched/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel scheduler module shape while substituting low-level task switching with the FrameVisor scheduler facade."
+
+[[entries]]
+service_path = "services/aster-framevm/src/sched/sched_class/fair.rs"
+kernel_path = "kernel/src/sched/sched_class/fair.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the fair scheduler class policy while adapting enqueue, pick, and CPU identity operations to FrameVisor service tasks."
+
+[[entries]]
+service_path = "services/aster-framevm/src/sched/sched_class/idle.rs"
+kernel_path = "kernel/src/sched/sched_class/idle.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps idle scheduler class structure while substituting idle handoff with FrameVisor service task scheduling."
+
+[[entries]]
+service_path = "services/aster-framevm/src/sched/sched_class/mod.rs"
+kernel_path = "kernel/src/sched/sched_class/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel scheduler class composition while substituting host runqueue transitions with FrameVisor vCPU-bound service queues."
+
+[[entries]]
+service_path = "services/aster-framevm/src/sched/sched_class/real_time.rs"
+kernel_path = "kernel/src/sched/sched_class/real_time.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps real-time scheduler class structure while adapting class queues to FrameVisor service scheduling primitives."
+
+[[entries]]
+service_path = "services/aster-framevm/src/sched/sched_class/stop.rs"
+kernel_path = "kernel/src/sched/sched_class/stop.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps stop scheduler class structure while substituting stop-task behavior with FrameVisor VM lifecycle stop handling."
+
+[[entries]]
+service_path = "services/aster-framevm/src/sched/sched_class/task_group.rs"
+kernel_path = "kernel/src/sched/sched_class/task_group.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps the scheduler task-group module path while trimming host cgroup and group accounting behavior outside the service target."
+
+[[entries]]
+service_path = "services/aster-framevm/src/syscall/setns.rs"
+kernel_path = "kernel/src/syscall/setns.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps the syscall source path while trimming namespace-switch behavior outside the reference service target."
+
+[[entries]]
+service_path = "services/aster-framevm/src/syscall/socket.rs"
+kernel_path = "kernel/src/syscall/socket.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel socket syscall dispatch while retaining only address families and providers available in the FrameVM service."
+
+[[entries]]
+service_path = "services/aster-framevm/src/syscall/sysinfo.rs"
+kernel_path = "kernel/src/syscall/sysinfo.rs"
+kind = "provider-substitution"
+reason = "FrameVM preserves sysinfo layout and process-count behavior while substituting Host OSTD allocator free-memory accounting with the FrameVM OSTD facade to avoid linking Host allocator CPU-local caches into the service artifact."
+
+[[entries]]
+service_path = "services/aster-framevm/src/thread/exception.rs"
+kernel_path = "kernel/src/thread/exception.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel exception handling shape while adapting fault delivery and fatal handling to FrameVisor service execution."
+
+[[entries]]
+service_path = "services/aster-framevm/src/thread/stats.rs"
+kernel_path = "kernel/src/thread/stats.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel thread statistics APIs while substituting the shared host per-CPU counter with the FrameVM service counter provider."
+
+[[entries]]
+service_path = "services/aster-framevm/src/time/cpu_time_stats.rs"
+kernel_path = "kernel/src/time/cpu_time_stats.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel CPU time statistics APIs while substituting the shared host per-CPU counter with the FrameVM service counter provider."
+
+[[entries]]
+service_path = "services/aster-framevm/src/time/clocks/system_wide.rs"
+kernel_path = "kernel/src/time/clocks/system_wide.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel system-wide clock APIs while substituting time and timer backing with the FrameVisor virtual timer facade."
+
+[[entries]]
+service_path = "services/aster-framevm/src/time/mod.rs"
+kernel_path = "kernel/src/time/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel time module shape while substituting host timer integration with service-side time and virtual timer providers."
+
+[[entries]]
+service_path = "services/aster-framevm/src/util/net/addr/family.rs"
+kernel_path = "kernel/src/util/net/addr/family.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps kernel socket address-family helpers while trimming unsupported families outside FrameV-sock and retained Unix socket coverage."
+
+[[entries]]
+service_path = "services/aster-framevm/src/util/net/addr/mod.rs"
+kernel_path = "kernel/src/util/net/addr/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps kernel network address helpers while trimming unsupported address-family support outside the reference service target."
+
+[[entries]]
+service_path = "services/aster-framevm/src/util/net/options/mod.rs"
+kernel_path = "kernel/src/util/net/options/mod.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps kernel socket option conversion helpers while trimming unsupported network option families."
+
+[[entries]]
+service_path = "services/aster-framevm/src/util/net/options/utils.rs"
+kernel_path = "kernel/src/util/net/options/utils.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM keeps kernel socket option read/write helpers while adapting imports to the service user-memory facade."
+
+[[entries]]
+service_path = "services/aster-framevm/src/util/mod.rs"
+kernel_path = "kernel/src/util/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps the kernel utility module shape while exposing the FrameVM service per-CPU counter provider under the kernel-shaped utility path."
+
+[[entries]]
+service_path = "services/aster-framevm/src/util/per_cpu_counter.rs"
+kernel_path = "kernel/src/util/per_cpu_counter.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps a kernel-shaped per-CPU counter module while substituting Host OSTD dynamic CPU-local storage with a safe FrameVisor vCPU-indexed vector provider to avoid Cargo feature leakage into the host kernel."
+
+[[entries]]
+service_path = "services/aster-framevm/src/vm/mod.rs"
+kernel_path = "kernel/src/vm/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel VM module shape while substituting low-level address-space operations with the FrameVisor OSTD facade."
+
+[[entries]]
+service_path = "services/aster-framevm/src/vm/vmar/vmar_impls/mod.rs"
+kernel_path = "kernel/src/vm/vmar/vmar_impls/mod.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel VMAR implementation shape while substituting RSS accounting to use the FrameVM service per-CPU counter provider."
+
+[[entries]]
+service_path = "services/aster-framevm/src/vm/vmar/vm_mapping.rs"
+kernel_path = "kernel/src/vm/vmar/vm_mapping.rs"
+kind = "provider-substitution"
+reason = "FrameVM keeps kernel VM mapping semantics while adapting mapping operations to FrameVisor-managed VM spaces and service memory objects."
+
+[[entries]]
+service_path = "services/aster-framevm/comps/softirq/src/lib.rs"
+kernel_path = "kernel/comps/softirq/src/lib.rs"
+kind = "unsupported-feature-trim"
+reason = "FrameVM retains SoftIrqLine initialization and L1 pending processing but removes host-only IRQ/softirq statistics, the stats module, and the L2 statistics hook."
+
+[[entries]]
+service_path = "services/aster-framevm/comps/softirq/src/taskless.rs"
+kernel_path = "kernel/comps/softirq/src/taskless.rs"
+kind = "provider-substitution"
+reason = "FrameVM uses the copied Taskless semantics but adapts the kernel RefCell CPU-local queues to safe FrameVisor CPU-local SpinLock queues because the FrameVM facade cannot expose Host OSTD's unsafe non-Sync unlocked CPU-local references."
+
+[[entries]]
+service_path = "services/aster-framevm/comps/softirq/src/lock.rs"
+kernel_path = "kernel/comps/softirq/src/lock.rs"
+kind = "mechanical-adaptation"
+reason = "FrameVM keeps the bottom-half-disabled lock behavior while adapting AsAtomicModeGuard to the FrameVisor facade trait shape."

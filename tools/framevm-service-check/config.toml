@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: MPL-2.0
+
+service_path = "services/aster-framevm"
+kernel_src_path = "kernel/src"
+facade_path = "kernel/comps/framevisor-ostd"
+host_ostd_path = "ostd"
+framevisor_backend_device_root = "kernel/comps/framevisor/src/device"
+trim_manifest_path = "tools/framevm-service-check/trim-manifest.toml"
+component_metadata_path = "Components.toml"
+kernel_component_profile = "kernel"
+framevm_component_profile = "framevm"
+
+source_trim_enforcement = "final"
+
+entry_trim_files = [
+    "src/lib.rs",
+    "src/init.rs",
+]
+forbidden_service_subtrees = [
+    "src/service",
+]
+service_local_module_aliases = [
+    "scheduler",
+    "fd_table",
+    "fs_context",
+    "rootfs",
+]
+host_only_component_packages = [
+    "aster-i8042",
+    "aster-mlsdisk",
+    "aster-nvme",
+    "aster-pci",
+    "aster-uart",
+    "aster-virtio",
+]
+
+framev_common_crate_roots = [
+    "kernel/comps/framev-device",
+    "kernel/comps/framev-blk",
+    "kernel/comps/framev-console",
+    "kernel/comps/framev-rng",
+    "kernel/comps/framev-sock",
+]
+
+excluded_path_prefixes = [
+    "framev_device",
+    "rng",
+]
+allowed_provider_facade_paths = [
+    "FramevisorError",
+    "mm::load_total_free_size",
+]
+
+[[service_side_trimmed_comps]]
+name = "block"
+service_path = "services/aster-framevm/comps/block"
+kernel_path = "kernel/comps/block"
+package = "aster-framevm-block"
+dependency_key = "aster-block"
+
+[[service_side_trimmed_comps]]
+name = "cmdline"
+service_path = "services/aster-framevm/comps/cmdline"
+kernel_path = "kernel/comps/cmdline"
+package = "aster-framevm-cmdline"
+dependency_key = "aster-cmdline"
+
+[[service_side_trimmed_comps]]
+name = "softirq"
+service_path = "services/aster-framevm/comps/softirq"
+kernel_path = "kernel/comps/softirq"
+package = "aster-framevm-softirq"
+dependency_key = "aster-softirq"
+
+[[service_side_trimmed_comps]]
+name = "systree"
+service_path = "services/aster-framevm/comps/systree"
+kernel_path = "kernel/comps/systree"
+package = "aster-framevm-systree"
+dependency_key = "aster-systree"
+
+[[service_side_trimmed_comps]]
+name = "time"
+service_path = "services/aster-framevm/comps/time"
+kernel_path = "kernel/comps/time"
+package = "aster-framevm-time"
+dependency_key = "aster-time"
+
+[[framev_frontend_crates]]
+name = "bus"
+path = "services/aster-framevm/comps/framev-bus"
+package = "framev-bus"
+common_package = "framev-device"
+allowed_service_dependencies = []
+
+[[framev_frontend_crates]]
+name = "blk"
+path = "services/aster-framevm/comps/framev-blk"
+package = "framev-blk-frontend"
+common_package = "framev-blk-common"
+allowed_service_dependencies = ["aster-block"]
+
+[[framev_frontend_crates]]
+name = "console"
+path = "services/aster-framevm/comps/framev-console"
+package = "framev-console-frontend"
+common_package = "framev-console-common"
+allowed_service_dependencies = []
+
+[[framev_frontend_crates]]
+name = "rng"
+path = "services/aster-framevm/comps/framev-rng"
+package = "framev-rng-frontend"
+common_package = "framev-rng-common"
+allowed_service_dependencies = []
+
+[[framev_frontend_crates]]
+name = "sock"
+path = "services/aster-framevm/comps/framev-sock"
+package = "framev-sock-frontend"
+common_package = "framev-sock-common"
+allowed_service_dependencies = []

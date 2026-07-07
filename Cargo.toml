@@ -40,6 +40,13 @@ members = [
     "kernel/comps/pci",
     "kernel/comps/softirq",
     "kernel/comps/systree",
+    "kernel/comps/framev-console",
+    "kernel/comps/framev-blk",
+    "kernel/comps/framev-device",
+    "kernel/comps/framev-rng",
+    "kernel/comps/framevisor",
+    "kernel/comps/framevisor-ostd",
+    "kernel/comps/framev-sock",
     "kernel/comps/time",
     "kernel/comps/uart",
     "kernel/comps/virtio",
@@ -59,6 +66,18 @@ members = [
     "kernel/libs/typeflags",
     "kernel/libs/typeflags-util",
     "kernel/libs/xarray",
+    "services/aster-framevm/comps/block",
+    "services/aster-framevm/comps/cmdline",
+    "services/aster-framevm/comps/framev-blk",
+    "services/aster-framevm/comps/framev-bus",
+    "services/aster-framevm/comps/framev-console",
+    "services/aster-framevm/comps/framev-rng",
+    "services/aster-framevm/comps/framev-sock",
+    "services/aster-framevm/comps/softirq",
+    "services/aster-framevm/comps/systree",
+    "services/aster-framevm/comps/time",
+    "services/aster-framevm",
+    "tools/framevm-service-check",
 ]
 # All OSDK-based in-kernel crates.
 #
@@ -87,6 +106,11 @@ default-members = [
     "kernel/comps/pci",
     "kernel/comps/softirq",
     "kernel/comps/systree",
+    "kernel/comps/framev-console",
+    "kernel/comps/framev-blk",
+    "kernel/comps/framev-device",
+    "kernel/comps/framev-rng",
+    "kernel/comps/framev-sock",
     "kernel/comps/time",
     "kernel/comps/uart",
     "kernel/comps/virtio",
@@ -97,6 +121,16 @@ default-members = [
     "kernel/libs/io-util",
     "kernel/libs/ring-buffer",
     "kernel/libs/xarray",
+    "services/aster-framevm/comps/block",
+    "services/aster-framevm/comps/cmdline",
+    "services/aster-framevm/comps/framev-blk",
+    "services/aster-framevm/comps/framev-bus",
+    "services/aster-framevm/comps/framev-console",
+    "services/aster-framevm/comps/framev-rng",
+    "services/aster-framevm/comps/framev-sock",
+    "services/aster-framevm/comps/softirq",
+    "services/aster-framevm/comps/systree",
+    "services/aster-framevm/comps/time",
 ]
 # All user-space or host-native crates.
 #
@@ -160,16 +194,33 @@ aster-nvme = { path = "kernel/comps/nvme" }
 aster-pci = { path = "kernel/comps/pci" }
 aster-softirq = { path = "kernel/comps/softirq" }
 aster-systree = { path = "kernel/comps/systree" }
+framev-console-common = { path = "kernel/comps/framev-console" }
+framev-blk-common = { path = "kernel/comps/framev-blk" }
+framev-device = { path = "kernel/comps/framev-device" }
+framev-rng-common = { path = "kernel/comps/framev-rng" }
+aster-framevisor = { package = "aster-framevisor", path = "kernel/comps/framevisor" }
+aster-framevisor-ostd = { path = "kernel/comps/framevisor-ostd" }
+aster-framevisor-exchangeable = { path = "kernel/comps/framevisor/exchangeable", default-features = false }
+aster-framevisor-macros = { path = "kernel/comps/framevisor/macros" }
+framev-sock-common = { path = "kernel/comps/framev-sock" }
+exchangeable = { package = "aster-framevisor-exchangeable", path = "kernel/comps/framevisor/exchangeable", default-features = false }
 aster-time = { path = "kernel/comps/time" }
 aster-uart = { path = "kernel/comps/uart" }
 aster-virtio = { path = "kernel/comps/virtio" }
+
+# FrameVM service-side FrameV frontends
+framev-blk-frontend = { path = "services/aster-framevm/comps/framev-blk" }
+framev-bus = { path = "services/aster-framevm/comps/framev-bus" }
+framev-console-frontend = { path = "services/aster-framevm/comps/framev-console" }
+framev-rng-frontend = { path = "services/aster-framevm/comps/framev-rng" }
+framev-sock-frontend = { path = "services/aster-framevm/comps/framev-sock" }
 
 # Crates under kernel/libs
 aster-bigtcp = { path = "kernel/libs/aster-bigtcp" }
 aster-fuse = { path = "kernel/libs/aster-fuse" }
 aster-rights = { path = "kernel/libs/aster-rights" }
 aster-rights-proc = { path = "kernel/libs/aster-rights-proc" }
-aster-util = { path = "kernel/libs/aster-util" }
+aster-util = { path = "kernel/libs/aster-util", default-features = false }
 atomic-integer-wrapper = { path = "kernel/libs/atomic-integer-wrapper" }
 cpio-decoder = { path = "kernel/libs/cpio-decoder" }
 device-id = { path = "kernel/libs/device-id" }
@@ -196,7 +247,9 @@ gimli = { version = "0.28", default-features = false, features = ["read-core"] }
 minicov = "0.3"
 num-traits = { version = "0.2", default-features = false }
 serde = { version = "1.0.192", default-features = false, features = ["alloc", "derive"] }
+sha2 = { version = "0.10.8", default-features = false, features = ["force-soft"] }
 smallvec = "1.13.2"
+toml = "0.8.8"
 uart_16550 = "0.3.0"
 volatile = "0.6.1"
 

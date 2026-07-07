@@ -43,6 +43,17 @@ impl SchedClassRq for IdleClassRq {
         );
     }
 
+    fn remove_queued_task(&mut self, task: &Arc<Task>) -> bool {
+        let Some(entity) = &self.entity else {
+            return false;
+        };
+        if !Arc::ptr_eq(entity, task) {
+            return false;
+        }
+        self.entity = None;
+        true
+    }
+
     fn len(&self) -> usize {
         usize::from(!self.is_empty())
     }

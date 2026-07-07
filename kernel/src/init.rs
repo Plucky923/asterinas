@@ -148,15 +148,24 @@ fn first_kthread() {
 static INIT_PROCESS: Once<Arc<Process>> = Once::new();
 
 fn init_in_first_kthread(path_resolver: &PathResolver) {
+    ostd::early_println!("[kernel] kthread init: components");
     component::init_all(InitStage::Kthread, component::parse_metadata!()).unwrap();
+    ostd::early_println!("[kernel] kthread init: work queue");
     // Work queue should be initialized before interrupt is enabled,
     // in case any irq handler uses work queue as bottom half
     crate::thread::work_queue::init_in_first_kthread();
+    ostd::early_println!("[kernel] kthread init: device");
     crate::device::init_in_first_kthread();
+    ostd::early_println!("[kernel] kthread init: net");
     crate::net::init_in_first_kthread();
+    ostd::early_println!("[kernel] kthread init: fs");
     crate::fs::init_in_first_kthread(path_resolver);
     #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-    crate::vdso::init_in_first_kthread();
+    {
+        ostd::early_println!("[kernel] kthread init: vdso");
+        crate::vdso::init_in_first_kthread();
+    }
+    ostd::early_println!("[kernel] kthread init: done");
 }
 
 fn print_banner() {
@@ -165,9 +174,13 @@ fn print_banner() {
 }
 
 pub(super) fn on_first_process_startup(ctx: &Context) {
+    ostd::early_println!("[kernel] process init: components");
     component::init_all(InitStage::Process, component::parse_metadata!()).unwrap();
+    ostd::early_println!("[kernel] process init: device");
     crate::device::init_in_first_process(ctx).unwrap();
+    ostd::early_println!("[kernel] process init: fs");
     crate::fs::init_in_first_process(ctx);
+    ostd::early_println!("[kernel] process init: done");
 }
 
 static INIT_PATH: Once<String> = Once::new();

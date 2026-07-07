@@ -157,3 +157,75 @@ pub(crate) fn root_task_group() -> &'static Arc<TaskGroup> {
 pub(super) fn init_root_task_group(cpu_count: usize) -> &'static Arc<TaskGroup> {
     ROOT_TASK_GROUP.call_once(|| TaskGroup::new_root(cpu_count))
 }
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::{
+        prelude::ktest,
+        task::scheduler::{EnqueueFlags, LocalRunQueue, UpdateFlags},
+    };
+
+    use super::{
+        super::{CurrentRuntime, SchedClassRq, time},
+        *,
+    };
+    use crate::{
+        sched::{DEFAULT_CGROUP_WEIGHT, Nice, SchedPolicy},
+        thread::{AsThread, kernel_thread::ThreadOptions},
+    };
+
+    fn test_thread(task_group: Arc<TaskGroup>) -> Arc<Task> {
+        let task = ThreadOptions::new(|| {})
+            .sched_policy(SchedPolicy::Fair(Nice::default()))
+            .build();
+        task.as_thread().unwrap().set_task_group(task_group);
+        task
+    }
+
+    #[ktest]
+    fn fair_group_weight_biases_repeated_picks() {
+        let cpu = CpuId::bsp();
+        let root = TaskGroup::new_root(1);
+        let low_group = TaskGroup::new_child(&root, DEFAULT_CGROUP_WEIGHT);
+        let high_group = TaskGroup::new_child(&root, DEFAULT_CGROUP_WEIGHT * 4);
+        let low_task = test_thread(low_group.clone());
+        let high_task = test_thread(high_group.clone());
+        let runtime_delta = time::min_period_clocks() * 2;
+
+        let mut low_ticks = 0u32;
+        let mut high_ticks = 0u32;
+        let mut current_period_delta = 0;
+        let mut rq = root.fair_queue(cpu).disable_irq().lock();
+        rq.enqueue(low_task, Some(EnqueueFlags::Spawn));
+        rq.enqueue(high_task, Some(EnqueueFlags::Spawn));
+
+        let mut current = rq.pick_next().unwrap();
+        for _ in 0..40 {
+            current_period_delta += runtime_delta;
+            let runtime = CurrentRuntime {
+                start: 0,
+                delta: runtime_delta,
+                period_delta: current_period_delta,
+            };
+
+            let thread = current.as_thread().unwrap();
+            if Arc::ptr_eq(&thread.task_group(), &low_group) {
+                low_ticks += 1;
+            } else if Arc::ptr_eq(&thread.task_group(), &high_group) {
+                high_ticks += 1;
+            }
+
+            if rq.update_current(&runtime, thread, UpdateFlags::Tick) {
+                let next = rq.pick_next().unwrap();
+                rq.enqueue(current, None);
+                current = next;
+                current_period_delta = 0;
+            }
+        }
+
+        assert!(
+            high_ticks >= low_ticks.saturating_mul(2),
+            "high-weight group should be picked at least twice as often: low={low_ticks}, high={high_ticks}"
+        );
+    }
+}

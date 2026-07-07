@@ -41,6 +41,7 @@ impl KernelDirOps {
             CapLastCapFileOps::new_inode,
         ),
         ("pid_max", InodeType::File, PidMaxFileOps::new_inode),
+        ("yama", InodeType::Dir, YamaDirOps::new_inode),
     ];
 }
 

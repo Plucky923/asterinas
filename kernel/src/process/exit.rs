@@ -34,6 +34,7 @@ pub(super) fn exit_process(current_process: &Process) {
     // This must happen after `move_children_to_reaper_process`. See the comments in
     // `find_reaper_process` for details.
     current_process.status().set_zombie();
+    current_process.status_wait_queue().wake_all();
 
     current_process.pidfile_pollee.notify(IoEvents::IN);
 

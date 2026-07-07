@@ -23,6 +23,7 @@ mod stats;
 use stats::CONTEXT_SWITCH_COUNTER;
 pub use stats::collect_context_switch_count;
 pub mod exception;
+mod framevm_task;
 pub mod kernel_thread;
 pub mod oops;
 pub mod task;
@@ -35,13 +36,14 @@ fn pre_schedule_handler(irq_guard: &DisabledLocalIrqGuard) {
         return;
     };
     let Some(thread_local) = task.as_thread_local() else {
+        let _ = aster_framevisor::task::dispatch_pre_schedule(irq_guard);
         return;
     };
 
     thread_local.supp_user_context().before_schedule(irq_guard);
 }
 
-fn post_schedule_handler() {
+fn post_schedule_handler() -> bool {
     // No races because preemption shouldn't happen in pre-/post-schedule handlers.
     CONTEXT_SWITCH_COUNTER
         .get()
@@ -50,18 +52,25 @@ fn post_schedule_handler() {
 
     let task = Task::current().unwrap();
     let Some(thread_local) = task.as_thread_local() else {
-        return;
+        return aster_framevisor::task::dispatch_post_schedule();
     };
 
     let vmar = thread_local.vmar().borrow();
     if let Some(vmar) = vmar.as_ref() {
         vmar.vm_space().activate()
     }
+
+    true
 }
 
 fn pre_user_run_handler(guard: &DisabledLocalIrqGuard) {
-    let task = Task::current().unwrap();
-    let thread_local = task.as_thread_local().unwrap();
+    let Some(task) = Task::current() else {
+        return;
+    };
+    let Some(thread_local) = task.as_thread_local() else {
+        let _ = aster_framevisor::task::dispatch_pre_user_run(guard);
+        return;
+    };
 
     thread_local.supp_user_context().before_user_exec(guard);
 }
@@ -72,6 +81,7 @@ pub(super) fn init() {
     ostd::task::inject_post_schedule_handler(post_schedule_handler);
     ostd::task::inject_pre_user_run_handler(pre_user_run_handler);
     ostd::arch::trap::inject_user_page_fault_handler(exception::page_fault_handler);
+    framevm_task::init();
 }
 
 /// A thread is a wrapper on top of task.

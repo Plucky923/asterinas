@@ -307,6 +307,11 @@ pub type NsProxyRef<'a> = ThreadLocalOptionRef<'a, Arc<NsProxy>>;
 pub struct ThreadLocalOptionRef<'a, T>(Ref<'a, Option<T>>);
 
 impl<T> ThreadLocalOptionRef<'_, T> {
+    /// Returns a reference to the data if it has not been dropped.
+    pub fn as_ref(&self) -> Option<&T> {
+        self.0.as_ref()
+    }
+
     /// Unwraps and returns a reference to the data.
     ///
     /// # Panics

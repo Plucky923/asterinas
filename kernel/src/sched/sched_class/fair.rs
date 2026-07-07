@@ -20,7 +20,7 @@ use ostd::{
 };
 
 use super::{
-    CurrentRuntime, SchedClassRq,
+    CurrentRuntime, SchedClassRq, frame_group,
     task_group::TaskGroup,
     time::{base_slice_clocks, min_period_clocks},
 };
@@ -255,13 +255,24 @@ impl FairAttr {
 enum FairEntity {
     Thread(Arc<Task>),
     Group(Arc<TaskGroup>),
+    FrameSchedGroup(Arc<frame_group::FrameSchedEntityState>),
+}
+
+pub(super) enum FairPick {
+    Task(Arc<Task>),
+    FrameSchedGroup(Arc<frame_group::FrameSchedEntityState>),
 }
 
 impl FairEntity {
+    fn from_task_group(task_group: Arc<TaskGroup>) -> Self {
+        Self::Group(task_group)
+    }
+
     fn fair_attr(&self, cpu: CpuId) -> Option<&FairAttr> {
         match self {
             Self::Thread(task) => Some(&task.as_thread()?.sched_attr().fair),
             Self::Group(task_group) => task_group.fair_attr(cpu),
+            Self::FrameSchedGroup(state) => Some(state.fair_attr()),
         }
     }
 }
@@ -599,12 +610,19 @@ impl FairClassRq {
             return true;
         }
 
+        let Some(min_queued_vruntime) = min_queued_vruntime else {
+            return false;
+        };
+        if vruntime <= min_queued_vruntime {
+            return false;
+        }
+
         let queued_entity_count = self.len().saturating_sub(usize::from(was_queued));
         let queued_weight = self
             .total_weight
             .saturating_sub(if was_queued { weight } else { 0 });
         rt.period_delta > self.time_slice(weight, queued_weight, queued_entity_count)
-            || vruntime > self.min_vruntime + self.vtime_slice(queued_entity_count)
+            || vruntime > min_queued_vruntime.saturating_add(self.vtime_slice(queued_entity_count))
     }
 
     /// Enqueues `child_group`'s entity into this runqueue.
@@ -619,9 +637,66 @@ impl FairClassRq {
 
         let was_empty = self.entities.is_empty();
         group_attr.update_vruntime_at_least(self.min_vruntime);
-        self.enqueue_entity(group_attr, FairEntity::Group(child_group.clone()));
+        self.enqueue_entity(group_attr, FairEntity::from_task_group(child_group.clone()));
 
         was_empty
+    }
+
+    pub(super) fn enqueue_frame_sched_group(
+        &mut self,
+        state: Arc<frame_group::FrameSchedEntityState>,
+    ) -> bool {
+        let fair_attr = state.fair_attr();
+        if self.has_entity(fair_attr.id) {
+            return false;
+        }
+
+        let was_empty = self.entities.is_empty();
+        fair_attr.update_vruntime_at_least(self.min_vruntime);
+        self.enqueue_entity(fair_attr, FairEntity::FrameSchedGroup(state.clone()));
+        self.add_queued_task();
+        was_empty
+    }
+
+    pub(super) fn pick_next_fair(&mut self) -> Option<FairPick> {
+        loop {
+            let item = self.entities.iter().next()?.clone();
+            let key = item.key();
+            let owner = item.entity().clone();
+
+            match owner {
+                FairEntity::Thread(task) => {
+                    self.remove_entity(key);
+                    self.remove_queued_task();
+                    return Some(FairPick::Task(task));
+                }
+                FairEntity::Group(child_group) => {
+                    let (task, child_is_empty) = {
+                        let mut child_rq = child_group.fair_queue(self.cpu).disable_irq().lock();
+                        let task = child_rq.pick_next();
+                        let child_is_empty = child_rq.is_empty();
+                        (task, child_is_empty)
+                    };
+
+                    let Some(task) = task else {
+                        self.remove_entity(key);
+                        continue;
+                    };
+
+                    self.remove_queued_task();
+                    if child_is_empty {
+                        self.remove_entity(key);
+                    }
+
+                    return Some(FairPick::Task(task));
+                }
+                FairEntity::FrameSchedGroup(state) => {
+                    self.remove_entity(key);
+                    self.remove_queued_task();
+                    return Some(FairPick::FrameSchedGroup(state));
+                }
+            }
+        }
     }
 
     /// Dequeues `child_group`'s entity from this runqueue.
@@ -643,6 +718,7 @@ impl SchedClassRq for FairClassRq {
         if let Some(current_tg) = self.task_group()
             && Arc::ptr_eq(&task_group, &current_tg)
         {
+            let was_queued = self.has_entity(fair_attr.id);
             if let Some(lag) = fair_attr.take_migration_lag() {
                 fair_attr.set_vruntime(self.min_vruntime.saturating_add(lag));
             } else {
@@ -653,16 +729,22 @@ impl SchedClassRq for FairClassRq {
                 fair_attr.update_vruntime_at_least(vruntime);
             }
             self.enqueue_entity(fair_attr, FairEntity::Thread(task.clone()));
-            self.add_queued_task();
+            if !was_queued {
+                self.add_queued_task();
+            }
             return;
         }
 
-        let was_empty = {
+        let (was_empty, was_queued) = {
             let mut leaf_rq = task_group.fair_queue(self.cpu).disable_irq().lock();
             let was_empty = leaf_rq.is_empty();
+            let was_queued = leaf_rq.has_entity(fair_attr.id);
             leaf_rq.enqueue(task, flags);
-            was_empty
+            (was_empty, was_queued)
         };
+        if was_queued {
+            return;
+        }
         self.update_queued_task_count_upwards(&task_group, Self::add_queued_task);
 
         if was_empty {
@@ -690,6 +772,13 @@ impl SchedClassRq for FairClassRq {
         }
     }
 
+    fn remove_queued_task(&mut self, task: &Arc<Task>) -> bool {
+        let Some(thread) = task.as_thread() else {
+            return false;
+        };
+        self.try_dequeue_task(task, &thread.task_group())
+    }
+
     fn len(&self) -> usize {
         self.entities.len()
     }
@@ -700,35 +789,10 @@ impl SchedClassRq for FairClassRq {
 
     fn pick_next(&mut self) -> Option<Arc<Task>> {
         loop {
-            let item = self.entities.iter().next()?.clone();
-            let key = item.key();
-            let owner = item.entity().clone();
-
-            match owner {
-                FairEntity::Thread(task) => {
-                    self.remove_entity(key);
-                    self.remove_queued_task();
-                    return Some(task);
-                }
-                FairEntity::Group(child_group) => {
-                    let (task, child_is_empty) = {
-                        let mut child_rq = child_group.fair_queue(self.cpu).disable_irq().lock();
-                        let task = child_rq.pick_next();
-                        let child_is_empty = child_rq.is_empty();
-                        (task, child_is_empty)
-                    };
-
-                    let Some(task) = task else {
-                        self.remove_entity(key);
-                        continue;
-                    };
-
-                    self.remove_queued_task();
-                    if child_is_empty {
-                        self.remove_entity(key);
-                    }
-
-                    return Some(task);
+            match self.pick_next_fair()? {
+                FairPick::Task(task) => return Some(task),
+                FairPick::FrameSchedGroup(_) => {
+                    continue;
                 }
             }
         }
@@ -763,6 +827,23 @@ impl SchedClassRq for FairClassRq {
             current_group = parent_group;
         }
 
+        should_preempt
+    }
+}
+
+impl FairClassRq {
+    pub(super) fn update_current_frame_group(
+        &mut self,
+        state: &frame_group::FrameSchedEntityState,
+        rt: &CurrentRuntime,
+        flags: UpdateFlags,
+    ) -> bool {
+        let should_preempt = self.update_current_entity(state.fair_attr(), rt, flags);
+        if matches!(flags, UpdateFlags::Tick)
+            && let Some(group) = state.group()
+        {
+            group.record_timer_tick();
+        }
         should_preempt
     }
 }

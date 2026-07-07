@@ -147,11 +147,19 @@ impl FrameVmTransaction {
                 if let Some(existing_artifact_set) = self.try_load_current_bundle_for_run()? {
                     Ok(existing_artifact_set)
                 } else if let Some(artifact_set) = self.try_build_framevm_only_artifact_set()? {
-                    let runtime_config = self.runtime_config(&artifact_set.initramfs.path);
+                    let initramfs_path = artifact_set
+                        .bundle
+                        .initramfs_path()
+                        .unwrap_or_else(|| artifact_set.initramfs.path.clone());
+                    let runtime_config = self.runtime_config(&initramfs_path);
                     Ok((artifact_set.bundle, runtime_config))
                 } else {
                     let artifact_set = self.build_validated_artifact_set()?;
-                    let runtime_config = self.runtime_config(&artifact_set.initramfs.path);
+                    let initramfs_path = artifact_set
+                        .bundle
+                        .initramfs_path()
+                        .unwrap_or_else(|| artifact_set.initramfs.path.clone());
+                    let runtime_config = self.runtime_config(&initramfs_path);
                     Ok((artifact_set.bundle, runtime_config))
                 }
             })?
@@ -250,14 +258,16 @@ impl FrameVmTransaction {
                 &policy.host_symbols.rlibs,
             )
         })?;
-        let host_rustflags = timings.measure("pre_host_final_retention_request", || {
-            retention::pre_host_final_retention_rustflags(
+        let host_retention_request = timings.measure("pre_host_final_retention_request", || {
+            retention::pre_host_final_retention_request(
                 super::rustflags::SHARED_RUSTFLAGS,
                 &object.actual_imports,
                 &host_symbol_files,
+                &staging_dir.join("pre-host-retention.rsp"),
             )
         })?;
-        let host_rustflag_refs = host_rustflags
+        let host_rustflag_refs = host_retention_request
+            .rustflags()
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
@@ -304,16 +314,28 @@ impl FrameVmTransaction {
             }
         }
         if !host_validation.is_exact_match() {
+            let host_symbol_files =
+                timings.measure("fallback_host_symbol_rlib_selection", || {
+                    retention::find_policy_rlib_candidates(
+                        &self.cargo_target_dir,
+                        &staging_config.target,
+                        &staging_config.osdk_config.run.build.profile,
+                        &policy.host_symbols.rlibs,
+                    )
+                })?;
             let refined_host_rustflags =
                 timings.measure("fallback_host_retention_request", || {
-                    retention::final_host_retention_rustflags(
+                    retention::final_host_retention_request(
                         super::rustflags::SHARED_RUSTFLAGS,
                         &object.actual_imports,
                         &host_symbol_files,
                         host_validation.host_elf().path(),
+                        &staging_dir.join("fallback-host-retention.rsp"),
                     )
                 })?;
-            if refined_host_rustflags != host_rustflags {
+            if refined_host_rustflags.requested_symbols()
+                != host_retention_request.requested_symbols()
+            {
                 self.remove_cached_host_elf_for_rebuild(
                     host_validation.host_elf().path(),
                     &staging_config.target,
@@ -321,6 +343,7 @@ impl FrameVmTransaction {
                 )?;
                 remove_dir_if_exists(&staging_bundle_path)?;
                 let refined_host_rustflag_refs = refined_host_rustflags
+                    .rustflags()
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>();
@@ -443,17 +466,23 @@ impl FrameVmTransaction {
             )
         })?;
         let runtime_config = self.runtime_config(&initramfs.path);
+        let mut bundle_runtime_config = runtime_config.clone();
+        bundle.update_config(&mut bundle_runtime_config, ActionChoice::Run);
         self.refresh_or_reuse_boot_carrier(
             &mut bundle,
             &staging_bundle_path,
-            &runtime_config,
+            &bundle_runtime_config,
             symbols.path(),
             &mut timings,
         )?;
         let mut bundle_artifact_set = artifact_set_metadata.bundle_manifest_entry();
         bundle_artifact_set.framevm_boot_carrier_hash = Some(
-            self.compute_boot_carrier_input_manifest(&bundle, &runtime_config, symbols.path())?
-                .input_hash,
+            self.compute_boot_carrier_input_manifest(
+                &bundle,
+                &bundle_runtime_config,
+                symbols.path(),
+            )?
+            .input_hash,
         );
         bundle.replace_framevm_artifact_set(bundle_artifact_set);
         timings.measure("build_index_report", || {
@@ -473,12 +502,7 @@ impl FrameVmTransaction {
         let mut bundle_guard = timings.measure("bundle_publish", || {
             PublishedDirectoryGuard::replace(&staging_bundle_path, &self.bundle_path, &rollback_dir)
         })?;
-        let bundle = Bundle::load(&self.bundle_path, true).ok_or_else(|| {
-            FrameVmStageError::Package(format!(
-                "published framevm bundle at {} failed validation",
-                self.bundle_path.display()
-            ))
-        })?;
+        let bundle = self.load_published_bundle_with_runtime_config(&runtime_config)?;
         report::write_stage_timing_report(&object.report_dir, "make_framevm", &timings)?;
 
         object_guard.commit();
@@ -536,7 +560,7 @@ impl FrameVmTransaction {
         {
             return Ok(None);
         }
-        let Some(existing_initramfs) = existing_bundle.config().run.boot.initramfs.clone() else {
+        let Some(existing_initramfs) = self.runnable_initramfs_for_bundle(&existing_bundle) else {
             return Ok(None);
         };
         let existing_runtime_config = self.runtime_config_from_existing_bundle(&existing_initramfs);
@@ -752,12 +776,7 @@ impl FrameVmTransaction {
             PublishedDirectoryGuard::replace(&staging_bundle_path, &self.bundle_path, &rollback_dir)
         })?;
         let bundle = refresh_timings.measure("published_bundle_load", || {
-            Bundle::load(&self.bundle_path, true).ok_or_else(|| {
-                FrameVmStageError::Package(format!(
-                    "published framevm bundle at {} failed validation",
-                    self.bundle_path.display()
-                ))
-            })
+            self.load_published_bundle_with_runtime_config(&runtime_config)
         })?;
         report::write_stage_timing_report(
             &object.report_dir,
@@ -800,19 +819,11 @@ impl FrameVmTransaction {
         }
 
         validate_existing_framevm_artifact_set(&bundle, &object_output)?;
-        let initramfs = self
-            .config
-            .osdk_config
-            .run
-            .boot
-            .initramfs
-            .clone()
-            .or_else(|| bundle.config().run.boot.initramfs.clone())
-            .ok_or_else(|| {
-                FrameVmStageError::Run(
-                    "existing framevm bundle does not identify a runnable initramfs".to_string(),
-                )
-            })?;
+        let initramfs = self.runnable_initramfs_for_bundle(&bundle).ok_or_else(|| {
+            FrameVmStageError::Run(
+                "existing framevm bundle does not identify a runnable initramfs".to_string(),
+            )
+        })?;
         let runtime_config = self.runtime_config_from_existing_bundle(&initramfs);
         let symbols_path = bundle.framevm_symbols_path().ok_or_else(|| {
             FrameVmStageError::Run(
@@ -861,12 +872,7 @@ impl FrameVmTransaction {
             &self.bundle_path,
             &rollback_dir,
         )?;
-        let bundle = Bundle::load(&self.bundle_path, true).ok_or_else(|| {
-            FrameVmStageError::Package(format!(
-                "published framevm bundle at {} failed validation",
-                self.bundle_path.display()
-            ))
-        })?;
+        let bundle = self.load_published_bundle_with_runtime_config(&runtime_config)?;
         report::write_stage_timing_report(&final_report_dir, "boot_carrier_refresh", &timings)?;
         bundle_guard.commit();
         remove_dir_if_exists(&staging_dir)?;
@@ -1199,19 +1205,11 @@ impl FrameVmTransaction {
             }
             return Ok(None);
         }
-        let initramfs = self
-            .config
-            .osdk_config
-            .run
-            .boot
-            .initramfs
-            .clone()
-            .or_else(|| bundle.config().run.boot.initramfs.clone())
-            .ok_or_else(|| {
-                FrameVmStageError::Run(
-                    "existing framevm bundle does not identify a runnable initramfs".to_string(),
-                )
-            })?;
+        let initramfs = self.runnable_initramfs_for_bundle(&bundle).ok_or_else(|| {
+            FrameVmStageError::Run(
+                "existing framevm bundle does not identify a runnable initramfs".to_string(),
+            )
+        })?;
         let runtime_config = self.runtime_config_from_existing_bundle(&initramfs);
         match bundle.can_run_with_config(&runtime_config, ActionChoice::Run) {
             Ok(()) => Ok(Some((bundle, runtime_config))),
@@ -1240,6 +1238,46 @@ impl FrameVmTransaction {
             self.config.load_action.init_args(),
         );
         config
+    }
+
+    fn runnable_initramfs_for_bundle(&self, bundle: &Bundle) -> Option<PathBuf> {
+        self.config
+            .osdk_config
+            .run
+            .boot
+            .initramfs
+            .clone()
+            .filter(|path| path.exists())
+            .or_else(|| bundle.initramfs_path())
+            .or_else(|| {
+                bundle
+                    .config()
+                    .run
+                    .boot
+                    .initramfs
+                    .clone()
+                    .filter(|path| path.exists())
+            })
+    }
+
+    fn load_published_bundle_with_runtime_config(
+        &self,
+        runtime_config: &Config,
+    ) -> Result<Bundle, FrameVmStageError> {
+        let mut bundle = Bundle::load(&self.bundle_path, true).ok_or_else(|| {
+            FrameVmStageError::Package(format!(
+                "published framevm bundle at {} failed validation",
+                self.bundle_path.display()
+            ))
+        })?;
+        let mut bundle_runtime_config = runtime_config.clone();
+        bundle.update_config(&mut bundle_runtime_config, ActionChoice::Run);
+        Bundle::load(&self.bundle_path, true).ok_or_else(|| {
+            FrameVmStageError::Package(format!(
+                "published framevm bundle at {} failed validation after config refresh",
+                self.bundle_path.display()
+            ))
+        })
     }
 
     fn framevm_object_path(&self) -> PathBuf {

@@ -304,14 +304,27 @@ pub(crate) fn refresh_grub_bootdev_image_with_framevm_symbols(
         aster_bin.version().clone(),
         aster_bin.stripped(),
     );
-    let initramfs_path = action_config.boot.initramfs.as_deref();
+    let mut boot_config = config.clone();
+    let initramfs_path = if let Some(initramfs_path) = action_config.boot.initramfs.as_deref() {
+        bundle.replace_initramfs(Initramfs::new(initramfs_path));
+        let initramfs_path = bundle
+            .initramfs_path()
+            .ok_or_else(|| "selected bundle does not contain an initramfs".to_string())?;
+        match action {
+            ActionChoice::Run => boot_config.run.boot.initramfs = Some(initramfs_path.clone()),
+            ActionChoice::Test => boot_config.test.boot.initramfs = Some(initramfs_path.clone()),
+        }
+        Some(initramfs_path)
+    } else {
+        None
+    };
     let bootdev_image = grub::create_bootdev_image(
         osdk_output_directory,
         &aster_bin,
-        initramfs_path,
+        initramfs_path.as_deref(),
         None,
         Some(framevm_symbols_path),
-        config,
+        &boot_config,
         action,
     );
     if matches!(action_config.boot.method, BootMethod::GrubQcow2) {
@@ -319,9 +332,6 @@ pub(crate) fn refresh_grub_bootdev_image_with_framevm_symbols(
         bundle.replace_vm_image(qcow2_image);
     } else {
         bundle.replace_vm_image(bootdev_image);
-    }
-    if let Some(initramfs_path) = initramfs_path {
-        bundle.replace_initramfs(Initramfs::new(initramfs_path));
     }
     bundle.replace_framevm_symbols(FrameVmSymbols::new(framevm_symbols_path));
     Ok(())

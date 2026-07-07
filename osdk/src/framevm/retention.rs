@@ -62,6 +62,22 @@ struct RlibSelection {
     selected_by_input: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct HostRetentionRequest {
+    rustflags: Vec<String>,
+    requested_symbols: BTreeSet<String>,
+}
+
+impl HostRetentionRequest {
+    pub(super) fn rustflags(&self) -> &[String] {
+        &self.rustflags
+    }
+
+    pub(super) fn requested_symbols(&self) -> &BTreeSet<String> {
+        &self.requested_symbols
+    }
+}
+
 pub(super) fn retain_ordinary_rlibs(
     policy: &FrameVmPolicy,
     target_dir: &Path,
@@ -225,25 +241,27 @@ pub(super) fn defined_demangled_symbols(path: &Path) -> Result<Vec<String>, Fram
     nm_symbols(path, NmMode::DefinedDemangled)
 }
 
-pub(super) fn pre_host_final_retention_rustflags<'a>(
-    shared_rustflags: &'a [&'a str],
-    imports: &'a super::imports::ActualHostImports,
+pub(super) fn pre_host_final_retention_request(
+    shared_rustflags: &[&str],
+    imports: &super::imports::ActualHostImports,
     host_symbol_files: &[PathBuf],
-) -> Result<Vec<String>, FrameVmStageError> {
+    response_file: &Path,
+) -> Result<HostRetentionRequest, FrameVmStageError> {
     let host_side_symbols =
         host_side_retention_symbols_from_candidates(imports, host_symbol_files)?;
-    retention_rustflags(shared_rustflags, imports, &host_side_symbols)
+    retention_request(shared_rustflags, imports, &host_side_symbols, response_file)
 }
 
-pub(super) fn final_host_retention_rustflags<'a>(
-    shared_rustflags: &'a [&'a str],
-    imports: &'a super::imports::ActualHostImports,
+pub(super) fn final_host_retention_request(
+    shared_rustflags: &[&str],
+    imports: &super::imports::ActualHostImports,
     host_symbol_files: &[PathBuf],
     final_host_elf: &Path,
-) -> Result<Vec<String>, FrameVmStageError> {
+    response_file: &Path,
+) -> Result<HostRetentionRequest, FrameVmStageError> {
     let host_side_symbols =
         host_side_retention_symbols_for_final_host(imports, host_symbol_files, final_host_elf)?;
-    retention_rustflags(shared_rustflags, imports, &host_side_symbols)
+    retention_request(shared_rustflags, imports, &host_side_symbols, response_file)
 }
 
 fn host_side_retention_symbols_from_candidates(
@@ -268,15 +286,33 @@ fn host_side_retention_symbols_from_candidates(
     Ok(host_side_symbols)
 }
 
-fn retention_rustflags<'a>(
-    shared_rustflags: &'a [&'a str],
-    imports: &'a super::imports::ActualHostImports,
+fn retention_request(
+    shared_rustflags: &[&str],
+    imports: &super::imports::ActualHostImports,
     host_side_symbols: &BTreeSet<String>,
-) -> Result<Vec<String>, FrameVmStageError> {
+    response_file: &Path,
+) -> Result<HostRetentionRequest, FrameVmStageError> {
+    let requested_symbols = requested_retention_symbols(imports, host_side_symbols)?;
+    write_linker_response_file(response_file, &requested_symbols)?;
+
     let mut rustflags = shared_rustflags
         .iter()
         .map(|flag| (*flag).to_string())
         .collect::<Vec<_>>();
+    if !requested_symbols.is_empty() {
+        rustflags.push(format!("-C link-arg=@{}", response_file.display()));
+    }
+
+    Ok(HostRetentionRequest {
+        rustflags,
+        requested_symbols,
+    })
+}
+
+fn requested_retention_symbols(
+    imports: &super::imports::ActualHostImports,
+    host_side_symbols: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, FrameVmStageError> {
     let mut requested_symbols = host_side_symbols.clone();
     for (raw_name, _) in imports.iter() {
         let raw_name = std::str::from_utf8(raw_name.as_bytes()).map_err(|_| {
@@ -287,12 +323,32 @@ fn retention_rustflags<'a>(
         })?;
         requested_symbols.insert(raw_name.to_string());
     }
+    Ok(requested_symbols)
+}
 
+fn write_linker_response_file(
+    response_file: &Path,
+    requested_symbols: &BTreeSet<String>,
+) -> Result<(), FrameVmStageError> {
+    let mut response = String::new();
     for raw_name in requested_symbols {
-        rustflags.push("-C link-arg=-u".to_string());
-        rustflags.push(format!("-C link-arg={}", raw_name));
+        if raw_name.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            return Err(FrameVmStageError::ImportValidation(format!(
+                "FrameVM host retention linker symbol contains whitespace: {raw_name}"
+            )));
+        }
+
+        response.push_str("-u\n");
+        response.push_str(raw_name);
+        response.push('\n');
     }
-    Ok(rustflags)
+
+    fs::write(response_file, response).map_err(|error| {
+        FrameVmStageError::ObjectBuild(format!(
+            "failed to write FrameVM host retention linker response file {}: {error}",
+            response_file.display()
+        ))
+    })
 }
 
 fn host_side_retention_symbols_for_final_host(

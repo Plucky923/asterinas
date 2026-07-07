@@ -552,6 +552,13 @@ impl Bundle {
             .map(|vm| self.path.join(vm.path()))
     }
 
+    pub(crate) fn initramfs_path(&self) -> Option<PathBuf> {
+        self.manifest
+            .initramfs
+            .as_ref()
+            .map(|initramfs| self.path.join(initramfs.path()))
+    }
+
     pub fn aster_bin_path(&self) -> Option<PathBuf> {
         self.manifest
             .aster_bin
@@ -645,7 +652,9 @@ impl Bundle {
         let config_initramfs_opt = config_action.boot.initramfs.clone();
         self.manifest.initramfs = if let Some(ref initramfs) = config_initramfs_opt {
             if initramfs.exists() {
-                Some(Initramfs::new(initramfs).copy_to(&self.path))
+                let copied_initramfs = Initramfs::new(initramfs).copy_to(&self.path);
+                config_action.boot.initramfs = Some(self.path.join(copied_initramfs.path()));
+                Some(copied_initramfs)
             } else if let Some(rel) = bundle_initramfs_rel {
                 warn_msg!(
                     "initramfs {} not found; reusing bundle initramfs",

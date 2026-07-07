@@ -18,11 +18,33 @@ pub trait BundleFile {
     fn size(&self) -> &u64;
 
     fn get_modified_time(&self) -> SystemTime {
-        self.path().metadata().unwrap().modified().unwrap()
+        self.path()
+            .metadata()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to inspect bundle file {}: {error}",
+                    self.path().display()
+                )
+            })
+            .modified()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to read modified time for bundle file {}: {error}",
+                    self.path().display()
+                )
+            })
     }
 
     fn get_size(&self) -> u64 {
-        self.path().metadata().unwrap().size()
+        self.path()
+            .metadata()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to inspect bundle file {}: {error}",
+                    self.path().display()
+                )
+            })
+            .size()
     }
 
     fn validate(&self) -> bool {

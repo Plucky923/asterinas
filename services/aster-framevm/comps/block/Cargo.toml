@@ -1,5 +1,5 @@
 [package]
-name = "aster-block"
+name = "aster-framevm-block"
 version = "0.1.0"
 edition.workspace = true
 
@@ -7,14 +7,14 @@ edition.workspace = true
 
 [dependencies]
 align_ext.workspace = true
-aster-util = { workspace = true, features = ["dynamic-cpu-local-counter"] }
+aster-util = { workspace = true, default-features = false }
 bitvec.workspace = true
 component.workspace = true
 device-id.workspace = true
 id-alloc.workspace = true
 int-to-c-enum.workspace = true
 io-util.workspace = true
-ostd.workspace = true
+ostd = { path = "../../../../kernel/comps/framevisor-ostd", package = "aster-framevisor-ostd" }
 ostd-pod.workspace = true
 spin.workspace = true
 zerocopy.workspace = true

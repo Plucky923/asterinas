@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 aster-block.workspace = true
 aster-pci.workspace = true
-aster-util.workspace = true
+aster-util = { workspace = true, features = ["dynamic-cpu-local-counter"] }
 component.workspace = true
 device-id.workspace = true
 io-util.workspace = true

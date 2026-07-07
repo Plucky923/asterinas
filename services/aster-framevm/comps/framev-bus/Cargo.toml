@@ -1,0 +1,16 @@
+[package]
+name = "framev-bus"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+component.workspace = true
+framev-blk-common.workspace = true
+framev-console-common.workspace = true
+framev-device.workspace = true
+framev-rng-common.workspace = true
+framev-sock-common.workspace = true
+ostd = { path = "../../../../kernel/comps/framevisor-ostd", package = "aster-framevisor-ostd" }
+
+[lints]
+workspace = true

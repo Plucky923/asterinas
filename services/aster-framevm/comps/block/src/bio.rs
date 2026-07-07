@@ -442,7 +442,7 @@ impl BioSegment {
     /// Constructs a new `BioSegment` with a given `USegment` and the bio direction.
     pub fn new_from_segment(segment: USegment, direction: BioDirection) -> Self {
         let len = segment.size();
-        let dma_stream = DmaStream::map(segment, false).unwrap();
+        let dma_stream = DmaStream::map(segment.into(), false).unwrap();
         Self {
             inner: Arc::new(BioSegmentInner {
                 dma_slice: Slice::new(Arc::new(dma_stream), 0..len),
@@ -510,6 +510,20 @@ impl BioSegment {
             return Err(Error::InvalidArgs);
         }
         self.inner_dma_slice().write_bytes(0, src)
+    }
+
+    /// Copies bytes submitted for a device write into `dst`.
+    ///
+    /// Block drivers use this when emulating a device-side write without
+    /// handing the segment to a real DMA device.
+    pub fn read_to_device_bytes(&self, dst: &mut [u8]) -> Result<(), Error> {
+        if dst.len() != self.nbytes() {
+            return Err(Error::InvalidArgs);
+        }
+        if self.inner.direction != BioDirection::ToDevice {
+            return Err(Error::AccessDenied);
+        }
+        self.inner_dma_slice().read_bytes(0, dst)
     }
 }
 

@@ -1,11 +1,14 @@
 # template
 [components]
+nix = { name = "aster-nix" }
+virtio = { name = "aster-virtio" }
+framevisor = { name = "aster-framevisor" }
+input = { name = "aster-input" }
 block = { name = "aster-block" }
 cmdline = { name = "aster-cmdline" }
 console = { name = "aster-console" }
 framebuffer = { name = "aster-framebuffer" }
 i8042 = { name = "aster-i8042" }
-input = { name = "aster-input" }
 kernel = { name = "aster-kernel" }
 logger = { name = "aster-logger" }
 mlsdisk = { name = "aster-mlsdisk" }
@@ -13,10 +16,56 @@ network = { name = "aster-network" }
 nvme = { name = "aster-nvme" }
 pci = { name = "aster-pci" }
 softirq = { name = "aster-softirq" }
+framevm_block = { name = "aster-framevm-block" }
+framevm_cmdline = { name = "aster-framevm-cmdline" }
+framev_blk_frontend = { name = "framev-blk-frontend" }
+framev_bus = { name = "framev-bus" }
+framev_console_frontend = { name = "framev-console-frontend" }
+framev_rng_frontend = { name = "framev-rng-frontend" }
+framev_sock_frontend = { name = "framev-sock-frontend" }
+framevm = { name = "aster-framevm" }
+framevm_softirq = { name = "aster-framevm-softirq" }
+framevm_systree = { name = "aster-framevm-systree" }
+framevm_time = { name = "aster-framevm-time" }
 systree = { name = "aster-systree" }
 time = { name = "aster-time" }
 uart = { name = "aster-uart" }
-virtio = { name = "aster-virtio" }
+
+[profiles]
+kernel = [
+    "aster-block",
+    "aster-cmdline",
+    "aster-console",
+    "aster-framebuffer",
+    "aster-framevisor",
+    "aster-i8042",
+    "aster-input",
+    "aster-kernel",
+    "aster-logger",
+    "aster-mlsdisk",
+    "aster-network",
+    "aster-nix",
+    "aster-nvme",
+    "aster-pci",
+    "aster-softirq",
+    "aster-systree",
+    "aster-time",
+    "aster-uart",
+    "aster-virtio",
+]
+framevm = [
+    "aster-framevm",
+    "aster-framevm-block",
+    "aster-framevm-cmdline",
+    "aster-framevm-softirq",
+    "aster-framevm-systree",
+    "aster-framevm-time",
+    "framev-bus",
+    "framev-blk-frontend",
+    "framev-console-frontend",
+    "framev-rng-frontend",
+    "framev-sock-frontend",
+]
 
 [whitelist]
 [whitelist.nix.main]

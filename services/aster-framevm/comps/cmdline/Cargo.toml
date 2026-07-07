@@ -1,15 +1,14 @@
 [package]
-name = "aster-softirq"
+name = "aster-framevm-cmdline"
 version = "0.1.0"
 edition.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-aster-util = { workspace = true, features = ["dynamic-cpu-local-counter"] }
 component.workspace = true
-intrusive-collections.workspace = true
-ostd.workspace = true
+inventory.workspace = true
+ostd = { path = "../../../../kernel/comps/framevisor-ostd", package = "aster-framevisor-ostd" }
 spin.workspace = true
 
 [lints]

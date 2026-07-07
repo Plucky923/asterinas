@@ -1,15 +1,15 @@
 [package]
-name = "aster-time"
+name = "aster-framevm-time"
 version = "0.1.0"
 edition.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-aster-util = { workspace = true, features = ["dynamic-cpu-local-counter"] }
+aster-util = { workspace = true, default-features = false }
 bitflags.workspace = true
 component.workspace = true
-ostd.workspace = true
+ostd = { path = "../../../../kernel/comps/framevisor-ostd", package = "aster-framevisor-ostd" }
 spin.workspace = true
 
 [target.riscv64imac-unknown-none-elf.dependencies]

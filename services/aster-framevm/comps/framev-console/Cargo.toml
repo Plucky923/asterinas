@@ -1,0 +1,12 @@
+[package]
+name = "framev-console-frontend"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+component.workspace = true
+framev-bus.workspace = true
+framev-console-common.workspace = true
+
+[lints]
+workspace = true

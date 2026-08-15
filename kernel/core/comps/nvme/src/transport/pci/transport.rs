@@ -102,7 +102,8 @@ impl NvmePciTransport {
     fn init_msix(common_device: &mut PciCommonDevice) -> Option<NvmeMsixManager> {
         let msix_opt = common_device.acquire_msix_capability().ok()?;
         let msix_data = msix_opt?;
-        let manager = NvmeMsixManager::new(msix_data)?;
+        let required_vector_count = u16::try_from(QUEUE_NUM).ok()?;
+        let manager = NvmeMsixManager::new(msix_data, required_vector_count)?;
         info!("MSI-X enabled with {} vectors", manager.table_size());
         Some(manager)
     }
@@ -137,6 +138,7 @@ pub(crate) struct NvmePciTransportLock {
 
 pub(crate) struct NvmePciTransportGuard<'a> {
     inner: SpinLockGuard<'a, NvmePciTransportInner, LocalIrqDisabled>,
+    config_bar: &'a BarAccess,
 }
 
 impl Deref for NvmePciTransportGuard<'_> {
@@ -153,6 +155,13 @@ impl DerefMut for NvmePciTransportGuard<'_> {
     }
 }
 
+impl NvmePciTransportGuard<'_> {
+    /// Returns access to the NVMe registers while holding the transport lock.
+    pub(crate) fn regs(&mut self) -> RegAccess<'_> {
+        RegAccess(self.config_bar)
+    }
+}
+
 impl NvmePciTransportLock {
     /// Wraps a probed [`NvmePciTransport`] for concurrent access.
     pub(crate) fn new(inner: NvmePciTransport) -> Self {
@@ -166,6 +175,7 @@ impl NvmePciTransportLock {
     pub(crate) fn lock(&self) -> NvmePciTransportGuard<'_> {
         NvmePciTransportGuard {
             inner: self.inner.lock(),
+            config_bar: &self.config_bar,
         }
     }
 

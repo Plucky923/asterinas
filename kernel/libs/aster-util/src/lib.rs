@@ -13,6 +13,7 @@ pub mod dup;
 pub mod fixed_point;
 pub mod fixed_str;
 pub mod mem_obj_slice;
+#[cfg(feature = "dynamic-cpu-local-counter")]
 pub mod per_cpu_counter;
 pub mod printer;
 pub mod ranged_integer;

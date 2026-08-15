@@ -7,10 +7,11 @@ mod stat;
 pub(crate) const MAX_NS_NUM: usize = 1024;
 
 #[derive(Debug)]
-pub(crate) enum NvmeDeviceError {
+pub enum NvmeDeviceError {
     BlockDeviceRegisterFailed,
     CommandFailed,
     ControllerEnableTimeout,
+    ControllerShutdownTimeout,
     InvalidControllerConfig,
     MsixAllocationFailed,
     NoNamespace,

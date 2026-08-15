@@ -52,6 +52,19 @@ pub(super) enum IpPacket<'a> {
     Ipv6(Ipv6Packet<&'a [u8]>),
 }
 
+/// The result of processing a frame received from a physical device.
+pub(super) enum PhyRxResult<'a, T> {
+    Packet(IpPacket<'a>, T),
+    NeighborResolved,
+    Ignored,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PhyTxStatus {
+    Sent,
+    NeighborPending,
+}
+
 /// A normalized IP address for binding purposes.
 ///
 /// IPv4 addresses are normalized to IPv4-mapped IPv6 addresses. IPv6 addresses
@@ -226,9 +239,9 @@ impl<E: Ext> IfaceCommon<E> {
                 &'pkt [u8],
                 &'cx mut Context,
                 D::TxToken<'tx>,
-                Option<(IpPacket<'pkt>, D::TxToken<'tx>)>,
+                PhyRxResult<'pkt, D::TxToken<'tx>>,
             >,
-        Q: FnMut(&Packet, &mut Context, D::TxToken<'_>),
+        Q: FnMut(&Packet, &mut Context, D::TxToken<'_>) -> PhyTxStatus,
     {
         let mut interface = self.interface();
         interface.context_mut().now = get_network_timestamp();

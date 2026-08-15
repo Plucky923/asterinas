@@ -15,7 +15,10 @@ use smoltcp::{
     },
 };
 
-use super::{common::IpPacket, poll_iface::PollableIfaceMut};
+use super::{
+    common::{IpPacket, PhyRxResult, PhyTxStatus},
+    poll_iface::PollableIfaceMut,
+};
 use crate::{
     ext::Ext,
     socket::{TcpConnectionBg, TcpProcessResult},
@@ -68,24 +71,28 @@ impl<E: Ext> PollContext<'_, E> {
                 &'pkt [u8],
                 &'cx mut Context,
                 D::TxToken<'tx>,
-                Option<(IpPacket<'pkt>, D::TxToken<'tx>)>,
+                PhyRxResult<'pkt, D::TxToken<'tx>>,
             >,
-        Q: FnMut(&Packet, &mut Context, D::TxToken<'_>),
+        Q: FnMut(&Packet, &mut Context, D::TxToken<'_>) -> PhyTxStatus,
     {
         while let Some((rx_token, tx_token)) = device.receive(self.iface.context().now()) {
             rx_token.consume(|data| {
-                let Some((ip_packet, tx_token)) =
-                    process_phy(data, self.iface.context_mut(), tx_token)
-                else {
-                    return;
-                };
+                let (ip_packet, tx_token) =
+                    match process_phy(data, self.iface.context_mut(), tx_token) {
+                        PhyRxResult::Packet(ip_packet, tx_token) => (ip_packet, tx_token),
+                        PhyRxResult::NeighborResolved => {
+                            self.iface.retry_neighbor_pending();
+                            return;
+                        }
+                        PhyRxResult::Ignored => return,
+                    };
 
                 let reply = match ip_packet {
                     IpPacket::Ipv4(p) => self.parse_and_process_ipv4(p),
                     IpPacket::Ipv6(p) => self.parse_and_process_ipv6(p),
                 };
                 let Some(reply) = reply else { return };
-                dispatch_phy(&reply, self.iface.context_mut(), tx_token);
+                let _ = dispatch_phy(&reply, self.iface.context_mut(), tx_token);
             });
         }
     }
@@ -389,7 +396,7 @@ impl<E: Ext> PollContext<'_, E> {
     pub(super) fn poll_egress<D, Q>(&mut self, device: &mut D, dispatch_phy: &mut Q)
     where
         D: Device + ?Sized,
-        Q: FnMut(&Packet, &mut Context, D::TxToken<'_>),
+        Q: FnMut(&Packet, &mut Context, D::TxToken<'_>) -> PhyTxStatus,
     {
         while let Some(tx_token) = device.transmit(self.iface.context().now()) {
             if !self.dispatch_ip(tx_token, dispatch_phy) {
@@ -401,7 +408,7 @@ impl<E: Ext> PollContext<'_, E> {
     fn dispatch_ip<T, Q>(&mut self, tx_token: T, dispatch_phy: &mut Q) -> bool
     where
         T: TxToken,
-        Q: FnMut(&Packet, &mut Context, T),
+        Q: FnMut(&Packet, &mut Context, T) -> PhyTxStatus,
     {
         let (did_something_tcp, tx_token) = self.dispatch_tcp(tx_token, dispatch_phy);
 
@@ -417,7 +424,7 @@ impl<E: Ext> PollContext<'_, E> {
     fn dispatch_tcp<T, Q>(&mut self, tx_token: T, dispatch_phy: &mut Q) -> (bool, Option<T>)
     where
         T: TxToken,
-        Q: FnMut(&Packet, &mut Context, T),
+        Q: FnMut(&Packet, &mut Context, T) -> PhyTxStatus,
     {
         let mut tx_token = Some(tx_token);
         let mut did_something = false;
@@ -432,22 +439,27 @@ impl<E: Ext> PollContext<'_, E> {
             did_something = true;
 
             let mut deferred = None;
+            let mut neighbor_pending = false;
 
             let (reply, became_dead) =
                 TcpConnectionBg::dispatch(&socket, &mut self.iface, |iface, ip_repr, tcp_repr| {
                     let mut this = PollContext::new(iface, self.sockets, self.actions);
 
                     if !this.is_unicast_local(ip_repr.dst_addr()) {
-                        dispatch_phy(
+                        let status = dispatch_phy(
                             &Packet::new(ip_repr.clone(), IpPayload::Tcp(*tcp_repr)),
                             this.iface.context_mut(),
                             tx_token.take().unwrap(),
                         );
-                        return None;
+                        if status == PhyTxStatus::NeighborPending {
+                            neighbor_pending = true;
+                            return Err(());
+                        }
+                        return Ok(None);
                     }
 
                     if !socket.can_process(tcp_repr.dst_port) {
-                        return this.process_tcp(ip_repr, tcp_repr);
+                        return Ok(this.process_tcp(ip_repr, tcp_repr));
                     }
 
                     // We cannot call `process_tcp` now because it may cause deadlocks. We will copy
@@ -463,7 +475,7 @@ impl<E: Ext> PollContext<'_, E> {
                         data
                     }));
 
-                    None
+                    Ok(None)
                 });
 
             if *became_dead {
@@ -479,28 +491,36 @@ impl<E: Ext> PollContext<'_, E> {
                         &ip_payload,
                         &ChecksumCapabilities::ignored(),
                     ) {
-                        dispatch_phy(&reply, self.iface.context_mut(), tx_token.take().unwrap());
+                        neighbor_pending |= dispatch_phy(
+                            &reply,
+                            self.iface.context_mut(),
+                            tx_token.take().unwrap(),
+                        ) == PhyTxStatus::NeighborPending;
                     }
                 }
                 (None, Some((ip_repr, tcp_repr))) if !self.is_unicast_local(ip_repr.dst_addr()) => {
-                    dispatch_phy(
+                    neighbor_pending |= dispatch_phy(
                         &Packet::new(ip_repr, IpPayload::Tcp(tcp_repr)),
                         self.iface.context_mut(),
                         tx_token.take().unwrap(),
-                    );
+                    ) == PhyTxStatus::NeighborPending;
                 }
                 (None, Some((ip_repr, tcp_repr))) => {
                     if let Some((new_ip_repr, new_tcp_repr)) =
                         self.process_tcp_until_outgoing(&ip_repr, &tcp_repr)
                     {
-                        dispatch_phy(
+                        neighbor_pending |= dispatch_phy(
                             &Packet::new(new_ip_repr, IpPayload::Tcp(new_tcp_repr)),
                             self.iface.context_mut(),
                             tx_token.take().unwrap(),
-                        );
+                        ) == PhyTxStatus::NeighborPending;
                     }
                 }
                 (Some(_), Some(_)) => unreachable!(),
+            }
+
+            if neighbor_pending {
+                self.iface.mark_neighbor_pending(socket.clone());
             }
 
             if tx_token.is_none() {
@@ -514,7 +534,7 @@ impl<E: Ext> PollContext<'_, E> {
     fn dispatch_udp<T, Q>(&mut self, tx_token: T, dispatch_phy: &mut Q) -> (bool, Option<T>)
     where
         T: TxToken,
-        Q: FnMut(&Packet, &mut Context, T),
+        Q: FnMut(&Packet, &mut Context, T) -> PhyTxStatus,
     {
         let mut tx_token = Some(tx_token);
         let mut did_something = false;
@@ -532,13 +552,13 @@ impl<E: Ext> PollContext<'_, E> {
 
             let mut deferred = None;
 
-            let (cx, pending) = self.iface.inner_mut();
+            let (cx, pending, neighbor_pending) = self.iface.inner_mut();
             socket.dispatch(cx, |cx, ip_repr, udp_repr, udp_payload| {
-                let iface = PollableIfaceMut::new(cx, pending);
+                let iface = PollableIfaceMut::new(cx, pending, neighbor_pending);
                 let mut this = PollContext::new(iface, self.sockets, &mut actions);
 
                 if ip_repr.dst_addr().is_broadcast() || !this.is_unicast_local(ip_repr.dst_addr()) {
-                    dispatch_phy(
+                    let _ = dispatch_phy(
                         &Packet::new(ip_repr.clone(), IpPayload::Udp(*udp_repr, udp_payload)),
                         this.iface.context_mut(),
                         tx_token.take().unwrap(),
@@ -578,7 +598,7 @@ impl<E: Ext> PollContext<'_, E> {
                     &ChecksumCapabilities::ignored(),
                 )
             {
-                dispatch_phy(&reply, self.iface.context_mut(), tx_token.take().unwrap());
+                let _ = dispatch_phy(&reply, self.iface.context_mut(), tx_token.take().unwrap());
             }
 
             if tx_token.is_none() {

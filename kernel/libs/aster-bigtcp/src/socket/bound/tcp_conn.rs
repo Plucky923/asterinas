@@ -752,7 +752,11 @@ impl<E: Ext> TcpConnectionBg<E> {
         dispatch: D,
     ) -> (Option<(IpRepr, TcpRepr<'static>)>, TcpConnBecameDead)
     where
-        D: FnOnce(PollableIfaceMut<E>, &IpRepr, &TcpRepr) -> Option<(IpRepr, TcpRepr<'static>)>,
+        D: FnOnce(
+            PollableIfaceMut<E>,
+            &IpRepr,
+            &TcpRepr,
+        ) -> Result<Option<(IpRepr, TcpRepr<'static>)>, ()>,
     {
         let mut socket = self.inner.lock();
 
@@ -762,13 +766,20 @@ impl<E: Ext> TcpConnectionBg<E> {
         let mut events = SocketEvents::empty();
 
         let mut reply = None;
-        let (cx, pending) = iface.inner_mut();
-        socket
-            .dispatch(cx, |cx, (ip_repr, tcp_repr)| {
-                reply = dispatch(PollableIfaceMut::new(cx, pending), &ip_repr, &tcp_repr);
-                Ok::<(), ()>(())
-            })
-            .unwrap();
+        let (cx, pending, neighbor_pending) = iface.inner_mut();
+        let _ = socket.dispatch(cx, |cx, (ip_repr, tcp_repr)| {
+            match dispatch(
+                PollableIfaceMut::new(cx, pending, neighbor_pending),
+                &ip_repr,
+                &tcp_repr,
+            ) {
+                Ok(next_reply) => {
+                    reply = next_reply;
+                    Ok(())
+                }
+                Err(()) => Err(()),
+            }
+        });
 
         // `dispatch` can return a packet in response to the generated packet. If the socket
         // accepts the packet, we can process it directly.

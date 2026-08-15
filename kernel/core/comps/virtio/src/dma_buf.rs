@@ -2,7 +2,7 @@
 
 use alloc::sync::Arc;
 
-use aster_network::{RxBuffer, TxBuffer, dma_pool::DmaSegment};
+use aster_network::{DmaRxBuffer, TxBuffer, dma_pool::DmaSegment};
 use aster_util::mem_obj_slice::Slice;
 use ostd::mm::{
     HasDaddr, HasSize,
@@ -68,7 +68,7 @@ impl DmaBuf for TxBuffer {
     }
 }
 
-impl DmaBuf for RxBuffer {
+impl DmaBuf for DmaRxBuffer {
     fn len(&self) -> usize {
         self.size()
     }

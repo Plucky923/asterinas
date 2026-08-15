@@ -13,7 +13,7 @@ use io_util::{
 use ostd::{
     Error,
     mm::{
-        HasSize, Infallible, USegment, VmReader, VmWriter,
+        HasSize, Infallible, USegment, VmIo, VmReader, VmWriter,
         dma::DmaStream,
         io::util::{HasVmReaderWriter, VmReaderWriterResult},
     },
@@ -61,12 +61,19 @@ impl Bio {
     ) -> Self {
         let nsectors = segments
             .iter()
-            .map(|segment| segment.nsectors().to_raw())
-            .sum();
+            .try_fold(0_u64, |total, segment| {
+                total.checked_add(segment.nsectors().to_raw())
+            })
+            .expect("BIO sector count must fit in `u64`");
+        let end_sid = start_sid
+            .to_raw()
+            .checked_add(nsectors)
+            .map(Sid::new)
+            .expect("BIO sector range must fit in `u64`");
 
         let metadata = Arc::new(BioMetadata {
             type_,
-            sid_range: start_sid..start_sid + nsectors,
+            sid_range: start_sid..end_sid,
             status: AtomicU32::new(BioStatus::Init as u32),
             wait_queue: WaitQueue::new(),
         });
@@ -314,11 +321,11 @@ impl IoCompletion for BioMetadata {
         });
 
         match status {
-            BioStatus::Complete => Ok(()),
+            BioStatus::Complete | BioStatus::Zeros => Ok(()),
             BioStatus::NotSupported => Err(IoError::Unsupported),
             BioStatus::NoSpace => Err(IoError::OutOfSpace),
             BioStatus::IoError => Err(IoError::Failed),
-            BioStatus::Init | BioStatus::Submit | BioStatus::Zeros => unreachable!(),
+            BioStatus::Init | BioStatus::Submit => unreachable!(),
         }
     }
 }
@@ -486,6 +493,72 @@ impl BioSegment {
     #[cfg(ktest)]
     pub fn inner_dma(&self) -> &Arc<DmaStream> {
         self.inner.dma_slice.mem_obj()
+    }
+
+    /// Copies this BIO segment into `dst`.
+    pub fn read_all_bytes(&self, dst: &mut [u8]) -> Result<(), Error> {
+        if dst.len() != self.nbytes() {
+            return Err(Error::InvalidArgs);
+        }
+        self.read(0, &mut VmWriter::from(dst).to_fallible())
+    }
+
+    /// Copies `src` into this BIO segment.
+    pub fn write_all_bytes(&self, src: &[u8]) -> Result<(), Error> {
+        if src.len() != self.nbytes() {
+            return Err(Error::InvalidArgs);
+        }
+        self.write(0, &mut VmReader::from(src).to_fallible())
+    }
+
+    /// Copies device-returned bytes into this BIO segment.
+    ///
+    /// Block drivers use this when emulating a device-side read completion
+    /// without handing the segment to a real DMA device.
+    pub fn write_from_device_bytes(&self, src: &[u8]) -> Result<(), Error> {
+        if src.len() != self.nbytes() {
+            return Err(Error::InvalidArgs);
+        }
+        if self.inner.direction != BioDirection::FromDevice {
+            return Err(Error::AccessDenied);
+        }
+        self.inner_dma_slice().write_bytes(0, src)
+    }
+
+    /// Copies bytes submitted for a device write into `dst`.
+    ///
+    /// Block drivers use this when emulating a device-side write without
+    /// handing the segment to a real DMA device.
+    pub fn read_to_device_bytes(&self, dst: &mut [u8]) -> Result<(), Error> {
+        if dst.len() != self.nbytes() {
+            return Err(Error::InvalidArgs);
+        }
+        if self.inner.direction != BioDirection::ToDevice {
+            return Err(Error::AccessDenied);
+        }
+        self.inner_dma_slice().read_bytes(0, dst)
+    }
+
+    /// Returns a cursor that lets a block driver read bytes sent to the device.
+    ///
+    /// The cursor borrows this segment, so the segment remains alive for the
+    /// whole driver operation without exposing its DMA address.
+    pub fn reader_for_device(&self) -> Result<VmReader<'_, Infallible>, Error> {
+        if self.inner.direction != BioDirection::ToDevice {
+            return Err(Error::AccessDenied);
+        }
+        self.inner.dma_slice.reader()
+    }
+
+    /// Returns a cursor that lets a block driver write bytes read from the device.
+    ///
+    /// The cursor borrows this segment, so the segment remains alive for the
+    /// whole driver operation without exposing its DMA address.
+    pub fn writer_for_device(&self) -> Result<VmWriter<'_, Infallible>, Error> {
+        if self.inner.direction != BioDirection::FromDevice {
+            return Err(Error::AccessDenied);
+        }
+        self.inner.dma_slice.writer()
     }
 }
 
@@ -727,7 +800,7 @@ pub struct AlignedUsize<const N: u16>(usize);
 impl<const N: u16> AlignedUsize<N> {
     /// Constructs a new instance of aligned integer if the given value is aligned.
     pub fn new(val: usize) -> Option<Self> {
-        if val.is_multiple_of(N as usize) {
+        if N != 0 && val.is_multiple_of(N as usize) {
             Some(Self(val))
         } else {
             None
@@ -752,5 +825,50 @@ impl<const N: u16> AlignedUsize<N> {
     /// Returns the alignment.
     pub fn align(&self) -> usize {
         N as usize
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use core::sync::atomic::AtomicBool;
+
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn completion_is_published_after_callback_and_zeros_is_successful() {
+        let metadata = Arc::new(BioMetadata {
+            type_: BioType::Read,
+            sid_range: Sid::new(0)..Sid::new(0),
+            status: AtomicU32::new(BioStatus::Submit as u32),
+            wait_queue: WaitQueue::new(),
+        });
+        let callback_observed_submit = Arc::new(AtomicBool::new(false));
+        let callback_metadata = metadata.clone();
+        let callback_observed_submit_clone = callback_observed_submit.clone();
+        let submitted = SubmittedBio {
+            metadata: metadata.clone(),
+            sid_offset: 0,
+            complete_fn: Some(Box::new(move |status| {
+                assert_eq!(status, BioStatus::Zeros);
+                callback_observed_submit_clone.store(
+                    callback_metadata.status() == BioStatus::Submit,
+                    Ordering::Relaxed,
+                );
+            })),
+            segments: Vec::new(),
+        };
+
+        submitted.complete(BioStatus::Zeros);
+
+        assert!(callback_observed_submit.load(Ordering::Relaxed));
+        assert_eq!(metadata.status(), BioStatus::Zeros);
+        assert!(metadata.wait().is_ok());
+    }
+
+    #[ktest]
+    fn zero_is_not_an_alignment() {
+        assert!(AlignedUsize::<0>::new(0).is_none());
     }
 }

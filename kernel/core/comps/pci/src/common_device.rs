@@ -22,6 +22,12 @@ pub struct PciCommonDevice {
     capabilities: RawCapabilities,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PciDeviceInitialization {
+    Host,
+    Reserved,
+}
+
 impl PciCommonDevice {
     /// Returns the PCI device ID.
     pub fn device_id(&self) -> &PciDeviceId {
@@ -94,11 +100,20 @@ impl PciCommonDevice {
         )
     }
 
-    pub(super) fn new(location: PciDeviceLocation) -> Option<Self> {
+    pub(super) fn new(
+        location: PciDeviceLocation,
+        initialization: PciDeviceInitialization,
+    ) -> Option<Self> {
         if location.read16(0) == 0xFFFF {
             // No device.
             return None;
         }
+
+        let original_command =
+            Command::from_bits_truncate(location.read16(PciCommonCfgOffset::Command as u16));
+        let inactive_command =
+            original_command - (Command::BUS_MASTER | Command::MEMORY_SPACE | Command::IO_SPACE);
+        location.write16(PciCommonCfgOffset::Command as u16, inactive_command.bits());
 
         let device_id = PciDeviceId::new(location);
 
@@ -128,10 +143,14 @@ impl PciCommonDevice {
         // While setting up the BARs, we need to ensure that
         // "Decode (I/O or memory) of the appropriate address space is disabled via the Command
         // Register before sizing a Base Address register."
-        let command_val = device.read_command() | Command::BUS_MASTER;
-        device.write_command(command_val - (Command::MEMORY_SPACE | Command::IO_SPACE));
         device.bar_manager = BarManager::new(device.header_type.device_type(), location);
-        device.write_command(command_val | (Command::MEMORY_SPACE | Command::IO_SPACE));
+        let final_command = match initialization {
+            PciDeviceInitialization::Host => {
+                original_command | Command::BUS_MASTER | Command::MEMORY_SPACE | Command::IO_SPACE
+            }
+            PciDeviceInitialization::Reserved => inactive_command,
+        };
+        device.write_command(final_command);
 
         device.capabilities = RawCapabilities::parse(&device);
 
@@ -220,6 +239,13 @@ impl BarManager {
     /// Gains mutable access to the BAR space and returns `None` if that BAR is absent.
     pub fn bar_mut(&mut self, idx: u8) -> Option<&mut Bar> {
         self.bars[idx as usize].as_mut()
+    }
+
+    /// Releases all BAR accesses cached by this manager.
+    pub(super) fn release_cached_accesses(&mut self) {
+        for bar in self.bars.iter_mut().flatten() {
+            bar.release_cached_access();
+        }
     }
 
     /// Parses the BAR space by PCI device location.

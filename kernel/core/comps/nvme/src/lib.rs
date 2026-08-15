@@ -20,7 +20,7 @@ macro_rules! __log_prefix {
     };
 }
 
-use aster_block::MajorIdOwner;
+use aster_block::{MajorIdOwner, request_queue::BioRequestSingleQueue};
 use component::{ComponentInitError, init_component};
 use spin::Once;
 use transport::pci::NVME_PCI_DRIVER;
@@ -46,7 +46,7 @@ fn nvme_init() -> Result<(), ComponentInitError> {
     transport::init();
 
     while let Some(transport) = NVME_PCI_DRIVER.get().unwrap().pop_device_transport() {
-        let res = NvmeBlockDevice::init(transport);
+        let res = NvmeBlockDevice::init(transport, BioRequestSingleQueue::new());
         if res.is_err() {
             ostd::error!("Device initialization error: {:?}", res);
         }

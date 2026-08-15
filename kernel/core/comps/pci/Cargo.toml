@@ -7,6 +7,7 @@ edition.workspace = true
 
 [dependencies]
 align_ext.workspace = true
+aster-cmdline.workspace = true
 bitflags.workspace = true
 component.workspace = true
 int-to-c-enum.workspace = true

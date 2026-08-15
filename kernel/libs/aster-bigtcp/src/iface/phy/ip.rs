@@ -13,7 +13,7 @@ use crate::{
     ext::Ext,
     iface::{
         Iface, InterfaceName, ScheduleNextPoll,
-        common::{IfaceCommon, InterfaceFlags, InterfaceType, IpPacket},
+        common::{IfaceCommon, InterfaceFlags, InterfaceType, IpPacket, PhyRxResult, PhyTxStatus},
         iface::internal::IfaceInternal,
         time::get_network_timestamp,
     },
@@ -73,18 +73,22 @@ impl<D: WithDevice + 'static, E: Ext> Iface<E> for IpIface<D, E> {
                 device,
                 |data, _iface_cx, tx_token| {
                     if data.is_empty() {
-                        return None;
+                        return PhyRxResult::Ignored;
                     }
                     let version = data[0] >> 4;
 
                     if version == 4 {
-                        let pkt = Ipv4Packet::new_checked(data).ok()?;
-                        Some((IpPacket::Ipv4(pkt), tx_token))
+                        let Ok(pkt) = Ipv4Packet::new_checked(data) else {
+                            return PhyRxResult::Ignored;
+                        };
+                        PhyRxResult::Packet(IpPacket::Ipv4(pkt), tx_token)
                     } else if version == 6 {
-                        let pkt = Ipv6Packet::new_checked(data).ok()?;
-                        Some((IpPacket::Ipv6(pkt), tx_token))
+                        let Ok(pkt) = Ipv6Packet::new_checked(data) else {
+                            return PhyRxResult::Ignored;
+                        };
+                        PhyRxResult::Packet(IpPacket::Ipv6(pkt), tx_token)
                     } else {
-                        None
+                        PhyRxResult::Ignored
                     }
                 },
                 |pkt, iface_cx, tx_token| {
@@ -97,6 +101,7 @@ impl<D: WithDevice + 'static, E: Ext> Iface<E> for IpIface<D, E> {
                             &iface_cx.caps,
                         );
                     });
+                    PhyTxStatus::Sent
                 },
             );
             self.common.sched_poll().schedule_next_poll(next_poll);

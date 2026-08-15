@@ -18,7 +18,7 @@ use crate::{
     ext::Ext,
     iface::{
         Iface, InterfaceFlags, InterfaceName, ScheduleNextPoll,
-        common::{IfaceCommon, InterfaceType, IpPacket},
+        common::{IfaceCommon, InterfaceType, IpPacket, PhyRxResult, PhyTxStatus},
         iface::internal::IfaceInternal,
         time::get_network_timestamp,
     },
@@ -106,14 +106,15 @@ impl<D, E: Ext> EtherIface<D, E> {
         data: &'pkt [u8],
         iface_cx: &mut Context,
         tx_token: T,
-    ) -> Option<(IpPacket<'pkt>, T)> {
+    ) -> PhyRxResult<'pkt, T> {
         match self.parse_ip_or_process_arp(data, iface_cx) {
-            Ok(pkt) => Some((pkt, tx_token)),
-            Err(Some(arp)) => {
+            Ok(pkt) => PhyRxResult::Packet(pkt, tx_token),
+            Err(ArpProcessResult::Reply(arp)) => {
                 Self::emit_arp(&arp, tx_token);
-                None
+                PhyRxResult::Ignored
             }
-            Err(None) => None,
+            Err(ArpProcessResult::NeighborResolved) => PhyRxResult::NeighborResolved,
+            Err(ArpProcessResult::Ignored) => PhyRxResult::Ignored,
         }
     }
 
@@ -121,36 +122,39 @@ impl<D, E: Ext> EtherIface<D, E> {
         &self,
         data: &'pkt [u8],
         iface_cx: &mut Context,
-    ) -> Result<IpPacket<'pkt>, Option<ArpRepr>> {
+    ) -> Result<IpPacket<'pkt>, ArpProcessResult> {
         // Parse the Ethernet header. Ignore the packet if the header is ill-formed.
-        let frame = EthernetFrame::new_checked(data).map_err(|_| None)?;
-        let repr = EthernetRepr::parse(&frame).map_err(|_| None)?;
+        let frame = EthernetFrame::new_checked(data).map_err(|_| ArpProcessResult::Ignored)?;
+        let repr = EthernetRepr::parse(&frame).map_err(|_| ArpProcessResult::Ignored)?;
 
         // Ignore the Ethernet frame if it is not sent to us.
         if !repr.dst_addr.is_broadcast() && repr.dst_addr != self.ether_addr {
-            return Err(None);
+            return Err(ArpProcessResult::Ignored);
         }
 
         // Ignore the Ethernet frame if the protocol is not supported.
         match repr.ethertype {
             EthernetProtocol::Ipv4 => {
-                let pkt = Ipv4Packet::new_checked(frame.payload()).map_err(|_| None)?;
+                let pkt = Ipv4Packet::new_checked(frame.payload())
+                    .map_err(|_| ArpProcessResult::Ignored)?;
                 Ok(IpPacket::Ipv4(pkt))
             }
             EthernetProtocol::Ipv6 => {
-                let pkt = Ipv6Packet::new_checked(frame.payload()).map_err(|_| None)?;
+                let pkt = Ipv6Packet::new_checked(frame.payload())
+                    .map_err(|_| ArpProcessResult::Ignored)?;
                 Ok(IpPacket::Ipv6(pkt))
             }
             EthernetProtocol::Arp => {
-                let pkt = ArpPacket::new_checked(frame.payload()).map_err(|_| None)?;
-                let arp = ArpRepr::parse(&pkt).map_err(|_| None)?;
+                let pkt = ArpPacket::new_checked(frame.payload())
+                    .map_err(|_| ArpProcessResult::Ignored)?;
+                let arp = ArpRepr::parse(&pkt).map_err(|_| ArpProcessResult::Ignored)?;
                 Err(self.process_arp(&arp, iface_cx))
             }
-            _ => Err(None),
+            _ => Err(ArpProcessResult::Ignored),
         }
     }
 
-    fn process_arp(&self, arp_repr: &ArpRepr, iface_cx: &mut Context) -> Option<ArpRepr> {
+    fn process_arp(&self, arp_repr: &ArpRepr, iface_cx: &mut Context) -> ArpProcessResult {
         match arp_repr {
             ArpRepr::EthernetIpv4 {
                 operation: ArpOperation::Reply,
@@ -162,7 +166,7 @@ impl<D, E: Ext> EtherIface<D, E> {
                 if !source_hardware_addr.is_unicast()
                     || !iface_cx.in_same_network(&IpAddress::Ipv4(*source_protocol_addr))
                 {
-                    return None;
+                    return ArpProcessResult::Ignored;
                 }
 
                 // Insert the mapping between the Ethernet address and the IP address.
@@ -172,7 +176,7 @@ impl<D, E: Ext> EtherIface<D, E> {
                     .lock()
                     .insert(*source_protocol_addr, *source_hardware_addr);
 
-                None
+                ArpProcessResult::NeighborResolved
             }
             ArpRepr::EthernetIpv4 {
                 operation: ArpOperation::Request,
@@ -183,7 +187,7 @@ impl<D, E: Ext> EtherIface<D, E> {
             } => {
                 // Ignore the ARP packet if the source addresses are not unicast.
                 if !source_hardware_addr.is_unicast() || !source_protocol_addr.x_is_unicast() {
-                    return None;
+                    return ArpProcessResult::Ignored;
                 }
 
                 // Ignore the ARP packet if we do not own the target address.
@@ -191,10 +195,10 @@ impl<D, E: Ext> EtherIface<D, E> {
                     .ipv4_addr()
                     .is_none_or(|addr| addr != *target_protocol_addr)
                 {
-                    return None;
+                    return ArpProcessResult::Ignored;
                 }
 
-                Some(ArpRepr::EthernetIpv4 {
+                ArpProcessResult::Reply(ArpRepr::EthernetIpv4 {
                     operation: ArpOperation::Reply,
                     source_hardware_addr: self.ether_addr,
                     source_protocol_addr: *target_protocol_addr,
@@ -202,15 +206,26 @@ impl<D, E: Ext> EtherIface<D, E> {
                     target_protocol_addr: *source_protocol_addr,
                 })
             }
-            _ => None,
+            _ => ArpProcessResult::Ignored,
         }
     }
 
-    fn dispatch<T: TxToken>(&self, pkt: &Packet, iface_cx: &mut Context, tx_token: T) {
+    fn dispatch<T: TxToken>(
+        &self,
+        pkt: &Packet,
+        iface_cx: &mut Context,
+        tx_token: T,
+    ) -> PhyTxStatus {
         match self.resolve_ether_or_generate_arp(pkt, iface_cx) {
-            Ok(ether) => Self::emit_ip(&ether, pkt, &iface_cx.caps, tx_token),
-            Err(Some(arp)) => Self::emit_arp(&arp, tx_token),
-            Err(None) => (),
+            Ok(ether) => {
+                Self::emit_ip(&ether, pkt, &iface_cx.caps, tx_token);
+                PhyTxStatus::Sent
+            }
+            Err(Some(arp)) => {
+                Self::emit_arp(&arp, tx_token);
+                PhyTxStatus::NeighborPending
+            }
+            Err(None) => PhyTxStatus::Sent,
         }
     }
 
@@ -303,4 +318,10 @@ impl<D, E: Ext> EtherIface<D, E> {
             arp_repr.emit(&mut pkt);
         });
     }
+}
+
+enum ArpProcessResult {
+    Reply(ArpRepr),
+    NeighborResolved,
+    Ignored,
 }

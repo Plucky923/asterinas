@@ -4,7 +4,7 @@
 //!
 //! Implements the [`aster_block::BlockDevice`] trait on top of the NVMe transport.
 //! BIOs are staged in [`BioRequestSingleQueue`] and drained by repeated calls to
-//! [`NvmeBlockDevice::handle_requests`] from the kernel registry's per-device
+//! [`NvmeBlockDevice::handle_next_request`] from the kernel registry's per-device
 //! kthread (see `kernel/core/src/device/registry/block.rs`). Reads, writes, and flushes
 //! issue synchronously to I/O queue [`IO_QID`] and wait on a per-queue `WaitQueue` driven
 //! by the MSI-X completion interrupt.
@@ -96,7 +96,10 @@ impl aster_block::BlockDevice for NvmeBlockDevice {
 static NR_NVME_DEVICE: AtomicU32 = AtomicU32::new(0);
 
 impl NvmeBlockDevice {
-    pub(crate) fn init(transport: NvmePciTransport) -> Result<(), NvmeDeviceError> {
+    pub(crate) fn init(
+        transport: NvmePciTransport,
+        queue: BioRequestSingleQueue,
+    ) -> Result<(), NvmeDeviceError> {
         let (device, io_msix_vectors) = NvmeDeviceInner::init(transport)?;
 
         let index = NR_NVME_DEVICE.fetch_add(1, Ordering::Relaxed);
@@ -109,7 +112,7 @@ impl NvmeBlockDevice {
 
         let block_device = Arc::new(Self {
             device,
-            queue: BioRequestSingleQueue::new(),
+            queue,
             name,
             id,
         });
@@ -125,10 +128,28 @@ impl NvmeBlockDevice {
         Ok(())
     }
 
-    /// Dequeues a `BioRequest` from the software staging queue and
-    /// processes the request.
-    pub fn handle_requests(&self) {
+    /// Dequeues one `BioRequest` from the software staging queue and processes it.
+    pub fn handle_next_request(&self) {
         let request = self.queue.dequeue();
+        self.handle_request(request);
+    }
+
+    /// Processes one queued request or returns `false` after the queue closes.
+    pub fn handle_next_request_until_closed(&self) -> bool {
+        let Some(request) = self.queue.dequeue_until_closed() else {
+            return false;
+        };
+        self.handle_request(request);
+        true
+    }
+
+    /// Flushes completed I/O and performs normal NVMe controller shutdown.
+    pub fn finish_orderly_shutdown(&self) -> Result<(), NvmeDeviceError> {
+        self.device.flush_controller()?;
+        self.device.shutdown_controller()
+    }
+
+    fn handle_request(&self, request: BioRequest) {
         debug!("Handle Request: {:?}", request);
         match request.type_() {
             BioType::Read => self.device.read(request),
@@ -209,6 +230,7 @@ struct NvmeDeviceInner {
     namespace: NvmeNamespace,
     dstrd: u16,
     max_io_bytes: NonZeroUsize,
+    controller_timeout: Duration,
     stats: NvmeStats,
 }
 
@@ -231,6 +253,11 @@ impl core::fmt::Debug for NvmeDeviceInner {
 impl NvmeDeviceInner {
     const CAP_TO_UNIT_MILLIS: u64 = 500;
     const MPS_BASE_PAGE_SHIFT: u32 = 12;
+    const CC_SHN_MASK: u32 = 0b11 << 14;
+    const CC_SHN_NORMAL: u32 = 0b01 << 14;
+    const CSTS_CFS: u32 = 0x2;
+    const CSTS_SHST_MASK: u32 = 0b11 << 2;
+    const CSTS_SHST_COMPLETE: u32 = 0b10 << 2;
 
     fn init(mut transport: NvmePciTransport) -> Result<(Self, IoMsixVectors), NvmeDeviceError> {
         let cap = transport.regs().read64(NvmeRegs64::Cap);
@@ -292,6 +319,7 @@ impl NvmeDeviceInner {
             namespace,
             dstrd: init_ctx.dstrd,
             max_io_bytes: init_ctx.max_io_bytes,
+            controller_timeout: controller_ready_timeout,
             stats: NvmeStats::new(),
         };
         Ok((device, io_msix_vectors))
@@ -805,15 +833,56 @@ impl NvmeDeviceInner {
     }
 
     fn flush(&self, request: BioRequest) {
-        let nsid = self.namespace.id;
-
-        let entry = nvme_cmd::io_flush(nsid);
-        // TODO: This path submits and waits synchronously, which may block.
         let status = self
-            .submit_and_wait(IO_QID, entry)
+            .flush_controller()
             .map_or(BioStatus::IoError, |_| BioStatus::Complete);
         for bio in request.into_bios() {
             bio.complete(status);
+        }
+    }
+
+    fn flush_controller(&self) -> Result<(), NvmeDeviceError> {
+        let entry = nvme_cmd::io_flush(self.namespace.id);
+        self.submit_and_wait(IO_QID, entry)
+    }
+
+    fn shutdown_controller(&self) -> Result<(), NvmeDeviceError> {
+        {
+            let mut transport = self.transport.lock();
+            let regs = transport.regs();
+            let cc = regs.read32(NvmeRegs32::Cc);
+            // NVMe Base Specification 2.3, §§3.1.5–3.1.6: `CC.SHN=01b`
+            // requests normal shutdown, completed by `CSTS.SHST=10b`.
+            regs.write32(
+                NvmeRegs32::Cc,
+                (cc & !Self::CC_SHN_MASK) | Self::CC_SHN_NORMAL,
+            );
+        }
+
+        let start = Jiffies::elapsed().as_duration();
+        let deadline = start
+            .checked_add(self.controller_timeout)
+            .unwrap_or(Duration::MAX);
+        loop {
+            let csts = {
+                let mut transport = self.transport.lock();
+                transport.regs().read32(NvmeRegs32::Csts)
+            };
+            if csts & Self::CSTS_CFS != 0 {
+                error!(
+                    "Controller reports fatal status during normal shutdown: CSTS={:#x}",
+                    csts
+                );
+                return Err(NvmeDeviceError::CommandFailed);
+            }
+            if csts & Self::CSTS_SHST_MASK == Self::CSTS_SHST_COMPLETE {
+                return Ok(());
+            }
+            if Jiffies::elapsed().as_duration() >= deadline {
+                error!("Controller normal shutdown timed out: CSTS={:#x}", csts);
+                return Err(NvmeDeviceError::ControllerShutdownTimeout);
+            }
+            spin_loop();
         }
     }
 }
@@ -928,7 +997,7 @@ mod test {
             TEST_BUF_LENGTH,
             TEST_CHAR,
         );
-        nvme_block_device.handle_requests();
+        nvme_block_device.handle_next_request();
         write_batch.wait_all().unwrap();
 
         let mut read_batch = IoBatch::with_capacity(1);
@@ -939,7 +1008,7 @@ mod test {
             TEST_BUF_LENGTH,
             TEST_CHAR,
         );
-        nvme_block_device.handle_requests();
+        nvme_block_device.handle_next_request();
         read_batch.wait_all().unwrap();
 
         let mut read_buf = [0u8; TEST_BUF_LENGTH];

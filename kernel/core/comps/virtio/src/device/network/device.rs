@@ -4,7 +4,7 @@ use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
 use core::fmt::Debug;
 
 use aster_bigtcp::device::{Checksum, DeviceCapabilities, Medium};
-use aster_network::{AnyNetworkDevice, EthernetAddr, NetError, RxBuffer, TxBuffer};
+use aster_network::{AnyNetworkDevice, DmaRxBuffer, EthernetAddr, NetError, RxBuffer, TxBuffer};
 use aster_util::slot_vec::SlotVec;
 use ostd::{arch::trap::TrapFrame, debug, sync::SpinLock, warn};
 
@@ -32,8 +32,8 @@ pub struct NetworkDevice {
     // we store it to avoid recreating the header repeatedly.
     header: VirtioNetHdr,
     tx_buffers: Vec<Option<TxBuffer>>,
-    rx_buffers: SlotVec<RxBuffer>,
-    new_rx_buffer: Option<RxBuffer>,
+    rx_buffers: SlotVec<DmaRxBuffer>,
+    new_rx_buffer: Option<DmaRxBuffer>,
     transport: DeviceTransport,
     poll_stat: PollStatistics,
 }
@@ -92,7 +92,7 @@ impl NetworkDevice {
         let mut rx_buffers = SlotVec::new();
         for i in 0..QUEUE_SIZE {
             let rx_pool = RX_BUFFER_POOL.get().unwrap();
-            let rx_buffer = RxBuffer::new(size_of::<VirtioNetHdr>(), rx_pool)
+            let rx_buffer = DmaRxBuffer::new(size_of::<VirtioNetHdr>(), rx_pool)
                 .map_err(VirtioDeviceError::ResourceAlloc)?;
             let token = recv_queue.add_output_bufs(&[&rx_buffer]).unwrap();
             assert_eq!(i, token);
@@ -150,8 +150,8 @@ impl NetworkDevice {
         Ok(())
     }
 
-    /// Adds a `RxBuffer` to the receive queue.
-    fn add_rx_buffer(&mut self, rx_buffer: RxBuffer) -> Result<(), queue::AddBufsError> {
+    /// Adds a DMA-backed receive buffer to the receive queue.
+    fn add_rx_buffer(&mut self, rx_buffer: DmaRxBuffer) -> Result<(), queue::AddBufsError> {
         let token = self.recv_queue.add_output_bufs(&[&rx_buffer])?;
         assert!(self.rx_buffers.put_at(token as usize, rx_buffer).is_none());
 
@@ -172,7 +172,7 @@ impl NetworkDevice {
             // FIXME: Ideally, we can reuse the returned buffer without creating new buffer.
             // But this requires locking device to be compatible with smoltcp interface.
             let rx_pool = RX_BUFFER_POOL.get().unwrap();
-            let new_rx_buffer = RxBuffer::new(size_of::<VirtioNetHdr>(), rx_pool)
+            let new_rx_buffer = DmaRxBuffer::new(size_of::<VirtioNetHdr>(), rx_pool)
                 .map_err(|_| NetError::NoMemory)?;
 
             self.new_rx_buffer = Some(new_rx_buffer);
@@ -190,7 +190,7 @@ impl NetworkDevice {
         let new_rx_buffer = self.new_rx_buffer.take().unwrap();
         self.add_rx_buffer(new_rx_buffer).unwrap();
 
-        Ok(rx_buffer)
+        Ok(rx_buffer.into_rx_buffer())
     }
 
     /// Sends a packet to network.

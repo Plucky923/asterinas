@@ -16,7 +16,6 @@ use crate::{
 
 /// Implements several commonly used APIs for the block device to conveniently
 /// read and write block(s).
-// TODO: Add API to submit bio with multiple segments in scatter/gather manner.
 impl dyn BlockDevice {
     /// Synchronously reads contiguous blocks starting from the `bid`.
     pub fn read_blocks(
@@ -71,6 +70,18 @@ impl dyn BlockDevice {
             vec![bio_segment],
             complete_fn,
         );
+        bio.submit(self, io_batch)
+    }
+
+    /// Asynchronously writes consecutive blocks from multiple segments.
+    pub fn write_block_segments_async(
+        &self,
+        bid: Bid,
+        bio_segments: Vec<BioSegment>,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<(), BioEnqueueError> {
+        let bio = Bio::new(BioType::Write, Sid::from(bid), bio_segments, complete_fn);
         bio.submit(self, io_batch)
     }
 

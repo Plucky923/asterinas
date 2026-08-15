@@ -6,7 +6,7 @@ edition.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-aster-util.workspace = true
+aster-util = { workspace = true, features = ["dynamic-cpu-local-counter"] }
 bitflags = "2.5"
 component.workspace = true
 inherit-methods-macro.workspace = true

@@ -20,8 +20,9 @@ use aster_softirq::{
     BottomHalfDisabled, SoftIrqLine,
     softirq_id::{NETWORK_RX_SOFTIRQ_ID, NETWORK_TX_SOFTIRQ_ID},
 };
-pub use buffer::{RxBuffer, TxBuffer, TxBufferBuilder};
+pub use buffer::{DmaRxBuffer, OwnedNetworkBufferRecycler, RxBuffer, TxBuffer, TxBufferBuilder};
 use component::{ComponentInitError, init_component};
+pub use framev_net_common::OwnedNetworkBuffer;
 use ostd::sync::SpinLock;
 use spin::Once;
 
@@ -77,6 +78,11 @@ pub fn register_device(
         .network_device_table
         .lock()
         .insert(name, NetworkDeviceIrqCallbackSet::new(device));
+}
+
+/// Registers one concrete network device without exposing its lock implementation.
+pub fn register_device_instance(name: String, device: impl AnyNetworkDevice + 'static) {
+    register_device(name, Arc::new(SpinLock::new(device)));
 }
 
 pub fn get_device(str: &str) -> Option<Arc<SpinLock<dyn AnyNetworkDevice, BottomHalfDisabled>>> {

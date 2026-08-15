@@ -4,13 +4,15 @@
 
 use alloc::vec::Vec;
 
-use ostd::{Error, Result, io::IoMem, irq::IrqLine, mm::VmIoOnce};
+#[cfg(target_arch = "x86_64")]
+use ostd::irq::PciIrqRequester;
+use ostd::{Error, Result, irq::IrqLine, mm::VmIoOnce};
 
 use crate::{
     PciDeviceLocation,
-    arch::{MSIX_DEFAULT_MSG_ADDR, construct_remappable_msix_address},
     cfg_space::{BarAccess, Command, PciCommonCfgOffset},
     common_device::{BarManager, PciCommonDevice},
+    platform::{MSIX_DEFAULT_MSG_ADDR, PciIoMem as IoMem, construct_remappable_msix_address},
 };
 
 /// Raw information about MSI-X capability.
@@ -144,6 +146,14 @@ impl CapabilityMsixData {
 
         // If interrupt remapping is enabled, then we need to change the value of the message address.
         if let Some(remapping_index) = irq.remapping_index() {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let requester =
+                    PciIrqRequester::new(self.loc.bus, self.loc.device, self.loc.function)
+                        .expect("an enumerated PCI function has a valid requester ID");
+                irq.bind_pci_requester(requester)
+                    .expect("an allocated remapping index accepts requester binding");
+            }
             let address = construct_remappable_msix_address(remapping_index as u32);
 
             self.table_bar

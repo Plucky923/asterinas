@@ -7,12 +7,13 @@
 use bitflags::bitflags;
 use ostd::{
     Error, Result,
-    arch::device::io_port::{PortRead, PortWrite},
-    io::IoMem,
     mm::{PodOnce, VmIoOnce},
 };
 
-use super::PciDeviceLocation;
+use super::{
+    PciDeviceLocation,
+    platform::{PciIoMem as IoMem, PortRead, PortWrite},
+};
 
 /// Offset in PCI device's common configuration space.
 #[repr(u16)]
@@ -266,6 +267,13 @@ impl Bar {
         }
     }
 
+    /// Releases the access cached by this BAR.
+    pub(super) fn release_cached_access(&mut self) {
+        if let Self::Memory(memory_bar) = self {
+            memory_bar.io_memory = None;
+        }
+    }
+
     pub(super) fn new(location: PciDeviceLocation, index: u8) -> Result<Self> {
         if index >= 6 {
             return Err(Error::InvalidArgs);
@@ -405,7 +413,6 @@ impl MemoryBar {
         // 32 bit register is considered an extension of the first (i.e., bits 63:32). Software
         // writes a value of all 1's to both registers, reads them back, and combines the result
         // into a 64-bit value."
-        #[cfg_attr(target_arch = "loongarch64", expect(unused_variables))]
         let (raw64, size_encoded64) = match address_length {
             AddrLen::Bits32 => (raw as u64, size_encoded as u64 | ((u32::MAX as u64) << 32)),
             AddrLen::Bits64 => {
@@ -421,15 +428,8 @@ impl MemoryBar {
         let size = decode_size(size_encoded64, BarKind::Memory);
 
         // Restore the original base address.
-        #[cfg(not(target_arch = "loongarch64"))]
-        let base = raw64 & MEMORY_ADDRESS_MASK;
-        // In LoongArch, the BAR base address needs to be allocated manually.
-        #[cfg(target_arch = "loongarch64")]
-        let base = {
-            use core::alloc::Layout;
-            crate::arch::alloc_mmio(Layout::from_size_align(size as usize, size as usize).unwrap())
-                .unwrap() as u64
-        };
+        let base = crate::platform::allocate_memory_bar(raw64 & MEMORY_ADDRESS_MASK, size)
+            .ok_or(Error::NotEnoughResources)?;
         match address_length {
             AddrLen::Bits32 => location.write32(offset, base as u32),
             AddrLen::Bits64 => {
@@ -442,7 +442,6 @@ impl MemoryBar {
         // initialize all PCI devices. Consequently, the base address reported by uninitialized PCI
         // devices is zero. To address this, we may need to add the ability to manually allocate
         // the base address.
-        #[cfg(not(target_arch = "loongarch64"))]
         if base == 0 {
             ostd::info!(
                 "presumably uninitialized BAR {} (Memory {:?}, size={}) of PCI device {:?}",

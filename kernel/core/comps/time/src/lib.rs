@@ -10,7 +10,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::time::Duration;
 
-pub use clocksource::{ClockSource, Instant};
+pub use clocksource::ClockSource;
 use component::{ComponentInitError, init_component};
 use rtc::Driver;
 use spin::Once;
@@ -26,7 +26,7 @@ mod clocksource;
 mod rtc;
 mod tsc;
 
-pub static VDSO_DATA_HIGH_RES_UPDATE_FN: Once<fn(Instant, u64)> = Once::new();
+pub static VDSO_DATA_HIGH_RES_UPDATE_FN: Once<fn(Duration, u64)> = Once::new();
 
 static RTC_DRIVER: Once<Arc<dyn Driver + Send + Sync>> = Once::new();
 
@@ -58,8 +58,7 @@ pub fn read_start_time() -> SystemTime {
 
 /// Returns the monotonic time from the TSC clocksource.
 pub fn read_monotonic_time() -> Duration {
-    let instant = tsc::read_instant();
-    Duration::new(instant.secs(), instant.nanos())
+    tsc::read_instant()
 }
 
 /// Returns the default (TSC) clocksource.

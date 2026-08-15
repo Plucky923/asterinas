@@ -30,6 +30,7 @@ mod lock;
 pub mod softirq_id;
 mod stats;
 mod taskless;
+pub mod timer;
 pub use lock::{BottomHalfDisabled, DisableLocalBottomHalfGuard};
 pub use taskless::Taskless;
 

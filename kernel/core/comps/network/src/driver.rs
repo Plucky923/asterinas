@@ -6,7 +6,6 @@ use aster_bigtcp::{
     device::{self, NotifyDevice},
     time::Instant,
 };
-use ostd::mm::VmWriter;
 
 use crate::{AnyNetworkDevice, buffer::RxBuffer};
 
@@ -49,10 +48,7 @@ impl device::RxToken for RxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let mut payload = self.0.payload();
-        let mut buffer = vec![0u8; payload.remain()];
-        payload.read(&mut VmWriter::from(&mut buffer as &mut [u8]));
-        f(&buffer)
+        self.0.consume_payload(f)
     }
 }
 
@@ -65,7 +61,10 @@ impl device::TxToken for TxToken<'_> {
     {
         let mut buffer = vec![0u8; len];
         let res = f(&mut buffer);
-        self.0.send(&buffer).expect("Send packet failed");
+        // A nonblocking device may become unavailable after `transmit` grants
+        // a token. Dropping this frame lets the protocol retry without turning
+        // ordinary backpressure into a kernel panic.
+        let _ = self.0.send(&buffer);
         res
     }
 }

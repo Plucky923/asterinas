@@ -2,6 +2,8 @@
 
 //! PCI device Information
 
+use ostd::Result;
+
 use crate::cfg_space::PciCommonCfgOffset;
 
 /// PCI device location.
@@ -43,12 +45,17 @@ impl PciDeviceLocation {
 
     /// Reads a 32-bit value from the PCI configuration space at the specified offset.
     pub fn read32(&self, offset: u16) -> u32 {
+        self.try_read32(offset).unwrap()
+    }
+
+    /// Tries to read a 32-bit value from PCI configuration space.
+    pub fn try_read32(&self, offset: u16) -> Result<u32> {
         debug_assert!(
             (offset & 0b11) == 0,
             "misaligned PCI configuration dword u32 read"
         );
 
-        crate::arch::read32(self, offset as u32).unwrap()
+        crate::platform::read32(self, offset as u32)
     }
 
     /// Writes an 8-bit value to the PCI configuration space at the specified offset.
@@ -80,12 +87,17 @@ impl PciDeviceLocation {
 
     /// Writes a 32-bit value to the PCI configuration space at the specified offset.
     pub fn write32(&self, offset: u16, val: u32) {
+        self.try_write32(offset, val).unwrap()
+    }
+
+    /// Tries to write a 32-bit value to PCI configuration space.
+    pub fn try_write32(&self, offset: u16, val: u32) -> Result<()> {
         debug_assert!(
             (offset & 0b11) == 0,
             "misaligned PCI configuration dword u32 write"
         );
 
-        crate::arch::write32(self, offset as u32, val).unwrap()
+        crate::platform::write32(self, offset as u32, val)
     }
 }
 

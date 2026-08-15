@@ -2,7 +2,7 @@
 
 //! DMA-backed virtio-vsock packets.
 
-use aster_network::{RxBuffer, TxBuffer, TxBufferBuilder};
+use aster_network::{DmaRxBuffer, TxBuffer, TxBufferBuilder};
 use ostd::{
     Result,
     mm::{Infallible, VmReader, VmWriter},
@@ -59,18 +59,18 @@ impl TxPacketBuilder {
 }
 
 /// An inbound virtio-vsock packet.
-pub struct RxPacket(RxBuffer);
+pub struct RxPacket(DmaRxBuffer);
 
 impl RxPacket {
     pub(super) fn new() -> Result<Self> {
-        RxBuffer::new(size_of::<VirtioVsockHdr>(), RX_BUFFER_POOL.get().unwrap()).map(Self)
+        DmaRxBuffer::new(size_of::<VirtioVsockHdr>(), RX_BUFFER_POOL.get().unwrap()).map(Self)
     }
 
     pub(super) fn set_payload_len(&mut self, len: usize) {
         self.0.set_payload_len(len);
     }
 
-    pub(super) fn inner(&self) -> &RxBuffer {
+    pub(super) fn inner(&self) -> &DmaRxBuffer {
         &self.0
     }
 

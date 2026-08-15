@@ -193,26 +193,23 @@ mod test {
     use core::sync::atomic::AtomicUsize;
 
     use ostd::prelude::*;
-    use spin::Once;
 
     use super::*;
 
     fn init() {
-        static INIT: Once<()> = Once::new();
-
-        INIT.call_once(|| super::super::init().unwrap());
+        super::super::init().unwrap();
     }
 
     #[ktest]
     fn schedule_taskless() {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         const SCHEDULE_TIMES: usize = 10;
 
-        fn add_counter() {
-            COUNTER.fetch_add(1, Ordering::Relaxed);
-        }
-
         init();
+        let counter_value = Arc::new(AtomicUsize::new(0));
+        let taskless_counter = counter_value.clone();
+        let add_counter = move || {
+            taskless_counter.fetch_add(1, Ordering::Relaxed);
+        };
         let taskless = Taskless::new(add_counter);
         let mut counter = 0;
 
@@ -232,6 +229,6 @@ mod test {
             core::hint::spin_loop()
         }
 
-        assert_eq!(counter, COUNTER.load(Ordering::Relaxed));
+        assert_eq!(counter, counter_value.load(Ordering::Relaxed));
     }
 }

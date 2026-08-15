@@ -19,7 +19,8 @@ use crate::prelude::*;
 pub struct BioRequestSingleQueue {
     queue: Mutex<VecDeque<BioRequest>>,
     num_requests: AtomicUsize,
-    wait_queue: WaitQueue,
+    wait_queue: Arc<WaitQueue>,
+    request_admission: Option<Arc<dyn RequestAdmission>>,
     max_nr_segments_per_bio: usize,
 }
 
@@ -34,8 +35,23 @@ impl BioRequestSingleQueue {
         Self {
             queue: Mutex::new(VecDeque::new()),
             num_requests: AtomicUsize::new(0),
-            wait_queue: WaitQueue::new(),
+            wait_queue: Arc::new(WaitQueue::new()),
+            request_admission: None,
             max_nr_segments_per_bio,
+        }
+    }
+
+    /// Creates an empty queue controlled by external request admission.
+    pub fn with_request_admission(
+        wait_queue: Arc<WaitQueue>,
+        request_admission: Arc<dyn RequestAdmission>,
+    ) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            num_requests: AtomicUsize::new(0),
+            wait_queue,
+            request_admission: Some(request_admission),
+            max_nr_segments_per_bio: usize::MAX,
         }
     }
 
@@ -60,6 +76,14 @@ impl BioRequestSingleQueue {
         if bio.segments().len() >= self.max_nr_segments_per_bio {
             return Err(BioEnqueueError::TooBig);
         }
+
+        let request_admission = self.request_admission.as_deref();
+        if let Some(request_admission) = request_admission
+            && !request_admission.try_acquire()
+        {
+            return Err(BioEnqueueError::Refused);
+        }
+        let _admission = RequestAdmissionGuard { request_admission };
 
         let mut queue = self.queue.lock();
         if let Some(request) = queue.front_mut()
@@ -105,12 +129,136 @@ impl BioRequestSingleQueue {
         }
     }
 
+    /// Dequeues a request or returns `None` after external admission closes.
+    pub fn dequeue_until_closed(&self) -> Option<BioRequest> {
+        loop {
+            if let Some(request) = self.try_dequeue() {
+                return Some(request);
+            }
+
+            if self.is_closed() {
+                return self.try_dequeue();
+            }
+
+            self.wait_queue
+                .wait_until(|| (self.num_requests() > 0 || self.is_closed()).then_some(()));
+        }
+    }
+
+    fn try_dequeue(&self) -> Option<BioRequest> {
+        let request = self.queue.lock().pop_back()?;
+        self.dec_num_requests();
+        Some(request)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.request_admission
+            .as_deref()
+            .is_some_and(|request_admission| request_admission.is_closed())
+    }
+
     fn dec_num_requests(&self) {
         self.num_requests.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn inc_num_requests(&self) {
         self.num_requests.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Controls request admission for a queue owned by an external lifecycle.
+pub trait RequestAdmission: Send + Sync {
+    /// Acquires admission before a request becomes accepted.
+    fn try_acquire(&self) -> bool;
+
+    /// Releases admission after an accepted request reaches the queue.
+    fn release(&self);
+
+    /// Returns whether a consumer may exit after draining the queue.
+    ///
+    /// Returning `true` guarantees that no later successful admission can add
+    /// a request to the queue.
+    fn is_closed(&self) -> bool;
+}
+
+struct RequestAdmissionGuard<'a> {
+    request_admission: Option<&'a dyn RequestAdmission>,
+}
+
+impl Drop for RequestAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(request_admission) = self.request_admission {
+            request_admission.release();
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use alloc::{
+        collections::VecDeque,
+        sync::{Arc, Weak},
+    };
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use ostd::{
+        prelude::ktest,
+        sync::{Mutex, WaitQueue},
+    };
+
+    use super::{BioRequest, BioRequestSingleQueue, BioType, RequestAdmission, Sid};
+
+    struct ClosingAdmission {
+        queue: Mutex<Option<Weak<BioRequestSingleQueue>>>,
+        injected: AtomicBool,
+    }
+
+    impl ClosingAdmission {
+        fn inject_request(&self) {
+            if self.injected.swap(true, Ordering::AcqRel) {
+                return;
+            }
+
+            let Some(queue) = self.queue.lock().as_ref().and_then(|queue| queue.upgrade()) else {
+                return;
+            };
+            queue.queue.lock().push_front(BioRequest {
+                type_: BioType::Flush,
+                sid_range: Sid::new(0)..Sid::new(0),
+                num_segments: 0,
+                bios: VecDeque::new(),
+            });
+            queue.inc_num_requests();
+        }
+    }
+
+    impl RequestAdmission for ClosingAdmission {
+        fn try_acquire(&self) -> bool {
+            true
+        }
+
+        fn release(&self) {}
+
+        fn is_closed(&self) -> bool {
+            self.inject_request();
+            true
+        }
+    }
+
+    #[ktest]
+    fn dequeue_until_closed_rechecks_the_queue_after_close() {
+        let admission = Arc::new(ClosingAdmission {
+            queue: Mutex::new(None),
+            injected: AtomicBool::new(false),
+        });
+        let queue = Arc::new(BioRequestSingleQueue::with_request_admission(
+            Arc::new(WaitQueue::new()),
+            admission.clone(),
+        ));
+        *admission.queue.lock() = Some(Arc::downgrade(&queue));
+
+        assert!(queue.dequeue_until_closed().is_some());
+        assert!(queue.dequeue_until_closed().is_none());
     }
 }
 

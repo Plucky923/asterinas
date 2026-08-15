@@ -62,22 +62,24 @@ macro_rules! __log_prefix {
     };
 }
 
-#[cfg_attr(target_arch = "x86_64", path = "arch/x86/mod.rs")]
-#[cfg_attr(target_arch = "riscv64", path = "arch/riscv/mod.rs")]
-#[cfg_attr(target_arch = "loongarch64", path = "arch/loongarch/mod.rs")]
-mod arch;
-
 pub mod bus;
 pub mod capability;
 pub mod cfg_space;
 pub mod common_device;
 mod device_info;
+mod enumeration;
+mod platform;
+mod reservation;
 
 extern crate alloc;
 
 use component::{ComponentInitError, init_component};
 pub use device_info::{PciDeviceId, PciDeviceLocation};
 use ostd::sync::Mutex;
+pub use reservation::{
+    AssignedPciGroup, PciAssignmentIdentity, PciReservationError, ReservedPciGroup,
+    claim_reserved_group, request_quarantine_for_active_assignments, request_quarantine_for_source,
+};
 
 use self::{bus::PciBus, common_device::PciCommonDevice};
 
@@ -90,41 +92,11 @@ fn pci_init() -> Result<(), ComponentInitError> {
 /// The PCI bus instance.
 pub static PCI_BUS: Mutex<PciBus> = Mutex::new(PciBus::new());
 
+/// Runs a closure with the PCI bus.
+pub fn with_bus<T>(access_fn: impl FnOnce(&mut PciBus) -> T) -> T {
+    access_fn(&mut PCI_BUS.lock())
+}
+
 fn init() {
-    let Some(all_bus) = arch::init() else {
-        ostd::info!("no PCI bus was found");
-        return;
-    };
-    ostd::info!("initializing the PCI bus with bus numbers `{:?}`", all_bus);
-
-    let mut lock = PCI_BUS.lock();
-
-    let all_dev = PciDeviceLocation::MIN_DEVICE..=PciDeviceLocation::MAX_DEVICE;
-    let all_func = PciDeviceLocation::MIN_FUNCTION..=PciDeviceLocation::MAX_FUNCTION;
-
-    for bus in all_bus {
-        for device in all_dev.clone() {
-            let mut device_location = PciDeviceLocation {
-                bus,
-                device,
-                function: PciDeviceLocation::MIN_FUNCTION,
-            };
-
-            let Some(first_function_device) = PciCommonDevice::new(device_location) else {
-                continue;
-            };
-            let has_multi_function = first_function_device.has_multi_funcs();
-            // Register function 0 in advance
-            lock.register_common_device(first_function_device);
-
-            if has_multi_function {
-                for function in all_func.clone().skip(1) {
-                    device_location.function = function;
-                    if let Some(common_device) = PciCommonDevice::new(device_location) {
-                        lock.register_common_device(common_device);
-                    }
-                }
-            }
-        }
-    }
+    enumeration::enumerate(platform::init(), &PCI_BUS);
 }

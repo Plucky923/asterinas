@@ -17,6 +17,8 @@ use ostd::irq::IrqLine;
 /// - Admin queue vector: Used for admin command completions.
 /// - I/O queue vectors: Each I/O queue can have its own interrupt vector.
 pub(crate) struct NvmeMsixManager {
+    /// Number of MSI-X vectors backed by allocated IRQ lines.
+    vector_count: u16,
     /// MSI-X vector for admin queue (queue 0).
     admin_vector: u16,
     /// Available MSI-X vectors for I/O queues.
@@ -36,18 +38,25 @@ impl NvmeMsixManager {
     ///
     /// # Returns
     ///
-    /// A new `NvmeMsixManager` with all vectors allocated and initialized, or `None` if allocating
-    /// an IRQ line for any vector fails.
-    pub(crate) fn new(mut msix: CapabilityMsixData) -> Option<Self> {
+    /// A new `NvmeMsixManager` with the vectors that fit in the current IRQ pool, or `None` if the
+    /// required admin vector cannot be allocated.
+    pub(crate) fn new(mut msix: CapabilityMsixData, required_vector_count: u16) -> Option<Self> {
         let table_size = msix.table_size();
-        if table_size == 0 {
+        if table_size == 0 || required_vector_count == 0 {
             return None;
         }
-        let n = usize::from(table_size);
+        let vector_count = table_size.min(required_vector_count);
+        let mut irqs = Vec::with_capacity(usize::from(vector_count));
+        for _ in 0..vector_count {
+            let Ok(irq) = IrqLine::alloc() else {
+                break;
+            };
+            irqs.push(irq);
+        }
 
-        let mut irqs = Vec::with_capacity(n);
-        for _ in 0..n {
-            irqs.push(IrqLine::alloc().ok()?);
+        let allocated_vector_count = u16::try_from(irqs.len()).ok()?;
+        if allocated_vector_count == 0 {
+            return None;
         }
 
         for (i, irq) in irqs.into_iter().enumerate() {
@@ -55,10 +64,11 @@ impl NvmeMsixManager {
         }
 
         // Reserve the first vector for admin queue
-        let mut vector_list: Vec<u16> = (0..table_size).collect();
-        let admin_vector = vector_list.remove(0);
+        let admin_vector = 0;
+        let vector_list: Vec<u16> = (1..allocated_vector_count).rev().collect();
 
         Some(Self {
+            vector_count: allocated_vector_count,
             admin_vector,
             unused_vectors: vector_list,
             used_vectors: Vec::new(),
@@ -85,7 +95,7 @@ impl NvmeMsixManager {
 
     /// Returns the total number of MSI-X vectors available.
     pub(crate) fn table_size(&self) -> u16 {
-        self.msix.table_size()
+        self.vector_count
     }
 
     /// Returns a mutable reference to the IRQ line for the given vector if any.

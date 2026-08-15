@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{collections::btree_set::BTreeSet, sync::Arc};
+use alloc::{
+    collections::{btree_map::BTreeMap, btree_set::BTreeSet},
+    sync::Arc,
+};
 use core::{
     borrow::Borrow,
     sync::atomic::{AtomicU64, Ordering},
@@ -18,6 +21,7 @@ use crate::{
 pub(crate) struct PollableIface<E: Ext> {
     interface: smoltcp::iface::Interface,
     pending_conns: PendingConnSet<E>,
+    neighbor_pending_conns: BTreeMap<usize, Arc<TcpConnectionBg<E>>>,
 }
 
 impl<E: Ext> PollableIface<E> {
@@ -25,6 +29,7 @@ impl<E: Ext> PollableIface<E> {
         Self {
             interface,
             pending_conns: PendingConnSet::new(),
+            neighbor_pending_conns: BTreeMap::new(),
         }
     }
 
@@ -32,6 +37,7 @@ impl<E: Ext> PollableIface<E> {
         PollableIfaceMut {
             context: self.interface.context(),
             pending_conns: &mut self.pending_conns,
+            neighbor_pending_conns: &mut self.neighbor_pending_conns,
         }
     }
 
@@ -88,7 +94,14 @@ impl<E: Ext> PollableIface<E> {
 pub(crate) struct PollableIfaceMut<'a, E: Ext> {
     context: &'a mut smoltcp::iface::Context,
     pending_conns: &'a mut PendingConnSet<E>,
+    neighbor_pending_conns: &'a mut BTreeMap<usize, Arc<TcpConnectionBg<E>>>,
 }
+
+type PollableIfaceFields<'a, E> = (
+    &'a mut smoltcp::iface::Context,
+    &'a mut PendingConnSet<E>,
+    &'a mut BTreeMap<usize, Arc<TcpConnectionBg<E>>>,
+);
 
 // FIXME: We provide `new()` and `inner_mut()` as `pub(crate)` methods because it's necessary to
 // allow the Rust compiler to check the lifetime for separate fields. We should find better ways to
@@ -97,15 +110,21 @@ impl<'a, E: Ext> PollableIfaceMut<'a, E> {
     pub(crate) fn new(
         context: &'a mut smoltcp::iface::Context,
         pending_conns: &'a mut PendingConnSet<E>,
+        neighbor_pending_conns: &'a mut BTreeMap<usize, Arc<TcpConnectionBg<E>>>,
     ) -> Self {
         Self {
             context,
             pending_conns,
+            neighbor_pending_conns,
         }
     }
 
-    pub(crate) fn inner_mut(&mut self) -> (&mut smoltcp::iface::Context, &mut PendingConnSet<E>) {
-        (self.context, self.pending_conns)
+    pub(crate) fn inner_mut(&mut self) -> PollableIfaceFields<'_, E> {
+        (
+            self.context,
+            self.pending_conns,
+            self.neighbor_pending_conns,
+        )
     }
 }
 
@@ -113,6 +132,21 @@ impl<E: Ext> PollableIfaceMut<'_, E> {
     pub(super) fn pop_pending_tcp(&mut self) -> Option<Arc<TcpConnectionBg<E>>> {
         let now = self.context.now.total_millis() as u64;
         self.pending_conns.pop_tcp_before_now(now)
+    }
+
+    pub(super) fn mark_neighbor_pending(&mut self, socket: Arc<TcpConnectionBg<E>>) {
+        self.pending_conns
+            .update_next_poll_at_ms(&socket, smoltcp::socket::PollAt::Ingress);
+        self.neighbor_pending_conns
+            .insert(Arc::as_ptr(&socket) as usize, socket);
+    }
+
+    pub(super) fn retry_neighbor_pending(&mut self) {
+        let pending_connections = core::mem::take(self.neighbor_pending_conns);
+        for connection in pending_connections.into_values() {
+            self.pending_conns
+                .update_next_poll_at_ms(&connection, smoltcp::socket::PollAt::Now);
+        }
     }
 }
 

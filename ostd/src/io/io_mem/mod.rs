@@ -54,7 +54,32 @@ pub struct IoMem<SecuritySensitivity = Insensitive> {
     limit: usize,
     pa: Paddr,
     cache_policy: CachePolicy,
+    allocation: Option<Arc<IoMemAllocation>>,
     phantom: PhantomData<SecuritySensitivity>,
+}
+
+struct IoMemAllocation {
+    range: Range<Paddr>,
+    allocator: &'static allocator::IoMemAllocator,
+}
+
+impl core::fmt::Debug for IoMemAllocation {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("IoMemAllocation")
+            .field("range", &self.range)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for IoMemAllocation {
+    fn drop(&mut self) {
+        // SAFETY: This token is created only after `allocator.acquire` exclusively
+        // allocates `range`, and all overlapping `IoMem` values share this token.
+        // Its destructor therefore runs only after the final access capability is
+        // gone.
+        unsafe { self.allocator.recycle(self.range.clone()) };
+    }
 }
 
 impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
@@ -74,6 +99,7 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
             limit: range.len(),
             pa: self.pa + range.start,
             cache_policy: self.cache_policy,
+            allocation: self.allocation.clone(),
             phantom: PhantomData,
         }
     }
@@ -146,8 +172,19 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
             limit: range.len(),
             pa: range.start,
             cache_policy: cache,
+            allocation: None,
             phantom: PhantomData,
         }
+    }
+
+    fn with_recyclable_allocation(
+        mut self,
+        range: Range<Paddr>,
+        allocator: &'static allocator::IoMemAllocator,
+    ) -> Self {
+        debug_assert!(self.allocation.is_none());
+        self.allocation = Some(Arc::new(IoMemAllocation { range, allocator }));
+        self
     }
 
     /// Returns the cache policy of this `IoMem`.
@@ -226,7 +263,7 @@ impl IoMem<Insensitive> {
         allocator::IO_MEM_ALLOCATOR
             .get()
             .unwrap()
-            .acquire(range, cache_policy)
+            .acquire_recyclable(range, cache_policy)
             .ok_or(Error::AccessDenied)
     }
 
@@ -424,14 +461,6 @@ impl<SecuritySensitivity> HasPaddr for IoMem<SecuritySensitivity> {
 impl<SecuritySensitivity> HasSize for IoMem<SecuritySensitivity> {
     fn size(&self) -> usize {
         self.limit
-    }
-}
-
-impl<SecuritySensitivity> Drop for IoMem<SecuritySensitivity> {
-    fn drop(&mut self) {
-        // TODO: Multiple `IoMem` instances should not overlap, we should refactor the driver code and
-        // remove the `Clone` and `IoMem::slice`. After refactoring, the `Drop` can be implemented to recycle
-        // the `IoMem`.
     }
 }
 

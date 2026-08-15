@@ -126,7 +126,6 @@ pub fn enable_preemption_on_cpu() {
 /// Use [`scheduler_singleton`] instead, which returns the current scheduler
 /// and falls back to a default FIFO scheduler if none has been injected.
 static SCHEDULER: Once<&'static dyn Scheduler<Task>> = Once::new();
-
 /// Returns the global scheduler.
 ///
 /// If a scheduler has already been injected (e.g., by a custom scheduler),
@@ -361,6 +360,11 @@ pub trait LocalRunQueue<T = Task> {
     /// Gets the current runnable task.
     fn current(&self) -> Option<&Arc<T>>;
 
+    /// Returns whether this runqueue has runnable work.
+    fn has_runnable(&self) -> bool {
+        self.current().is_some()
+    }
+
     /// Updates the current runnable task's scheduling statistics and
     /// potentially its position in the runqueue.
     ///
@@ -487,6 +491,10 @@ where
 
 /// Unblocks a target task.
 pub(crate) fn unpark_target(runnable: Arc<Task>) {
+    if runnable.is_completed() {
+        return;
+    }
+
     let preempt_cpu = scheduler_singleton().enqueue(runnable, EnqueueFlags::Wake);
     if let Some(preempt_cpu_id) = preempt_cpu {
         set_need_preempt(preempt_cpu_id);
@@ -506,7 +514,11 @@ pub(super) fn run_new_task(runnable: Arc<Task>) {
     might_preempt();
 }
 
-fn set_need_preempt(cpu_id: CpuId) {
+/// Requests a scheduling decision on `cpu_id` at its next preemption boundary.
+///
+/// This is used when a resource-policy update invalidates the placement of a
+/// task that may currently be running on another CPU.
+pub fn request_preemption_on_cpu(cpu_id: CpuId) {
     let preempt_guard = disable_preempt();
 
     if preempt_guard.current_cpu() == cpu_id {
@@ -516,6 +528,10 @@ fn set_need_preempt(cpu_id: CpuId) {
             cpu_local::set_need_preempt();
         });
     }
+}
+
+fn set_need_preempt(cpu_id: CpuId) {
+    request_preemption_on_cpu(cpu_id);
 }
 
 /// Dequeues the current task from its runqueue.
@@ -550,7 +566,7 @@ pub(super) fn exit_current() -> ! {
 pub(super) fn yield_now() {
     reschedule(|local_rq| {
         let should_pick_next = local_rq.update_current(UpdateFlags::Yield);
-        let next_task_opt = should_pick_next.then(|| local_rq.pick_next());
+        let next_task_opt = should_pick_next.then(|| local_rq.try_pick_next()).flatten();
         if let Some(next_task) = next_task_opt {
             ReschedAction::SwitchTo(next_task.clone())
         } else {

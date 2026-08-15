@@ -133,12 +133,13 @@ unsafe extern "C" fn riscv_boot(hart_id: usize, device_tree_paddr: usize) -> ! {
     let fdt = unsafe { Fdt::from_ptr(device_tree_ptr).unwrap() };
     DEVICE_TREE.call_once(|| fdt);
 
-    use crate::boot::{EARLY_INFO, EarlyBootInfo, start_kernel};
+    use crate::boot::{BootSymbolSources, EARLY_INFO, EarlyBootInfo, start_kernel};
 
     EARLY_INFO.call_once(|| EarlyBootInfo {
         bootloader_name: parse_bootloader_name(),
         kernel_cmdline: parse_kernel_commandline(),
         initramfs: parse_initramfs(),
+        symbol_sources: BootSymbolSources::empty(),
         acpi_arg: parse_acpi_arg(),
         framebuffer_arg: parse_framebuffer_info(),
         memory_regions: parse_memory_regions(),

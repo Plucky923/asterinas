@@ -22,4 +22,6 @@ impl IrqRemapping {
     pub(crate) fn remapping_index(&self) -> Option<u16> {
         None
     }
+
+    pub(crate) fn reset(&self) {}
 }

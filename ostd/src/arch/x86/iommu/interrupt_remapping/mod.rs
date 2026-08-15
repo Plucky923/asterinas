@@ -9,7 +9,9 @@ pub(super) use table::IntRemappingTable;
 
 use crate::{
     arch::iommu::registers::{ExtendedCapabilityFlags, IOMMU_REGS},
-    info, warn,
+    info,
+    irq::PciIrqRequester,
+    warn,
 };
 
 pub struct IrtEntryHandle {
@@ -22,16 +24,43 @@ impl IrtEntryHandle {
         self.index
     }
 
-    pub fn enable(&self, vector: u32) {
+    pub fn enable(&self, vector: u8) {
         self.table
             .set_entry(self.index, table::IrtEntry::new_enabled(vector));
 
-        IOMMU_REGS
-            .get()
-            .unwrap()
-            .lock()
-            .invalidate_interrupt_cache();
+        invalidate_interrupt_cache();
     }
+
+    pub fn enable_for_requester(&self, vector: u8, requester: PciIrqRequester) {
+        self.table.set_entry(
+            self.index,
+            table::IrtEntry::new_source_bound(vector, requester),
+        );
+
+        invalidate_interrupt_cache();
+    }
+
+    fn disable(&self) {
+        self.table
+            .set_entry(self.index, table::IrtEntry::disabled());
+
+        invalidate_interrupt_cache();
+    }
+}
+
+impl Drop for IrtEntryHandle {
+    fn drop(&mut self) {
+        self.disable();
+        self.table.free(self.index);
+    }
+}
+
+fn invalidate_interrupt_cache() {
+    IOMMU_REGS
+        .get()
+        .unwrap()
+        .lock()
+        .invalidate_interrupt_cache();
 }
 
 impl Debug for IrtEntryHandle {
@@ -56,8 +85,11 @@ pub(super) fn init() {
 
     // Check if interrupt remapping is supported
     let extend_cap = iommu_regs.read_extended_capability();
-    if !extend_cap.flags().contains(ExtendedCapabilityFlags::IR) {
-        warn!("Interrupt remapping not supported");
+    if !extend_cap
+        .flags()
+        .contains(ExtendedCapabilityFlags::IR | ExtendedCapabilityFlags::QI)
+    {
+        warn!("Interrupt remapping with queued invalidation not supported");
         return;
     }
 

@@ -39,6 +39,25 @@ enum Inner {
 }
 
 impl DmaCoherent {
+    /// Wraps an already allocated coherent segment as a DMA buffer.
+    ///
+    /// The caller owns the segment's allocation policy.  This constructor
+    /// only establishes the architecture's DMA preparation state and keeps
+    /// the segment alive until the mapping is dropped.
+    pub fn from_segment(segment: Segment<()>) -> Result<Self, Error> {
+        let paddr_range = segment.paddr_range();
+
+        // SAFETY: The caller supplies an untyped, page-aligned segment and
+        // the returned object retains it until the matching unprepare.
+        let map_daddr = unsafe { prepare_dma(&paddr_range) };
+
+        Ok(Self {
+            inner: Inner::Segment(segment),
+            map_daddr,
+            is_cache_coherent: true,
+        })
+    }
+
     /// Allocates a region of physical memory for coherent DMA access.
     ///
     /// The memory of the newly-allocated DMA buffer is initialized to zeros.

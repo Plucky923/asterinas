@@ -20,10 +20,21 @@ pub(super) struct IoMemAllocator {
 }
 
 impl IoMemAllocator {
+    /// Acquires recyclable insensitive MMIO from an allocator with static lifetime.
+    pub(super) fn acquire_recyclable(
+        &'static self,
+        range: Range<usize>,
+        cache_policy: CachePolicy,
+    ) -> Option<IoMem<Insensitive>> {
+        let allocation_range = range.clone();
+        self.acquire(range, cache_policy)
+            .map(|io_mem| io_mem.with_recyclable_allocation(allocation_range, self))
+    }
+
     /// Acquires `range` for insensitive MMIO with the specified cache policy.
     ///
     /// If the range is not available, then the return value will be `None`.
-    pub(super) fn acquire(
+    fn acquire(
         &self,
         range: Range<usize>,
         cache_policy: CachePolicy,
@@ -50,8 +61,7 @@ impl IoMemAllocator {
     ///
     /// # Safety
     ///
-    /// The caller must have ownership of the MMIO region through the `IoMemAllocator::get` interface.
-    #[expect(dead_code)]
+    /// The caller must own the MMIO region returned by this allocator's acquisition interface.
     pub(super) unsafe fn recycle(&self, range: Range<usize>) {
         debug!("Recycling MMIO range: {:#x?}", range);
 
@@ -176,7 +186,7 @@ fn find_allocator<'a>(
 
 #[cfg(ktest)]
 mod test {
-    use alloc::vec;
+    use alloc::{boxed::Box, vec};
 
     use super::{IoMemAllocator, IoMemAllocatorBuilder};
     use crate::{
@@ -303,6 +313,35 @@ mod test {
                     CachePolicy::Uncacheable
                 )
                 .is_none()
+        );
+    }
+
+    #[ktest]
+    fn recycle_after_last_clone() {
+        let range = 0x100_000_000_000..0x100_000_001_000;
+        // SAFETY: The test range lies outside the configured physical-memory
+        // range and this dedicated allocator is leaked to give recycling
+        // tokens the required static lifetime.
+        let allocator = Box::leak(Box::new(unsafe {
+            IoMemAllocator::new(IoMemAllocatorBuilder::new(vec![range.clone()]).allocators)
+        }));
+
+        let io_mem = allocator
+            .acquire_recyclable(range.clone(), CachePolicy::Uncacheable)
+            .unwrap();
+        let cloned_io_mem = io_mem.clone();
+        drop(io_mem);
+        assert!(
+            allocator
+                .acquire_recyclable(range.clone(), CachePolicy::Uncacheable)
+                .is_none()
+        );
+
+        drop(cloned_io_mem);
+        assert!(
+            allocator
+                .acquire_recyclable(range, CachePolicy::Uncacheable)
+                .is_some()
         );
     }
 }

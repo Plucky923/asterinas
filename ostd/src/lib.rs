@@ -39,12 +39,16 @@ pub mod cpu;
 mod error;
 pub mod io;
 pub mod irq;
+/// Loads and relocates trusted OSTD service modules.
+pub mod loader;
 pub mod log;
 pub mod mm;
 pub mod panic;
 pub mod power;
 pub mod prelude;
 pub mod smp;
+/// Resolves kernel symbols exported to dynamically loaded services.
+pub mod symbols;
 pub mod sync;
 pub mod task;
 pub mod timer;
@@ -62,6 +66,7 @@ pub use ostd_macros::{
 };
 
 pub use self::{error::Error, prelude::Result};
+use crate::symbols::symbols_table_init;
 
 /// Initializes OSTD.
 ///
@@ -137,6 +142,8 @@ unsafe fn init() {
     invoke_ffi_init_funcs();
 
     IN_BOOTSTRAP_CONTEXT.store(false, Ordering::Relaxed);
+
+    symbols_table_init();
 }
 
 /// Indicates whether the kernel is in bootstrap context.

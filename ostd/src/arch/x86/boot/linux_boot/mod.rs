@@ -223,7 +223,7 @@ unsafe extern "sysv64" fn __linux_boot(params_ptr: *const BootParams) -> ! {
     let params = unsafe { &*params_ptr };
     assert_eq!({ params.hdr.header }, LINUX_BOOT_HEADER_MAGIC);
 
-    use crate::boot::{EARLY_INFO, EarlyBootInfo, start_kernel};
+    use crate::boot::{BootSymbolSources, EARLY_INFO, EarlyBootInfo, start_kernel};
 
     #[cfg(feature = "cvm_guest")]
     init_cvm_guest();
@@ -232,6 +232,7 @@ unsafe extern "sysv64" fn __linux_boot(params_ptr: *const BootParams) -> ! {
         bootloader_name: parse_bootloader_name(params),
         kernel_cmdline: parse_kernel_commandline(params).unwrap_or(""),
         initramfs: parse_initramfs(params),
+        symbol_sources: BootSymbolSources::empty(),
         acpi_arg: parse_acpi_arg(params),
         framebuffer_arg: parse_framebuffer_info(params),
         memory_regions: parse_memory_regions(params),

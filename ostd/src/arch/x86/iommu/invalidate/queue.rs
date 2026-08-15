@@ -13,13 +13,16 @@ pub struct Queue {
 
 impl Queue {
     pub fn append_descriptor(&mut self, descriptor: u128) {
-        if self.tail == self.queue_size {
-            self.tail = 0;
-        }
         self.segment
             .write_val(self.tail * size_of::<u128>(), &descriptor)
             .unwrap();
         self.tail += 1;
+        if self.tail == self.queue_size {
+            // The IOMMU tail register names the next descriptor slot. Keeping
+            // `queue_size` here would publish an out-of-range byte offset
+            // after a submission ends at the final queue entry.
+            self.tail = 0;
+        }
     }
 
     pub fn tail(&self) -> usize {
@@ -44,5 +47,24 @@ impl Queue {
             queue_size: (DEFAULT_PAGES * PAGE_SIZE) / size_of::<u128>(),
             tail: 0,
         }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use super::*;
+    use crate::prelude::ktest;
+
+    #[ktest]
+    fn tail_wraps_to_the_first_descriptor_slot() {
+        let mut queue = Queue::new();
+
+        for descriptor in 0..queue.size() {
+            queue.append_descriptor(descriptor as u128);
+        }
+        assert_eq!(queue.tail(), 0);
+
+        queue.append_descriptor(0);
+        assert_eq!(queue.tail(), 1);
     }
 }

@@ -22,7 +22,20 @@ mod test;
 
 mod dma_coherent;
 mod dma_stream;
+mod fault;
+#[cfg(target_arch = "x86_64")]
+mod pci_domain;
 mod util;
 
 pub use dma_coherent::DmaCoherent;
 pub use dma_stream::{DmaDirection, DmaStream, FromAndToDevice, FromDevice, ToDevice};
+#[cfg(ktest)]
+pub use fault::inject_dma_remapping_fault_for_test;
+pub(crate) use fault::report_dma_remapping_fault;
+pub use fault::{
+    DmaRemappingFault, register_dma_remapping_fault_handler, resume_dma_remapping_fault_reporting,
+};
+#[cfg(target_arch = "x86_64")]
+pub use pci_domain::{
+    PciDmaDomain, PciDmaError, PciDmaSegment, PciRequesterLease, register_host_pci_requester,
+};

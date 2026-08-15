@@ -10,16 +10,18 @@ use volatile::{VolatileRef, access::ReadWrite};
 use super::registers::Capability;
 use crate::{
     arch::trap::TrapFrame,
-    error, info,
     irq::IrqLine,
+    mm::dma::{DmaRemappingFault, report_dma_remapping_fault},
     sync::{LocalIrqDisabled, SpinLock},
 };
+
+const INTERRUPT_MASK: u32 = 1 << 31;
 
 #[derive(Debug)]
 pub struct FaultEventRegisters {
     status: VolatileRef<'static, u32, ReadWrite>,
     /// bit31: Interrupt Mask; bit30: Interrupt Pending.
-    _control: VolatileRef<'static, u32, ReadWrite>,
+    control: VolatileRef<'static, u32, ReadWrite>,
     _data: VolatileRef<'static, u32, ReadWrite>,
     _address: VolatileRef<'static, u32, ReadWrite>,
     _upper_address: VolatileRef<'static, u32, ReadWrite>,
@@ -39,7 +41,7 @@ impl FaultEventRegisters {
     ///
     /// The caller must ensure that the base address is a valid IOMMU base address and that it has
     /// exclusive ownership of the IOMMU fault event registers.
-    unsafe fn new(base_register_vaddr: NonNull<u8>) -> Self {
+    unsafe fn new(base_register_vaddr: NonNull<u8>) -> Option<Self> {
         // SAFETY: The safety is upheld by the caller.
         let (capability, status, mut control, mut data, mut address, upper_address) = unsafe {
             let base = base_register_vaddr;
@@ -60,38 +62,58 @@ impl FaultEventRegisters {
         };
 
         let capability_val = Capability::new(capability.as_ptr().read());
-        let length = capability_val.fault_recording_number() as usize + 1;
-        let offset = (capability_val.fault_recording_register_offset() as usize) * 16;
+        let length = (capability_val.fault_recording_number() as usize).checked_add(1)?;
+        let offset = (capability_val.fault_recording_register_offset() as usize)
+            .checked_mul(size_of::<u128>())?;
+        let recordings_size = length.checked_mul(size_of::<u128>())?;
+        let recordings_end = offset.checked_add(recordings_size)?;
 
-        // FIXME: We now trust the hardware. We should instead find a way to check that `length`
-        // and `offset` are reasonable values before proceeding.
+        // IommuRegisters maps and reserves only one page for the IOMMU register
+        // block. Do not form volatile references outside that mapped MMIO range
+        // even if the hardware reports an invalid capability value.
+        if recordings_end > crate::mm::PAGE_SIZE {
+            crate::warn!(
+                "IOMMU fault-recording registers exceed the mapped register page: offset={}, length={}",
+                offset,
+                length
+            );
+            return None;
+        }
 
         let mut recordings = Vec::with_capacity(length);
         for i in 0..length {
             // SAFETY: The safety is upheld by the caller and the correctness of the capability
             // value.
             recordings.push(unsafe {
-                VolatileRef::new(base_register_vaddr.add(offset).add(i * 16).cast::<u128>())
+                VolatileRef::new(
+                    base_register_vaddr
+                        .add(offset)
+                        .add(i * size_of::<u128>())
+                        .cast::<u128>(),
+                )
             })
         }
 
-        let mut fault_irq = IrqLine::alloc().unwrap();
+        let mut fault_irq = IrqLine::alloc().ok()?;
         fault_irq.on_active(iommu_fault_handler);
 
         // Set page fault interrupt vector and address
         data.as_mut_ptr().write(fault_irq.num() as u32);
         address.as_mut_ptr().write(0xFEE0_0000);
-        control.as_mut_ptr().write(0);
+        // Keep fault interrupts masked until the kernel installs its deferred
+        // containment handler. Fault records remain available for processing
+        // when reporting is resumed.
+        control.as_mut_ptr().write(INTERRUPT_MASK);
 
-        FaultEventRegisters {
+        Some(FaultEventRegisters {
             status,
-            _control: control,
+            control,
             _data: data,
             _address: address,
             _upper_address: upper_address,
             recordings,
             _fault_irq: fault_irq,
-        }
+        })
     }
 }
 
@@ -241,14 +263,22 @@ pub(super) static FAULT_EVENT_REGS: Once<SpinLock<FaultEventRegisters, LocalIrqD
 ///
 /// The caller must ensure that the base address is a valid IOMMU base address and that it has
 /// exclusive ownership of the IOMMU fault event registers.
-pub(super) unsafe fn init(base_register_vaddr: NonNull<u8>) {
-    FAULT_EVENT_REGS
+pub(super) unsafe fn init(base_register_vaddr: NonNull<u8>) -> bool {
+    let Some(registers) = (|| {
         // SAFETY: The safety is upheld by the caller.
-        .call_once(|| SpinLock::new(unsafe { FaultEventRegisters::new(base_register_vaddr) }));
+        unsafe { FaultEventRegisters::new(base_register_vaddr) }
+    })() else {
+        return false;
+    };
+    FAULT_EVENT_REGS.call_once(|| SpinLock::new(registers));
+    true
 }
 
 fn iommu_fault_handler(_frame: &TrapFrame) {
-    let mut fault_event_regs = FAULT_EVENT_REGS.get().unwrap().lock();
+    let Some(fault_event_regs) = FAULT_EVENT_REGS.get() else {
+        return;
+    };
+    let mut fault_event_regs = fault_event_regs.lock();
 
     primary_fault_handler(&mut fault_event_regs);
 
@@ -268,32 +298,67 @@ fn primary_fault_handler(fault_event_regs: &mut FaultEventRegisters) {
     }
 
     let start_index = ((fault_event_regs.status().bits & FaultStatus::FRI.bits) >> 8) as usize;
-    let mut fault_iter = fault_event_regs.recordings.iter_mut();
-    fault_iter.advance_by(start_index).unwrap();
-    for raw_recording in fault_iter {
-        let raw_recording = raw_recording.as_mut_ptr();
+    if start_index >= fault_event_regs.recordings.len() {
+        mask_fault_reporting(fault_event_regs);
+        report_dma_remapping_fault(DmaRemappingFault::overflow());
+        return;
+    }
+    const MAX_RECORDS_PER_INTERRUPT: usize = 32;
+    let recording_count = fault_event_regs.recordings.len();
+    let bounded_count = recording_count.min(MAX_RECORDS_PER_INTERRUPT);
+    let mut processed_count = 0;
+    while processed_count < bounded_count {
+        let recording_index = (start_index + processed_count) % recording_count;
+        let raw_recording = fault_event_regs.recordings[recording_index].as_mut_ptr();
         let mut recording = FaultRecording(raw_recording.read());
         if !recording.is_fault() {
             break;
         }
 
-        // Report
-        error!(
-            "caught page fault, doing nothing. recording: {:x?}",
-            recording
-        );
+        report_dma_remapping_fault(DmaRemappingFault::request(
+            recording.source_identifier(),
+            recording.fault_reason(),
+            recording.fault_info(),
+        ));
 
         // Clear Fault field
         recording.clear_fault();
         raw_recording.write(recording.0);
+        processed_count += 1;
+    }
+    let record_limit_reached =
+        processed_count == bounded_count && recording_count > bounded_count && {
+            let next_index = (start_index + processed_count) % recording_count;
+            FaultRecording(fault_event_regs.recordings[next_index].as_ptr().read()).is_fault()
+        };
+    if record_limit_reached {
+        mask_fault_reporting(fault_event_regs);
+        report_dma_remapping_fault(DmaRemappingFault::overflow());
     }
 
     if fault_status.contains(FaultStatus::PFO) {
-        info!("Primary fault overflow detected.");
+        mask_fault_reporting(fault_event_regs);
+        if !record_limit_reached {
+            report_dma_remapping_fault(DmaRemappingFault::overflow());
+        }
         fault_status.remove(FaultStatus::PFO);
         fault_event_regs
             .status
             .as_mut_ptr()
             .write(fault_status.bits);
     }
+}
+
+fn mask_fault_reporting(fault_event_regs: &mut FaultEventRegisters) {
+    let control = fault_event_regs.control.as_ptr().read() | INTERRUPT_MASK;
+    fault_event_regs.control.as_mut_ptr().write(control);
+}
+
+pub(crate) fn resume_fault_reporting() {
+    let Some(registers) = FAULT_EVENT_REGS.get() else {
+        return;
+    };
+    let mut registers = registers.lock();
+    let control = registers.control.as_ptr().read() & !INTERRUPT_MASK;
+    registers.control.as_mut_ptr().write(control);
 }

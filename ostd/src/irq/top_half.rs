@@ -17,6 +17,27 @@ use crate::{
     sync::{RwLock, SpinLock, WriteIrqDisabled},
 };
 
+/// Identifies one PCI requester that may originate MSI or MSI-X messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciIrqRequester(u16);
+
+impl PciIrqRequester {
+    /// Creates a requester identifier from a PCI bus/device/function tuple.
+    pub fn new(bus: u8, device: u8, function: u8) -> Result<Self> {
+        if device >= 32 || function >= 8 {
+            return Err(Error::InvalidArgs);
+        }
+        Ok(Self(
+            ((bus as u16) << 8) | ((device as u16) << 3) | function as u16,
+        ))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
 /// A type alias for the IRQ callback function.
 pub type IrqCallbackFunction = dyn Fn(&TrapFrame) + Sync + Send + 'static;
 
@@ -107,6 +128,16 @@ impl IrqLine {
     pub fn remapping_index(&self) -> Option<u16> {
         self.inner.remapping.remapping_index()
     }
+
+    /// Restricts remapped interrupts to one PCI requester.
+    ///
+    /// This operation fails closed when interrupt remapping is unavailable.
+    #[cfg(target_arch = "x86_64")]
+    pub fn bind_pci_requester(&self, requester: PciIrqRequester) -> Result<()> {
+        self.inner
+            .remapping
+            .bind_pci_requester(self.num(), requester)
+    }
 }
 
 impl Clone for IrqLine {
@@ -160,6 +191,7 @@ impl Deref for InnerHandle {
 
 impl Drop for InnerHandle {
     fn drop(&mut self) {
+        self.remapping.reset();
         ALLOCATOR.get().unwrap().lock().free(self.index as usize);
     }
 }
@@ -199,6 +231,18 @@ mod test {
 
     const IRQ_NUM: u8 = 64;
     const IRQ_INDEX: usize = (IRQ_NUM - IRQ_NUM_MIN) as usize;
+
+    #[ktest]
+    fn pci_requester_id_rejects_invalid_device_and_function() {
+        assert!(PciIrqRequester::new(0, 32, 0).is_err());
+        assert!(PciIrqRequester::new(0, 0, 8).is_err());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[ktest]
+    fn pci_requester_id_encodes_bdf() {
+        assert_eq!(PciIrqRequester::new(0x12, 3, 1).unwrap().raw(), 0x1219);
+    }
 
     #[ktest]
     fn alloc_and_free_irq() {

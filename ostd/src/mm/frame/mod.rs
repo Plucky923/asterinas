@@ -50,13 +50,13 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-pub use allocator::GlobalFrameAllocator;
+pub use allocator::{GlobalFrameAllocator, alloc_raw, dealloc_raw, zero_raw};
 use meta::{AnyFrameMeta, GetFrameError, MetaSlot, REF_COUNT_UNUSED, mapping};
 pub use segment::Segment;
 use untyped::{AnyUFrameMeta, UFrame};
 
 use crate::{
-    mm::{HasPaddr, HasSize, PAGE_SIZE, Paddr, PagingConsts, PagingLevel, Vaddr},
+    mm::{HasPaddr, HasSize, PAGE_SIZE, Paddr, PagingConsts, PagingLevel, Vaddr, paddr_to_vaddr},
     sync::RcuDrop,
 };
 
@@ -101,6 +101,15 @@ impl<M: AnyFrameMeta + ?Sized> PartialEq for Frame<M> {
 impl<M: AnyFrameMeta + ?Sized> Eq for Frame<M> {}
 
 impl<M: AnyFrameMeta> Frame<M> {
+    /// Zeroes the physical page covered by this frame.
+    #[doc(hidden)]
+    pub fn zero(&self) {
+        let address = paddr_to_vaddr(self.paddr()) as *mut u8;
+        // SAFETY: A live frame always refers to a valid page in the linear
+        // mapping, and the frame size is exactly `PAGE_SIZE`.
+        unsafe { core::ptr::write_bytes(address, 0, PAGE_SIZE) }
+    }
+
     /// Gets a [`Frame`] with a specific usage from a raw, unused page.
     ///
     /// The caller should provide the initial metadata of the page.
@@ -250,6 +259,13 @@ impl<M: AnyFrameMeta + ?Sized> Drop for Frame<M> {
     fn drop(&mut self) {
         let last_ref_cnt = self.slot().ref_count.fetch_sub(1, Ordering::Release);
         debug_assert!(last_ref_cnt != 0 && last_ref_cnt != REF_COUNT_UNUSED);
+
+        if last_ref_cnt == 2 {
+            // A provider may retain one hidden ownership reference. Notify it
+            // when all public references have drained without changing the
+            // normal Host deallocation contract.
+            allocator::notify_frame_idle(self.paddr());
+        }
 
         if last_ref_cnt == 1 {
             // A fence is needed here with the same reasons stated in the implementation of

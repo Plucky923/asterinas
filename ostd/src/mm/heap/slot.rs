@@ -7,7 +7,8 @@ use core::{alloc::AllocError, ptr::NonNull};
 use crate::{
     impl_frame_meta_for,
     mm::{
-        FrameAllocOptions, PAGE_SIZE, Paddr, Segment, Vaddr, kspace::LINEAR_MAPPING_BASE_VADDR,
+        FrameAllocOptions, PAGE_SIZE, Paddr, Segment, Vaddr,
+        kspace::{LINEAR_MAPPING_BASE_VADDR, LINEAR_MAPPING_VADDR_RANGE},
         paddr_to_vaddr,
     },
 };
@@ -56,6 +57,48 @@ impl SlotInfo {
 }
 
 impl HeapSlot {
+    /// Creates a heap slot for a provider-owned virtual address.
+    ///
+    /// The caller must keep the physical backing alive until the slot is
+    /// returned to the same provider through [`GlobalHeapAllocator::dealloc`].
+    /// This constructor does not touch frame metadata or the Host allocator;
+    /// it only records the pointer and slot shape.
+    #[doc(hidden)]
+    pub fn from_raw_parts(paddr: Paddr, info: SlotInfo) -> Result<Self, AllocError> {
+        let size = info.size();
+        let linear_mapping_size = LINEAR_MAPPING_VADDR_RANGE.end - LINEAR_MAPPING_VADDR_RANGE.start;
+        if size == 0
+            || paddr
+                .checked_add(size)
+                .is_none_or(|end| end > linear_mapping_size)
+        {
+            return Err(AllocError);
+        }
+        let addr = paddr_to_vaddr(paddr);
+        let Some(addr) = NonNull::new(addr as *mut u8) else {
+            return Err(AllocError);
+        };
+        Ok(Self { addr, info })
+    }
+
+    /// Creates a heap slot from a linear-mapped kernel pointer.
+    ///
+    /// This is used by an allocator shim that receives the pointer returned by
+    /// [`GlobalAlloc`] but must hand the allocation back through OSTD's safe
+    /// [`GlobalHeapAllocator`] contract. The pointer is validated as one
+    /// linear-mapped physical address; no memory is accessed here.
+    #[doc(hidden)]
+    pub fn from_ptr_parts(ptr: *mut u8, info: SlotInfo) -> Result<Self, AllocError> {
+        let address = ptr.addr();
+        let Some(end) = address.checked_add(info.size()) else {
+            return Err(AllocError);
+        };
+        if address < LINEAR_MAPPING_BASE_VADDR || end > LINEAR_MAPPING_VADDR_RANGE.end {
+            return Err(AllocError);
+        }
+        Self::from_raw_parts(address - LINEAR_MAPPING_BASE_VADDR, info)
+    }
+
     /// Creates a new pointer to a heap slot.
     ///
     /// # Safety

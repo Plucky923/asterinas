@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![cfg_attr(
-    any(target_arch = "riscv64", target_arch = "loongarch64"),
-    expect(dead_code)
-)]
-
 use core::{
     fmt::Debug,
     intrinsics::transmute_unchecked,
@@ -450,15 +445,6 @@ impl<C: PageTableConfig> PageTable<C> {
         va: &Range<Vaddr>,
     ) -> Result<Cursor<'rcu, C>, PageTableError> {
         Cursor::new(self, guard.as_atomic_mode_guard(), va)
-    }
-
-    /// Create a new reference to the same page table.
-    /// The caller must ensure that the kernel page table is not copied.
-    /// This is only useful for IOMMU page tables. Think twice before using it in other cases.
-    pub unsafe fn shallow_copy(&self) -> Self {
-        PageTable {
-            root: self.root.clone(),
-        }
     }
 }
 

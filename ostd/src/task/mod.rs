@@ -15,7 +15,7 @@ use core::{
     cell::{Cell, SyncUnsafeCell},
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use kernel_stack::KernelStack;
@@ -35,7 +35,7 @@ use crate::{
 
 static PRE_SCHEDULE_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 
-static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
+static POST_SCHEDULE_HANDLER: Once<fn() -> bool> = Once::new();
 
 /// Injects a handler to be executed before scheduling.
 pub fn inject_pre_schedule_handler(handler: fn(&DisabledLocalIrqGuard)) {
@@ -43,7 +43,7 @@ pub fn inject_pre_schedule_handler(handler: fn(&DisabledLocalIrqGuard)) {
 }
 
 /// Injects a handler to be executed after scheduling.
-pub fn inject_post_schedule_handler(handler: fn()) {
+pub fn inject_post_schedule_handler(handler: fn() -> bool) {
     POST_SCHEDULE_HANDLER.call_once(|| handler);
 }
 
@@ -57,8 +57,9 @@ pub struct Task {
     #[expect(clippy::type_complexity)]
     func: ForceSync<Cell<Option<Box<dyn FnOnce() + Send>>>>,
 
-    data: Box<dyn Any + Send + Sync>,
     local_data: ForceSync<Box<dyn Any + Send>>,
+    data: Box<dyn Any + Send + Sync>,
+    extension: Box<dyn Any + Send + Sync>,
 
     ctx: SyncUnsafeCell<TaskContext>,
     /// kernel stack, note that the top is SyscallFrame/TrapFrame
@@ -69,6 +70,7 @@ pub struct Task {
     /// This is to enforce not context switching to an already running task.
     /// See [`processor::switch_to_task`] for more details.
     switched_to_cpu: AtomicBool,
+    completed: AtomicBool,
 
     schedule_info: TaskScheduleInfo,
 }
@@ -105,9 +107,28 @@ impl Task {
         scheduler::run_new_task(self.clone());
     }
 
+    /// Re-enqueues a parked task through the scheduler.
+    #[track_caller]
+    pub fn wake_up(self: &Arc<Self>) {
+        if self.is_completed() {
+            return;
+        }
+        scheduler::unpark_target(self.clone());
+    }
+
+    /// Returns whether this task has finished its task function.
+    pub fn is_completed(&self) -> bool {
+        self.completed.load(Ordering::Acquire)
+    }
+
     /// Returns the task data.
     pub fn data(&self) -> &Box<dyn Any + Send + Sync> {
         &self.data
+    }
+
+    /// Returns the type-erased extension data attached to the task.
+    pub fn extension(&self) -> &Box<dyn Any + Send + Sync> {
+        &self.extension
     }
 
     /// Get the attached scheduling information.
@@ -116,10 +137,21 @@ impl Task {
     }
 }
 
+/// Terminates the current task without returning.
+///
+/// Stack-local destructors are not run. Callers must release guards and other
+/// resources whose drop behavior is required before invoking this function.
+pub fn exit_current_task() -> ! {
+    let current_task = Task::current().expect("current task must exist before task exit");
+    current_task.completed.store(true, Ordering::Release);
+    scheduler::exit_current();
+}
+
 /// Options to create or spawn a new task.
 pub struct TaskOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
     data: Option<Box<dyn Any + Send + Sync>>,
+    extension: Option<Box<dyn Any + Send + Sync>>,
     local_data: Option<Box<dyn Any + Send>>,
 }
 
@@ -132,6 +164,7 @@ impl TaskOptions {
         Self {
             func: Some(Box::new(func)),
             data: None,
+            extension: None,
             local_data: None,
         }
     }
@@ -146,20 +179,44 @@ impl TaskOptions {
     }
 
     /// Sets the data associated with the task.
-    pub fn data<T>(mut self, data: T) -> Self
+    pub fn data<T>(self, data: T) -> Self
     where
         T: Any + Send + Sync,
     {
-        self.data = Some(Box::new(data));
+        self.data_any(Box::new(data))
+    }
+
+    /// Sets the data associated with the task, but with an already-boxed value.
+    pub fn data_any(mut self, data: Box<dyn Any + Send + Sync>) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// Sets the extension data associated with the task.
+    pub fn extension<T>(self, extension: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        self.extension_any(Box::new(extension))
+    }
+
+    /// Sets the extension data associated with the task, but with an already-boxed value.
+    pub fn extension_any(mut self, extension: Box<dyn Any + Send + Sync>) -> Self {
+        self.extension = Some(extension);
         self
     }
 
     /// Sets the local data associated with the task.
-    pub fn local_data<T>(mut self, data: T) -> Self
+    pub fn local_data<T>(self, data: T) -> Self
     where
         T: Any + Send,
     {
-        self.local_data = Some(Box::new(data));
+        self.local_data_any(Box::new(data))
+    }
+
+    /// Sets the local data associated with the task, but with an already-boxed value.
+    pub fn local_data_any(mut self, data: Box<dyn Any + Send>) -> Self {
+        self.local_data = Some(data);
         self
     }
 
@@ -190,6 +247,7 @@ impl TaskOptions {
                 .take()
                 .expect("task function is `None` when trying to run");
             task_func();
+            current_task.completed.store(true, Ordering::Release);
 
             // Manually drop all the on-stack variables to prevent memory leakage!
             // This is needed because `scheduler::exit_current()` will never return.
@@ -219,11 +277,13 @@ impl TaskOptions {
 
         let new_task = Task {
             func: ForceSync::new(Cell::new(self.func)),
-            data: self.data.unwrap_or_else(|| Box::new(())),
             local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),
+            data: self.data.unwrap_or_else(|| Box::new(())),
+            extension: self.extension.unwrap_or_else(|| Box::new(())),
             ctx: SyncUnsafeCell::new(ctx),
             kstack,
             switched_to_cpu: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },

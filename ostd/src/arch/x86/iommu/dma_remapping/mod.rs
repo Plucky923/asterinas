@@ -4,11 +4,12 @@ pub use context_table::RootTable;
 pub use second_stage::IommuPtConfig;
 use spin::Once;
 
-use super::IommuError;
+use self::context_table::{ContextTableError, DomainId, HOST_DOMAIN_ID};
+use super::{IommuError, invalidate::QUEUE};
 use crate::{
     arch::iommu::registers::{CapabilitySagaw, IOMMU_REGS},
     info,
-    mm::{Daddr, PageTable},
+    mm::Daddr,
     prelude::Paddr,
     sync::{LocalIrqDisabled, SpinLock},
     warn,
@@ -33,42 +34,172 @@ pub struct PciDeviceLocation {
 }
 
 impl PciDeviceLocation {
-    // TODO: Find a proper way to obtain the bus range. For example, if the PCI bus is identified
-    // from a device tree, this information can be obtained from the `bus-range` field (e.g.,
-    // `bus-range = <0x00 0x7f>`).
-    const MIN_BUS: u8 = 0;
-    const MAX_BUS: u8 = 255;
-
-    const MIN_DEVICE: u8 = 0;
     const MAX_DEVICE: u8 = 31;
-
-    const MIN_FUNCTION: u8 = 0;
     const MAX_FUNCTION: u8 = 7;
 
-    /// Returns an iterator that enumerates all possible PCI device locations.
-    fn all() -> impl Iterator<Item = PciDeviceLocation> {
-        let all_bus = Self::MIN_BUS..=Self::MAX_BUS;
-        let all_dev = Self::MIN_DEVICE..=Self::MAX_DEVICE;
-        let all_func = Self::MIN_FUNCTION..=Self::MAX_FUNCTION;
-
-        all_bus
-            .flat_map(move |bus| all_dev.clone().map(move |dev| (bus, dev)))
-            .flat_map(move |(bus, dev)| all_func.clone().map(move |func| (bus, dev, func)))
-            .map(|(bus, dev, func)| PciDeviceLocation {
-                bus,
-                device: dev,
-                function: func,
-            })
-    }
-
-    /// Returns the zero PCI device location.
-    fn zero() -> Self {
-        Self {
-            bus: 0,
-            device: 0,
-            function: 0,
+    fn validate(self) -> Result<(), ContextTableError> {
+        if self.device > Self::MAX_DEVICE || self.function > Self::MAX_FUNCTION {
+            return Err(ContextTableError::InvalidDeviceId);
         }
+        Ok(())
     }
+}
+
+/// Owns one independent VT-d second-stage address space.
+///
+/// The domain is non-cloneable. Dropping it first moves every attached
+/// requester to the deny-all domain and synchronously invalidates translation
+/// caches before releasing its page tables.
+pub(crate) struct DmaRemappingDomain {
+    id: DomainId,
+}
+
+impl DmaRemappingDomain {
+    pub(crate) fn new() -> Result<Self, IommuError> {
+        if QUEUE.get().is_none() {
+            return Err(IommuError::NoQueuedInvalidation);
+        }
+        let table = PAGE_TABLE.get().ok_or(IommuError::NoIommu)?;
+        let id = table.lock().create_domain().map_err(map_error)?;
+        Ok(Self { id })
+    }
+
+    /// Attaches a quiesced requester to this domain.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the complete requester group, must have disabled
+    /// bus mastering and interrupts, and must prevent concurrent Host-driver
+    /// access until the domain is detached.
+    pub(crate) unsafe fn attach(&self, device: PciDeviceLocation) -> Result<(), IommuError> {
+        let table = PAGE_TABLE.get().ok_or(IommuError::NoIommu)?;
+        table
+            .lock()
+            .attach_device(device, self.id)
+            .map_err(map_error)?;
+        invalidate_dma_caches();
+        Ok(())
+    }
+
+    /// Maps one contiguous untyped physical range into the domain.
+    ///
+    /// # Safety
+    ///
+    /// The complete physical range must remain untyped and alive until the
+    /// matching [`Self::unmap_pages`] call.
+    pub(crate) unsafe fn map_pages(
+        &self,
+        daddr: Daddr,
+        paddr: Paddr,
+        size: usize,
+    ) -> Result<(), IommuError> {
+        if size == 0 || !size.is_multiple_of(crate::mm::PAGE_SIZE) {
+            return Err(IommuError::InvalidAddress);
+        }
+        daddr.checked_add(size).ok_or(IommuError::InvalidAddress)?;
+        paddr.checked_add(size).ok_or(IommuError::InvalidAddress)?;
+
+        let table = PAGE_TABLE.get().ok_or(IommuError::NoIommu)?;
+        let mut table = table.lock();
+        let mut mapped_size = 0;
+        while mapped_size < size {
+            // SAFETY: The caller guarantees that the whole range remains
+            // untyped and alive through the matching unmap operation.
+            let result = unsafe { table.map(self.id, daddr + mapped_size, paddr + mapped_size) };
+            if let Err(error) = result {
+                let mut rollback_failed = false;
+                for rollback_offset in (0..mapped_size).step_by(crate::mm::PAGE_SIZE) {
+                    if let Err(rollback_error) = table.unmap(self.id, daddr + rollback_offset) {
+                        rollback_failed = true;
+                        crate::error!(
+                            "failed to roll back DMA mapping at {:#x}: {:?}",
+                            daddr + rollback_offset,
+                            rollback_error
+                        );
+                    }
+                }
+                drop(table);
+                invalidate_dma_caches();
+                return Err(if rollback_failed {
+                    IommuError::MappingRollbackFailed
+                } else {
+                    map_error(error)
+                });
+            }
+            mapped_size += crate::mm::PAGE_SIZE;
+        }
+        drop(table);
+        invalidate_dma_caches();
+        Ok(())
+    }
+
+    pub(crate) fn unmap_pages(&self, daddr: Daddr, size: usize) -> Result<(), IommuError> {
+        if size == 0 || !size.is_multiple_of(crate::mm::PAGE_SIZE) {
+            return Err(IommuError::InvalidAddress);
+        }
+        daddr.checked_add(size).ok_or(IommuError::InvalidAddress)?;
+
+        let table = PAGE_TABLE.get().ok_or(IommuError::NoIommu)?;
+        let mut table = table.lock();
+        for offset in (0..size).step_by(crate::mm::PAGE_SIZE) {
+            table.unmap(self.id, daddr + offset).map_err(map_error)?;
+        }
+        drop(table);
+        invalidate_dma_caches();
+        Ok(())
+    }
+}
+
+impl Drop for DmaRemappingDomain {
+    fn drop(&mut self) {
+        let Some(table) = PAGE_TABLE.get() else {
+            return;
+        };
+        let detached_domain = match table.lock().detach_domain(self.id) {
+            Ok(detached_domain) => detached_domain,
+            Err(error) => {
+                crate::error!(
+                    "failed to detach DMA-remapping domain {} during drop: {:?}",
+                    self.id,
+                    error
+                );
+                return;
+            }
+        };
+        let domain_id = detached_domain.id;
+        invalidate_dma_caches();
+        drop(detached_domain);
+        table.lock().recycle_domain_id(domain_id);
+    }
+}
+
+/// Registers an enumerated Host requester in the shared Host domain.
+pub(crate) fn register_host_pci_requester(device: PciDeviceLocation) -> Result<(), IommuError> {
+    let Some(table) = PAGE_TABLE.get() else {
+        return Ok(());
+    };
+    table
+        .lock()
+        .attach_device(device, HOST_DOMAIN_ID)
+        .map_err(map_error)?;
+    invalidate_dma_caches();
+    Ok(())
+}
+
+/// Claims an unregistered requester for a soon-to-be-created isolated domain.
+pub(crate) fn claim_pci_requester(device: PciDeviceLocation) -> Result<(), IommuError> {
+    let Some(table) = PAGE_TABLE.get() else {
+        return Ok(());
+    };
+    table.lock().claim_device(device).map_err(map_error)
+}
+
+/// Releases an unconsumed requester claim.
+pub(crate) fn release_pci_requester(device: PciDeviceLocation) {
+    let Some(table) = PAGE_TABLE.get() else {
+        return;
+    };
+    table.lock().release_device_claim(device);
 }
 
 /// Maps a device address to a physical address.
@@ -86,18 +217,9 @@ pub unsafe fn map(daddr: Daddr, paddr: Paddr) -> Result<(), IommuError> {
         return Err(IommuError::NoIommu);
     };
 
-    // The page table of all devices is the same. So we can use any device ID.
     let mut locked_table = table.lock();
     // SAFETY: The safety is upheld by the caller.
-    let res = unsafe { locked_table.map(PciDeviceLocation::zero(), daddr, paddr) };
-
-    match res {
-        Ok(()) => Ok(()),
-        Err(context_table::ContextTableError::InvalidDeviceId) => unreachable!(),
-        Err(context_table::ContextTableError::ModificationError(err)) => {
-            Err(IommuError::ModificationError(err))
-        }
-    }
+    unsafe { locked_table.map(HOST_DOMAIN_ID, daddr, paddr) }.map_err(map_error)
 }
 
 /// Unmaps a device address.
@@ -108,17 +230,13 @@ pub fn unmap(daddr: Daddr) -> Result<(), IommuError> {
         return Err(IommuError::NoIommu);
     };
 
-    // The page table of all devices is the same. So we can use any device ID.
     let mut locked_table = table.lock();
-    let res = locked_table.unmap(PciDeviceLocation::zero(), daddr);
-
-    match res {
-        Ok(()) => Ok(()),
-        Err(context_table::ContextTableError::InvalidDeviceId) => unreachable!(),
-        Err(context_table::ContextTableError::ModificationError(err)) => {
-            Err(IommuError::ModificationError(err))
-        }
-    }
+    locked_table
+        .unmap(HOST_DOMAIN_ID, daddr)
+        .map_err(map_error)?;
+    drop(locked_table);
+    invalidate_dma_caches();
+    Ok(())
 }
 
 pub fn init() {
@@ -134,24 +252,42 @@ pub fn init() {
         return;
     }
 
-    // Create a Root Table instance.
-    let mut root_table = RootTable::new();
-    // For all PCI devices, use the same page table.
+    // Every enumerated ordinary Host requester is attached to one shared Host
+    // domain. Reserved assignment requesters stay without a context entry
+    // until a reservation creates an isolated domain; after teardown they are
+    // explicitly moved to the deny-all domain.
     //
     // TODO: The BIOS reserves some memory regions as DMA targets and lists them in the Reserved
     // Memory Region Reporting (RMRR) structures. These regions must be mapped for the hardware or
     // firmware to function properly. For more details, see Intel(R) Virtualization Technology for
     // Directed I/O (Revision 5.0), 3.16 Handling Requests to Reserved System Memory.
-    let page_table = PageTable::<IommuPtConfig>::empty();
-    for table in PciDeviceLocation::all() {
-        root_table.specify_device_page_table(table, unsafe { page_table.shallow_copy() })
-    }
-    PAGE_TABLE.call_once(|| SpinLock::new(root_table));
+    PAGE_TABLE.call_once(|| SpinLock::new(RootTable::new()));
 
     // Enable DMA remapping.
     let mut iommu_regs = IOMMU_REGS.get().unwrap().lock();
     iommu_regs.enable_dma_remapping(PAGE_TABLE.get().unwrap());
     info!("DMA remapping enabled");
+}
+
+fn invalidate_dma_caches() {
+    IOMMU_REGS
+        .get()
+        .expect("DMA remapping requires IOMMU registers")
+        .lock()
+        .invalidate_dma_caches();
+}
+
+fn map_error(error: ContextTableError) -> IommuError {
+    match error {
+        ContextTableError::ModificationError(error) => IommuError::ModificationError(error),
+        ContextTableError::AlreadyMapped => IommuError::AlreadyMapped,
+        ContextTableError::InvalidAddress => IommuError::InvalidAddress,
+        ContextTableError::InvalidDeviceId => IommuError::InvalidDevice,
+        ContextTableError::DeviceBusy => IommuError::DeviceBusy,
+        ContextTableError::InvalidDomain => IommuError::InvalidDomain,
+        ContextTableError::NoDomainIds => IommuError::NoDomainIds,
+        ContextTableError::NotMapped => IommuError::NotMapped,
+    }
 }
 
 // TODO: Currently `map()` or `unmap()` could be called in both task and interrupt

@@ -33,7 +33,7 @@ use crate::{
             fault,
             invalidate::{
                 QUEUE,
-                descriptor::{InterruptEntryCache, InvalidationWait},
+                descriptor::{ContextCache, InterruptEntryCache, InvalidationWait, IoTlb},
             },
         },
         kernel::acpi::dmar::{Dmar, Remapping},
@@ -197,37 +197,15 @@ impl IommuRegisters {
 
     // Invalidates Interrupt-remapping cache.
     pub(super) fn invalidate_interrupt_cache(&mut self) {
-        if !self.read_global_status().contains(GlobalStatus::QIES) {
-            self.global_invalidation();
-            return;
-        }
+        assert!(
+            self.read_global_status().contains(GlobalStatus::QIES),
+            "interrupt remapping requires queued invalidation"
+        );
 
-        let mut queue = QUEUE.get().unwrap().lock();
-
-        // Currently, we don't support asynchronous processing in the queue. Therefore, when we
-        // lock the queue, we know that it is empty and that the Invalidation Completion Status
-        // Register has been cleared.
-
-        // Construct an Interrupt Entry Cache Invalidate Descriptor.
-        queue.append_descriptor(InterruptEntryCache::global_invalidation().0);
-        // Construct an Invalidation Wait Descriptor. We need to set the interrupt flag so that the
-        // Invalidation Completion Status Register can report the completion status.
-        queue.append_descriptor(InvalidationWait::with_interrupt_flag().0);
-
-        // Update the queue tail.
-        let tail = queue.tail();
-        self.invalidate
-            .queue_tail
-            .as_mut_ptr()
-            .write((tail << 4) as u64);
-
-        // Wait for completion.
-        while self.invalidate.completion_status.as_ptr().read() == 0 {}
-        // Clear the Invalidation Completion Status Register.
-        self.invalidate.completion_status.as_mut_ptr().write(1);
+        self.submit_invalidation_descriptors(&[InterruptEntryCache::global_invalidation().0]);
     }
 
-    fn global_invalidation(&mut self) {
+    fn invalidate_legacy_dma_caches(&mut self) {
         // Set ICC(63) to 1 to requests invalidation and CIRG(62:61) to 01 to indicate global invalidation request.
         self.context_command
             .as_mut_ptr()
@@ -244,6 +222,39 @@ impl IommuRegisters {
             .iotlb_invalidate
             .as_mut_ptr()
             .write(0x9000_0000_0000_0000);
+        while self.invalidate.iotlb_invalidate.as_ptr().read() & (1 << 63) != 0 {}
+    }
+
+    pub(super) fn invalidate_dma_caches(&mut self) {
+        if !self.read_global_status().contains(GlobalStatus::QIES) {
+            self.invalidate_legacy_dma_caches();
+            return;
+        }
+
+        self.submit_invalidation_descriptors(&[
+            ContextCache::global_invalidation().0,
+            IoTlb::global_invalidation().0,
+        ]);
+    }
+
+    fn submit_invalidation_descriptors(&mut self, descriptors: &[u128]) {
+        let mut queue = QUEUE.get().unwrap().lock();
+
+        // The queue lock serializes synchronous submissions. Completion of the previous wait
+        // descriptor guarantees that every slot before the software tail can be reused.
+        for descriptor in descriptors {
+            queue.append_descriptor(*descriptor);
+        }
+        queue.append_descriptor(InvalidationWait::with_interrupt_flag().0);
+
+        let tail = queue.tail();
+        self.invalidate
+            .queue_tail
+            .as_mut_ptr()
+            .write((tail << 4) as u64);
+
+        while self.invalidate.completion_status.as_ptr().read() == 0 {}
+        self.invalidate.completion_status.as_mut_ptr().write(1);
     }
 
     /// Writes value to the global command register. This function will not wait until the command
@@ -295,7 +306,9 @@ impl IommuRegisters {
         // - `io_mem_builder.remove()` guarantees that we have exclusive ownership of all the IOMMU
         //   registers.
         let iommu_regs = unsafe {
-            fault::init(base);
+            if !fault::init(base) {
+                return None;
+            }
 
             Self {
                 version: VolatileRef::new_read_only(base.cast::<u32>()),

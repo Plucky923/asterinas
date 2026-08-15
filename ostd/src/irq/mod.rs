@@ -79,7 +79,7 @@ mod top_half;
 pub use bottom_half::{register_bottom_half_handler_l1, register_bottom_half_handler_l2};
 pub use guard::{DisabledLocalIrqGuard, disable_local};
 pub use level::InterruptLevel;
-pub use top_half::{IrqCallbackFunction, IrqLine};
+pub use top_half::{IrqCallbackFunction, IrqLine, PciIrqRequester};
 
 use crate::{
     arch::{irq::HwIrqLine, trap::TrapFrame},

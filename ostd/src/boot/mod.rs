@@ -47,6 +47,72 @@ pub fn boot_info() -> &'static BootInfo {
 
 static INFO: Once<BootInfo> = Once::new();
 
+/// OSTD-internal symbol images supplied by the boot protocol.
+///
+/// The two images have different formats and consumers. They are grouped in
+/// one handoff so that the public [`BootInfo`] does not expose bootloader
+/// storage or format-specific symbol payloads.
+#[derive(Clone, Copy)]
+pub(crate) struct BootSymbolSources {
+    kernel_elf: Option<KernelSymbolImage>,
+    framevm_fvsymtb: Option<FrameVmSymbolImage>,
+}
+
+impl BootSymbolSources {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            kernel_elf: None,
+            framevm_fvsymtb: None,
+        }
+    }
+
+    pub(crate) const fn new(
+        kernel_elf: Option<KernelSymbolImage>,
+        framevm_fvsymtb: Option<FrameVmSymbolImage>,
+    ) -> Self {
+        Self {
+            kernel_elf,
+            framevm_fvsymtb,
+        }
+    }
+
+    pub(crate) const fn kernel_elf(self) -> Option<KernelSymbolImage> {
+        self.kernel_elf
+    }
+
+    pub(crate) const fn framevm_fvsymtb(self) -> Option<FrameVmSymbolImage> {
+        self.framevm_fvsymtb
+    }
+}
+
+/// A bootloader-resident kernel ELF image.
+#[derive(Clone, Copy)]
+pub(crate) struct KernelSymbolImage(&'static [u8]);
+
+impl KernelSymbolImage {
+    pub(crate) const fn new(bytes: &'static [u8]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn bytes(self) -> &'static [u8] {
+        self.0
+    }
+}
+
+/// A bootloader-resident FrameVM FVSYMTB image.
+#[derive(Clone, Copy)]
+pub(crate) struct FrameVmSymbolImage(&'static [u8]);
+
+impl FrameVmSymbolImage {
+    pub(crate) const fn new(bytes: &'static [u8]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) const fn bytes(self) -> &'static [u8] {
+        self.0
+    }
+}
+
 /// ACPI information from the bootloader.
 ///
 /// The boot crate can choose either providing the raw RSDP physical address or
@@ -93,6 +159,7 @@ pub(crate) struct EarlyBootInfo {
     pub(crate) bootloader_name: &'static str,
     pub(crate) kernel_cmdline: &'static str,
     pub(crate) initramfs: Option<&'static [u8]>,
+    pub(crate) symbol_sources: BootSymbolSources,
     pub(crate) acpi_arg: BootloaderAcpiArg,
     pub(crate) framebuffer_arg: Option<BootloaderFramebufferArg>,
     pub(crate) memory_regions: MemoryRegionArray,
@@ -100,6 +167,11 @@ pub(crate) struct EarlyBootInfo {
 
 /// The boot-time information.
 pub(crate) static EARLY_INFO: Once<EarlyBootInfo> = Once::new();
+
+/// Returns the bootloader-provided symbol images to OSTD's symbol subsystem.
+pub(crate) fn symbol_sources() -> BootSymbolSources {
+    EARLY_INFO.get().unwrap().symbol_sources
+}
 
 /// Initializes the boot information.
 ///

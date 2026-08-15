@@ -8,6 +8,7 @@ use int_to_c_enum::TryFromInt;
 
 use super::IrtEntryHandle;
 use crate::{
+    irq::PciIrqRequester,
     mm::{FrameAllocOptions, HasPaddr, PAGE_SIZE, Segment, io::util::HasVmReaderWriter},
     sync::{LocalIrqDisabled, SpinLock},
 };
@@ -39,6 +40,10 @@ impl IntRemappingTable {
             index: index as u16,
             table: self,
         })
+    }
+
+    pub(super) fn free(&self, index: u16) {
+        self.allocator.lock().free(index as usize);
     }
 
     /// Creates an Interrupt Remapping Table with one page.
@@ -166,8 +171,22 @@ impl IrtEntry {
     /// Creates an enabled entry with no validation,
     ///
     /// DST = 0, IM = 0, DLM = 0, TM = 0, RH = 0, DM = 0, FPD = 1, P = 1
-    pub(super) fn new_enabled(vector: u32) -> Self {
+    pub(super) fn new_enabled(vector: u8) -> Self {
         Self(0b11 | ((vector as u128) << 16))
+    }
+
+    /// Creates an enabled entry that accepts one exact PCI requester.
+    pub(super) fn new_source_bound(vector: u8, requester: PciIrqRequester) -> Self {
+        const REQUESTER_ID_VALIDATION: u128 = 1 << 82;
+        Self(
+            1 | ((vector as u128) << 16)
+                | ((requester.raw() as u128) << 64)
+                | REQUESTER_ID_VALIDATION,
+        )
+    }
+
+    pub(super) const fn disabled() -> Self {
+        Self(0)
     }
 
     fn as_raw_u64(&self) -> [u64; 2] {
@@ -180,8 +199,8 @@ impl IrtEntry {
     }
 
     pub fn source_id_qualifier(&self) -> SourceIdQualifier {
-        const SQ_MASK: u128 = 0x3 << 82;
-        SourceIdQualifier::try_from(((self.0 & SQ_MASK) >> 82) as u32).unwrap()
+        const SQ_MASK: u128 = 0x3 << 80;
+        SourceIdQualifier::try_from(((self.0 & SQ_MASK) >> 80) as u32).unwrap()
     }
 
     pub const fn source_identifier(&self) -> u32 {
@@ -261,5 +280,30 @@ bitflags! {
         /// - 0: Remapped Mode.
         /// - 1: Posted Mode.
         const IM =          1 << 15;
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use super::*;
+    use crate::prelude::ktest;
+
+    #[ktest]
+    fn source_bound_entry_requires_exact_requester() {
+        let requester = PciIrqRequester::new(0x12, 3, 1).unwrap();
+        let entry = IrtEntry::new_source_bound(0x40, requester);
+
+        assert_eq!(entry.vector(), 0x40);
+        assert_eq!(entry.source_identifier(), 0x1219);
+        assert!(matches!(
+            entry.source_validation_type(),
+            SourceValidationType::RequesterId
+        ));
+        assert!(matches!(
+            entry.source_id_qualifier(),
+            SourceIdQualifier::All
+        ));
+        assert!(entry.flags().contains(IrtEntryFlags::P));
+        assert!(!entry.flags().contains(IrtEntryFlags::FPD));
     }
 }

@@ -8,7 +8,7 @@ use super::{
     Frame, inc_frame_ref_count,
     meta::{AnyFrameMeta, GetFrameError},
 };
-use crate::mm::{AnyUFrameMeta, HasPaddr, HasSize, PAGE_SIZE, Paddr, Split};
+use crate::mm::{AnyUFrameMeta, HasPaddr, HasSize, PAGE_SIZE, Paddr, Split, paddr_to_vaddr};
 
 /// A contiguous range of homogeneous physical memory frames.
 ///
@@ -152,6 +152,14 @@ impl<M: AnyFrameMeta + ?Sized> Split for Segment<M> {
 }
 
 impl<M: AnyFrameMeta + ?Sized> Segment<M> {
+    /// Zeroes every physical page covered by this segment.
+    #[doc(hidden)]
+    pub fn zero(&self) {
+        let address = paddr_to_vaddr(self.paddr()) as *mut u8;
+        // SAFETY: A live segment contains only valid, linearly mapped pages.
+        unsafe { core::ptr::write_bytes(address, 0, self.size()) }
+    }
+
     /// Gets an extra handle to the frames in the byte offset range.
     ///
     /// The sliced byte offset range in indexed by the offset from the start of

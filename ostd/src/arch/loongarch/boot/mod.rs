@@ -133,12 +133,13 @@ unsafe extern "C" fn loongarch_boot(
     // SAFETY: The caller ensures the correctness of `cmdline_paddr`.
     let cmdline = unsafe { CStr::from_ptr(cmdline_ptr) }.to_str();
 
-    use crate::boot::{EARLY_INFO, EarlyBootInfo, start_kernel};
+    use crate::boot::{BootSymbolSources, EARLY_INFO, EarlyBootInfo, start_kernel};
 
     EARLY_INFO.call_once(|| EarlyBootInfo {
         bootloader_name: parse_bootloader_name(),
         kernel_cmdline: cmdline.unwrap_or(""),
         initramfs: parse_initramfs(),
+        symbol_sources: BootSymbolSources::empty(),
         acpi_arg: parse_acpi_arg(),
         framebuffer_arg: parse_framebuffer_info(),
         memory_regions: parse_memory_regions(),

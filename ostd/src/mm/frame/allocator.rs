@@ -64,6 +64,13 @@ impl FrameAllocOptions {
             unsafe { core::ptr::write_bytes(addr, 0, PAGE_SIZE) }
         }
 
+        let accepted = get_global_frame_allocator()
+            .on_frame_allocated(Frame::<dyn AnyFrameMeta>::from_unsized(frame.clone()));
+        if !accepted {
+            drop(frame);
+            return Err(Error::NoMemory);
+        }
+
         Ok(frame)
     }
 
@@ -99,6 +106,13 @@ impl FrameAllocOptions {
             let addr = paddr_to_vaddr(segment.paddr()) as *mut u8;
             // SAFETY: The newly allocated segment is guaranteed to be valid.
             unsafe { core::ptr::write_bytes(addr, 0, nframes * PAGE_SIZE) }
+        }
+
+        let accepted = get_global_frame_allocator()
+            .on_segment_allocated(Segment::<dyn AnyFrameMeta>::from_unsized(segment.clone()));
+        if !accepted {
+            drop(segment);
+            return Err(Error::NoMemory);
         }
 
         Ok(segment)
@@ -173,6 +187,29 @@ pub trait GlobalFrameAllocator: Sync {
     ///
     /// The added memory can be uninitialized.
     fn add_free_memory(&self, addr: Paddr, size: usize);
+
+    /// Accepts a frame after OSTD has initialized its metadata and reference
+    /// count.
+    ///
+    /// The default implementation keeps the historical allocator contract.
+    /// A provider that maintains an ownership domain can retain the supplied
+    /// clone as its hidden owner. Returning `false` rejects the allocation;
+    /// OSTD drops the public frame and reports [`Error::NoMemory`].
+    fn on_frame_allocated(&self, _frame: Frame<dyn AnyFrameMeta>) -> bool {
+        true
+    }
+
+    /// Accepts a segment after OSTD has initialized all member frames.
+    ///
+    /// Returning `false` rejects the allocation and lets OSTD drop the public
+    /// segment, which invokes the normal deallocation path for every member.
+    fn on_segment_allocated(&self, _segment: Segment<dyn AnyFrameMeta>) -> bool {
+        true
+    }
+
+    /// Notifies a provider that one public reference has drained and only its
+    /// hidden ownership reference may remain.
+    fn on_frame_idle(&self, _paddr: Paddr) {}
 }
 
 unsafe extern "Rust" {
@@ -186,6 +223,44 @@ pub(super) fn get_global_frame_allocator() -> &'static dyn GlobalFrameAllocator 
     // `global_frame_allocator` attribute. If they use safe code only, the
     // up-call is safe.
     unsafe { __GLOBAL_FRAME_ALLOCATOR_REF }
+}
+
+pub(super) fn notify_frame_idle(paddr: Paddr) {
+    get_global_frame_allocator().on_frame_idle(paddr);
+}
+
+/// Allocates raw physical pages from the configured global allocator.
+///
+/// This is an OSTD integration seam for a provider that needs to let OSTD
+/// construct the typed [`Frame`] or [`Segment`] value itself. The returned
+/// range is unused until OSTD wraps it; callers must either complete that
+/// construction or call [`dealloc_raw`].
+#[doc(hidden)]
+pub fn alloc_raw(layout: Layout) -> Option<Paddr> {
+    get_global_frame_allocator().alloc(layout)
+}
+
+/// Returns raw pages obtained from [`alloc_raw`] to the global allocator.
+#[doc(hidden)]
+pub fn dealloc_raw(addr: Paddr, size: usize) {
+    get_global_frame_allocator().dealloc(addr, size);
+}
+
+/// Zeroes a raw page range obtained from [`alloc_raw`].
+///
+/// This is intentionally hidden from ordinary OSTD users.  FrameVisor uses it
+/// while a range is between the Host allocator and an image-defined provider,
+/// before OSTD has constructed `Frame` metadata for the range.
+#[doc(hidden)]
+pub fn zero_raw(addr: Paddr, size: usize) -> Result<()> {
+    if addr % PAGE_SIZE != 0 || size == 0 || size % PAGE_SIZE != 0 {
+        return Err(Error::InvalidArgs);
+    }
+    let address = paddr_to_vaddr(addr) as *mut u8;
+    // SAFETY: The caller owns a page-aligned range returned by `alloc_raw` and
+    // keeps it allocated for the duration of this operation.
+    unsafe { core::ptr::write_bytes(address, 0, size) };
+    Ok(())
 }
 
 /// Initializes the global frame allocator.

@@ -1,0 +1,13 @@
+[package]
+name = "framev-pci-common"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+framev-blk-common.workspace = true
+framev-console-common.workspace = true
+framev-net-common.workspace = true
+framev-rng-common.workspace = true
+
+[lints]
+workspace = true

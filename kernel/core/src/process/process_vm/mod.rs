@@ -9,6 +9,7 @@
 //! the basic info of process level vm segments,
 //! like init stack and heap.
 
+mod aio;
 mod heap;
 mod init_stack;
 
@@ -67,6 +68,8 @@ use crate::{
 
 /// The process user space virtual memory
 pub(crate) struct ProcessVm {
+    /// The native AIO contexts owned by this address space.
+    aio_contexts: Mutex<aio::AioContextTable>,
     /// The initial portion of the main stack of a process.
     init_stack: InitStack,
     /// The user heap
@@ -86,6 +89,7 @@ impl ProcessVm {
     /// Creates a new `ProcessVm` without mapping anything.
     pub(super) fn new(executable_path: Path) -> Self {
         Self {
+            aio_contexts: Mutex::new(aio::AioContextTable::new()),
             init_stack: InitStack::new(),
             heap: Heap::new_uninitialized(),
             code_range: SpinLock::new(0..0),
@@ -99,6 +103,7 @@ impl ProcessVm {
     /// Creates a new `ProcessVm` with identical contents of an existing one.
     pub(crate) fn fork_from(process_vm: &Self, heap_guard: &LockedHeap) -> Self {
         Self {
+            aio_contexts: Mutex::new(aio::AioContextTable::new()),
             init_stack: process_vm.init_stack.clone(),
             heap: Heap::fork_from(heap_guard),
             code_range: SpinLock::new(process_vm.code_range.lock().clone()),
@@ -107,6 +112,16 @@ impl ProcessVm {
             #[cfg(target_arch = "riscv64")]
             vdso_base: AtomicUsize::new(process_vm.vdso_base.load(Ordering::Relaxed)),
         }
+    }
+
+    /// Creates a native AIO context in this address space.
+    pub(crate) fn create_aio_context(&self, max_events: u32) -> Result<u64> {
+        self.aio_contexts.lock().create(max_events)
+    }
+
+    /// Removes a native AIO context from this address space.
+    pub(crate) fn remove_aio_context(&self, context_id: u64) -> bool {
+        self.aio_contexts.lock().remove(context_id)
     }
 
     /// Returns the initial portion of the main stack of a process.

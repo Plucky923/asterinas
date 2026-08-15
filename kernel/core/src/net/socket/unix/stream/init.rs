@@ -126,8 +126,8 @@ impl Init {
     }
 
     pub(super) fn check_io_events(&self) -> IoEvents {
-        // According to the Linux implementation, we always have `IoEvents::HUP` and
-        // `IoEvents::HUP` in this state.
+        // According to the Linux implementation, `IoEvents::OUT` and `IoEvents::HUP` are always
+        // present in this state.
         IoEvents::OUT | IoEvents::HUP
     }
 }

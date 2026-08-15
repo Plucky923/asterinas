@@ -15,7 +15,7 @@
 use alloc::sync::Arc;
 use core::{mem::ManuallyDrop, time::Duration};
 
-use aster_time::{Instant, read_monotonic_time};
+use aster_time::read_monotonic_time;
 use aster_util::coeff::Coeff;
 use ostd::{
     const_assert,
@@ -160,31 +160,31 @@ impl VdsoData {
         self.basetime[clockid].nanos_info = nanos_info;
     }
 
-    fn update_high_res_instant(&mut self, instant: Instant, instant_cycles: u64) {
+    fn update_high_res_instant(&mut self, instant: Duration, instant_cycles: u64) {
         self.last_cycles = instant_cycles;
         for clock_id in HIGH_RES_CLOCK_IDS {
             let secs = if clock_id == ClockId::CLOCK_REALTIME {
-                instant.secs() + START_SECS_COUNT.get().unwrap()
+                instant.as_secs() + START_SECS_COUNT.get().unwrap()
             } else {
-                instant.secs()
+                instant.as_secs()
             };
 
             self.update_clock_instant(
                 clock_id as usize,
                 secs,
-                (instant.nanos() as u64) << self.shift as u64,
+                (instant.subsec_nanos() as u64) << self.shift as u64,
             );
         }
     }
 
-    fn update_coarse_res_instant(&mut self, instant: Instant) {
+    fn update_coarse_res_instant(&mut self, instant: Duration) {
         for clock_id in COARSE_RES_CLOCK_IDS {
             let secs = if clock_id == ClockId::CLOCK_REALTIME_COARSE {
-                instant.secs() + START_SECS_COUNT.get().unwrap()
+                instant.as_secs() + START_SECS_COUNT.get().unwrap()
             } else {
-                instant.secs()
+                instant.as_secs()
             };
-            self.update_clock_instant(clock_id as usize, secs, instant.nanos() as u64);
+            self.update_clock_instant(clock_id as usize, secs, instant.subsec_nanos() as u64);
         }
     }
 }
@@ -270,7 +270,7 @@ impl Vdso {
         }
     }
 
-    fn update_high_res_instant(&self, instant: Instant, instant_cycles: u64) {
+    fn update_high_res_instant(&self, instant: Duration, instant_cycles: u64) {
         let mut data = self.data.lock();
 
         data.update_high_res_instant(instant, instant_cycles);
@@ -289,7 +289,7 @@ impl Vdso {
         self.finish_update_data_frame(&mut data);
     }
 
-    fn update_coarse_res_instant(&self, instant: Instant) {
+    fn update_coarse_res_instant(&self, instant: Duration) {
         let mut data = self.data.lock();
 
         data.update_coarse_res_instant(instant);
@@ -344,7 +344,7 @@ impl Vdso {
 }
 
 /// Updates instants with respect to high-resolution clocks in vDSO data.
-fn update_vdso_high_res_instant(instant: Instant, instant_cycles: u64) {
+fn update_vdso_high_res_instant(instant: Duration, instant_cycles: u64) {
     VDSO.get()
         .unwrap()
         .update_high_res_instant(instant, instant_cycles);
@@ -352,7 +352,7 @@ fn update_vdso_high_res_instant(instant: Instant, instant_cycles: u64) {
 
 /// Updates instants with respect to coarse-resolution clocks in vDSO data.
 fn update_vdso_coarse_res_instant(_guard: TimerGuard) {
-    let instant = Instant::from(read_monotonic_time());
+    let instant = read_monotonic_time();
     VDSO.get().unwrap().update_coarse_res_instant(instant);
 }
 

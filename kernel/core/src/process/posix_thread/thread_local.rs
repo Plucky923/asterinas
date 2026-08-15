@@ -8,7 +8,7 @@ use ostd::{
     arch::cpu::context::FpuContext, irq::DisabledLocalIrqGuard, sync::RwArc, task::CurrentTask,
 };
 
-use super::{RobustListHead, cpu_sync::CpuSync};
+use super::cpu_sync::CpuSync;
 use crate::{
     fs::{file::file_table::FileTable, thread_info::ThreadFsInfo},
     prelude::*,
@@ -32,7 +32,7 @@ pub(crate) struct ThreadLocal {
 
     // Robust futexes.
     // https://man7.org/linux/man-pages/man2/get_robust_list.2.html
-    robust_list: RefCell<Option<RobustListHead>>,
+    robust_list: RefCell<Option<Vaddr>>,
 
     // Files.
     /// File table.
@@ -138,7 +138,7 @@ impl ThreadLocal {
         self.page_fault_disabled.get()
     }
 
-    pub(crate) fn robust_list(&self) -> &RefCell<Option<RobustListHead>> {
+    pub(crate) fn robust_list(&self) -> &RefCell<Option<Vaddr>> {
         &self.robust_list
     }
 
@@ -307,6 +307,11 @@ pub(crate) type NsProxyRef<'a> = ThreadLocalOptionRef<'a, Arc<NsProxy>>;
 pub(crate) struct ThreadLocalOptionRef<'a, T>(Ref<'a, Option<T>>);
 
 impl<T> ThreadLocalOptionRef<'_, T> {
+    /// Returns a reference to the data if it has not been dropped.
+    pub fn as_ref(&self) -> Option<&T> {
+        self.0.as_ref()
+    }
+
     /// Unwraps and returns a reference to the data.
     ///
     /// # Panics

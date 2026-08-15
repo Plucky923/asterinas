@@ -15,6 +15,12 @@ const PTRS_PER_BLOCK: usize = BLOCK_SIZE / size_of::<u32>();
 const SECTORS_PER_BLOCK: u32 = (BLOCK_SIZE / SECTOR_SIZE) as u32;
 const MAX_BLOCK_POINTER_LEVELS: usize = 4;
 
+#[derive(Clone, Copy)]
+pub(super) enum NewBlockInitialization {
+    Storage,
+    Writeback,
+}
+
 /// An ext2 inode's block-pointer tree.
 ///
 /// Each tree is rooted in the 15 raw block pointer slots stored in the inode.
@@ -113,6 +119,36 @@ impl BlockPtrTree {
         iblock: Iblock,
         max_blocks: u32,
     ) -> Result<ResolvedBlockRange> {
+        self.resolve_block_range_with_initialization(
+            fs,
+            iblock,
+            max_blocks,
+            NewBlockInitialization::Storage,
+        )
+    }
+
+    /// Resolves blocks whose payload is already staged for writeback.
+    pub(in crate::fs::fs_impls::ext2::inode) fn resolve_writeback_block_range(
+        &mut self,
+        fs: &Ext2,
+        iblock: Iblock,
+        max_blocks: u32,
+    ) -> Result<ResolvedBlockRange> {
+        self.resolve_block_range_with_initialization(
+            fs,
+            iblock,
+            max_blocks,
+            NewBlockInitialization::Writeback,
+        )
+    }
+
+    fn resolve_block_range_with_initialization(
+        &mut self,
+        fs: &Ext2,
+        iblock: Iblock,
+        max_blocks: u32,
+        initialization: NewBlockInitialization,
+    ) -> Result<ResolvedBlockRange> {
         if max_blocks == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
@@ -127,7 +163,8 @@ impl BlockPtrTree {
         // Allocate the missing indirect metadata blocks, plus as many contiguous
         // data blocks as we can place before the current leaf boundary.
         let (indirect_blks, data_blks) = self.planned_allocation(&walk, max_blocks)?;
-        let mut guard = self.allocate_blocks(fs, indirect_blks, data_blks, &walk)?;
+        let mut guard =
+            self.allocate_blocks(fs, indirect_blks, data_blks, &walk, initialization)?;
         self.link_allocated_blocks(&guard, &walk)?;
         guard.commit();
         Ok(ResolvedBlockRange::NewlyAllocated(
@@ -642,6 +679,7 @@ impl BlockPtrTree {
         indirect_blks: u32,
         data_blks: u32,
         walk: &BlockPointerWalk,
+        initialization: NewBlockInitialization,
     ) -> Result<BlockAllocGuard<'a>> {
         let mut alloc_goal = walk
             .visited_entries
@@ -671,12 +709,14 @@ impl BlockPtrTree {
         guard.track_data_blocks(data_blocks_range.clone());
         debug_assert!(allocated_count > 0 && allocated_count <= data_blks);
 
-        // We must wait until the blocks are initialized before we can proceed.
-        // Otherwise, concurrent page faults may see uninitialized blocks.
-        //
-        // TODO: In the write path, if the entire block is going to be
-        // overwritten, we should write the real payload instead of zeroing it.
-        Self::zero_new_blocks(fs, &data_blocks_range)?;
+        // Initialize before linking so concurrent page faults cannot observe old
+        // storage contents through the new mapping. Buffered writes establish
+        // zero pages in the cache and subsequently replace them with payload;
+        // allocation-only and direct-I/O paths initialize storage itself.
+        match initialization {
+            NewBlockInitialization::Storage => Self::zero_new_blocks(fs, &data_blocks_range)?,
+            NewBlockInitialization::Writeback => {}
+        }
 
         Ok(guard)
     }

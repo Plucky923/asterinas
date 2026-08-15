@@ -17,7 +17,9 @@ pub(super) fn sys_kill(process_filter: u64, sig_num: u64, ctx: &Context) -> Resu
     let sig_num = if sig_num == 0 {
         None
     } else {
-        Some(SigNum::try_from(sig_num as u8)?)
+        let sig_num = u8::try_from(sig_num)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid signal number"))?;
+        Some(SigNum::try_from(sig_num)?)
     };
     debug!(
         "process_filter = {:?}, sig_num = {:?}",

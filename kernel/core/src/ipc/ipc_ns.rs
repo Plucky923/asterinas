@@ -24,7 +24,9 @@ use crate::{
     fs::pseudofs::{NsCommonOps, NsType, StashedDentry},
     prelude::*,
     process::{
-        Credentials, UserNamespace, credentials::capabilities::CapSet, posix_thread::PosixThread,
+        Credentials, UserNamespace,
+        credentials::capabilities::CapSet,
+        posix_thread::{AsPosixThread, PosixThread},
     },
     security::lsm::hooks as lsm_hooks,
 };
@@ -101,7 +103,7 @@ impl IpcNamespace {
         F: FnOnce(&SemaphoreSet) -> Result<T>,
     {
         self.sem_ids.with(semid, |sem_set| {
-            Self::validate_sem_set(sem_set, required_perm)?;
+            self.validate_sem_set(sem_set, required_perm)?;
             op(sem_set)
         })?
     }
@@ -142,7 +144,7 @@ impl IpcNamespace {
                     return_errno_with_message!(Errno::ENOENT, "the key does not exist");
                 }
 
-                Self::validate_sem_set(sem_set, PermissionMode::ALTER | PermissionMode::READ)?;
+                self.validate_sem_set(sem_set, PermissionMode::ALTER | PermissionMode::READ)?;
 
                 if flags.contains(IpcFlags::IPC_CREAT | IpcFlags::IPC_EXCL) {
                     return_errno_with_message!(
@@ -174,13 +176,48 @@ impl IpcNamespace {
         }
     }
 
-    fn validate_sem_set(_sem_set: &SemaphoreSet, required_perm: PermissionMode) -> Result<()> {
-        if !required_perm.is_empty() {
-            // TODO: Support permission check
-            warn!("Semaphore doesn't support permission check now");
+    fn validate_sem_set(
+        &self,
+        sem_set: &SemaphoreSet,
+        required_perm: PermissionMode,
+    ) -> Result<()> {
+        if required_perm.is_empty() {
+            return Ok(());
         }
 
-        Ok(())
+        let current = current_thread!();
+        let posix_thread = current.as_posix_thread().unwrap();
+        let credentials = posix_thread.credentials();
+        let permission = sem_set.permission();
+        let is_owner =
+            credentials.euid() == permission.uid() || credentials.euid() == permission.cuid();
+        let is_group = credentials.egid() == permission.gid()
+            || credentials.egid() == permission.cguid()
+            || credentials.groups().contains(&permission.gid())
+            || credentials.groups().contains(&permission.cguid());
+        let shift = if is_owner {
+            6
+        } else if is_group {
+            3
+        } else {
+            0
+        };
+        let granted = PermissionMode::from_bits_truncate(permission.mode() >> shift);
+        if granted.contains(required_perm) {
+            return Ok(());
+        }
+
+        if lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+            self.owner.as_ref(),
+            posix_thread,
+            CapSet::IPC_OWNER,
+        ))
+        .is_ok()
+        {
+            return Ok(());
+        }
+
+        return_errno_with_message!(Errno::EACCES, "semaphore permission denied")
     }
 
     /// Creates a new semaphore set and returns its ID.

@@ -17,8 +17,8 @@ use ostd::{
     },
 };
 
-use super::{CurrentRuntime, SchedAttr, SchedClassRq, time::base_slice_clocks};
-use crate::thread::AsThread;
+use super::{CurrentRuntime, SchedClassRq, time::base_slice_clocks};
+use crate::thread::{AsThread, Thread};
 
 pub(crate) type RealTimePriority = RangedU8<1, 99>;
 
@@ -132,6 +132,24 @@ impl PrioArray {
         Some(thread)
     }
 
+    fn remove_task(&mut self, task: &Arc<Task>) -> usize {
+        let mut removed = 0usize;
+        for prio in self.map.iter_ones().collect::<alloc::vec::Vec<_>>() {
+            let queue = &mut self.queue[prio];
+            queue.retain(|queued| {
+                let should_remove = Arc::ptr_eq(queued, task);
+                if should_remove {
+                    removed = removed.saturating_add(1);
+                }
+                !should_remove
+            });
+            if queue.is_empty() {
+                self.map.set(prio, false);
+            }
+        }
+        removed
+    }
+
     fn peek_prio(&self) -> Option<u8> {
         let prio = self.map.iter_ones().next()?;
         Some(prio as u8)
@@ -192,6 +210,17 @@ impl SchedClassRq for RealTimeClassRq {
         self.nr_running += 1;
     }
 
+    fn remove_queued_task(&mut self, task: &Arc<Task>) -> bool {
+        let removed = self
+            .active_array()
+            .remove_task(task)
+            .saturating_add(self.inactive_array().remove_task(task));
+        if removed > 0 {
+            self.nr_running = self.nr_running.saturating_sub(removed);
+        }
+        removed > 0
+    }
+
     fn len(&self) -> usize {
         self.nr_running
     }
@@ -213,13 +242,8 @@ impl SchedClassRq for RealTimeClassRq {
             .inspect(|_| self.nr_running -= 1)
     }
 
-    fn update_current(
-        &mut self,
-        rt: &CurrentRuntime,
-        attr: &SchedAttr,
-        flags: UpdateFlags,
-    ) -> bool {
-        let attr = &attr.real_time;
+    fn update_current(&mut self, rt: &CurrentRuntime, thread: &Thread, flags: UpdateFlags) -> bool {
+        let attr = &thread.sched_attr().real_time;
 
         match flags {
             UpdateFlags::Tick | UpdateFlags::Yield => match attr.time_slice.load(Relaxed) {

@@ -13,6 +13,7 @@ macro_rules! import_generic_syscall_entries {
         use $crate::syscall::{
             accept::{sys_accept, sys_accept4},
             access::{sys_faccessat, sys_faccessat2},
+            aio::{sys_io_destroy, sys_io_setup},
             bind::sys_bind,
             brk::sys_brk,
             capget::sys_capget,
@@ -22,7 +23,7 @@ macro_rules! import_generic_syscall_entries {
             chown::{sys_fchown, sys_fchownat},
             chroot::sys_chroot,
             clock_gettime::sys_clock_gettime,
-            clone::{sys_clone, sys_clone3},
+            clone::{sys_clone_generic, sys_clone3},
             close::{sys_close, sys_close_range},
             connect::sys_connect,
             dup::{sys_dup, sys_dup3},
@@ -208,6 +209,8 @@ macro_rules! define_syscalls_with_generic_syscall_table {
 
         $crate::syscall::impl_syscall_nums_and_dispatch_fn! {
             // Generic syscalls
+            SYS_IO_SETUP = 0                  => sys_io_setup(args[..2]);
+            SYS_IO_DESTROY = 1                => sys_io_destroy(args[..1]);
             SYS_SETXATTR = 5                 => sys_setxattr(args[..5]);
             SYS_LSETXATTR = 6                => sys_lsetxattr(args[..5]);
             SYS_FSETXATTR = 7                => sys_fsetxattr(args[..5]);
@@ -381,7 +384,7 @@ macro_rules! define_syscalls_with_generic_syscall_table {
             SYS_BRK = 214                    => sys_brk(args[..1]);
             SYS_MUNMAP = 215                 => sys_munmap(args[..2]);
             SYS_MREMAP = 216                 => sys_mremap(args[..5]);
-            SYS_CLONE = 220                  => sys_clone(args[..5], &user_ctx);
+            SYS_CLONE = 220                  => sys_clone_generic(args[..5], &user_ctx);
             SYS_EXECVE = 221                 => sys_execve(args[..3], &mut user_ctx);
             SYS_MMAP = 222                   => sys_mmap(args[..6]);
             SYS_FADVISE64 = 223              => sys_fadvise64(args[..4]);

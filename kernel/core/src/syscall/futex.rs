@@ -148,8 +148,5 @@ pub(super) fn sys_futex(
 }
 
 fn futex_val_to_max_count(futex_val: u32) -> usize {
-    // From gVisor/test/syscalls/linux/futex.cc:260: "The Linux kernel wakes one
-    // waiter even if val is 0 or negative." To be consistent with Linux, we set
-    // the max_count to 1 if it is 0 or negative.
-    (futex_val as i32).max(1) as usize
+    usize::try_from(futex_val as i32).unwrap_or(0)
 }

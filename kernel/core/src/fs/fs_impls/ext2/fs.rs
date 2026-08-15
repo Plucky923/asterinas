@@ -501,6 +501,23 @@ impl Ext2 {
         Ok(())
     }
 
+    /// Submits an asynchronous scatter/gather block write starting at `bid`.
+    pub(super) fn write_block_segments_async(
+        &self,
+        bid: Ext2Bid,
+        bio_segments: Vec<BioSegment>,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        self.block_device.write_block_segments_async(
+            Bid::new(bid as u64),
+            bio_segments,
+            complete_fn,
+            io_batch,
+        )?;
+        Ok(())
+    }
+
     /// Writes blocks synchronously starting at `bid`.
     pub(super) fn write_blocks(&self, bid: Ext2Bid, bio_segment: BioSegment) -> Result<()> {
         let bio_status = self

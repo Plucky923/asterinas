@@ -31,7 +31,9 @@ pub(super) fn sys_pidfd_send_signal(
     let sig_num = if sig_num == 0 {
         None
     } else {
-        Some(SigNum::try_from(sig_num as u8)?)
+        let sig_num = u8::try_from(sig_num)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid signal number"))?;
+        Some(SigNum::try_from(sig_num)?)
     };
     debug!(
         "pidfd={}, info_ptr={:#x}, flags={:?}",

@@ -9,7 +9,10 @@ use crate::{
 
 pub(super) fn sys_umount(path_addr: Vaddr, flags: u64, ctx: &Context) -> Result<SyscallReturn> {
     let path_name = ctx.user_space().read_cstring(path_addr, MAX_FILENAME_LEN)?;
-    let umount_flags = UmountFlags::from_bits_truncate(flags as u32);
+    let umount_flags = u32::try_from(flags)
+        .ok()
+        .and_then(UmountFlags::from_bits)
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "unsupported flags"))?;
     debug!("path = {:?}, flags = {:?}", path_name, umount_flags);
 
     umount_flags.check_unsupported_flags()?;

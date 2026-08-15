@@ -144,5 +144,6 @@ impl UserModeHooks for Context<'_> {
         self.thread_local
             .supp_user_context()
             .before_user_exec(guard);
+        let _ = aster_framevisor::task::dispatch_pre_user_run(guard);
     }
 }

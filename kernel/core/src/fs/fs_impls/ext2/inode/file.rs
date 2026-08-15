@@ -201,6 +201,16 @@ impl InodeInner {
         Ok(())
     }
 
+    /// Prepares a buffered write without issuing redundant storage zero writes.
+    fn prepare_buffered_write(&mut self, fs: &Ext2, end: usize) -> Result<()> {
+        let old_size = self.file_size();
+        if end > old_size {
+            self.ensure_size_within_limit(fs, end)?;
+            self.resize_page_cache(end, old_size)?;
+        }
+        Ok(())
+    }
+
     /// Truncates page cache and blocks after a failed write.
     pub(super) fn rollback_write(&mut self, old_size: usize, end: usize) {
         if end <= old_size {
@@ -254,7 +264,7 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         let old_size = self.file_size();
 
-        if let Err(err) = self.prepare_write(fs, offset, end) {
+        if let Err(err) = self.prepare_buffered_write(fs, end) {
             self.rollback_write(old_size, end);
             return Err(err);
         }

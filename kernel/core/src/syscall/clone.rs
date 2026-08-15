@@ -2,14 +2,17 @@
 
 use core::num::NonZeroU64;
 
-use ostd::{arch::cpu::context::UserContext, mm::VmIo};
+use ostd::arch::cpu::context::UserContext;
 
 use super::SyscallReturn;
 use crate::{
     prelude::*,
     process::{CloneArgs, CloneFlags, clone_child, signal::sig_num::SigNum},
+    util::CopyCompat,
     vm::vmar::is_userspace_vaddr,
 };
+
+const CLONE_ARGS_SIZE_VER0: usize = 64;
 
 // The order of arguments for clone differs in different architecture.
 // This order we use here is the order for x86_64. See https://man7.org/linux/man-pages/man2/clone.2.html.
@@ -29,6 +32,31 @@ pub(super) fn sys_clone(
     Ok(SyscallReturn::Return(child_pid as _))
 }
 
+/// Implements the asm-generic `clone` argument order used by RISC-V and LoongArch.
+#[expect(
+    dead_code,
+    reason = "the x86 build does not use the asm-generic clone entry"
+)]
+pub(super) fn sys_clone_generic(
+    clone_flags: u64,
+    new_sp: u64,
+    parent_tidptr: Vaddr,
+    tls: u64,
+    child_tidptr: Vaddr,
+    ctx: &Context,
+    parent_context: &UserContext,
+) -> Result<SyscallReturn> {
+    sys_clone(
+        clone_flags,
+        new_sp,
+        parent_tidptr,
+        child_tidptr,
+        tls,
+        ctx,
+        parent_context,
+    )
+}
+
 pub(super) fn sys_clone3(
     clong_args_addr: Vaddr,
     size: usize,
@@ -39,12 +67,14 @@ pub(super) fn sys_clone3(
         "clone args addr = 0x{:x}, size = 0x{:x}",
         clong_args_addr, size
     );
-    if size != size_of::<Clone3Args>() {
+    if size < CLONE_ARGS_SIZE_VER0 {
         return_errno_with_message!(Errno::EINVAL, "invalid size");
     }
 
     let clone_args = {
-        let args: Clone3Args = ctx.user_space().read_val(clong_args_addr)?;
+        let args = ctx
+            .user_space()
+            .read_val_compat::<Clone3Args>(clong_args_addr, size)?;
         debug!("clone3 args = {:x?}", args);
         CloneArgs::try_from(args)?
     };
@@ -97,7 +127,9 @@ impl TryFrom<Clone3Args> for CloneArgs {
         // This checks arguments only for the `clone3()` system call.
         // Reference: <https://elixir.bootlin.com/linux/v6.16.9/source/kernel/fork.c#L2843-L2869>.
 
-        let flags = CloneFlags::from_bits(value.flags as u32)
+        let flags = u32::try_from(value.flags)
+            .ok()
+            .and_then(CloneFlags::from_bits)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clone flags"))?;
         let exit_signal = if value.exit_signal == 0 {
             None

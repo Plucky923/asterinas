@@ -394,6 +394,21 @@ pub(crate) trait PageCacheBackend: Sync + Send {
         locked_page: LockedCachePage,
         io_batch: &mut IoBatch,
     ) -> Result<()>;
+
+    /// Writes multiple pages to the backend asynchronously.
+    ///
+    /// Backends may override this method to combine adjacent pages into fewer
+    /// storage requests. The default preserves the per-page behavior.
+    fn write_pages_async(
+        &self,
+        pages: Vec<(usize, CachePage)>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        for (idx, page) in pages {
+            self.write_page_async(idx, page.lock(), io_batch)?;
+        }
+        Ok(())
+    }
 }
 
 impl dyn PageCacheBackend {
@@ -422,6 +437,11 @@ impl dyn PageCacheBackend {
 // TODO: This trait should provide interfaces for reading or writing multiple
 // pages in a single BIO to improve efficiency for sequential I/O.
 pub(crate) trait BlockAsPageCacheBackend: Sync + Send {
+    /// Returns the maximum number of pages prepared for one writeback submission.
+    fn writeback_batch_size(&self) -> Result<usize> {
+        Ok(1)
+    }
+
     /// Submits read I/O for the page at `idx`.
     ///
     /// `bio_segment` identifies the page memory that must receive the data.
@@ -458,6 +478,51 @@ pub(crate) trait BlockAsPageCacheBackend: Sync + Send {
         complete_fn: BioCompleteFn,
         io_batch: &mut IoBatch,
     ) -> Result<()>;
+
+    /// Submits writeback for multiple pages.
+    ///
+    /// Implementations may combine physically adjacent pages into one BIO.
+    /// The default submits each page independently.
+    fn submit_write_bios(
+        &self,
+        writebacks: Vec<PageWritebackBio>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        for writeback in writebacks {
+            let (idx, bio_segment, page) = writeback.into_parts();
+            let complete_fn: BioCompleteFn =
+                Box::new(move |status| complete_page_writeback(idx, &page, status));
+            self.submit_write_bio(idx, bio_segment, complete_fn, io_batch)?;
+        }
+        Ok(())
+    }
+}
+
+/// A page writeback prepared for block BIO submission.
+pub struct PageWritebackBio {
+    idx: usize,
+    bio_segment: BioSegment,
+    page: CachePage,
+}
+
+impl PageWritebackBio {
+    /// Returns the page index represented by this writeback.
+    pub fn idx(&self) -> usize {
+        self.idx
+    }
+
+    /// Consumes the writeback and returns its BIO fields and cache page.
+    pub fn into_parts(self) -> (usize, BioSegment, CachePage) {
+        (self.idx, self.bio_segment, self.page)
+    }
+}
+
+pub(crate) fn complete_page_writeback(idx: usize, page: &CachePage, status: BioStatus) {
+    page.clear_writing_back();
+    if status != BioStatus::Complete {
+        page.clone().lock().set_dirty();
+        ostd::error!("writeback I/O failed for page index {idx} with status {status:?}");
+    }
 }
 
 impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
@@ -508,18 +573,11 @@ impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
         let complete_fn: BioCompleteFn = Box::new(move |status| {
             submit_page.clear_writing_back();
             if status != BioStatus::Complete {
-                // TODO: Record the writeback error (e.g., EIO) in the VMO
-                // (or the corresponding inode) so that a subsequent sync syscall
-                // can detect and report it to userspace.
-                //
-                // Following Linux's design, we intentionally do **not** re-dirty the
-                // page here. Re-dirtying would cause the writeback mechanism to retry
-                // the I/O indefinitely, which could stall the entire system if the
-                // underlying device has a persistent hardware fault. Instead, the page
-                // is left clean and the data is considered lost.
-                ostd::error!(
-                    "writeback I/O failed for page index {idx} with status {status:?}; data may be lost"
-                );
+                // Keep failed data eligible for a later `fsync`/writeback attempt. The `IoBatch`
+                // reports this attempt's error to its current waiter; re-dirtying prevents a
+                // failure that completed in the background from being forgotten by future syncs.
+                submit_page.lock().set_dirty();
+                ostd::error!("writeback I/O failed for page index {idx} with status {status:?}");
             }
         });
 
@@ -532,6 +590,70 @@ impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
             locked_page.clear_writing_back();
         }
 
+        res
+    }
+
+    fn write_pages_async(
+        &self,
+        pages: Vec<(usize, CachePage)>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        let batch_size = self.writeback_batch_size()?.max(1);
+        let mut writebacks = Vec::with_capacity(batch_size);
+        let mut submitted_pages = Vec::with_capacity(batch_size);
+
+        for (idx, page) in pages {
+            let locked_page = page.lock();
+            locked_page.wait_until_finish_writing_back();
+
+            let bio_segment = BioSegment::alloc(1, BioDirection::ToDevice);
+            bio_segment
+                .writer()
+                .unwrap()
+                .write(&mut locked_page.reader());
+
+            locked_page.set_writing_back();
+            locked_page.set_up_to_date();
+
+            let page = locked_page.unlock();
+            submitted_pages.push(page.clone());
+            writebacks.push(PageWritebackBio {
+                idx,
+                bio_segment,
+                page,
+            });
+
+            if writebacks.len() == batch_size {
+                if let Err(error) =
+                    self.submit_write_bios(core::mem::take(&mut writebacks), io_batch)
+                {
+                    for page in submitted_pages {
+                        let locked_page = page.lock();
+                        locked_page.set_dirty();
+                        locked_page.clear_writing_back();
+                    }
+                    return Err(error);
+                }
+                submitted_pages.clear();
+            }
+        }
+
+        let res = if writebacks.is_empty() {
+            Ok(())
+        } else {
+            self.submit_write_bios(writebacks, io_batch)
+        };
+        if res.is_err() {
+            for page in submitted_pages {
+                let locked_page = page.lock();
+                locked_page.set_dirty();
+                locked_page.clear_writing_back();
+            }
+        }
         res
     }
 }

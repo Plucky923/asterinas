@@ -249,15 +249,26 @@ fn with_init_argv0(init_name: &str, mut argv: Vec<CString>) -> Vec<CString> {
 static INIT_PROCESS: Once<Arc<Process>> = Once::new();
 
 fn init_in_first_kthread(path_resolver: &PathResolver) {
+    ostd::early_println!("[kernel] kthread init: components");
     component::init_all(InitStage::Kthread, component::parse_metadata!()).unwrap();
+    ostd::early_println!("[kernel] kthread init: work queue");
     // Work queue should be initialized before interrupt is enabled,
     // in case any irq handler uses work queue as bottom half
     crate::thread::work_queue::init_in_first_kthread();
+    #[cfg(target_arch = "x86_64")]
+    crate::vmm::init_assigned_pci_fault_containment();
+    ostd::early_println!("[kernel] kthread init: device");
     crate::device::init_in_first_kthread();
+    ostd::early_println!("[kernel] kthread init: net");
     crate::net::init_in_first_kthread();
+    ostd::early_println!("[kernel] kthread init: fs");
     crate::fs::init_in_first_kthread(path_resolver);
     #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-    crate::vdso::init_in_first_kthread();
+    {
+        ostd::early_println!("[kernel] kthread init: vdso");
+        crate::vdso::init_in_first_kthread();
+    }
+    ostd::early_println!("[kernel] kthread init: done");
 }
 
 fn print_banner() {

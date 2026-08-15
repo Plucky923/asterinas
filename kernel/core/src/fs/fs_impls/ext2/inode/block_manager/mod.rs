@@ -9,10 +9,16 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use aster_block::bio::BioCompleteFn;
 
-use self::block_ptr_tree::ResolvedBlockRange;
 pub(super) use self::block_ptr_tree::{BlockPtrTree, RawBlockPtrs};
+use self::block_ptr_tree::{NewBlockInitialization, ResolvedBlockRange};
 use super::io_range::IoRangeIter;
-use crate::fs::ext2::{fs::Ext2, prelude::*};
+use crate::{
+    fs::ext2::{fs::Ext2, prelude::*},
+    vm::page_cache::{CachePage, PageWritebackBio, complete_page_writeback},
+};
+
+/// Matches the FrameV scatter/gather limit while bounding one BIO's descriptors.
+const MAX_COALESCED_WRITEBACK_PAGES: usize = 32;
 
 /// Bridges the inode's logical file view and the physical block device.
 ///
@@ -100,6 +106,28 @@ impl InodeBlockManager {
 
     /// Allocates missing data blocks that cover the requested logical block range.
     pub(super) fn allocate_range_blocks(&self, start_block: usize, end_block: usize) -> Result<()> {
+        self.allocate_range_blocks_with_initialization(
+            start_block,
+            end_block,
+            NewBlockInitialization::Storage,
+        )
+    }
+
+    /// Allocates blocks whose real contents are staged in a writeback batch.
+    fn allocate_writeback_blocks(&self, start_block: usize, end_block: usize) -> Result<()> {
+        self.allocate_range_blocks_with_initialization(
+            start_block,
+            end_block,
+            NewBlockInitialization::Writeback,
+        )
+    }
+
+    fn allocate_range_blocks_with_initialization(
+        &self,
+        start_block: usize,
+        end_block: usize,
+        initialization: NewBlockInitialization,
+    ) -> Result<()> {
         let fs = self.fs()?;
         let mut tree = self.block_ptr_tree.write();
         let mut current_block = start_block;
@@ -109,7 +137,14 @@ impl InodeBlockManager {
             let remaining = u32::try_from(end_block - current_block)
                 .map_err(|_| Error::with_message(Errno::EINVAL, "block range length overflow"))?;
 
-            let block_range = tree.resolve_block_range(&fs, iblock, remaining)?;
+            let block_range = match initialization {
+                NewBlockInitialization::Storage => {
+                    tree.resolve_block_range(&fs, iblock, remaining)?
+                }
+                NewBlockInitialization::Writeback => {
+                    tree.resolve_writeback_block_range(&fs, iblock, remaining)?
+                }
+            };
             match block_range {
                 ResolvedBlockRange::Existing(range) => {
                     debug_assert!(!range.is_empty());
@@ -128,9 +163,34 @@ impl InodeBlockManager {
     pub(super) fn set_npages(&self, npages: usize) {
         self.npages.store(npages, Ordering::Release);
     }
+
+    fn resolve_write_bid(&self, idx: usize, nblocks: usize, fs: &Ext2) -> Result<Ext2Bid> {
+        if idx >= self.npages.load(Ordering::Acquire) {
+            return_errno_with_message!(Errno::EINVAL, "invalid write size");
+        }
+        let iblock = Iblock::try_from(idx)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+
+        if let Some(bid) = self.lookup_block(iblock)? {
+            return Ok(bid);
+        }
+
+        let nblocks = u32::try_from(nblocks)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "block range length overflow"))?;
+        let mut tree = self.block_ptr_tree.write();
+        let step = tree.resolve_block_range(fs, iblock, nblocks)?;
+        Ok(match step {
+            ResolvedBlockRange::NewlyAllocated(range) => range.start,
+            ResolvedBlockRange::Existing(range) => range.start,
+        })
+    }
 }
 
 impl BlockAsPageCacheBackend for InodeBlockManager {
+    fn writeback_batch_size(&self) -> Result<usize> {
+        Ok(MAX_COALESCED_WRITEBACK_PAGES)
+    }
+
     fn submit_read_bio(
         &self,
         idx: usize,
@@ -163,31 +223,104 @@ impl BlockAsPageCacheBackend for InodeBlockManager {
         complete_fn: BioCompleteFn,
         io_batch: &mut IoBatch,
     ) -> Result<()> {
-        if idx >= self.npages.load(Ordering::Acquire) {
-            return_errno_with_message!(Errno::EINVAL, "invalid write size");
-        }
-        let iblock = Iblock::try_from(idx)
-            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
         let fs = self.fs()?;
+        let bid = self.resolve_write_bid(idx, bio_segment.nblocks(), &fs)?;
+        fs.write_blocks_async(bid, bio_segment, Some(complete_fn), io_batch)
+    }
 
-        // TODO: Refactor `lookup_block` and `resolve_block_range`. Currently
-        // `bio_segment.nblocks()` is always 1, so the point lookup works correctly, but the
-        // semantics are misleading because `bio_segment` can represent a contiguous block range.
-        // The block is already allocated; write it directly.
-        if let Some(bid) = self.lookup_block(iblock)? {
-            return fs.write_blocks_async(bid, bio_segment, Some(complete_fn), io_batch);
+    fn submit_write_bios(
+        &self,
+        mut writebacks: Vec<PageWritebackBio>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        if writebacks.is_empty() {
+            return Ok(());
         }
 
-        // Encounter a hole; allocate a block. Since we dropped the read lock
-        // above, another thread may have filled the hole; the `Existing` arm
-        // below handles that race.
-        let mut tree = self.block_ptr_tree.write();
-        let step = tree.resolve_block_range(&fs, iblock, bio_segment.nblocks() as u32)?;
-        let bid = match step {
-            ResolvedBlockRange::NewlyAllocated(r) => r.start,
-            ResolvedBlockRange::Existing(r) => r.start,
-        };
+        if writebacks.len() == 1 {
+            let Some(writeback) = writebacks.pop() else {
+                unreachable!("writeback length was checked")
+            };
+            let (idx, bio_segment, page) = writeback.into_parts();
+            let complete_fn: BioCompleteFn =
+                Box::new(move |status| complete_page_writeback(idx, &page, status));
+            return self.submit_write_bio(idx, bio_segment, complete_fn, io_batch);
+        }
 
-        fs.write_blocks_async(bid, bio_segment, Some(complete_fn), io_batch)
+        writebacks.sort_unstable_by_key(PageWritebackBio::idx);
+        let mut run_start = writebacks[0].idx();
+        let mut run_end = run_start + 1;
+        for writeback in &writebacks[1..] {
+            let idx = writeback.idx();
+            if idx == run_end {
+                run_end += 1;
+                continue;
+            }
+            self.allocate_writeback_blocks(run_start, run_end)?;
+            run_start = idx;
+            run_end = idx + 1;
+        }
+        self.allocate_writeback_blocks(run_start, run_end)?;
+
+        let fs = self.fs()?;
+        let mut group: Option<WritebackGroup> = None;
+
+        for writeback in writebacks {
+            let (idx, bio_segment, page) = writeback.into_parts();
+            let bid = self.resolve_write_bid(idx, bio_segment.nblocks(), &fs)?;
+
+            let can_append = group.as_ref().is_some_and(|group| group.next_bid == bid);
+            if !can_append && let Some(group) = group.take() {
+                group.submit(&fs, io_batch)?;
+            }
+
+            let group = group.get_or_insert_with(|| WritebackGroup::new(bid));
+            let nblocks = u32::try_from(bio_segment.nblocks())
+                .map_err(|_| Error::with_message(Errno::EINVAL, "block range length overflow"))?;
+            group.next_bid = group
+                .next_bid
+                .checked_add(nblocks)
+                .ok_or_else(|| Error::with_message(Errno::EINVAL, "block address overflow"))?;
+            group.bio_segments.push(bio_segment);
+            group.pages.push((idx, page));
+        }
+
+        if let Some(group) = group {
+            group.submit(&fs, io_batch)?;
+        }
+        Ok(())
+    }
+}
+
+struct WritebackGroup {
+    start_bid: Ext2Bid,
+    next_bid: Ext2Bid,
+    bio_segments: Vec<BioSegment>,
+    pages: Vec<(usize, CachePage)>,
+}
+
+impl WritebackGroup {
+    fn new(start_bid: Ext2Bid) -> Self {
+        Self {
+            start_bid,
+            next_bid: start_bid,
+            bio_segments: Vec::new(),
+            pages: Vec::new(),
+        }
+    }
+
+    fn submit(self, fs: &Ext2, io_batch: &mut IoBatch) -> Result<()> {
+        let pages = self.pages;
+        let complete_fn: BioCompleteFn = Box::new(move |status| {
+            for (idx, page) in pages {
+                complete_page_writeback(idx, &page, status);
+            }
+        });
+        fs.write_block_segments_async(
+            self.start_bid,
+            self.bio_segments,
+            Some(complete_fn),
+            io_batch,
+        )
     }
 }

@@ -22,7 +22,8 @@ pub(super) fn sys_socketpair(
 ) -> Result<SyscallReturn> {
     let domain = CSocketAddrFamily::try_from(domain)?;
     let sock_type = SockType::try_from(type_ & SOCK_TYPE_MASK)?;
-    let sock_flags = SockFlags::from_bits_truncate(type_ & !SOCK_TYPE_MASK);
+    let sock_flags = SockFlags::from_bits(type_ & !SOCK_TYPE_MASK)
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid socket flags"))?;
     let protocol = Protocol::try_from(protocol)?;
     debug!(
         "domain = {:?}, sock_type = {:?}, sock_flags = {:?}, protocol = {:?}",
@@ -53,7 +54,7 @@ pub(super) fn sys_socketpair(
         ),
     };
 
-    let socket_fds = {
+    let (fd_a, fd_b) = {
         let file_table = ctx.thread_local.borrow_file_table();
         let mut file_table_locked = file_table.unwrap().write();
         let fd_flags = if sock_flags.contains(SockFlags::SOCK_CLOEXEC) {
@@ -63,9 +64,16 @@ pub(super) fn sys_socketpair(
         };
         let fd_a = file_table_locked.insert(socket_a, fd_flags);
         let fd_b = file_table_locked.insert(socket_b, fd_flags);
-        SocketFds(fd_a.into(), fd_b.into())
+        (fd_a, fd_b)
     };
-    ctx.user_space().write_val(sv, &socket_fds)?;
+    let socket_fds = SocketFds(fd_a.into(), fd_b.into());
+    if let Err(error) = ctx.user_space().write_val(sv, &socket_fds) {
+        let file_table = ctx.thread_local.borrow_file_table();
+        let mut file_table_locked = file_table.unwrap().write();
+        file_table_locked.close_file(fd_a);
+        file_table_locked.close_file(fd_b);
+        return Err(error.into());
+    }
 
     Ok(SyscallReturn::Return(0))
 }

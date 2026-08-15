@@ -188,6 +188,7 @@ pub(crate) fn init_in_first_process(ctx: &Context) -> Result<()> {
     pty::init_in_first_process(&path_resolver, ctx)?;
     shm::init_in_first_process(&path_resolver, ctx)?;
     registry::init_in_first_process(&path_resolver)?;
+    misc::init_in_first_process()?;
 
     Ok(())
 }

@@ -8,7 +8,7 @@ use ostd::{
     util::id_set::Id,
 };
 
-use super::SyscallReturn;
+use super::{SyscallReturn, sched_getattr::check_sched_write_permission};
 use crate::{prelude::*, process::pid_table, thread::Tid};
 
 pub(super) fn sys_sched_getaffinity(
@@ -49,6 +49,7 @@ pub(super) fn sys_sched_setaffinity(
             .store(&user_cpu_set, Ordering::Relaxed),
         _ => match pid_table::pid_table_mut().get_thread(tid) {
             Some(thread) => {
+                check_sched_write_permission(&thread, ctx)?;
                 thread
                     .atomic_cpu_affinity()
                     .store(&user_cpu_set, Ordering::Relaxed);

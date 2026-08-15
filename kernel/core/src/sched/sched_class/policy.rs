@@ -147,6 +147,26 @@ impl SchedPolicyState {
     }
 
     pub(crate) fn update<T>(&self, update: impl FnOnce(&mut SchedPolicy) -> T) -> T {
-        update(&mut self.policy.disable_irq().lock())
+        let mut policy = self.policy.disable_irq().lock();
+        let result = update(&mut policy);
+        self.kind.store(policy.kind(), Relaxed);
+        result
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn update_keeps_cached_policy_kind_in_sync() {
+        let state = SchedPolicyState::new(SchedPolicy::Fair(Nice::default()));
+
+        state.update(|policy| *policy = SchedPolicy::Idle);
+
+        assert_eq!(state.kind(), SchedPolicyKind::Idle);
+        assert_eq!(state.get(), SchedPolicy::Idle);
     }
 }

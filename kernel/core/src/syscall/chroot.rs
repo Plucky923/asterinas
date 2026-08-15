@@ -10,6 +10,11 @@ use crate::{
 };
 
 pub(super) fn sys_chroot(path_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
+    lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+        ctx.thread_local.borrow_user_ns().as_ref(),
+        ctx.posix_thread,
+        CapSet::SYS_CHROOT,
+    ))?;
     let path_name = ctx.user_space().read_cstring(path_ptr, MAX_FILENAME_LEN)?;
     debug!("path_name = {:?}", path_name);
 
@@ -24,12 +29,6 @@ pub(super) fn sys_chroot(path_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn
     if path.type_() != InodeType::Dir {
         return_errno_with_message!(Errno::ENOTDIR, "must be directory");
     }
-
-    lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
-        ctx.thread_local.borrow_user_ns().as_ref(),
-        ctx.posix_thread,
-        CapSet::SYS_CHROOT,
-    ))?;
 
     path_resolver.set_root(path);
     Ok(SyscallReturn::Return(0))

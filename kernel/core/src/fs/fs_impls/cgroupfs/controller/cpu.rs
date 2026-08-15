@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use aster_systree::{Error, MAX_ATTR_SIZE, Result, SysAttrSetBuilder, SysPerms, SysStr};
-use aster_util::{per_cpu_counter::PerCpuCounter, printer::VmPrinter};
+use aster_util::printer::VmPrinter;
 use ostd::{
     cpu::CpuId,
     mm::{VmReader, VmWriter},
     sync::SpinLock,
-    task::atomic_mode::AsAtomicModeGuard,
+    task::{Task, atomic_mode::AsAtomicModeGuard},
     timer::Jiffies,
     warn,
 };
@@ -17,6 +17,8 @@ use ostd::{
 use crate::{
     fs::cgroupfs::systree_node::{CgroupSysNode, CgroupSystem},
     process::Process,
+    sched::{self, TaskGroup},
+    thread::AsThread,
     util::ReadCString,
 };
 
@@ -26,38 +28,26 @@ use crate::{
 /// is enabled. When inactive, only the base usage fields are exposed and the non-root
 /// CPU control files are hidden.
 pub(crate) struct CpuController {
-    /// Persistent CPU usage accounting for this cgroup.
-    stats: CpuStats,
+    /// Scheduler state used by hierarchical fair group scheduling for this CPU cgroup.
+    task_group: Arc<TaskGroup>,
     /// Optional CPU resource control attributes exposed only when `+cpu` is active.
     control: Option<CpuControl>,
-}
-
-/// CPU usage accounting that survives CPU controller toggles.
-struct CpuStats {
-    /// A counter accumulates CPU time spent executing user-space code.
-    ///
-    /// The counter is in units of one [`Jiffies`] per increment.
-    user: PerCpuCounter,
-    /// A counter accumulates CPU time spent executing kernel code on behalf of tasks.
-    ///
-    /// The counter is in units of one [`Jiffies`] per increment.
-    system: PerCpuCounter,
 }
 
 /// CPU resource controls that are reset whenever `+cpu` is re-enabled.
 struct CpuControl {
     /// A value stores the configured relative CPU share for scheduler integration.
     weight: AtomicU32,
-    /// A value stores the configured CPU bandwidth limit for scheduler integration.
+    /// A value stores the configured CPU bandwidth limit.
     max: SpinLock<CpuMax>,
 }
 
 /// A CPU bandwidth limit.
 #[derive(Clone, Copy)]
 struct CpuMax {
-    /// The configured CPU runtime budget for bandwidth enforcement.
+    /// The configured CPU runtime budget.
     quota_usec: u64,
-    /// The window over which the CPU runtime budget is intended to apply.
+    /// The window over which the CPU runtime budget is configured.
     period_usec: u64,
 }
 
@@ -80,43 +70,48 @@ impl CpuController {
         }
     }
 
-    fn new(is_active: bool) -> Self {
+    fn new(is_active: bool, task_group: Arc<TaskGroup>) -> Self {
         Self {
-            stats: CpuStats::new(),
+            task_group,
             control: is_active.then(CpuControl::new),
         }
     }
 
-    /// Initializes CPU usage statistics from the previous sub-controller.
+    /// Inherits persistent state from the previous sub-controller.
     ///
     /// Toggling `+cpu` must reset some controller attributes such as `cpu.weight`
     /// and `cpu.max`, but `cpu.stat` remains visible and continues to report the
-    /// accumulated CPU usage.
-    pub(super) fn init_stats(&mut self, previous: &Self) {
-        // No one cares which CPU the count is on. Therefore, choose the BSP for simplicity.
-        self.stats.user.add_on_cpu(
-            CpuId::bsp(),
-            isize::try_from(previous.stats.user.sum_all_cpus()).unwrap_or(isize::MAX),
-        );
-        self.stats.system.add_on_cpu(
-            CpuId::bsp(),
-            isize::try_from(previous.stats.system.sum_all_cpus()).unwrap_or(isize::MAX),
-        );
+    /// accumulated CPU usage. The scheduler state is also reused so that existing
+    /// tasks remain associated with the same CPU cgroup scheduling entity.
+    pub(super) fn inherit_state_from(&mut self, previous: &Self) {
+        self.task_group = previous.task_group.clone();
     }
 
     fn control(&self) -> Result<&CpuControl> {
         self.control.as_ref().ok_or(Error::AttributeError)
     }
 
+    fn sync_weight(&self) {
+        let Some(control) = &self.control else {
+            return;
+        };
+
+        let weight = control.weight.load(Ordering::Relaxed);
+        self.task_group.update_weight(weight);
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.control.is_some()
+    }
+
     fn read_cpu_stat(&self, printer: &mut VmPrinter) -> Result<usize> {
-        /// Converts a per-CPU counter expressed in jiffies to microseconds.
-        fn counter_usec(counter: &PerCpuCounter) -> u64 {
-            let jiffies = u64::try_from(counter.sum_all_cpus()).unwrap_or(u64::MAX);
+        fn counter_usec(jiffies: u64) -> u64 {
             u64::try_from(Jiffies::new(jiffies).as_duration().as_micros()).unwrap_or(u64::MAX)
         }
 
-        let user_usec = counter_usec(&self.stats.user);
-        let system_usec = counter_usec(&self.stats.system);
+        let (user_ticks, system_ticks) = self.task_group.cpu_time_ticks();
+        let user_usec = counter_usec(user_ticks);
+        let system_usec = counter_usec(system_ticks);
         writeln!(
             printer,
             "usage_usec {}",
@@ -138,41 +133,25 @@ impl CpuController {
 
         Ok(printer.bytes_written())
     }
-
-    /// Accounts one [`Jiffies`] of CPU time on `cpu`.
-    fn account(&self, cpu: CpuId, stat_kind: CpuStatKind) {
-        match stat_kind {
-            CpuStatKind::User => self.stats.user.add_on_cpu(cpu, 1),
-            CpuStatKind::System => self.stats.system.add_on_cpu(cpu, 1),
-        }
-    }
 }
 
 impl CpuControl {
+    const DEFAULT_WEIGHT: u32 = 100;
+
     fn new() -> Self {
         // The default CPU weight is 100 and the default CPU bandwidth limit is
         // unlimited quota with a 100ms period.
         //
         // Reference: <https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu-interface-files>
-        const DEFAULT_WEIGHT: u32 = 100;
         const DEFAULT_QUOTA_USEC: u64 = u64::MAX;
         const DEFAULT_PERIOD_USEC: u64 = 100_000;
 
         Self {
-            weight: AtomicU32::new(DEFAULT_WEIGHT),
+            weight: AtomicU32::new(Self::DEFAULT_WEIGHT),
             max: SpinLock::new(CpuMax {
                 quota_usec: DEFAULT_QUOTA_USEC,
                 period_usec: DEFAULT_PERIOD_USEC,
             }),
-        }
-    }
-}
-
-impl CpuStats {
-    fn new() -> Self {
-        Self {
-            user: PerCpuCounter::new(),
-            system: PerCpuCounter::new(),
         }
     }
 }
@@ -229,11 +208,6 @@ impl super::SubControl for CpuController {
                     return Err(Error::InvalidOperation);
                 }
 
-                // TODO: Enforce cgroup CPU weight for scheduling and remove this warning.
-                warn!(
-                    "`cpu.weight` is accepted but not enforced yet; weight = {}",
-                    weight
-                );
                 control.weight.store(weight, Ordering::Relaxed);
 
                 Ok(len)
@@ -306,8 +280,16 @@ impl super::SubControl for CpuController {
 }
 
 impl super::SubControlStatic for CpuController {
-    fn new(is_root: bool, is_active: bool) -> Self {
-        Self::new(is_root || is_active)
+    fn new(is_root: bool, is_active: bool, parent_controller: Option<&super::Controller>) -> Self {
+        let task_group = if let Some(parent_controller) = parent_controller {
+            TaskGroup::new_child(
+                &parent_controller.task_group(),
+                sched::DEFAULT_CGROUP_WEIGHT,
+            )
+        } else {
+            sched::root_task_group().clone()
+        };
+        Self::new(is_root || is_active, task_group)
     }
 
     fn type_() -> super::SubCtrlType {
@@ -320,16 +302,25 @@ impl super::SubControlStatic for CpuController {
 }
 
 impl super::SubController<CpuController> {
-    /// Accounts one [`Jiffies`] of CPU time for this cgroup and all of its ancestors.
-    fn account_hierarchy(&self, stat_kind: CpuStatKind) {
-        // This is race-free because `charge_cpu_time` holds `cgroup_guard` when
-        // invoking this method.
-        let cpu = CpuId::current_racy();
+    fn effective_task_group(&self) -> Arc<TaskGroup> {
+        let inner = self.inner.as_ref().unwrap();
+        if inner.is_active() {
+            return inner.task_group.clone();
+        }
 
-        let mut current = Some(self);
-        while let Some(node) = current {
-            node.inner.as_ref().unwrap().account(cpu, stat_kind);
-            current = node.parent.as_deref();
+        self.parent
+            .as_ref()
+            .map(|parent| parent.effective_task_group())
+            .unwrap_or_else(|| sched::root_task_group().clone())
+    }
+
+    /// Accounts one [`Jiffies`] of CPU time through this cgroup's scheduler hierarchy.
+    fn account(&self, stat_kind: CpuStatKind) {
+        let cpu = CpuId::current_racy();
+        let task_group = &self.inner.as_ref().unwrap().task_group;
+        match stat_kind {
+            CpuStatKind::User => task_group.account_user_tick(cpu),
+            CpuStatKind::System => task_group.account_system_tick(cpu),
         }
     }
 }
@@ -337,7 +328,48 @@ impl super::SubController<CpuController> {
 impl super::Controller {
     /// Charges one [`Jiffies`] in the CPU sub-controller hierarchy.
     fn charge_cpu_time<G: AsAtomicModeGuard + ?Sized>(&self, guard: &G, stat_kind: CpuStatKind) {
-        self.cpu.read_with(guard).account_hierarchy(stat_kind);
+        self.cpu.read_with(guard).account(stat_kind);
+    }
+
+    pub(crate) fn sync_cpu_weight(&self) {
+        self.cpu.read().get().inner.as_ref().unwrap().sync_weight();
+    }
+
+    fn task_group(&self) -> Arc<TaskGroup> {
+        self.cpu
+            .read()
+            .get()
+            .inner
+            .as_ref()
+            .unwrap()
+            .task_group
+            .clone()
+    }
+
+    pub(crate) fn effective_task_group(&self) -> Arc<TaskGroup> {
+        self.cpu.read().get().effective_task_group()
+    }
+
+    /// Applies this cgroup's effective CPU control to all threads in `process`.
+    ///
+    /// Returned tasks were dequeued from old fair runqueues and must be woken so
+    /// they can be requeued through the updated task group.
+    pub(crate) fn apply_cpu_control_to_process(&self, process: &Process) -> Vec<Arc<Task>> {
+        let task_group = self.effective_task_group();
+        let mut old_task_groups = Vec::new();
+
+        for task in process.tasks().lock().as_slice() {
+            let Some(thread) = task.as_thread() else {
+                continue;
+            };
+
+            if !thread.is_exited() {
+                old_task_groups.push((task.clone(), thread.task_group()));
+            }
+            thread.set_task_group(task_group.clone());
+        }
+
+        task_group.migrate_tasks_from(&old_task_groups)
     }
 }
 

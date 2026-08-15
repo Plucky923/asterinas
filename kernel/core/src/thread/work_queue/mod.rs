@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![expect(dead_code)]
-
 //! Work queue mechanism.
 //!
 //! # Overview
@@ -108,7 +106,7 @@ pub(crate) fn submit_work_item(work_item: Arc<WorkItem>, work_priority: WorkPrio
 /// A work queue maintains a series of work items to be handled
 /// asynchronously in a process context.
 pub(crate) struct WorkQueue {
-    worker_pool: Weak<WorkerPool>,
+    _worker_pool: Weak<WorkerPool>,
     inner: SpinLock<WorkQueueInner>,
 }
 
@@ -121,7 +119,7 @@ impl WorkQueue {
     /// process the submitted `WorkItems`.
     pub(crate) fn new(worker_pool: Weak<WorkerPool>) -> Arc<Self> {
         let queue = Arc::new(WorkQueue {
-            worker_pool: worker_pool.clone(),
+            _worker_pool: worker_pool.clone(),
             inner: SpinLock::new(WorkQueueInner {
                 pending_work_items: LinkedList::new(WorkItemAdapter::NEW),
             }),

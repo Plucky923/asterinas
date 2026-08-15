@@ -49,6 +49,33 @@ fn write_vmo_bytes(vmo: &Vmo, bytes: &[u8]) {
     assert_eq!(writer.write(&mut reader), bytes.len());
 }
 
+/// Writes several source extents into one initialized cache page.
+#[ktest]
+fn write_readers_updates_initialized_page() {
+    let backend = MockPageCacheBackend::new(1);
+    backend.set_persisted_page_bytes(0, &[0x11; PAGE_SIZE]);
+    let page_cache = new_backend_page_cache(&backend, 1);
+
+    let mut initial_bytes = [0; 8];
+    page_cache.read_bytes(32, &mut initial_bytes).unwrap();
+    assert_eq!(initial_bytes, [0x11; 8]);
+
+    let first = [0x22; 3];
+    let second = [0x33; 5];
+    let mut readers = [
+        VmReader::from(first.as_slice()).to_fallible(),
+        VmReader::from(second.as_slice()).to_fallible(),
+    ];
+    page_cache.as_vmo().write_readers(32, &mut readers).unwrap();
+    assert!(readers.iter().all(|reader| !reader.has_remain()));
+
+    let mut written_bytes = [0; 8];
+    page_cache.read_bytes(32, &mut written_bytes).unwrap();
+    assert_eq!(written_bytes[..3], first);
+    assert_eq!(written_bytes[3..], second);
+    assert_eq!(backend.read_count(0), 1);
+}
+
 /// Serializes a cold read and a later overwrite with the caller-provided
 /// buffered-I/O lock required by the page-cache synchronization model.
 #[ktest]

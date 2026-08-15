@@ -24,7 +24,7 @@ use core::{
 use align_ext::AlignExt;
 use io_util::batch::IoBatch;
 use ostd::{
-    mm::{HasPaddr, io::util::HasVmReaderWriter},
+    mm::{HasPaddr, Infallible, io::util::HasVmReaderWriter},
     task::disable_preempt,
 };
 use xarray::{Cursor, LockedXArray, XArray};
@@ -40,6 +40,62 @@ use crate::{
 mod options;
 
 pub(crate) use options::VmoOptions;
+
+trait VmoReadSource {
+    fn remain(&self) -> usize;
+
+    fn write_fallible(
+        &mut self,
+        writer: &mut VmWriter<'_, Infallible>,
+    ) -> core::result::Result<usize, (ostd::Error, usize)>;
+}
+
+impl VmoReadSource for VmReader<'_> {
+    fn remain(&self) -> usize {
+        VmReader::remain(self)
+    }
+
+    fn write_fallible(
+        &mut self,
+        writer: &mut VmWriter<'_, Infallible>,
+    ) -> core::result::Result<usize, (ostd::Error, usize)> {
+        self.read_fallible(writer)
+    }
+}
+
+struct VmReaderSlice<'a, 'b> {
+    readers: &'a mut [VmReader<'b>],
+    current: usize,
+}
+
+impl VmoReadSource for VmReaderSlice<'_, '_> {
+    fn remain(&self) -> usize {
+        self.readers[self.current..]
+            .iter()
+            .fold(0_usize, |total, reader| {
+                total.saturating_add(reader.remain())
+            })
+    }
+
+    fn write_fallible(
+        &mut self,
+        writer: &mut VmWriter<'_, Infallible>,
+    ) -> core::result::Result<usize, (ostd::Error, usize)> {
+        let mut total = 0;
+        while self.current < self.readers.len() && writer.has_avail() {
+            let reader = &mut self.readers[self.current];
+            let copied = reader
+                .read_fallible(writer)
+                .map_err(|(error, copied)| (error, total + copied))?;
+            total += copied;
+            if reader.has_remain() {
+                break;
+            }
+            self.current += 1;
+        }
+        Ok(total)
+    }
+}
 
 /// Page-indexed memory object used by the page cache and mapping code.
 ///
@@ -540,6 +596,22 @@ impl Vmo {
 
         let range = offset..read_end;
         let page_idx_range = get_page_idx_range(&range);
+        if page_idx_range.len() == 1 {
+            let guard = disable_preempt();
+            let cached_page = self
+                .pages
+                .load(&guard, page_idx_range.start as u64)
+                .filter(|page| !page.is_uninit())
+                .map(|page| page.clone());
+            drop(guard);
+            if let Some(page) = cached_page {
+                page.reader()
+                    .skip(offset % PAGE_SIZE)
+                    .read_fallible(writer)?;
+                return Ok(());
+            }
+        }
+
         let mut current_idx = page_idx_range.start;
         let mut page_offset = offset % PAGE_SIZE;
         let mut page_batch =
@@ -568,6 +640,19 @@ impl Vmo {
 
     /// Writes data from `reader` into the VMO at `offset`.
     pub(crate) fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
+        self.write_from_source(offset, reader)
+    }
+
+    /// Writes consecutive data from multiple readers into the VMO at `offset`.
+    pub(crate) fn write_readers(&self, offset: usize, readers: &mut [VmReader<'_>]) -> Result<()> {
+        let mut source = VmReaderSlice {
+            readers,
+            current: 0,
+        };
+        self.write_from_source(offset, &mut source)
+    }
+
+    fn write_from_source(&self, offset: usize, reader: &mut dyn VmoReadSource) -> Result<()> {
         let write_len = reader.remain().min(self.size().saturating_sub(offset));
         if write_len == 0 {
             return Ok(());
@@ -576,6 +661,7 @@ impl Vmo {
 
         let write_range = offset..write_end;
         let mut page_offset = offset % PAGE_SIZE;
+
         let mut page_batch = Vec::with_capacity(min(
             write_range.len().div_ceil(PAGE_SIZE),
             Self::PAGE_BATCH_CAPACITY,
@@ -672,7 +758,7 @@ impl Vmo {
         &self,
         range: &Range<usize>,
         page_offset: &mut usize,
-        reader: &mut VmReader,
+        reader: &mut dyn VmoReadSource,
         page_batch: &mut Vec<(usize, CachePage)>,
     ) -> Result<()> {
         let page_idx_range = get_page_idx_range(range);
@@ -687,7 +773,9 @@ impl Vmo {
             )?;
 
             for (_, page) in page_batch.iter() {
-                page.writer().skip(*page_offset).write_fallible(reader)?;
+                reader
+                    .write_fallible(page.writer().skip(*page_offset))
+                    .map_err(|(error, _)| Error::from(error))?;
                 *page_offset = 0;
             }
 
@@ -707,7 +795,7 @@ impl Vmo {
         &self,
         range: &Range<usize>,
         page_offset: &mut usize,
-        reader: &mut VmReader,
+        reader: &mut dyn VmoReadSource,
         commit_mode: CommitMode,
         page_batch: &mut Vec<(usize, CachePage)>,
     ) -> Result<()> {
@@ -731,11 +819,7 @@ impl Vmo {
                     continue;
                 }
 
-                let written_size = match locked_page
-                    .writer()
-                    .skip(*page_offset)
-                    .write_fallible(reader)
-                {
+                let written_size = match reader.write_fallible(&mut locked_page.writer().skip(*page_offset)) {
                     Ok(written_size) => written_size,
                     Err((err, written_size)) => {
                         // If the page is not initialized, keep it as it is on a partial write.

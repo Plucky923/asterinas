@@ -296,13 +296,19 @@ pub(crate) fn clone_child(
     clone_args: CloneArgs,
 ) -> Result<Tid> {
     clone_args.check(ctx)?;
+    let parent_cpu_affinity = ctx.thread.atomic_cpu_affinity().load(Ordering::Relaxed);
 
     if clone_args.flags.contains(CloneFlags::CLONE_THREAD) {
+        let _cgroup_read_guard = CgroupMembership::read_lock();
         let child_task = clone_child_task(ctx, parent_context, clone_args)?;
         let child_thread = child_task.as_thread().unwrap();
+        child_thread
+            .atomic_cpu_affinity()
+            .store(&parent_cpu_affinity, Ordering::Relaxed);
+        child_thread.set_task_group(ctx.thread.task_group());
         child_thread.run();
-
         let child_tid = child_thread.as_posix_thread().unwrap().tid();
+
         Ok(child_tid)
     } else {
         // Hold the read lock before charge to ensure the cgroup of current process
@@ -327,6 +333,10 @@ pub(crate) fn clone_child(
         };
 
         let child_process = clone_child_process(ctx, parent_context, clone_args)?;
+        child_process
+            .main_thread()
+            .atomic_cpu_affinity()
+            .store(&parent_cpu_affinity, Ordering::Relaxed);
 
         // Use the same cgroup snapshot that was charged above to avoid
         // a mismatch if the parent migrates concurrently.

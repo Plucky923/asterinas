@@ -11,6 +11,8 @@ use crate::{
         },
     },
     prelude::*,
+    process::credentials::capabilities::CapSet,
+    security::lsm::hooks as lsm_hooks,
     syscall::constants::MAX_FILENAME_LEN,
 };
 
@@ -26,6 +28,12 @@ pub(super) fn sys_mount(
     data_addr: Vaddr,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
+    lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+        ctx.thread_local.borrow_user_ns().as_ref(),
+        ctx.posix_thread,
+        CapSet::SYS_ADMIN,
+    ))?;
+
     let dst_name = ctx
         .user_space()
         .read_cstring(dst_name_addr, MAX_FILENAME_LEN)?;

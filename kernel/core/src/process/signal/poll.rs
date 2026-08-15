@@ -316,8 +316,14 @@ impl Poller {
 }
 
 impl Observer<IoEvents> for Waker {
-    fn on_events(&self, _events: &IoEvents) {
+    fn on_events(&self, events: &IoEvents) {
+        if events.contains(IoEvents::HUP) {
+            ostd::early_println!("[FrameVM] terminal poll waker entered");
+        }
         self.wake_up();
+        if events.contains(IoEvents::HUP) {
+            ostd::early_println!("[FrameVM] terminal poll waker returned");
+        }
     }
 }
 

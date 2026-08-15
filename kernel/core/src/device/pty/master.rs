@@ -16,7 +16,7 @@ use crate::{
     },
     prelude::*,
     process::{
-        Terminal,
+        Terminal, TerminalSide,
         signal::{PollHandle, Pollable},
     },
     util::ioctl::{RawIoctl, dispatch_ioctl},
@@ -227,7 +227,7 @@ impl PerOpenFileOps for PtyMaster {
             _ => {
                 let terminal = self.slave.clone() as Arc<dyn Terminal>;
 
-                if terminal.job_ioctl(raw_ioctl, true)? {
+                if terminal.job_ioctl(raw_ioctl, TerminalSide::Master)? {
                     return Ok(0);
                 }
 

@@ -48,7 +48,7 @@ pub(super) fn init_in_first_kthread() {
                 info!("spawn the nvme-block thread");
                 let nvme_block_device = device_clone.downcast_ref::<NvmeBlockDevice>().unwrap();
                 loop {
-                    nvme_block_device.handle_requests();
+                    nvme_block_device.handle_next_request();
                 }
             };
             ThreadOptions::new(task_fn).spawn();

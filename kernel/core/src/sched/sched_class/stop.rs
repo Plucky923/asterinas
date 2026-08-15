@@ -7,7 +7,8 @@ use ostd::task::{
     scheduler::{EnqueueFlags, UpdateFlags},
 };
 
-use super::{CurrentRuntime, SchedAttr, SchedClassRq};
+use super::{CurrentRuntime, SchedClassRq};
+use crate::thread::Thread;
 
 /// The per-cpu run queue for the STOP scheduling class.
 ///
@@ -43,6 +44,17 @@ impl SchedClassRq for StopClassRq {
         );
     }
 
+    fn remove_queued_task(&mut self, task: &Arc<Task>) -> bool {
+        let Some(entity) = &self.entity else {
+            return false;
+        };
+        if !Arc::ptr_eq(entity, task) {
+            return false;
+        }
+        self.entity = None;
+        true
+    }
+
     fn len(&self) -> usize {
         usize::from(!self.is_empty())
     }
@@ -55,7 +67,7 @@ impl SchedClassRq for StopClassRq {
         self.entity.take()
     }
 
-    fn update_current(&mut self, _: &CurrentRuntime, _: &SchedAttr, _flags: UpdateFlags) -> bool {
+    fn update_current(&mut self, _: &CurrentRuntime, _: &Thread, _flags: UpdateFlags) -> bool {
         // Stop entities has the lowest priority value. They should never be preempted.
         false
     }

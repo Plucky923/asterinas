@@ -218,7 +218,7 @@ impl Inner {
     }
 
     pub(self) fn new_file_in_memfd() -> Self {
-        Self::File(Mutex::new(PageCache::new_anon(0).unwrap()))
+        Self::new_file()
     }
 
     fn as_direntry(&self) -> Option<&RwLock<DirEntry>> {
@@ -703,8 +703,8 @@ impl FileOps for RamInode {
                 let (offset, read_len) = {
                     let file_size = self.size();
                     let start = file_size.min(offset);
-                    let end = file_size.min(offset + writer.avail());
-                    (start, end - start)
+                    let read_len = file_size.saturating_sub(start).min(writer.avail());
+                    (start, read_len)
                 };
                 page_cache.lock().read(offset, writer)?;
                 read_len
@@ -730,25 +730,30 @@ impl FileOps for RamInode {
 
                 let mut page_cache = self.inner.as_file().unwrap().lock();
 
-                let mut inode_meta = self.metadata.lock();
-                let file_size = inode_meta.size;
+                let file_size = self.metadata.lock().size;
                 let write_len = reader.remain();
-                let new_size = offset + write_len;
+                let new_size = offset.checked_add(write_len).ok_or_else(|| {
+                    Error::with_message(Errno::EFBIG, "file size exceeds addressable range")
+                })?;
                 let should_expand_size = new_size > file_size;
-                let new_size_aligned = new_size.align_up(BLOCK_SIZE);
+                let new_size_aligned = new_size
+                    .checked_add(BLOCK_SIZE - 1)
+                    .map(|size| size / BLOCK_SIZE * BLOCK_SIZE)
+                    .ok_or_else(|| {
+                        Error::with_message(Errno::EFBIG, "aligned file size overflows")
+                    })?;
+                if should_expand_size {
+                    page_cache.resize(new_size_aligned, file_size)?;
+                }
+                page_cache.write(offset, reader)?;
+
+                let mut inode_meta = self.metadata.lock();
                 inode_meta.set_mtime(now);
                 inode_meta.set_ctime(now);
                 if should_expand_size {
                     inode_meta.size = new_size;
                     inode_meta.blocks = new_size_aligned / BLOCK_SIZE;
                 }
-                drop(inode_meta);
-
-                if should_expand_size {
-                    page_cache.resize(new_size_aligned, file_size)?;
-                }
-                page_cache.write(offset, reader)?;
-
                 write_len
             }
             _ => return_errno_with_message!(Errno::EISDIR, "write is not supported"),
@@ -984,6 +989,9 @@ impl Inode for RamInode {
     }
 
     fn link(&self, old: &Arc<dyn Inode>, name: &str) -> Result<()> {
+        if name.len() > NAME_MAX {
+            return_errno!(Errno::ENAMETOOLONG);
+        }
         if !Arc::ptr_eq(&self.fs(), &old.fs()) {
             return_errno_with_message!(Errno::EXDEV, "not same fs");
         }
@@ -1161,6 +1169,9 @@ impl Inode for RamInode {
                 dst_inode.set_ctime(now);
             } else if let Some((dst_idx, dst_inode)) = self_dir.get_entry(new_name) {
                 check_replace_inode(&src_inode, &dst_inode)?;
+                if Arc::ptr_eq(&src_inode, &dst_inode) {
+                    return Ok(());
+                }
                 self_dir.remove_entry(dst_idx);
                 self_dir.substitute_entry(
                     src_idx,
@@ -1171,7 +1182,12 @@ impl Inode for RamInode {
                 let now = now();
                 DirChange::del(&src_inode).apply(self, now);
                 src_inode.set_ctime(now);
-                dst_inode.set_ctime(now);
+                let mut dst_meta = dst_inode.metadata.lock();
+                dst_meta.dec_nlinks();
+                if dst_inode.typ == InodeType::Dir {
+                    dst_meta.dec_nlinks();
+                }
+                dst_meta.set_ctime(now);
             } else {
                 self_dir.substitute_entry(
                     src_idx,
@@ -1218,6 +1234,9 @@ impl Inode for RamInode {
                     return_errno!(Errno::ENOTEMPTY);
                 }
                 check_replace_inode(&src_inode, &dst_inode)?;
+                if Arc::ptr_eq(&src_inode, &dst_inode) {
+                    return Ok(());
+                }
                 self_dir.remove_entry(src_idx);
                 target_dir.remove_entry(dst_idx);
                 target_dir.append_entry(new_name, src_inode.clone());
@@ -1227,7 +1246,12 @@ impl Inode for RamInode {
                 let now = now();
                 DirChange::del(&src_inode).apply(self, now);
                 DirChange::exchange(&dst_inode, &src_inode).apply(target, now);
-                dst_inode.set_ctime(now);
+                let mut dst_meta = dst_inode.metadata.lock();
+                dst_meta.dec_nlinks();
+                if dst_inode.typ == InodeType::Dir {
+                    dst_meta.dec_nlinks();
+                }
+                dst_meta.set_ctime(now);
                 src_inode.set_ctime(now);
             } else {
                 self_dir.remove_entry(src_idx);

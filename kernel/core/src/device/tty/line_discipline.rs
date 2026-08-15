@@ -147,12 +147,12 @@ impl LineDiscipline {
 
         // Canonical mode
 
-        if ch == self.termios.special_char(CCtrlCharId::VKILL) {
+        if matches_special_char(ch, &self.termios, CCtrlCharId::VKILL) {
             // Erase current line
             self.current_line.drain();
         }
 
-        if ch == self.termios.special_char(CCtrlCharId::VERASE) {
+        if matches_special_char(ch, &self.termios, CCtrlCharId::VERASE) {
             // Type backspace
             self.current_line.backspace();
         }
@@ -173,17 +173,17 @@ impl LineDiscipline {
     }
 
     // TODO: respect output flags
-    fn output_char<F: FnMut(&[u8])>(&self, ch: u8, mut echo_callback: F) {
+    fn output_char(&self, ch: u8, echo: &mut Vec<u8>) {
         match ch {
-            b'\n' => echo_callback(b"\n"),
-            b'\r' => echo_callback(b"\r\n"),
+            b'\n' => echo.extend_from_slice(b"\n"),
+            b'\r' => echo.extend_from_slice(b"\r\n"),
             ch if ch == self.termios.special_char(CCtrlCharId::VERASE) => {
                 // The driver should erase the current character
-                echo_callback(b"\x08");
+                echo.extend_from_slice(b"\x08");
             }
-            ch if is_printable_char(ch) => echo_callback(&[ch]),
+            ch if is_printable_char(ch) => echo.push(ch),
             ch if is_ctrl_char(ch) && self.termios.local_flags().contains(CLocalFlags::ECHOCTL) => {
-                echo_callback(&[b'^', ctrl_char_to_printable(ch)]);
+                echo.extend_from_slice(&[b'^', ctrl_char_to_printable(ch)]);
             }
             _ => {}
         }
@@ -243,6 +243,16 @@ impl LineDiscipline {
         self.read_buffer.len()
     }
 
+    /// Returns whether a read can make progress under the current termios settings.
+    pub(crate) fn is_readable(&self) -> bool {
+        if self.termios.is_canonical_mode() {
+            return self.buffer_len() > 0;
+        }
+
+        let vmin = self.termios.special_char(CCtrlCharId::VMIN) as usize;
+        vmin == 0 || self.buffer_len() >= vmin
+    }
+
     pub(crate) fn is_full(&self) -> bool {
         self.read_buffer.len() + self.current_line.len() >= self.read_buffer.capacity()
     }
@@ -287,14 +297,14 @@ impl LineDiscipline {
 
 fn is_line_terminator(ch: u8, termios: &CTermios) -> bool {
     if ch == b'\n'
-        || ch == termios.special_char(CCtrlCharId::VEOF)
-        || ch == termios.special_char(CCtrlCharId::VEOL)
+        || matches_special_char(ch, termios, CCtrlCharId::VEOF)
+        || matches_special_char(ch, termios, CCtrlCharId::VEOL)
     {
         return true;
     }
 
     if termios.local_flags().contains(CLocalFlags::IEXTEN)
-        && ch == termios.special_char(CCtrlCharId::VEOL2)
+        && matches_special_char(ch, termios, CCtrlCharId::VEOL2)
     {
         return true;
     }
@@ -303,7 +313,12 @@ fn is_line_terminator(ch: u8, termios: &CTermios) -> bool {
 }
 
 fn is_eof(ch: u8, termios: &CTermios) -> bool {
-    ch == termios.special_char(CCtrlCharId::VEOF)
+    matches_special_char(ch, termios, CCtrlCharId::VEOF)
+}
+
+fn matches_special_char(ch: u8, termios: &CTermios, id: CCtrlCharId) -> bool {
+    let special_char = termios.special_char(id);
+    special_char != 0 && ch == special_char
 }
 
 fn is_printable_char(ch: u8) -> bool {

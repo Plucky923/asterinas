@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Implements POSIX thread state on top of the kernel's generic task and process objects.
+//!
+//! [`PosixThread`] owns process-facing identity, scheduling, and signal state, while
+//! [`ThreadLocal`] stores per-thread resources and userspace ABI state.
+
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use aster_rights::{ReadDupOp, ReadOp, ReadWriteOp};

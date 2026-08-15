@@ -3,7 +3,7 @@
 use ostd::{arch::cpu::context::UserContext, mm::VmIo, task::Task};
 
 use super::{
-    AsPosixThread, ThreadLocal,
+    AsPosixThread, RobustListHead, ThreadLocal,
     futex::{FutexVisibility, futex_wake},
     ptrace::PtraceEvent,
     robust_list::wake_robust_futex,
@@ -27,7 +27,7 @@ use crate::{
 ///
 /// If the current thread is not a POSIX thread, this method will panic.
 pub(crate) fn do_exit(term_status: TermStatus, ctx: &Context, user_ctx: &mut UserContext) {
-    exit_internal(term_status, false, ctx, user_ctx);
+    exit_internal(term_status, ExitScope::Thread, ctx, user_ctx);
 }
 
 /// Kills all threads and exits the current POSIX process.
@@ -36,7 +36,13 @@ pub(crate) fn do_exit(term_status: TermStatus, ctx: &Context, user_ctx: &mut Use
 ///
 /// If the current thread is not a POSIX thread, this method will panic.
 pub(crate) fn do_exit_group(term_status: TermStatus, ctx: &Context, user_ctx: &mut UserContext) {
-    exit_internal(term_status, true, ctx, user_ctx);
+    exit_internal(term_status, ExitScope::Process, ctx, user_ctx);
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExitScope {
+    Thread,
+    Process,
 }
 
 /// Exits the current POSIX thread or process.
@@ -46,7 +52,7 @@ pub(crate) fn do_exit_group(term_status: TermStatus, ctx: &Context, user_ctx: &m
 // register state and may later restore tracer-updated registers.
 fn exit_internal(
     term_status: TermStatus,
-    is_exiting_group: bool,
+    scope: ExitScope,
     ctx: &Context,
     user_ctx: &mut UserContext,
 ) {
@@ -65,7 +71,7 @@ fn exit_internal(
         let has_exited_group = tasks.has_exited_group();
         let in_evecve = tasks.in_execve();
 
-        if is_exiting_group && !has_exited_group && !in_evecve {
+        if scope == ExitScope::Process && !has_exited_group && !in_evecve {
             sigkill_other_threads(&current_task, &tasks);
             tasks.set_exited_group();
         }
@@ -162,9 +168,16 @@ fn wake_clear_ctid(thread_local: &ThreadLocal) {
 ///
 /// This corresponds to Linux's `exit_robust_list`. Errors are silently ignored.
 fn wake_robust_list(thread_local: &ThreadLocal, tid: Tid) {
-    let list_head = match thread_local.robust_list().borrow_mut().take() {
-        Some(robust_list_head) => robust_list_head,
+    let list_head_ptr = match thread_local.robust_list().borrow_mut().take() {
+        Some(list_head_ptr) => list_head_ptr,
         None => return,
+    };
+    let Ok(list_head) = current_userspace!().read_val::<RobustListHead>(list_head_ptr) else {
+        debug!(
+            "exit: cannot read the robust list head at {:#x}",
+            list_head_ptr
+        );
+        return;
     };
 
     debug!("exit: wake up the robust list: {:?}", list_head);

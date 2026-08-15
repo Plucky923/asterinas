@@ -46,7 +46,7 @@ impl dyn Terminal {
     pub(crate) fn job_ioctl(
         self: Arc<Self>,
         raw_ioctl: RawIoctl,
-        via_master: bool,
+        side: TerminalSide,
     ) -> Result<bool> {
         use ioctl_defs::*;
 
@@ -59,7 +59,7 @@ impl dyn Terminal {
                         .map_or(0, |foreground| foreground.pgid())
                 };
 
-                let pgid = if via_master {
+                let pgid = if side == TerminalSide::Master {
                     operate()
                 } else {
                     self.is_control_and(&current!(), |_, _| Ok(operate()))?
@@ -85,7 +85,7 @@ impl dyn Terminal {
                 self.set_control(&current!())?;
             }
             _cmd @ SetControlNoTty => {
-                if via_master {
+                if side == TerminalSide::Master {
                     return_errno_with_message!(
                         Errno::ENOTTY,
                         "the terminal to operate is not our controlling terminal"
@@ -95,7 +95,7 @@ impl dyn Terminal {
                 self.unset_control(&current!())?;
             }
             cmd @ GetControlSid => {
-                let sid = if via_master {
+                let sid = if side == TerminalSide::Master {
                     self.job_control()
                         .session()
                         .ok_or_else(|| {
@@ -236,4 +236,10 @@ impl dyn Terminal {
 
         op(session, &mut session_inner)
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum TerminalSide {
+    Master,
+    Slave,
 }

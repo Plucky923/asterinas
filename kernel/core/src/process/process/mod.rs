@@ -52,7 +52,7 @@ use ostd::{
 };
 pub(crate) use process_group::ProcessGroup;
 pub(crate) use session::Session;
-pub(crate) use terminal::Terminal;
+pub(crate) use terminal::{Terminal, TerminalSide};
 
 /// Process ID.
 pub(crate) type Pid = u32;
@@ -90,6 +90,8 @@ pub(crate) struct Process {
     vmar: Mutex<Option<Arc<Vmar>>>,
     /// Wait for child status changed
     children_wait_queue: WaitQueue,
+    /// Wait for process status changed
+    status_wait_queue: WaitQueue,
     pub(super) pidfile_pollee: Pollee,
 
     // Mutable Part
@@ -239,6 +241,7 @@ impl Process {
             // SIGCHID does not interrupt pauser. Child process will
             // resume paused parent when doing exit.
             let children_wait_queue = WaitQueue::new();
+            let status_wait_queue = WaitQueue::new();
 
             let prof_clock = ProfClock::new();
             let timer_manager = PosixTimerManager::new(&prof_clock, process_ref);
@@ -247,6 +250,7 @@ impl Process {
                 pid,
                 vmar: Mutex::new(Some(vmar)),
                 children_wait_queue,
+                status_wait_queue,
                 pidfile_pollee: Pollee::new(),
                 tasks: Mutex::new(TaskSet::new()),
                 status: ProcessStatus::default(),
@@ -342,6 +346,10 @@ impl Process {
 
     pub(crate) fn children_wait_queue(&self) -> &WaitQueue {
         &self.children_wait_queue
+    }
+
+    pub(crate) fn status_wait_queue(&self) -> &WaitQueue {
+        &self.status_wait_queue
     }
 
     pub(crate) fn reaped_children_stats(&self) -> &Mutex<ReapedChildrenStats> {

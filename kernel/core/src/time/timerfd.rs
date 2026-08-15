@@ -182,7 +182,10 @@ impl TimerfdFile {
             return_errno_with_message!(Errno::EAGAIN, "the counter is zero");
         }
 
-        writer.write_fallible(&mut ticks.as_bytes().into())?;
+        if let Err(error) = writer.write_fallible(&mut ticks.as_bytes().into()) {
+            self.ticks.fetch_add(ticks, Ordering::Relaxed);
+            return Err(error.into());
+        }
 
         Ok(())
     }

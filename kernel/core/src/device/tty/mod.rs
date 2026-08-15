@@ -154,7 +154,7 @@ impl<D: TtyDriver> Tty<D> {
     fn check_io_events(&self) -> IoEvents {
         let mut events = IoEvents::empty();
 
-        if self.ldisc.lock().buffer_len() > 0 {
+        if self.ldisc.lock().is_readable() {
             events |= IoEvents::IN | IoEvents::RDNORM;
         }
 
@@ -321,7 +321,7 @@ impl<D: TtyDriver> Tty<D> {
                 let terminal = self.weak_self.upgrade().unwrap() as Arc<dyn Terminal>;
 
                 // Process job-control ioctls.
-                if terminal.job_ioctl(raw_ioctl, false)? {
+                if terminal.job_ioctl(raw_ioctl, crate::process::TerminalSide::Slave)? {
                     return Ok(0);
                 }
 

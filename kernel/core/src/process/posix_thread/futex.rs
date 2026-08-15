@@ -190,8 +190,8 @@ struct FutexWakeOpEncode {
     /// as `res = (1 << oparg) + oldval`.
     is_oparg_shift: bool,
     cmp: FutexWakeCmp,
-    oparg: u32,
-    cmparg: u32,
+    oparg: i32,
+    cmparg: i32,
 }
 
 #[expect(non_camel_case_types)]
@@ -233,8 +233,8 @@ impl FutexWakeOpEncode {
         let is_oparg_shift = (bits >> 31) & 1 == 1;
         let op = FutexWakeOp::try_from((bits >> 28) & 0x7)?;
         let cmp = FutexWakeCmp::try_from((bits >> 24) & 0xf)?;
-        let oparg = (bits >> 12) & 0xfff;
-        let cmparg = bits & 0xfff;
+        let oparg = ((bits << 8) as i32) >> 20;
+        let cmparg = ((bits << 20) as i32) >> 20;
 
         Ok(FutexWakeOpEncode {
             op,
@@ -247,27 +247,24 @@ impl FutexWakeOpEncode {
 
     fn calculate_new_val(&self, old_val: u32) -> u32 {
         let oparg = if self.is_oparg_shift {
-            if self.oparg > 31 {
-                // Linux might return EINVAL in the future
-                // Reference: https://elixir.bootlin.com/linux/v6.15.2/source/kernel/futex/waitwake.c#L211-L222
-                warn!("futex_wake_op: program tries to shift op by {}", self.oparg);
-            }
-
-            1 << (self.oparg & 31)
+            1i32.wrapping_shl(self.oparg as u32 & 31)
         } else {
             self.oparg
         };
 
-        match self.op {
+        let old_val = old_val as i32;
+
+        (match self.op {
             FutexWakeOp::FUTEX_OP_SET => oparg,
             FutexWakeOp::FUTEX_OP_ADD => oparg.wrapping_add(old_val),
             FutexWakeOp::FUTEX_OP_OR => oparg | old_val,
             FutexWakeOp::FUTEX_OP_ANDN => !oparg & old_val,
             FutexWakeOp::FUTEX_OP_XOR => oparg ^ old_val,
-        }
+        }) as u32
     }
 
     fn should_wake(&self, old_val: u32) -> bool {
+        let old_val = old_val as i32;
         match self.cmp {
             FutexWakeCmp::FUTEX_OP_CMP_EQ => old_val == self.cmparg,
             FutexWakeCmp::FUTEX_OP_CMP_NE => old_val != self.cmparg,

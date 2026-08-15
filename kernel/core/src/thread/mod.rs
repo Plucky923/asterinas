@@ -2,18 +2,22 @@
 
 //! Posix thread implementation
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    fmt,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use aster_util::per_cpu_counter::PerCpuCounter;
 use ostd::{
     cpu::{AtomicCpuSet, CpuId, CpuSet},
     irq::DisabledLocalIrqGuard,
+    sync::Rcu,
     task::Task,
 };
 
 use crate::{
     prelude::*,
-    sched::{SchedAttr, SchedPolicy},
+    sched::{self, SchedAttr, SchedPolicy, TaskGroup},
 };
 mod stats;
 use stats::CONTEXT_SWITCH_COUNTER;
@@ -23,6 +27,7 @@ pub(crate) mod kernel_thread;
 pub(crate) mod oops;
 pub(crate) mod task;
 pub(crate) mod work_queue;
+mod framevm_task;
 
 pub(crate) type Tid = u32;
 
@@ -31,13 +36,14 @@ fn pre_schedule_handler(irq_guard: &DisabledLocalIrqGuard) {
         return;
     };
     let Some(thread_local) = task.as_thread_local() else {
+        let _ = aster_framevisor::task::dispatch_pre_schedule(irq_guard);
         return;
     };
 
     thread_local.supp_user_context().before_schedule(irq_guard);
 }
 
-fn post_schedule_handler() {
+fn post_schedule_handler() -> bool {
     // No races because preemption shouldn't happen in pre-/post-schedule handlers.
     CONTEXT_SWITCH_COUNTER
         .get()
@@ -46,13 +52,15 @@ fn post_schedule_handler() {
 
     let task = Task::current().unwrap();
     let Some(thread_local) = task.as_thread_local() else {
-        return;
+        return aster_framevisor::task::dispatch_post_schedule();
     };
 
     let vmar = thread_local.vmar().borrow();
     if let Some(vmar) = vmar.as_ref() {
         vmar.vm_space().activate()
     }
+
+    true
 }
 
 pub(super) fn init() {
@@ -60,6 +68,7 @@ pub(super) fn init() {
     ostd::task::inject_pre_schedule_handler(pre_schedule_handler);
     ostd::task::inject_post_schedule_handler(post_schedule_handler);
     ostd::mm::fault::inject_user_page_fault_handler(exception::page_fault_handler);
+    framevm_task::init();
 }
 
 /// A thread is a wrapper on top of task.
@@ -77,6 +86,18 @@ pub(crate) struct Thread {
     /// Thread CPU affinity
     cpu_affinity: AtomicCpuSet,
     sched_attr: SchedAttr,
+    /// The task group this thread belongs to.
+    task_group: Rcu<Arc<TaskGroup>>,
+}
+
+impl Debug for Thread {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Thread")
+            .field("is_exited", &self.is_exited)
+            .field("cpu_affinity", &self.cpu_affinity)
+            .field("sched_attr", &self.sched_attr)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Thread {
@@ -88,11 +109,12 @@ impl Thread {
         sched_policy: SchedPolicy,
     ) -> Self {
         Thread {
-            task,
+            task: task.clone(),
             data: Box::new(data),
             is_exited: AtomicBool::new(false),
             cpu_affinity: AtomicCpuSet::new(cpu_affinity),
             sched_attr: SchedAttr::new(sched_policy),
+            task_group: Rcu::new(sched::root_task_group().clone()),
         }
     }
 
@@ -132,6 +154,16 @@ impl Thread {
 
     pub(crate) fn sched_attr(&self) -> &SchedAttr {
         &self.sched_attr
+    }
+
+    /// Returns the task group this thread belongs to.
+    pub fn task_group(&self) -> Arc<TaskGroup> {
+        self.task_group.read().get().clone()
+    }
+
+    /// Sets the task group for this thread.
+    pub(crate) fn set_task_group(&self, task_group: Arc<TaskGroup>) {
+        self.task_group.update(task_group);
     }
 
     /// Yields the execution to another thread.

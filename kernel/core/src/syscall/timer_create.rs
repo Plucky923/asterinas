@@ -65,13 +65,11 @@ pub(super) fn sys_timer_create(
                         process.enqueue_signal(Box::new(signal));
                     })
                 }
-                // Spawn a POSIX thread to run the `sigev_function`, which is stored in
-                // `sig_event.sigev_un._sigev_thread`.
-                //
-                // TODO: enable this instructions. Currently the system does not provide an API to spawn
-                // a POSIX thread to run a specified function.
                 SigNotify::SIGEV_THREAD => {
-                    unimplemented!()
+                    return_errno_with_message!(
+                        Errno::EINVAL,
+                        "SIGEV_THREAD is implemented by the C library"
+                    )
                 }
                 // Send a signal to the specified thread when the timer is expired.
                 SigNotify::SIGEV_THREAD_ID => {
@@ -152,10 +150,13 @@ where
                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
                 let process_timer_manager = process.timer_manager();
                 match clock_type {
-                    DynamicClockType::Profiling => process_timer_manager.create_prof_timer(func),
+                    DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                        process_timer_manager.create_prof_timer(func)
+                    }
                     DynamicClockType::Virtual => process_timer_manager.create_virtual_timer(func),
-                    // TODO: support scheduling clock and fd clock.
-                    _ => unimplemented!(),
+                    DynamicClockType::FD => {
+                        return_errno_with_message!(Errno::EINVAL, "unsupported clock ID")
+                    }
                 }
             }
             DynamicClockIdInfo::Tid(tid, clock_type) => {
@@ -164,12 +165,18 @@ where
                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
                 let posix_thread = thread.as_posix_thread().unwrap();
                 match clock_type {
-                    DynamicClockType::Profiling => posix_thread.create_prof_timer(func),
+                    DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                        posix_thread.create_prof_timer(func)
+                    }
                     DynamicClockType::Virtual => posix_thread.create_virtual_timer(func),
-                    _ => unimplemented!(),
+                    DynamicClockType::FD => {
+                        return_errno_with_message!(Errno::EINVAL, "unsupported clock ID")
+                    }
                 }
             }
-            DynamicClockIdInfo::Fd(_) => unimplemented!(),
+            DynamicClockIdInfo::Fd(_) => {
+                return_errno_with_message!(Errno::EINVAL, "unsupported clock ID")
+            }
         }
     };
     Ok(timer)

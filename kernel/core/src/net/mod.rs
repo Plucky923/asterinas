@@ -8,6 +8,7 @@ pub(crate) fn init() {
     iface::init();
     socket::netlink::init();
     socket::vsock::init();
+    socket::framevsock::init();
 }
 
 /// Lazy init should be called after spawning init thread.

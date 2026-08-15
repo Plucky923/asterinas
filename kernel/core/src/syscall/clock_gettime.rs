@@ -130,10 +130,13 @@ pub(super) fn read_clock(clockid: clockid_t, ctx: &Context) -> Result<Duration> 
                     .get_process(pid)
                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
                 match clock_type {
-                    DynamicClockType::Profiling => Ok(process.prof_clock().read_time()),
+                    DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                        Ok(process.prof_clock().read_time())
+                    }
                     DynamicClockType::Virtual => Ok(process.prof_clock().user_clock().read_time()),
-                    // TODO: support scheduling clock and fd clock.
-                    _ => unimplemented!(),
+                    DynamicClockType::FD => {
+                        return_errno_with_message!(Errno::EINVAL, "unsupported clock ID")
+                    }
                 }
             }
             DynamicClockIdInfo::Tid(tid, clock_type) => {
@@ -142,14 +145,20 @@ pub(super) fn read_clock(clockid: clockid_t, ctx: &Context) -> Result<Duration> 
                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
                 let posix_thread = thread.as_posix_thread().unwrap();
                 match clock_type {
-                    DynamicClockType::Profiling => Ok(posix_thread.prof_clock().read_time()),
+                    DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                        Ok(posix_thread.prof_clock().read_time())
+                    }
                     DynamicClockType::Virtual => {
                         Ok(posix_thread.prof_clock().user_clock().read_time())
                     }
-                    _ => unimplemented!(),
+                    DynamicClockType::FD => {
+                        return_errno_with_message!(Errno::EINVAL, "unsupported clock ID")
+                    }
                 }
             }
-            DynamicClockIdInfo::Fd(_) => unimplemented!(),
+            DynamicClockIdInfo::Fd(_) => {
+                return_errno_with_message!(Errno::EINVAL, "unsupported clock ID")
+            }
         }
     }
 }

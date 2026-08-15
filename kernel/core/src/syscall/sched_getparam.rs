@@ -2,7 +2,10 @@
 
 use ostd::mm::VmIo;
 
-use super::{SyscallReturn, sched_getattr::access_sched_attr_with};
+use super::{
+    SyscallReturn,
+    sched_getattr::{SchedAttrAccess, access_sched_attr_with},
+};
 use crate::{prelude::*, sched::SchedPolicy, thread::Tid};
 
 pub(super) fn sys_sched_getparam(tid: Tid, addr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
@@ -10,7 +13,7 @@ pub(super) fn sys_sched_getparam(tid: Tid, addr: Vaddr, ctx: &Context) -> Result
         return_errno_with_message!(Errno::EINVAL, "invalid user space address");
     }
 
-    let policy = access_sched_attr_with(tid, ctx, |attr| Ok(attr.policy()))?;
+    let policy = access_sched_attr_with(tid, SchedAttrAccess::Read, ctx, |attr| Ok(attr.policy()))?;
     let rt_prio = match policy {
         SchedPolicy::RealTime { rt_prio, .. } => rt_prio.get().into(),
         _ => 0,

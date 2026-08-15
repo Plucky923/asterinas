@@ -133,13 +133,16 @@ impl<E: Events, F: EventsFilter<E>> SyncSubject<E, F> {
             return;
         }
 
-        // Slow path: broadcast the new events to all observers.
+        // Slow path: collect matching observers while maintaining the table,
+        // then invoke them after releasing the spin lock. Observers may wake
+        // tasks and enter the scheduler, which must not happen in atomic mode.
         let mut num_freed = 0;
+        let mut matching_observers = Vec::new();
         let mut observers = self.observers.lock();
         observers.retain(|observer, filter| {
             if let Some(observer) = observer.upgrade() {
                 if filter.filter(events) {
-                    observer.on_events(events);
+                    matching_observers.push(observer);
                 }
                 true
             } else {
@@ -149,6 +152,11 @@ impl<E: Events, F: EventsFilter<E>> SyncSubject<E, F> {
         });
         if num_freed > 0 {
             self.num_observers.fetch_sub(num_freed, Ordering::Relaxed);
+        }
+        drop(observers);
+
+        for observer in matching_observers {
+            observer.on_events(events);
         }
     }
 }

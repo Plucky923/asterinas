@@ -2,7 +2,7 @@
 
 use core::sync::atomic::Ordering;
 
-use super::SyscallReturn;
+use super::{SyscallReturn, sched_getattr::check_sched_write_permission};
 use crate::{
     prelude::*,
     process::ResourceType::RLIMIT_NICE,
@@ -32,6 +32,7 @@ pub(super) fn sys_set_priority(
 
     let processes = get_processes(prio_target)?;
     for process in processes.iter() {
+        check_sched_write_permission(&process.main_thread(), ctx)?;
         let rlimit = process.resource_limits();
         let limit = (rlimit.get_rlimit(RLIMIT_NICE).get_cur() as i8)
             .try_into()

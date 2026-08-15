@@ -4,13 +4,15 @@
 
 #![warn(unused)]
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
 use core::{fmt, ops::Bound, sync::atomic::Ordering};
 
+use aster_framevisor::FrameVcpuId;
 use ostd::{
     arch::read_tsc as sched_clock,
     cpu::{CpuId, CpuSet, PinCurrentCpu, all_cpus},
     irq::disable_local,
+    smp,
     sync::{LocalIrqDisabled, SpinLock},
     task::{
         AtomicCpuId, Task,
@@ -28,24 +30,63 @@ use super::{
 };
 use crate::thread::{AsThread, Thread};
 
+mod frame_group;
 mod policy;
+mod task_group;
 mod time;
 
-mod fair;
+pub(crate) mod fair;
 mod idle;
 mod real_time;
 mod stop;
 
-use self::policy::{SchedPolicyKind, SchedPolicyState};
 pub(crate) use self::{
+    fair::DEFAULT_CGROUP_WEIGHT,
+    task_group::{TaskGroup, root_task_group},
     policy::{LinuxSchedPolicy, SchedPolicy},
     real_time::{RealTimePolicy, RealTimePriority},
+};
+use self::{
+    policy::{SchedPolicyKind, SchedPolicyState},
+    task_group::init_root_task_group,
 };
 
 type SchedEntity = (Arc<Task>, Arc<Thread>);
 
+static CLASS_SCHEDULER: spin::Once<&'static ClassScheduler> = spin::Once::new();
+
+// The scheduler-owned FrameVM state map serializes registration, placement,
+// admission, and removal. Placement paths acquire it before a per-CPU
+// runqueue; ordinary picks use the `Arc<FrameSchedEntityState>` already held
+// by a queue entry or `current` and never need the map. Placement paths do not
+// yield or request remote preemption while the map and Host runqueue locks are
+// held. A bootstrap handoff is resolved from the map before
+// `mut_local_rq_with` locks the queue and retained only until the next pick.
+#[derive(Clone)]
+struct PickedSchedEntity {
+    concrete: SchedEntity,
+    outer: CurrentOuterEntity,
+}
+
+impl PickedSchedEntity {
+    fn task(&self) -> &Arc<Task> {
+        &self.concrete.0
+    }
+
+    fn thread(&self) -> &Arc<Thread> {
+        &self.concrete.1
+    }
+}
+
+#[derive(Clone)]
+enum CurrentOuterEntity {
+    Task,
+    FrameSchedGroup(Arc<frame_group::FrameSchedEntityState>),
+}
+
 pub(crate) fn init() {
     let scheduler = Box::leak(Box::new(ClassScheduler::new()));
+    CLASS_SCHEDULER.call_once(|| scheduler);
 
     // Inject the scheduler into the ostd for actual scheduling work.
     inject_scheduler(scheduler);
@@ -60,6 +101,56 @@ pub(crate) fn init_on_each_cpu() {
     enable_preemption_on_cpu();
 }
 
+pub(crate) fn register_frame_sched_group(
+    group: Arc<aster_framevisor::FrameSchedGroup>,
+    task_group: Arc<TaskGroup>,
+    cpu_affinity: &CpuSet,
+) {
+    if let Some(scheduler) = CLASS_SCHEDULER.get().copied() {
+        scheduler.register_frame_sched_group(group, task_group, cpu_affinity);
+    }
+}
+
+/// Applies a live CPU placement constraint to every vCPU of `vm_id`.
+pub(crate) fn update_framevm_cpu_affinity(vm_id: aster_framevisor::VmId, cpu_affinity: &CpuSet) {
+    let Some(scheduler) = CLASS_SCHEDULER.get().copied() else {
+        return;
+    };
+
+    scheduler.update_framevm_cpu_affinity(vm_id, cpu_affinity);
+}
+
+/// Creates the scheduler-only task group that contains one FrameVM.
+pub(crate) fn create_framevm_task_group(parent: &Arc<TaskGroup>, share: u32) -> Arc<TaskGroup> {
+    let weight =
+        share.saturating_mul(DEFAULT_CGROUP_WEIGHT) / aster_framevisor::DEFAULT_FRAMEVM_SHARE;
+    TaskGroup::new_child(parent, weight.max(1))
+}
+
+fn enable_framevisor_preemption_on_cpu(cpu: CpuId) {
+    let current_cpu = {
+        let guard = disable_local();
+        guard.current_cpu()
+    };
+    if current_cpu == cpu {
+        aster_framevisor::task::scheduler::enable_preemption_on_cpu();
+        return;
+    }
+
+    let mut targets = CpuSet::new_empty();
+    targets.add(cpu);
+    smp::inter_processor_call(
+        &targets,
+        aster_framevisor::task::scheduler::enable_preemption_on_cpu,
+    );
+}
+
+pub(crate) fn unregister_frame_sched_groups(vm_id: aster_framevisor::VmId) {
+    if let Some(scheduler) = CLASS_SCHEDULER.get().copied() {
+        scheduler.unregister_frame_sched_groups(vm_id);
+    }
+}
+
 /// Represents the middle layer between scheduling classes and generic scheduler
 /// traits. It consists of all the sets of run queues for CPU cores. Other global
 /// information may also be stored here.
@@ -70,6 +161,14 @@ pub(crate) struct ClassScheduler {
     /// preventing potential deadlocks due to the fact that
     /// the runqueues may be accessed in both the task and interrupt context (L1 and L2).
     rqs: Box<[SpinLock<PerCpuClassRqSet, LocalIrqDisabled>]>,
+    /// Serializes FrameVM placement state while disabling local Host IRQs.
+    ///
+    /// Host wake and affinity paths can enter from interrupt context. The
+    /// state map therefore uses the same IRQ-disabled guard as a runqueue;
+    /// placement code always acquires this map before the destination
+    /// runqueue.
+    frame_group_states:
+        SpinLock<BTreeMap<FrameVcpuId, Arc<frame_group::FrameSchedEntityState>>, LocalIrqDisabled>,
     last_chosen_cpu: AtomicCpuId,
 }
 
@@ -79,9 +178,10 @@ pub(crate) struct ClassScheduler {
 struct PerCpuClassRqSet {
     stop: stop::StopClassRq,
     real_time: real_time::RealTimeClassRq,
-    fair: fair::FairClassRq,
+    fair: Arc<SpinLock<fair::FairClassRq>>,
     idle: idle::IdleClassRq,
-    current: Option<(SchedEntity, CurrentRuntime)>,
+    current: Option<(PickedSchedEntity, CurrentRuntime)>,
+    current_can_compete_on_pick: bool,
 }
 
 /// Stores the runtime information of the current task.
@@ -98,11 +198,11 @@ struct CurrentRuntime {
 }
 
 impl CurrentRuntime {
-    fn new() -> Self {
+    fn new_with_period_delta(period_delta: u64) -> Self {
         CurrentRuntime {
             start: sched_clock(),
             delta: 0,
-            period_delta: 0,
+            period_delta,
         }
     }
 
@@ -119,6 +219,9 @@ trait SchedClassRq: Send + fmt::Debug {
     /// Enqueues a task into the run queue.
     fn enqueue(&mut self, task: Arc<Task>, flags: Option<EnqueueFlags>);
 
+    /// Removes a queued copy of the task from the run queue.
+    fn remove_queued_task(&mut self, task: &Arc<Task>) -> bool;
+
     /// Returns the number of threads in the run queue.
     fn len(&self) -> usize;
 
@@ -134,8 +237,7 @@ trait SchedClassRq: Send + fmt::Debug {
     ///
     /// The return value of this method indicates whether there is another task
     /// **in this run queue** to replace the current one.
-    fn update_current(&mut self, rt: &CurrentRuntime, attr: &SchedAttr, flags: UpdateFlags)
-    -> bool;
+    fn update_current(&mut self, rt: &CurrentRuntime, thread: &Thread, flags: UpdateFlags) -> bool;
 }
 
 /// The scheduling attribute for a thread.
@@ -218,7 +320,16 @@ impl SchedAttr {
 
 impl Scheduler for ClassScheduler {
     fn enqueue(&self, task: Arc<Task>, flags: EnqueueFlags) -> Option<CpuId> {
+        if task.is_completed() {
+            return None;
+        }
+
         let thread = task.as_thread()?.clone();
+
+        if let Some(group) = aster_framevisor::task::frame_sched_group_for_ostd_task(task.as_ref())
+        {
+            return self.enqueue_frame_sched_group_task(task, thread, group, flags);
+        }
 
         let (still_in_rq, cpu) = {
             let selected_cpu_id = self.select_cpu(&thread, flags);
@@ -239,12 +350,9 @@ impl Scheduler for ClassScheduler {
         }
 
         // Preempt if the new task has a higher priority.
-        let should_preempt = rq
-            .current
-            .as_ref()
-            .is_none_or(|((_, rq_current_thread), _)| {
-                thread.sched_attr().policy() < rq_current_thread.sched_attr().policy()
-            });
+        let should_preempt = rq.current.as_ref().is_none_or(|(current_entity, _)| {
+            thread.sched_attr().policy() < current_entity.thread().sched_attr().policy()
+        });
 
         thread.sched_attr().set_last_cpu(cpu);
         rq.enqueue_entity((task, thread), Some(flags));
@@ -254,8 +362,8 @@ impl Scheduler for ClassScheduler {
 
     fn mut_local_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue)) {
         let guard = disable_local();
-        let mut lock = self.rqs[guard.current_cpu().as_usize()].lock();
-        f(&mut *lock)
+        let mut rq = self.rqs[guard.current_cpu().as_usize()].lock();
+        f(&mut *rq);
     }
 
     fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
@@ -266,27 +374,34 @@ impl Scheduler for ClassScheduler {
 
 impl ClassScheduler {
     pub(crate) fn new() -> Self {
+        let root_task_group = init_root_task_group(ostd::cpu::num_cpus());
         let class_rq = |cpu| {
             SpinLock::new(PerCpuClassRqSet {
                 stop: stop::StopClassRq::new(),
                 real_time: real_time::RealTimeClassRq::new(cpu),
-                fair: fair::FairClassRq::new(cpu),
+                fair: root_task_group.fair_queue(cpu).clone(),
                 idle: idle::IdleClassRq::new(),
                 current: None,
+                current_can_compete_on_pick: false,
             })
         };
         ClassScheduler {
             rqs: all_cpus().map(class_rq).collect(),
+            frame_group_states: SpinLock::new(BTreeMap::new()),
             last_chosen_cpu: AtomicCpuId::default(),
         }
     }
 
     // TODO: Implement a better algorithm and replace the current naive implementation.
     fn select_cpu(&self, thread: &Thread, flags: EnqueueFlags) -> CpuId {
-        if let Some(last_cpu) = thread.sched_attr().last_cpu() {
+        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
+        let last_cpu = thread.sched_attr().last_cpu();
+        if let Some(last_cpu) = last_cpu
+            && affinity.contains(last_cpu)
+        {
             return last_cpu;
         }
-        debug_assert!(flags == EnqueueFlags::Spawn);
+        debug_assert!(flags == EnqueueFlags::Spawn || last_cpu.is_some());
 
         let guard = disable_local();
 
@@ -304,7 +419,6 @@ impl ClassScheduler {
             }
         };
 
-        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
         match self.last_chosen_cpu.get() {
             Some(cpu) => {
                 // Perform a round-robin selection starting after the last chosen CPU.
@@ -320,6 +434,65 @@ impl ClassScheduler {
         selected
     }
 
+    fn select_frame_sched_group_cpu(
+        &self,
+        cpu_affinity: &CpuSet,
+        states: &BTreeMap<FrameVcpuId, Arc<frame_group::FrameSchedEntityState>>,
+    ) -> Option<CpuId> {
+        if cpu_affinity.is_empty() {
+            return None;
+        }
+
+        let guard = disable_local();
+        let current_cpu = guard.current_cpu();
+        let mut selected = None;
+        let mut minimum_load = u32::MAX;
+        let minimum_assignment_count = cpu_affinity
+            .iter()
+            .map(|cpu| self.frame_group_assignment_count(states, cpu))
+            .min()?;
+        let avoid_current_cpu = cpu_affinity.iter().any(|candidate| {
+            candidate != current_cpu
+                && self.frame_group_assignment_count(states, candidate) == minimum_assignment_count
+        });
+
+        let test_candidate = |candidate: CpuId| {
+            if self.frame_group_assignment_count(states, candidate) != minimum_assignment_count
+                || (avoid_current_cpu && candidate == current_cpu)
+            {
+                return;
+            }
+            let PerCpuLoadStats { queue_len, .. } =
+                self.rqs[candidate.as_usize()].lock().load_stats();
+            if queue_len < minimum_load {
+                minimum_load = queue_len;
+                selected = Some(candidate);
+            }
+        };
+
+        match self.last_chosen_cpu.get() {
+            Some(cpu) => Self::cycle_after(cpu, cpu_affinity).for_each(test_candidate),
+            None => cpu_affinity.iter().for_each(test_candidate),
+        }
+
+        if let Some(selected) = selected {
+            self.last_chosen_cpu.set_anyway(selected);
+        }
+        selected
+    }
+
+    fn frame_group_assignment_count(
+        &self,
+        states: &BTreeMap<FrameVcpuId, Arc<frame_group::FrameSchedEntityState>>,
+        cpu: CpuId,
+    ) -> usize {
+        states
+            .values()
+            .filter(|state| state.is_admitted())
+            .filter(|state| state.group().is_some_and(|group| group.host_cpu() == cpu))
+            .count()
+    }
+
     /// Returns a cycling iterator over the CPUs in the [`CpuSet`], starting *after*
     /// the given [`CpuId`].
     ///
@@ -332,33 +505,385 @@ impl ClassScheduler {
             .iter_in((Bound::Excluded(cpu), Bound::Unbounded))
             .chain(cpu_set.iter_in(..=cpu))
     }
+
+    fn register_frame_sched_group(
+        &self,
+        group: Arc<aster_framevisor::FrameSchedGroup>,
+        task_group: Arc<TaskGroup>,
+        cpu_affinity: &CpuSet,
+    ) {
+        let registered = self.frame_group_states.lock().clone();
+        let host_cpu = self.select_frame_sched_group_cpu(cpu_affinity, &registered);
+        let host_cpu = {
+            let mut states = self.frame_group_states.lock();
+            if states.contains_key(&group.id()) {
+                debug_assert!(
+                    !states.contains_key(&group.id()),
+                    "FrameVM vCPU scheduling group registered twice"
+                );
+                return;
+            }
+            if let Some(host_cpu) = host_cpu {
+                group.bind_host_cpu(host_cpu);
+            }
+            let state = Arc::new(frame_group::FrameSchedEntityState::new(
+                &group,
+                task_group,
+                cpu_affinity.clone(),
+            ));
+            states.insert(group.id(), state);
+            host_cpu
+        };
+        if let Some(host_cpu) = host_cpu {
+            enable_framevisor_preemption_on_cpu(host_cpu);
+        }
+    }
+
+    fn enqueue_frame_sched_group_task(
+        &self,
+        task: Arc<Task>,
+        thread: Arc<Thread>,
+        group: Arc<aster_framevisor::FrameSchedGroup>,
+        flags: EnqueueFlags,
+    ) -> Option<CpuId> {
+        let group = if flags == EnqueueFlags::Wake {
+            let _ = aster_framevisor::task::scheduler::enqueue_service_task_from_host_wake(
+                task.clone(),
+            );
+            aster_framevisor::task::frame_sched_group_for_ostd_task(task.as_ref()).unwrap_or(group)
+        } else {
+            group
+        };
+        let state = {
+            let states = self.frame_group_states.lock();
+            states.get(&group.id())?.clone()
+        };
+        if state
+            .group()
+            .is_none_or(|live_group| !Arc::ptr_eq(&live_group, &group))
+        {
+            return None;
+        }
+        let cpu = group.host_cpu();
+        if !state.allows_host_cpu(cpu) {
+            return None;
+        }
+        if Task::current()
+            .and_then(|current| {
+                aster_framevisor::task::frame_sched_group_for_ostd_task(current.as_ref()).or_else(
+                    || {
+                        aster_framevisor::task::bootstrap_frame_sched_group_for_ostd_task(
+                            current.as_ref(),
+                        )
+                    },
+                )
+            })
+            .is_some_and(|current_group| Arc::ptr_eq(&current_group, &group))
+        {
+            let _ = task.cpu().set_if_is_none(cpu);
+            thread.sched_attr().set_last_cpu(cpu);
+            return Some(cpu);
+        }
+        // The FrameVM runqueue must be inspected without either Host scheduler
+        // lock or the FrameVM state-map lock. Virtual interrupt delivery and
+        // Host wakeups can otherwise acquire these locks in the opposite order.
+        let rq = self.rqs[cpu.as_usize()].lock();
+        let _ = task.cpu().set_if_is_none(cpu);
+        thread.sched_attr().set_last_cpu(cpu);
+        let current_group = rq.is_current_frame_group(&state);
+        if current_group {
+            return None;
+        }
+        if !group.has_runnable_work() {
+            return None;
+        }
+
+        let should_preempt = frame_group::preempt_on_enqueue(
+            &state,
+            rq.current
+                .as_ref()
+                .map(|(current_entity, _)| current_entity),
+        );
+        let did_enqueue = rq.fair.lock().enqueue_frame_sched_group(state.clone());
+        (did_enqueue && should_preempt).then_some(cpu)
+    }
+
+    fn update_framevm_cpu_affinity(&self, vm_id: aster_framevisor::VmId, cpu_affinity: &CpuSet) {
+        let states = self
+            .frame_group_states
+            .lock()
+            .iter()
+            .filter(|(id, _)| id.vm_id() == vm_id)
+            .map(|(_, state)| state.clone())
+            .collect::<alloc::vec::Vec<_>>();
+        for state in states {
+            self.update_frame_sched_group_cpu_affinity(state, cpu_affinity);
+        }
+    }
+
+    fn update_frame_sched_group_cpu_affinity(
+        &self,
+        state: Arc<frame_group::FrameSchedEntityState>,
+        cpu_affinity: &CpuSet,
+    ) {
+        {
+            let mut states = self.frame_group_states.lock();
+            let Some(group) = state.group() else {
+                states.retain(|_, registered| !Arc::ptr_eq(registered, &state));
+                return;
+            };
+            let Some(registered) = states.get(&group.id()) else {
+                return;
+            };
+            if !Arc::ptr_eq(registered, &state) {
+                return;
+            }
+            if !state.is_admitted() {
+                return;
+            }
+            state.set_cpu_affinity(cpu_affinity.clone());
+        }
+
+        loop {
+            let group = {
+                let states = self.frame_group_states.lock();
+                if state.cpu_affinity() != *cpu_affinity || !state.is_admitted() {
+                    return;
+                }
+                let Some(group) = state.group() else {
+                    return;
+                };
+                let Some(registered) = states.get(&group.id()) else {
+                    return;
+                };
+                if !Arc::ptr_eq(registered, &state) {
+                    return;
+                }
+                group.clone()
+            };
+
+            // Keep the inner scheduler lock outside the Host state-map and
+            // runqueue locks. Host wakeups can take the state map after the
+            // inner scheduler has released its runqueue lock.
+            let has_runnable_work = group.has_runnable_work();
+
+            {
+                let states = self.frame_group_states.lock();
+                if state.cpu_affinity() != *cpu_affinity || !state.is_admitted() {
+                    return;
+                }
+                let Some(registered) = states.get(&group.id()) else {
+                    return;
+                };
+                if !Arc::ptr_eq(registered, &state) {
+                    return;
+                }
+            }
+            let source_cpu = group.host_cpu();
+            let source_cpu_is_allowed = state.allows_host_cpu(source_cpu);
+            let source_rq = self.rqs[source_cpu.as_usize()].lock();
+            if source_cpu_is_allowed {
+                let did_enqueue = if source_rq.is_current_frame_group(&state) {
+                    false
+                } else if has_runnable_work {
+                    source_rq
+                        .fair
+                        .lock()
+                        .enqueue_frame_sched_group(state.clone())
+                } else {
+                    source_rq.fair.lock().try_dequeue_frame_sched_group(&state);
+                    false
+                };
+                drop(source_rq);
+                if did_enqueue {
+                    ostd::task::scheduler::request_preemption_on_cpu(source_cpu);
+                }
+                return;
+            }
+            if source_rq.is_current_frame_group(&state) {
+                drop(source_rq);
+                ostd::task::scheduler::request_preemption_on_cpu(source_cpu);
+                Task::yield_now();
+                continue;
+            }
+
+            source_rq.fair.lock().try_dequeue_frame_sched_group(&state);
+            drop(source_rq);
+
+            let registered = self.frame_group_states.lock().clone();
+            if state.cpu_affinity() != *cpu_affinity || !state.is_admitted() {
+                return;
+            }
+            if registered
+                .get(&group.id())
+                .is_none_or(|registered| !Arc::ptr_eq(registered, &state))
+            {
+                return;
+            }
+            let Some(destination_cpu) =
+                self.select_frame_sched_group_cpu(cpu_affinity, &registered)
+            else {
+                return;
+            };
+
+            let did_move = destination_cpu != source_cpu;
+            if did_move {
+                group.bind_host_cpu(destination_cpu);
+            }
+            let destination_rq = self.rqs[destination_cpu.as_usize()].lock();
+            let did_enqueue = state.allows_host_cpu(destination_cpu)
+                && has_runnable_work
+                && destination_rq
+                    .fair
+                    .lock()
+                    .enqueue_frame_sched_group(state.clone());
+            drop(destination_rq);
+            if did_move {
+                enable_framevisor_preemption_on_cpu(destination_cpu);
+            }
+            if did_enqueue {
+                ostd::task::scheduler::request_preemption_on_cpu(destination_cpu);
+            }
+            return;
+        }
+    }
+
+    fn unregister_frame_sched_groups(&self, vm_id: aster_framevisor::VmId) {
+        let mut states = self.frame_group_states.lock();
+        states.retain(|id, state| {
+            if id.vm_id() != vm_id {
+                return true;
+            }
+            state.stop_admission();
+            false
+        });
+    }
 }
 
 impl PerCpuClassRqSet {
-    fn pick_next_entity(&mut self) -> Option<SchedEntity> {
-        (self.stop.pick_next())
-            .or_else(|| self.real_time.pick_next())
-            .or_else(|| self.fair.pick_next())
-            .or_else(|| self.idle.pick_next())
-            .and_then(|task| {
-                let thread = task.as_thread()?.clone();
-                Some((task, thread))
-            })
+    fn is_current_frame_group(&self, state: &Arc<frame_group::FrameSchedEntityState>) -> bool {
+        self.current.as_ref().is_some_and(|(entity, _)| {
+            matches!(
+                &entity.outer,
+                CurrentOuterEntity::FrameSchedGroup(current_state)
+                    if Arc::ptr_eq(current_state, state)
+            )
+        })
+    }
+
+    fn sched_entity_from_task(task: Arc<Task>) -> Option<PickedSchedEntity> {
+        if task.is_completed() {
+            task.schedule_info().cpu.set_to_none();
+            return None;
+        }
+
+        let thread = task.as_thread()?.clone();
+        Some(PickedSchedEntity {
+            concrete: (task, thread),
+            outer: CurrentOuterEntity::Task,
+        })
+    }
+
+    fn pick_next_entity(&mut self) -> Option<PickedSchedEntity> {
+        while let Some(task) = self.stop.pick_next() {
+            if let Some(entity) = Self::sched_entity_from_task(task) {
+                return Some(entity);
+            }
+        }
+        while let Some(task) = self.real_time.pick_next() {
+            if let Some(entity) = Self::sched_entity_from_task(task) {
+                return Some(entity);
+            }
+        }
+        {
+            loop {
+                let fair_pick = self.fair.lock().pick_next_fair();
+                let Some(fair_pick) = fair_pick else {
+                    break;
+                };
+                match fair_pick {
+                    fair::FairPick::Task(task) => {
+                        if let Some(entity) = Self::sched_entity_from_task(task) {
+                            return Some(entity);
+                        }
+                    }
+                    fair::FairPick::FrameSchedGroup(state) => {
+                        let Some(entity) = frame_group::pick_task(&state) else {
+                            continue;
+                        };
+                        return Some(entity);
+                    }
+                }
+            }
+        }
+        while let Some(task) = self.idle.pick_next() {
+            if let Some(entity) = Self::sched_entity_from_task(task) {
+                return Some(entity);
+            }
+        }
+        None
+    }
+
+    fn inherited_period_delta(
+        previous: Option<&(PickedSchedEntity, CurrentRuntime)>,
+        next: &PickedSchedEntity,
+    ) -> u64 {
+        let Some((previous_entity, previous_runtime)) = previous else {
+            return 0;
+        };
+        match (&previous_entity.outer, &next.outer) {
+            (
+                CurrentOuterEntity::FrameSchedGroup(previous_state),
+                CurrentOuterEntity::FrameSchedGroup(next_state),
+            ) if Arc::ptr_eq(previous_state, next_state) => previous_runtime.period_delta,
+            _ => 0,
+        }
+    }
+
+    fn is_same_frame_group(left: &PickedSchedEntity, right: &PickedSchedEntity) -> bool {
+        matches!(
+            (&left.outer, &right.outer),
+            (
+                CurrentOuterEntity::FrameSchedGroup(left_state),
+                CurrentOuterEntity::FrameSchedGroup(right_state),
+            ) if Arc::ptr_eq(left_state, right_state)
+        )
+    }
+
+    fn picked_actual_current(
+        previous: Option<&(PickedSchedEntity, CurrentRuntime)>,
+        next: &PickedSchedEntity,
+    ) -> bool {
+        let Some((previous_entity, _)) = previous else {
+            return false;
+        };
+        if !Arc::ptr_eq(previous_entity.task(), next.task()) {
+            return false;
+        }
+        Task::current()
+            .is_some_and(|current| Arc::ptr_eq(&current.cloned(), previous_entity.task()))
+    }
+
+    fn has_not_switched_to(entity: &PickedSchedEntity) -> bool {
+        Task::current().is_some_and(|current| !Arc::ptr_eq(&current.cloned(), entity.task()))
     }
 
     fn enqueue_entity(&mut self, (task, thread): SchedEntity, flags: Option<EnqueueFlags>) {
         match thread.sched_attr().policy_kind() {
             SchedPolicyKind::Stop => self.stop.enqueue(task, flags),
             SchedPolicyKind::RealTime => self.real_time.enqueue(task, flags),
-            SchedPolicyKind::Fair => self.fair.enqueue(task, flags),
+            SchedPolicyKind::Fair => self.fair.lock().enqueue(task, flags),
             SchedPolicyKind::Idle => self.idle.enqueue(task, flags),
         }
     }
 
     fn load_stats(&self) -> PerCpuLoadStats {
-        let queue_len = (self.stop.len() + self.real_time.len() + self.fair.len()) as u32;
+        let fair_queue_len = self.fair.lock().total_queued_task_count();
+        let queue_len = (self.stop.len() + self.real_time.len() + fair_queue_len) as u32;
         let is_idle = match &self.current {
-            Some(((_, thread), _)) => thread.sched_attr().policy_kind() == SchedPolicyKind::Idle,
+            Some((entity, _)) => {
+                entity.thread().sched_attr().policy_kind() == SchedPolicyKind::Idle
+            }
             None => true,
         };
         PerCpuLoadStats { queue_len, is_idle }
@@ -367,30 +892,140 @@ impl PerCpuClassRqSet {
 
 impl LocalRunQueue for PerCpuClassRqSet {
     fn current(&self) -> Option<&Arc<Task>> {
-        self.current.as_ref().map(|((task, _), _)| task)
+        self.current.as_ref().map(|(entity, _)| entity.task())
+    }
+
+    fn has_runnable(&self) -> bool {
+        self.current.is_some()
+            || !self.stop.is_empty()
+            || !self.real_time.is_empty()
+            || !self.fair.lock().is_empty()
+            || !self.idle.is_empty()
     }
 
     fn try_pick_next(&mut self) -> Option<&Arc<Task>> {
-        self.pick_next_entity().and_then(|next| {
-            // We guarantee that a task can appear at once in a `PerCpuClassRqSet`. So, the `next` cannot be the same
-            // as the current task here.
-            if let Some((old, _)) = self.current.replace((next, CurrentRuntime::new())) {
-                self.enqueue_entity(old, None);
+        let requested_current_can_compete = self.current_can_compete_on_pick;
+        self.current_can_compete_on_pick = false;
+
+        let previous = self.current.take();
+        if let Some((previous_entity, _)) = &previous
+            && Self::has_not_switched_to(previous_entity)
+        {
+            self.current = previous;
+            return self.current.as_ref().map(|(entity, _)| entity.task());
+        }
+        let previous = previous;
+        let current_can_compete_on_pick = requested_current_can_compete;
+        if current_can_compete_on_pick && let Some((previous_entity, _)) = &previous {
+            match &previous_entity.outer {
+                CurrentOuterEntity::FrameSchedGroup(state) => {
+                    frame_group::requeue(state, self.fair.as_ref());
+                }
+                CurrentOuterEntity::Task => {
+                    self.enqueue_entity(previous_entity.concrete.clone(), None);
+                }
             }
-            self.current.as_ref().map(|((task, _), _)| task)
-        })
+        }
+
+        // A waiting or exiting inner task is no longer competitive, but its
+        // outer group may still contain other runnable work. Make that group
+        // visible before picking; deferring this until after `pick_next_entity`
+        // would lose the only path to its sibling inner task.
+        if !current_can_compete_on_pick
+            && let Some((previous_entity, _)) = &previous
+            && let CurrentOuterEntity::FrameSchedGroup(state) = &previous_entity.outer
+        {
+            frame_group::requeue(state, self.fair.as_ref());
+        }
+
+        let next = self.pick_next_entity();
+        let Some(next) = next else {
+            if previous.as_ref().is_some_and(|(entity, _)| {
+                matches!(&entity.outer, CurrentOuterEntity::FrameSchedGroup(_))
+            }) {
+                ostd::early_println!(
+                    "[FrameVM] Host scheduler found no successor after service task"
+                );
+            }
+            debug_assert!(previous.is_none() || !current_can_compete_on_pick);
+            self.current = previous;
+            return None;
+        };
+        let picked_previous = Self::picked_actual_current(previous.as_ref(), &next);
+        let period_delta = Self::inherited_period_delta(previous.as_ref(), &next);
+        let picked_same_frame_group = previous
+            .as_ref()
+            .is_some_and(|(previous_entity, _)| Self::is_same_frame_group(previous_entity, &next));
+        if !picked_same_frame_group
+            && previous.as_ref().is_some_and(|(entity, _)| {
+                matches!(entity.outer, CurrentOuterEntity::FrameSchedGroup(_))
+            })
+        {
+            ostd::early_println!(
+                "[FrameVM] Host scheduler selected successor: task={:p}, frame_group={}",
+                Arc::as_ptr(next.task()),
+                matches!(&next.outer, CurrentOuterEntity::FrameSchedGroup(_)),
+            );
+        }
+
+        // `current` is published while this CPU's runqueue lock is held. It
+        // is the sole handoff record between the two scheduling stages: until
+        // the Host switch commits, `has_not_switched_to` retains this exact
+        // outer/inner pair instead of selecting another inner task.
+        self.current = Some((next, CurrentRuntime::new_with_period_delta(period_delta)));
+        if !current_can_compete_on_pick
+            && !picked_same_frame_group
+            && let Some((old, _)) = previous
+        {
+            match old.outer {
+                CurrentOuterEntity::FrameSchedGroup(state) => {
+                    frame_group::requeue(&state, self.fair.as_ref());
+                }
+                CurrentOuterEntity::Task => self.enqueue_entity(old.concrete, None),
+            }
+        }
+
+        if picked_previous {
+            return None;
+        }
+        self.current.as_ref().map(|(entity, _)| entity.task())
     }
 
     fn update_current(&mut self, flags: UpdateFlags) -> bool {
-        let (should_preempt, mut lookahead) = if let Some(((_, cur), rt)) = &mut self.current {
+        self.current_can_compete_on_pick = false;
+        let mut current_can_compete_after_update = false;
+        let (should_preempt, mut lookahead) = if let Some((current_entity, rt)) = &mut self.current
+        {
             rt.update();
+            let cur = current_entity.thread();
             let attr = &cur.sched_attr();
+            let policy_kind = attr.policy_kind();
+            current_can_compete_after_update = frame_group::current_can_compete(current_entity);
 
-            match attr.policy_kind() {
-                SchedPolicyKind::Stop => (self.stop.update_current(rt, attr, flags), 0),
-                SchedPolicyKind::RealTime => (self.real_time.update_current(rt, attr, flags), 1),
-                SchedPolicyKind::Fair => (self.fair.update_current(rt, attr, flags), 2),
-                SchedPolicyKind::Idle => (self.idle.update_current(rt, attr, flags), 3),
+            match &current_entity.outer {
+                CurrentOuterEntity::FrameSchedGroup(state) => {
+                    let should_preempt = frame_group::update_current(
+                        state,
+                        current_entity.task(),
+                        rt,
+                        self.fair.as_ref(),
+                        flags,
+                    );
+                    (should_preempt, 2)
+                }
+                CurrentOuterEntity::Task => {
+                    let (should_preempt, lookahead) = match policy_kind {
+                        SchedPolicyKind::Stop => (self.stop.update_current(rt, cur, flags), 0),
+                        SchedPolicyKind::RealTime => {
+                            (self.real_time.update_current(rt, cur, flags), 1)
+                        }
+                        SchedPolicyKind::Fair => {
+                            (self.fair.lock().update_current(rt, cur, flags), 2)
+                        }
+                        SchedPolicyKind::Idle => (self.idle.update_current(rt, cur, flags), 3),
+                    };
+                    (should_preempt, lookahead)
+                }
             }
         } else {
             (false, 4)
@@ -400,18 +1035,69 @@ impl LocalRunQueue for PerCpuClassRqSet {
             lookahead = 4;
         }
 
-        should_preempt
+        let should_pick_next = should_preempt
             || (lookahead >= 1 && !self.stop.is_empty())
             || (lookahead >= 2 && !self.real_time.is_empty())
-            || (lookahead >= 3 && !self.fair.is_empty())
-            || (lookahead >= 4 && !self.idle.is_empty())
+            || (lookahead >= 3 && !self.fair.lock().is_empty())
+            || (lookahead >= 4 && !self.idle.is_empty());
+        if matches!(flags, UpdateFlags::Exit)
+            && self.current.as_ref().is_some_and(|(entity, _)| {
+                matches!(&entity.outer, CurrentOuterEntity::FrameSchedGroup(_))
+            })
+        {
+            ostd::early_println!(
+                "[FrameVM] Host service exit update: should_pick={}, fair_empty={}, idle_empty={}",
+                should_pick_next,
+                self.fair.lock().is_empty(),
+                self.idle.is_empty(),
+            );
+        }
+        self.current_can_compete_on_pick = false;
+        if should_pick_next
+            && matches!(flags, UpdateFlags::Tick)
+            && current_can_compete_after_update
+        {
+            self.current_can_compete_on_pick = true;
+        }
+        should_pick_next
     }
 
     fn dequeue_current(&mut self) -> Option<Arc<Task>> {
-        self.current.take().map(|((cur_task, _), _)| {
-            cur_task.schedule_info().cpu.set_to_none();
-            cur_task
-        })
+        let current_task = Task::current();
+        let current_task = current_task?.cloned();
+        let (entity, runtime) = self.current.take()?;
+        if !Arc::ptr_eq(entity.task(), &current_task) {
+            if matches!(&entity.outer, CurrentOuterEntity::FrameSchedGroup(_)) {
+                ostd::early_println!(
+                    "[FrameVM] Host service dequeue mismatch: actual={:p}, selected={:p}",
+                    Arc::as_ptr(&current_task),
+                    Arc::as_ptr(entity.task()),
+                );
+            }
+            self.current = Some((entity, runtime));
+            return None;
+        }
+
+        if matches!(&entity.outer, CurrentOuterEntity::FrameSchedGroup(_)) {
+            ostd::debug!(
+                "[FrameVM] Host service dequeue matched: task={:p}",
+                Arc::as_ptr(&current_task),
+            );
+        }
+
+        self.remove_queued_task(entity.task());
+        let cur_task = entity.concrete.0;
+        cur_task.schedule_info().cpu.set_to_none();
+        Some(cur_task)
+    }
+}
+
+impl PerCpuClassRqSet {
+    fn remove_queued_task(&mut self, task: &Arc<Task>) {
+        let _ = self.stop.remove_queued_task(task);
+        let _ = self.real_time.remove_queued_task(task);
+        let _ = self.fair.lock().remove_queued_task(task);
+        let _ = self.idle.remove_queued_task(task);
     }
 }
 
@@ -429,10 +1115,17 @@ struct PerCpuLoadStats {
 
 impl SchedulerStats for ClassScheduler {
     fn nr_queued_and_running(&self) -> (u32, u32) {
-        self.rqs.iter().fold((0, 0), |(queued, running), rq| {
-            let PerCpuLoadStats { queue_len, is_idle } = rq.lock().load_stats();
-            (queued + queue_len, running + u32::from(!is_idle))
-        })
+        let mut queued = 0u32;
+        let mut running = 0u32;
+        for rq in self.rqs.iter() {
+            let rq = rq.lock();
+            let load_stats = rq.load_stats();
+            queued += load_stats.queue_len;
+            if !load_stats.is_idle {
+                running += 1;
+            }
+        }
+        (queued, running)
     }
 }
 

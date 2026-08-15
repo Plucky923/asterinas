@@ -8,9 +8,10 @@ use super::{
 };
 use crate::{
     prelude::*,
-    process::pid_table,
+    process::{credentials::capabilities::CapSet, pid_table, posix_thread::AsPosixThread},
     sched::{LinuxSchedPolicy, Nice, RealTimePolicy, SchedAttr, SchedPolicy},
-    thread::Tid,
+    security::lsm::hooks as lsm_hooks,
+    thread::{Thread, Tid},
     util::CopyCompat,
 };
 
@@ -194,8 +195,38 @@ pub(super) fn write_linux_sched_attr_to_user(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SchedAttrAccess {
+    Read,
+    Write,
+}
+
+pub(super) fn check_sched_write_permission(thread: &Thread, ctx: &Context) -> Result<()> {
+    let target = thread
+        .as_posix_thread()
+        .ok_or_else(|| Error::with_message(Errno::ESRCH, "the target is not a POSIX thread"))?;
+    let current_credentials = ctx.posix_thread.credentials();
+    let target_credentials = target.credentials();
+    let current_euid = current_credentials.euid();
+    let owns_target = current_euid == target_credentials.ruid()
+        || current_euid == target_credentials.euid()
+        || current_euid == target_credentials.suid();
+    if owns_target {
+        return Ok(());
+    }
+
+    let target_process = target.process();
+    let target_user_ns = target_process.user_ns().lock();
+    lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+        target_user_ns.as_ref(),
+        ctx.posix_thread,
+        CapSet::SYS_NICE,
+    ))
+}
+
 pub(super) fn access_sched_attr_with<T>(
     tid: Tid,
+    access: SchedAttrAccess,
     ctx: &Context,
     f: impl FnOnce(&SchedAttr) -> Result<T>,
 ) -> Result<T> {
@@ -210,6 +241,9 @@ pub(super) fn access_sched_attr_with<T>(
     let Some(thread) = pid_table::pid_table_mut().get_thread(tid) else {
         return_errno_with_message!(Errno::ESRCH, "the target thread does not exist");
     };
+    if access == SchedAttrAccess::Write {
+        check_sched_write_permission(&thread, ctx)?;
+    }
     f(thread.sched_attr())
 }
 
@@ -228,7 +262,7 @@ pub(super) fn sys_sched_getattr(
         return_errno_with_message!(Errno::EINVAL, "invalid flags");
     }
 
-    let policy = access_sched_attr_with(tid, ctx, |attr| Ok(attr.policy()))?;
+    let policy = access_sched_attr_with(tid, SchedAttrAccess::Read, ctx, |attr| Ok(attr.policy()))?;
     let attr: LinuxSchedAttr = policy
         .try_into()
         .expect("all user-visible scheduling attributes should be valid");

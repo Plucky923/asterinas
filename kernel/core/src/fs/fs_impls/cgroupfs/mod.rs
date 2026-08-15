@@ -2,6 +2,7 @@
 
 pub(crate) use cgroup_ns::CgroupNamespace;
 pub(crate) use controller::cpu::{CpuStatKind, charge_cpu_time};
+pub(crate) use controller::cpuset::CpuPlacement;
 use fs::CgroupFsType;
 pub(in crate::fs) use systree_node::CgroupSystem;
 pub(crate) use systree_node::{CgroupMembership, CgroupNode, CgroupSysNode};
@@ -23,4 +24,9 @@ mod systree_node;
 // _after_ `aster_systree::init`.
 pub(super) fn init() {
     crate::fs::vfs::registry::register(&CgroupFsType).unwrap();
+}
+
+/// Returns the root cgroup's stable CPU-placement domain.
+pub(crate) fn root_cpu_placement() -> alloc::sync::Arc<CpuPlacement> {
+    CgroupSystem::singleton().controller().cpu_placement()
 }

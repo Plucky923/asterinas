@@ -24,6 +24,8 @@ pub(crate) mod options;
 pub(crate) mod unix;
 pub(crate) mod util;
 pub(crate) mod vsock;
+pub(crate) mod framevsock;
+pub(crate) mod vsock_mux;
 
 mod private {
     use core::time::Duration;

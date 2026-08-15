@@ -36,7 +36,10 @@ use crate::{
     process::{
         TermStatus,
         posix_thread::{ContextPthreadAdminApi, do_exit_group, ptrace::PtraceStopResult},
-        signal::{c_types::stack_t, constants::SIGKILL},
+        signal::{
+            c_types::stack_t,
+            constants::{SI_KERNEL, SIGKILL},
+        },
     },
 };
 
@@ -123,6 +126,8 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
     };
 
     let sig_num = signal.num();
+    let signal_info = signal.to_info();
+    let terminates_init = sig_num == SIGKILL && signal_info.si_code == SI_KERNEL;
     match sig_action {
         SigAction::Ign => {
             debug!("Ignore signal {:?}", sig_num);
@@ -166,7 +171,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                 mask,
                 restore_sig_mask.map(RestoreSigMaskGuard::into_mask),
                 user_ctx,
-                signal.to_info(),
+                signal_info,
             ) {
                 debug!("Failed to handle user signal: {:?}", e);
                 // If signal handling fails, the process should be terminated with SIGSEGV.
@@ -178,7 +183,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
                 do_exit_group(TermStatus::Killed(SIGSEGV), ctx, user_ctx);
             }
         }
-        SigAction::Dfl if ctx.process.is_init_process() => {
+        SigAction::Dfl if ctx.process.is_init_process() && !terminates_init => {
             // From Linux man pages "kill(2)":
             // "The only signals that can be sent to process ID 1, the init process, are those for
             // which init has explicitly installed signal handlers."

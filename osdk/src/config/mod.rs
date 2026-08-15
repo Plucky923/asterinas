@@ -32,6 +32,12 @@ use crate::{
     util::new_command_checked_exists,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissingInitramfsPolicy {
+    Reject,
+    AllowOutput,
+}
+
 /// The global configuration for the OSDK actions.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Config {
@@ -46,6 +52,7 @@ fn apply_args_before_finalize(
     action_scheme: &mut ActionScheme,
     args: &CommonArgs,
     workdir: &PathBuf,
+    missing_initramfs_policy: MissingInitramfsPolicy,
 ) {
     if action_scheme.grub.is_none() {
         action_scheme.grub = Some(GrubScheme::default());
@@ -70,13 +77,11 @@ fn apply_args_before_finalize(
             }
         }
         if let Some(initramfs) = &args.initramfs {
-            let Ok(initramfs) = initramfs.canonicalize() else {
-                error_msg!(
-                    "The initramfs path provided with argument `--initramfs` does not match any files."
-                );
-                process::exit(Errno::GetMetadata as _);
-            };
-            boot.initramfs = Some(initramfs);
+            boot.initramfs = Some(resolve_initramfs_path(
+                initramfs,
+                workdir,
+                missing_initramfs_policy,
+            ));
         }
         if let Some(boot_method) = args.boot_method {
             boot.method = Some(boot_method);
@@ -101,10 +106,14 @@ fn apply_args_before_finalize(
         }
     }
 
-    canonicalize_and_eval(action_scheme, workdir);
+    canonicalize_and_eval(action_scheme, workdir, missing_initramfs_policy);
 }
 
-fn canonicalize_and_eval(action_scheme: &mut ActionScheme, workdir: &PathBuf) {
+fn canonicalize_and_eval(
+    action_scheme: &mut ActionScheme,
+    workdir: &PathBuf,
+    missing_initramfs_policy: MissingInitramfsPolicy,
+) {
     let canonicalize = |target: &mut PathBuf| {
         let last_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(workdir).unwrap();
@@ -123,7 +132,7 @@ fn canonicalize_and_eval(action_scheme: &mut ActionScheme, workdir: &PathBuf) {
 
     if let Some(ref mut boot) = action_scheme.boot {
         if let Some(ref mut initramfs) = boot.initramfs {
-            canonicalize(initramfs);
+            *initramfs = resolve_initramfs_path(initramfs, workdir, missing_initramfs_policy);
         }
 
         if let Some(ref mut qemu) = action_scheme.qemu
@@ -151,6 +160,31 @@ fn canonicalize_and_eval(action_scheme: &mut ActionScheme, workdir: &PathBuf) {
                 error_msg!("Failed to evaluate qemu args: {:#?}", e);
                 process::exit(Errno::ParseMetadata as _);
             }
+        }
+    }
+}
+
+fn resolve_initramfs_path(
+    path: &Path,
+    workdir: &PathBuf,
+    missing_initramfs_policy: MissingInitramfsPolicy,
+) -> PathBuf {
+    let initramfs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workdir.join(path)
+    };
+
+    match initramfs.canonicalize() {
+        Ok(path) => path,
+        Err(_) if missing_initramfs_policy == MissingInitramfsPolicy::AllowOutput => initramfs,
+        Err(err) => {
+            error_msg!(
+                "Cannot canonicalize path `{}`: {}",
+                initramfs.to_string_lossy(),
+                err,
+            );
+            process::exit(Errno::GetMetadata as _);
         }
     }
 }
@@ -188,6 +222,18 @@ fn apply_args_after_finalize(action: &mut Action, args: &CommonArgs) {
 
 impl Config {
     pub fn new(scheme: &Scheme, common_args: &CommonArgs) -> Self {
+        Self::new_with_initramfs_policy(scheme, common_args, MissingInitramfsPolicy::Reject)
+    }
+
+    pub fn new_framevm(scheme: &Scheme, common_args: &CommonArgs) -> Self {
+        Self::new_with_initramfs_policy(scheme, common_args, MissingInitramfsPolicy::AllowOutput)
+    }
+
+    fn new_with_initramfs_policy(
+        scheme: &Scheme,
+        common_args: &CommonArgs,
+        missing_initramfs_policy: MissingInitramfsPolicy,
+    ) -> Self {
         let check_compatibility = |protocol: BootProtocol, encoding: PayloadEncoding| {
             if protocol != BootProtocol::Linux && encoding != PayloadEncoding::Raw {
                 panic!(
@@ -211,7 +257,12 @@ impl Config {
         let run = {
             let mut run = scheme.run.clone().unwrap_or_default();
             run.inherit(&default_scheme);
-            apply_args_before_finalize(&mut run, common_args, scheme.work_dir.as_ref().unwrap());
+            apply_args_before_finalize(
+                &mut run,
+                common_args,
+                scheme.work_dir.as_ref().unwrap(),
+                missing_initramfs_policy,
+            );
             let mut run = run.finalize(target_arch);
             apply_args_after_finalize(&mut run, common_args);
             check_compatibility(run.grub.boot_protocol, run.build.encoding.clone());
@@ -220,7 +271,12 @@ impl Config {
         let test = {
             let mut test = scheme.test.clone().unwrap_or_default();
             test.inherit(&default_scheme);
-            apply_args_before_finalize(&mut test, common_args, scheme.work_dir.as_ref().unwrap());
+            apply_args_before_finalize(
+                &mut test,
+                common_args,
+                scheme.work_dir.as_ref().unwrap(),
+                missing_initramfs_policy,
+            );
             let mut test = test.finalize(target_arch);
             apply_args_after_finalize(&mut test, common_args);
             check_compatibility(test.grub.boot_protocol, test.build.encoding.clone());

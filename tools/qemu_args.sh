@@ -63,11 +63,24 @@ fi
 
 VIRTIO_NET_FEATURES=",csum=off,ctrl_guest_offloads=off,ctrl_mac_addr=off,ctrl_rx_extra=off,ctrl_rx=off,ctrl_vlan=off,ctrl_vq=off,event_idx=off,guest_announce=off,guest_csum=off,guest_ecn=off,guest_tso4=off,guest_tso6=off,guest_ufo=off,guest_uso4=off,guest_uso6=off,host_ecn=off,host_tso4=off,host_tso6=off,host_ufo=off,host_uso=off,indirect_desc=off,mrg_rxbuf=off,queue_reset=off"
 
-if [ "$CONSOLE" = "hvc0" ]; then
-    # Kernel logs are printed to all consoles. Redirect serial output to a file to avoid duplicate logs.
-    CONSOLE_ARGS="-device virtconsole,chardev=mux -serial file:qemu-serial.log"
+if [ "${STDIO_SERIAL_ONLY:-off}" = "on" ]; then
+    STDIO_CHARDEV_ARGS="-chardev stdio,id=serial0,signal=off,logfile=qemu.log"
+    MONITOR_ARGS="-monitor none"
+    if [ "$CONSOLE" = "hvc0" ]; then
+        # Kernel logs are printed to all consoles. Redirect serial output to a file to avoid duplicate logs.
+        CONSOLE_ARGS="-device virtconsole,chardev=serial0 -serial file:qemu-serial.log"
+    else
+        CONSOLE_ARGS="-serial chardev:serial0"
+    fi
 else
-    CONSOLE_ARGS="-serial chardev:mux"
+    STDIO_CHARDEV_ARGS="-chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log"
+    MONITOR_ARGS="-monitor chardev:mux"
+    if [ "$CONSOLE" = "hvc0" ]; then
+        # Kernel logs are printed to all consoles. Redirect serial output to a file to avoid duplicate logs.
+        CONSOLE_ARGS="-device virtconsole,chardev=mux -serial file:qemu-serial.log"
+    else
+        CONSOLE_ARGS="-serial chardev:mux"
+    fi
 fi
 
 if [ "$INITRAMFS" = "off" ]; then
@@ -94,8 +107,8 @@ if [ "$1" = "riscv" ]; then
         --no-reboot \
         -nographic \
         -display none \
-        -monitor chardev:mux \
-        -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
+        $MONITOR_ARGS \
+        $STDIO_CHARDEV_ARGS \
         $ROOTFS_DRIVE_ARGS \
         -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
         -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
@@ -141,11 +154,11 @@ if [ "$1" = "tdx" ]; then
         -device virtio-keyboard-pci,disable-legacy=on,disable-modern=off \
         $NETDEV_ARGS \
         $QEMU_OPT_ARG_DUMP_PACKETS \
-        -chardev stdio,id=mux,mux=on,logfile=qemu.log \
+        $STDIO_CHARDEV_ARGS \
         -device virtio-serial,romfile= \
         $CONSOLE_ARGS \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-        -monitor chardev:mux \
+        $MONITOR_ARGS \
         -d guest_errors \
     "
     echo $QEMU_ARGS
@@ -159,8 +172,8 @@ COMMON_QEMU_ARGS="\
     --no-reboot \
     -nographic \
     -display vnc=0.0.0.0:${VNC_PORT:-42} \
-    -monitor chardev:mux \
-    -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
+    $MONITOR_ARGS \
+    $STDIO_CHARDEV_ARGS \
     $NETDEV_ARGS \
     $QEMU_OPT_ARG_DUMP_PACKETS \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -224,7 +237,7 @@ else
         -device virtio-net-pci,netdev=net01,disable-legacy=on,disable-modern=off$VIRTIO_NET_FEATURES$IOMMU_DEV_EXTRA \
         -device virtio-serial-pci,disable-legacy=on,disable-modern=off$IOMMU_DEV_EXTRA \
         -drive if=none,format=raw,id=nvme0n1,file=./test/initramfs/build/nvme0n1.img \
-        -device nvme,drive=nvme0n1,serial=nvme0n1 \
+        -device nvme,bus=pcie.0,addr=0xb,drive=nvme0n1,serial=nvme0n1 \
         $CONSOLE_ARGS \
         $IOMMU_EXTRA_ARGS \
     "

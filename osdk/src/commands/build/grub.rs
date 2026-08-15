@@ -22,7 +22,9 @@ use crate::{
 pub fn create_bootdev_image(
     target_dir: impl AsRef<Path>,
     aster_bin: &AsterBin,
-    initramfs_path: Option<impl AsRef<Path>>,
+    initramfs_path: Option<&Path>,
+    binary_path: Option<&Path>,
+    framevm_symbols_path: Option<&Path>,
     config: &Config,
     action: ActionChoice,
 ) -> AsterVmImage {
@@ -41,13 +43,30 @@ pub fn create_bootdev_image(
     fs::create_dir_all(iso_root.join("boot").join("grub")).unwrap();
 
     // Copy the initramfs to the boot directory.
-    if let Some(init_path) = &initramfs_path {
-        hard_link_or_copy(
-            init_path.as_ref().to_str().unwrap(),
-            iso_root.join("boot").join("initramfs.cpio.gz"),
-        )
-        .unwrap();
+    if let Some(init_path) = initramfs_path {
+        hard_link_or_copy(init_path, iso_root.join("boot").join("initramfs.cpio.gz")).unwrap();
     }
+
+    let binary_in_image = if let Some(binary_path) = binary_path {
+        let binary_file_name = binary_path
+            .file_name()
+            .expect("The binary_path must point to a file.");
+        let dest_path = iso_root.join("boot").join(binary_file_name);
+        hard_link_or_copy(binary_path, dest_path).unwrap();
+        Some((
+            format!("/boot/{}", binary_file_name.to_str().unwrap()),
+            binary_file_name.to_string_lossy().to_string(),
+        ))
+    } else {
+        None
+    };
+    let framevm_symbols_in_image = if let Some(framevm_symbols_path) = framevm_symbols_path {
+        let dest_path = iso_root.join("boot").join("framevm.symbols");
+        hard_link_or_copy(framevm_symbols_path, dest_path).unwrap();
+        Some("/boot/framevm.symbols".to_string())
+    } else {
+        None
+    };
 
     // Make the kernel image and place it in the boot directory.
     match protocol {
@@ -77,6 +96,8 @@ pub fn create_bootdev_image(
         &action.boot.kcmdline.join(" "),
         !action.grub.display_grub_menu,
         initramfs_in_image,
+        binary_in_image,
+        framevm_symbols_in_image,
         protocol,
     );
     let grub_cfg_path = iso_root.join("boot").join("grub").join("grub.cfg");
@@ -106,6 +127,8 @@ fn generate_grub_cfg(
     kcmdline: &str,
     skip_grub_menu: bool,
     initramfs_path: Option<String>,
+    binary_module: Option<(String, String)>,
+    framevm_symbols_path: Option<String>,
     protocol: &BootProtocol,
 ) -> String {
     let target_name = get_current_crates().remove(0).name;
@@ -129,28 +152,47 @@ fn generate_grub_cfg(
         .into_string()
         .unwrap();
     match protocol {
-        BootProtocol::Multiboot => grub_cfg
-            .replace("#GRUB_CMD_KERNEL#", "multiboot")
-            .replace("#KERNEL#", &aster_bin_path_on_device)
-            .replace(
-                "#GRUB_CMD_INITRAMFS#",
-                &if let Some(p) = &initramfs_path {
-                    "module --nounzip ".to_owned() + p
-                } else {
-                    "".to_owned()
-                },
-            ),
-        BootProtocol::Multiboot2 => grub_cfg
-            .replace("#GRUB_CMD_KERNEL#", "multiboot2")
-            .replace("#KERNEL#", &aster_bin_path_on_device)
-            .replace(
-                "#GRUB_CMD_INITRAMFS#",
-                &if let Some(p) = &initramfs_path {
-                    "module2 --nounzip ".to_owned() + p
-                } else {
-                    "".to_owned()
-                },
-            ),
+        BootProtocol::Multiboot => {
+            let initramfs_cmd = if let Some(p) = &initramfs_path {
+                format!("module --nounzip {} type=initramfs", p)
+            } else {
+                String::new()
+            };
+
+            grub_cfg
+                .replace("#GRUB_CMD_KERNEL#", "multiboot")
+                .replace("#KERNEL#", &aster_bin_path_on_device)
+                .replace("#GRUB_CMD_INITRAMFS#", &initramfs_cmd)
+                .replace("#GRUB_CMD_BINARY#", "")
+                .replace("#GRUB_CMD_FRAMEVM_SYMBOLS#", "")
+        }
+        BootProtocol::Multiboot2 => {
+            let initramfs_cmd = if let Some(p) = &initramfs_path {
+                format!("module2 --nounzip {} type=initramfs", p)
+            } else {
+                String::new()
+            };
+            let binary_cmd = if let Some((path, name)) = &binary_module {
+                format!("module2 --nounzip {} type=kernel-bin name={}", path, name)
+            } else {
+                String::new()
+            };
+            let framevm_symbols_cmd = if let Some(path) = &framevm_symbols_path {
+                format!(
+                    "module2 --nounzip {} type=framevm-symbol-table name=framevm.symbols",
+                    path
+                )
+            } else {
+                String::new()
+            };
+
+            grub_cfg
+                .replace("#GRUB_CMD_KERNEL#", "multiboot2")
+                .replace("#KERNEL#", &aster_bin_path_on_device)
+                .replace("#GRUB_CMD_INITRAMFS#", &initramfs_cmd)
+                .replace("#GRUB_CMD_BINARY#", &binary_cmd)
+                .replace("#GRUB_CMD_FRAMEVM_SYMBOLS#", &framevm_symbols_cmd)
+        }
         BootProtocol::Linux => grub_cfg
             .replace("#GRUB_CMD_KERNEL#", "linux")
             .replace("#KERNEL#", &aster_bin_path_on_device)
@@ -161,7 +203,9 @@ fn generate_grub_cfg(
                 } else {
                     "".to_owned()
                 },
-            ),
+            )
+            .replace("#GRUB_CMD_BINARY#", "")
+            .replace("#GRUB_CMD_FRAMEVM_SYMBOLS#", ""),
     }
 }
 

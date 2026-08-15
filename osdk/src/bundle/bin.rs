@@ -87,12 +87,12 @@ impl AsterBin {
         &self.version
     }
 
-    pub fn stripped(&self) -> bool {
-        self.stripped
-    }
-
     pub fn typ(&self) -> &AsterBinType {
         &self.typ
+    }
+
+    pub fn stripped(&self) -> bool {
+        self.stripped
     }
 
     /// Copy the binary to the `base` directory and convert the path to a relative path.

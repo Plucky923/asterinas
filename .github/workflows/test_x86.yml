@@ -105,6 +105,47 @@ jobs:
           smp: ${{ matrix.smp }}
           boot_protocol: ${{ matrix.boot_protocol || 'linux-efi-handover64' }}
 
+  framevm-passthrough:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: asterinas/asterinas:0.18.0-20260702
+      options: -v /dev:/dev --privileged
+      volumes:
+        - /usr/lib/google-cloud-sdk:/usr/lib/google-cloud-sdk
+        - /usr/local/lib/android:/usr/local/lib/android
+        - /usr/share/dotnet:/usr/share/dotnet
+    steps:
+      - name: Free disk space
+        run: rm -rf /usr/lib/google-cloud-sdk/* /usr/local/lib/android/* /usr/share/dotnet/*
+      - uses: actions/checkout@v4
+      - name: Run FrameVM NVMe passthrough test
+        run: >-
+          make run_framevm
+          AUTO_TEST=nvme-passthrough
+          FRAMEVM_PCI_RESERVE=0000:00:0b.0
+          CARGO_INCREMENTAL=0
+
+  framevm-application:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: asterinas/asterinas:0.18.0-20260702
+      options: -v /dev:/dev --privileged
+      volumes:
+        - /usr/lib/google-cloud-sdk:/usr/lib/google-cloud-sdk
+        - /usr/local/lib/android:/usr/local/lib/android
+        - /usr/share/dotnet:/usr/share/dotnet
+    steps:
+      - name: Free disk space
+        run: rm -rf /usr/lib/google-cloud-sdk/* /usr/local/lib/android/* /usr/share/dotnet/*
+      - uses: actions/checkout@v4
+      - name: Run FrameVM application compatibility test
+        run: >-
+          make run_framevm
+          AUTO_TEST=application
+          CARGO_INCREMENTAL=0
+
   conformance-test:
     runs-on: ubuntu-latest
     container:

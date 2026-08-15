@@ -79,9 +79,14 @@ run_workspace_clippy() {
 
     build_package_args "--non-default-ones" non_default_package_args
     for ((index = 0; index < ${#non_default_package_args[@]}; index += 2)); do
-        if [[ "${non_default_package_args[index + 1]}" = "linux-bzimage-setup" ]]; then
-            continue
-        fi
+        case "${non_default_package_args[index + 1]}" in
+            aster-framevm|linux-bzimage-setup)
+                # `aster-framevm` is a deliberately trimmed kernel source mirror.
+                # Its facade shape and target build are checked separately by
+                # `framevm_service_check` and the FrameVM integration targets.
+                continue
+                ;;
+        esac
 
         filtered_non_default_package_args+=(
             "${non_default_package_args[index]}"

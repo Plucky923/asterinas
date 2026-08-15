@@ -15,6 +15,10 @@ RELEASE ?= 0
 RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
 SCHEME ?= ""
+ifeq ($(AUTO_TEST), nvme-passthrough)
+SCHEME := iommu
+FRAMEVM_PCI_RESERVE := 0000:00:0b.0
+endif
 SMP ?= 1
 OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
 FEATURES ?=
@@ -22,6 +26,18 @@ NO_DEFAULT_FEATURES ?= 0
 COVERAGE ?= 0
 INITRAMFS ?= on
 CMDLINE ?=
+
+# FrameVM development options.
+FRAMEVM_OBJ_OUTPUT ?= build/framevm/framevm.o
+FRAMEVM_TARGET ?= x86_64-unknown-none
+FRAMEVM_INITRAMFS_PATH ?= /framevm/framevm.o
+FRAMEVM_FEATURES ?=
+FRAMEVM_SQLITE_TIMEOUT ?=
+FRAMEVM_SQLITE_SIZE ?=
+FRAMEVM_NO_DEFAULT_FEATURES ?= 0
+# Limit used by the inner FrameVM instances launched by the initramfs tests.
+# This is deliberately distinct from MEM, which sizes the outer Host QEMU.
+FRAMEVM_MEMORY_LIMIT ?= 8G
 
 # Specify the primary system console (supported: tty0, ttyS0, hvc0).
 # - tty0: The active virtual terminal (VT).
@@ -99,7 +115,7 @@ export OSDK_TARGET_ARCH=$(TARGET_ARCH)
 
 SHELL := /bin/bash
 
-CARGO_OSDK := ~/.cargo/bin/cargo-osdk
+CARGO_OSDK := $(HOME)/.cargo/bin/cargo-osdk
 
 # Common arguments for `cargo osdk` `build`, `run` and `test` commands.
 CARGO_OSDK_COMMON_ARGS :=
@@ -109,6 +125,16 @@ CARGO_OSDK_BUILD_ARGS += --kcmd-args="earlycon"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
 ifneq ($(strip $(CMDLINE)),)
 CARGO_OSDK_BUILD_ARGS += $(foreach arg,$(CMDLINE),--kcmd-args="$(arg)")
+endif
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="ostd.log_level=$(LOG_LEVEL)"
+ifneq ($(strip $(FRAMEVM_PCI_RESERVE)),)
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="framevm.pci_reserve=$(FRAMEVM_PCI_RESERVE)"
+endif
+ifneq ($(strip $(FRAMEVM_SQLITE_TIMEOUT)),)
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="FRAMEVM_SQLITE_TIMEOUT=$(FRAMEVM_SQLITE_TIMEOUT)"
+endif
+ifneq ($(strip $(FRAMEVM_SQLITE_SIZE)),)
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="FRAMEVM_SQLITE_SIZE=$(FRAMEVM_SQLITE_SIZE)"
 endif
 CARGO_OSDK_TEST_ARGS :=
 
@@ -225,6 +251,81 @@ endif
 CARGO_OSDK_BUILD_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 CARGO_OSDK_TEST_ARGS += $(CARGO_OSDK_COMMON_ARGS)
 
+FRAMEVM_FEATURE_ARGS :=
+ifneq ($(strip $(FRAMEVM_FEATURES)),)
+FRAMEVM_FEATURE_ARGS += $(addprefix --framevm-features=,$(FRAMEVM_FEATURES))
+endif
+ifeq ($(FRAMEVM_NO_DEFAULT_FEATURES), 1)
+FRAMEVM_FEATURE_ARGS += --framevm-no-default-features
+endif
+
+FRAMEVM_OSDK_ARGS := --framevm-target="$(FRAMEVM_TARGET)"
+FRAMEVM_OSDK_ARGS += --framevm-object-output="$(abspath $(FRAMEVM_OBJ_OUTPUT))"
+FRAMEVM_OSDK_ARGS += --framevm-install-path="$(FRAMEVM_INITRAMFS_PATH)"
+FRAMEVM_OSDK_ARGS += $(FRAMEVM_FEATURE_ARGS)
+FRAMEVM_OSDK_MEMORY_ARGS :=
+ifneq ($(strip $(FRAMEVM_MEMORY_LIMIT)),)
+FRAMEVM_OSDK_MEMORY_ARGS += --framevm-memory-limit="$(FRAMEVM_MEMORY_LIMIT)"
+endif
+
+FRAMEVM_LOAD_INIT ?= /test/framevm/shell.sh
+FRAMEVM_MARKERS ?=
+ifeq ($(AUTO_TEST), load)
+FRAMEVM_LOAD_INIT := /test/framevm/load.sh
+FRAMEVM_MARKERS := FRAMEVM_LOAD_OK
+else ifeq ($(AUTO_TEST), boot)
+FRAMEVM_LOAD_INIT := /test/framevm/boot.sh
+FRAMEVM_MARKERS := FRAMEVM_BOOT_OK
+else ifeq ($(AUTO_TEST), regression)
+FRAMEVM_LOAD_INIT := /test/framevm/regression.sh
+FRAMEVM_MARKERS := FRAMEVM_REGRESSION_OK
+else ifeq ($(AUTO_TEST), device)
+SMP := 4
+FRAMEVM_LOAD_INIT := /test/framevm/device.sh
+FRAMEVM_MARKERS := FRAMEVM_DEVICE_OK
+else ifeq ($(AUTO_TEST), nvme-passthrough)
+SMP := 4
+FRAMEVM_LOAD_INIT := /test/framevm/nvme_passthrough.sh
+FRAMEVM_MARKERS := FRAMEVM_NVME_PASSTHROUGH_OK
+else ifeq ($(AUTO_TEST), memory)
+FRAMEVM_LOAD_INIT := /test/framevm/memory.sh
+FRAMEVM_MARKERS := FRAMEVM_MEMORY_OK
+else ifeq ($(AUTO_TEST), allocator)
+FRAMEVM_LOAD_INIT := /test/framevm/allocator.sh
+FRAMEVM_MARKERS := FRAMEVM_ALLOCATOR_OK
+else ifeq ($(AUTO_TEST), rootfs)
+FRAMEVM_LOAD_INIT := /test/framevm/rootfs.sh
+FRAMEVM_MARKERS := FRAMEVM_ROOTFS_OK
+else ifeq ($(AUTO_TEST), lifecycle)
+FRAMEVM_LOAD_INIT := /test/framevm/lifecycle.sh
+FRAMEVM_MARKERS := FRAMEVM_LIFECYCLE_OK
+else ifeq ($(AUTO_TEST), net)
+FRAMEVM_LOAD_INIT := /test/framevm/net.sh
+FRAMEVM_MARKERS := FRAMEV_NET_OK
+else ifeq ($(AUTO_TEST), application)
+SMP := 2
+FRAMEVM_LOAD_INIT := /test/framevm/application.sh
+FRAMEVM_MARKERS := FRAMEVM_SQLITE_OK FRAMEVM_NGINX_OK FRAMEVM_APPLICATION_OK
+else ifeq ($(AUTO_TEST), placement)
+SMP := 4
+FRAMEVM_LOAD_INIT := /test/framevm/placement.sh
+FRAMEVM_MARKERS := FRAMEVM_PLACEMENT_OK
+else ifeq ($(AUTO_TEST), smp)
+SMP := 4
+FRAMEVM_LOAD_INIT := /test/framevm/smp.sh
+FRAMEVM_MARKERS := FRAMEVM_SMP_OK
+else ifeq ($(AUTO_TEST), fairness)
+SMP := 4
+FRAMEVM_LOAD_INIT := /test/framevm/fairness.sh
+FRAMEVM_MARKERS := FRAMEVM_FAIRNESS_OK
+else ifeq ($(AUTO_TEST), shell)
+FRAMEVM_LOAD_INIT := /test/framevm/shell_test.sh
+FRAMEVM_MARKERS := FRAMEVM_SHELL_OK
+else ifeq ($(AUTO_TEST), all)
+FRAMEVM_LOAD_INIT := /test/framevm/all.sh
+FRAMEVM_MARKERS := FRAMEVM_BOOT_OK FRAMEVM_REGRESSION_OK FRAMEVM_DEVICE_OK FRAMEVM_ROOTFS_OK FRAMEVM_LIFECYCLE_OK FRAMEV_NET_OK FRAMEVM_PLACEMENT_OK FRAMEVM_FAIRNESS_OK FRAMEVM_SHELL_OK
+endif
+
 # Pass make variables to all subdirectory makes
 export
 
@@ -270,8 +371,8 @@ check_vdso:
 	fi
 
 .PHONY: initramfs
-initramfs: check_vdso
-	@$(MAKE) --no-print-directory -C test/initramfs initramfs-boot-images
+initramfs: check_vdso $(INITRAMFS_EXTRA_DEPS)
+	@$(MAKE) --no-print-directory -C test/initramfs initramfs-boot-images $(INITRAMFS_EXTRA_ARGS)
 
 .PHONY: rootfs
 rootfs: check_vdso
@@ -450,6 +551,9 @@ check: $(CARGO_OSDK)
 		exit 1; \
 	fi
 	@
+	@# Check FrameVM service boundary and facade shape
+	@$(MAKE) --no-print-directory framevm_service_check
+	@
 	@# Check if all workspace members enable workspace lints
 	@for dir in $(WORKSPACE_MEMBER_DIRS); do \
 		if [[ "$$(tail -2 $$dir/Cargo.toml)" != "[lints]"$$'\n'"workspace = true" ]]; then \
@@ -488,3 +592,67 @@ clean:
 	@$(MAKE) --no-print-directory -C test/initramfs clean
 	@echo "Uninstalling OSDK"
 	@rm -f $(CARGO_OSDK)
+
+.PHONY: framevm_service_check
+framevm_service_check:
+	@cargo run --quiet -p framevm-service-check -- tools/framevm-service-check/config.toml
+
+.PHONY: framevm
+framevm: CONSOLE = ttyS0
+framevm: $(CARGO_OSDK)
+	@cd kernel && $(CARGO_OSDK) osdk framevm build $(CARGO_OSDK_BUILD_ARGS) $(FRAMEVM_OSDK_ARGS)
+
+.PHONY: run_framevm
+run_framevm: CONSOLE = ttyS0
+run_framevm: $(CARGO_OSDK)
+	@cd kernel && STDIO_SERIAL_ONLY=on $(CARGO_OSDK) osdk framevm run $(CARGO_OSDK_BUILD_ARGS) \
+		$(FRAMEVM_OSDK_ARGS) $(FRAMEVM_OSDK_MEMORY_ARGS) --framevm-load-init $(FRAMEVM_LOAD_INIT)
+	@for marker in $(FRAMEVM_MARKERS); do \
+		if ! tr -d '\r' < qemu.log | grep -qx "$${marker}"; then \
+			echo "framevm diagnostic marker $${marker} missing (case protocol is authoritative)"; \
+			tail --lines 200 qemu.log | tr -d '\r' | grep "FrameVM terminal status:" | tail --lines 1 || true; \
+			echo "qemu.log tail:"; \
+			tail --lines 80 qemu.log | tr -d '\r'; \
+		fi; \
+	done
+
+.PHONY: run_framevm_no_build
+run_framevm_no_build: CONSOLE = ttyS0
+run_framevm_no_build: $(CARGO_OSDK)
+	@cd kernel && STDIO_SERIAL_ONLY=on $(CARGO_OSDK) osdk framevm run --no-build $(CARGO_OSDK_BUILD_ARGS) \
+		$(FRAMEVM_OSDK_ARGS) $(FRAMEVM_OSDK_MEMORY_ARGS) --framevm-load-init $(FRAMEVM_LOAD_INIT)
+
+.PHONY: run_framevm_smoke
+run_framevm_smoke:
+	@$(MAKE) --no-print-directory run_framevm AUTO_TEST=load
+	@$(MAKE) --no-print-directory run_framevm_no_build AUTO_TEST=load
+
+.PHONY: run_framevm_memory
+run_framevm_memory:
+	@$(MAKE) --no-print-directory run_framevm AUTO_TEST=memory FRAMEVM_MEMORY_LIMIT=64M MEM=8G
+
+.PHONY: run_framevm_allocator
+run_framevm_allocator:
+	@$(MAKE) --no-print-directory run_framevm AUTO_TEST=allocator FRAMEVM_MEMORY_LIMIT=64M MEM=8G
+
+FRAMEVM_FULL_TESTS := load boot regression device rootfs lifecycle net application allocator placement smp fairness shell
+
+.PHONY: run_framevm_full
+run_framevm_full:
+	@set -eu; \
+	for test_name in $(FRAMEVM_FULL_TESTS); do \
+		echo "FrameVM full test: $${test_name}"; \
+		$(MAKE) --no-print-directory run_framevm AUTO_TEST=$${test_name}; \
+	done
+
+.PHONY: run_framev
+run_framev: run_framevm
+
+FRAMEVM_BOOT_STABILITY_RUNS ?= 3
+
+.PHONY: run_framevm_boot_stability
+run_framevm_boot_stability:
+	@for run in $$(seq 1 $(FRAMEVM_BOOT_STABILITY_RUNS)); do \
+		echo "FrameVM boot stability run $${run}/$(FRAMEVM_BOOT_STABILITY_RUNS)"; \
+		$(MAKE) --no-print-directory run_framevm AUTO_TEST=boot FRAMEV_VSOCK_VCPUS=$(FRAMEV_VSOCK_VCPUS); \
+	done

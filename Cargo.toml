@@ -44,6 +44,17 @@ members = [
     "kernel/core/comps/time",
     "kernel/core/comps/uart",
     "kernel/core/comps/virtio",
+    "kernel/comps/framev-console",
+    "kernel/comps/framev-blk",
+    "kernel/comps/framev-net",
+    "kernel/comps/framev-pci",
+    "kernel/comps/framev-rng",
+    "kernel/comps/framevisor",
+    "kernel/comps/framevisor-ostd",
+    "kernel/comps/framevisor-ostd/libs/aster-util",
+    "kernel/comps/framev-sock",
+    "kernel/comps/framevisor/exchangeable",
+    "kernel/comps/framevisor/macros",
     "kernel/libs/aster-bigtcp",
     "kernel/libs/aster-fuse",
     "kernel/libs/aster-rights",
@@ -52,6 +63,7 @@ members = [
     "kernel/libs/atomic-integer-wrapper",
     "kernel/libs/cpio-decoder",
     "kernel/libs/device-id",
+    "kernel/libs/framevm-abi",
     "kernel/libs/io-util",
     "kernel/libs/jhash",
     "kernel/libs/keyable-arc",
@@ -62,6 +74,23 @@ members = [
     "kernel/libs/typeflags",
     "kernel/libs/typeflags-util",
     "kernel/libs/xarray",
+    "services/aster-framevm/comps/block",
+    "services/aster-framevm/comps/bigtcp",
+    "services/aster-framevm/comps/cmdline",
+    "services/aster-framevm/comps/framev-blk",
+    "services/aster-framevm/comps/framev-net",
+    "services/aster-framevm/comps/framev-pci",
+    "services/aster-framevm/comps/framev-console",
+    "services/aster-framevm/comps/framev-rng",
+    "services/aster-framevm/comps/framev-sock",
+    "services/aster-framevm/comps/nvme",
+    "services/aster-framevm/comps/network",
+    "services/aster-framevm/comps/pci",
+    "services/aster-framevm/comps/softirq",
+    "services/aster-framevm/comps/systree",
+    "services/aster-framevm/comps/time",
+    "services/aster-framevm",
+    "tools/framevm-service-check",
 ]
 # All OSDK-based in-kernel crates.
 #
@@ -94,14 +123,41 @@ default-members = [
     "kernel/core/comps/time",
     "kernel/core/comps/uart",
     "kernel/core/comps/virtio",
+    "kernel/comps/framev-console",
+    "kernel/comps/framev-blk",
+    "kernel/comps/framev-net",
+    "kernel/comps/framev-pci",
+    "kernel/comps/framev-rng",
+    "kernel/comps/framev-sock",
+    "kernel/comps/framevisor",
+    "kernel/comps/framevisor/exchangeable",
+    "kernel/comps/framevisor-ostd",
+    "kernel/comps/framevisor-ostd/libs/aster-util",
+    "kernel/comps/framevisor/macros",
     "kernel/libs/aster-bigtcp",
     "kernel/libs/aster-fuse",
     "kernel/libs/aster-util",
     "kernel/libs/device-id",
+    "kernel/libs/framevm-abi",
     "kernel/libs/io-util",
     "kernel/libs/ring-buffer",
     "kernel/libs/sparse-id-alloc",
     "kernel/libs/xarray",
+    "services/aster-framevm/comps/block",
+    "services/aster-framevm/comps/bigtcp",
+    "services/aster-framevm/comps/cmdline",
+    "services/aster-framevm/comps/framev-blk",
+    "services/aster-framevm/comps/framev-net",
+    "services/aster-framevm/comps/framev-pci",
+    "services/aster-framevm/comps/framev-console",
+    "services/aster-framevm/comps/framev-rng",
+    "services/aster-framevm/comps/framev-sock",
+    "services/aster-framevm/comps/network",
+    "services/aster-framevm/comps/nvme",
+    "services/aster-framevm/comps/pci",
+    "services/aster-framevm/comps/softirq",
+    "services/aster-framevm/comps/systree",
+    "services/aster-framevm/comps/time",
 ]
 # All user-space or host-native crates.
 #
@@ -114,6 +170,7 @@ exclude = [
     "kernel/libs/comp-sys/component-macro",
     "kernel/libs/comp-sys/controlled",
     "osdk",
+    "tools/framevmm",
     "tools/sctrace",
 ]
 
@@ -173,16 +230,41 @@ aster-systree = { path = "kernel/core/comps/systree" }
 aster-time = { path = "kernel/core/comps/time" }
 aster-uart = { path = "kernel/core/comps/uart" }
 aster-virtio = { path = "kernel/core/comps/virtio" }
+# Crates under kernel/comps
+framev-console-common = { path = "kernel/comps/framev-console" }
+framev-blk-common = { path = "kernel/comps/framev-blk" }
+framev-net-common = { path = "kernel/comps/framev-net" }
+framev-pci-common = { path = "kernel/comps/framev-pci" }
+framev-rng-common = { path = "kernel/comps/framev-rng" }
+aster-framevisor = { package = "aster-framevisor", path = "kernel/comps/framevisor" }
+aster-framevisor-ostd = { path = "kernel/comps/framevisor-ostd" }
+aster-framevisor-exchangeable = { path = "kernel/comps/framevisor/exchangeable", default-features = false }
+aster-framevisor-macros = { path = "kernel/comps/framevisor/macros" }
+framev-sock-common = { path = "kernel/comps/framev-sock" }
+exchangeable = { package = "aster-framevisor-exchangeable", path = "kernel/comps/framevisor/exchangeable", default-features = false }
+
+# FrameVM service-side FrameV frontends
+framev-blk-frontend = { path = "services/aster-framevm/comps/framev-blk" }
+framev-net-frontend = { path = "services/aster-framevm/comps/framev-net" }
+framev-pci = { path = "services/aster-framevm/comps/framev-pci" }
+framev-console-frontend = { path = "services/aster-framevm/comps/framev-console" }
+framev-rng-frontend = { path = "services/aster-framevm/comps/framev-rng" }
+framev-sock-frontend = { path = "services/aster-framevm/comps/framev-sock" }
+aster-framevm-pci = { path = "services/aster-framevm/comps/pci" }
+aster-framevm-nvme = { path = "services/aster-framevm/comps/nvme" }
+aster-framevm-bigtcp = { path = "services/aster-framevm/comps/bigtcp" }
+aster-framevm-network = { path = "services/aster-framevm/comps/network" }
 
 # Crates under kernel/libs
 aster-bigtcp = { path = "kernel/libs/aster-bigtcp" }
 aster-fuse = { path = "kernel/libs/aster-fuse" }
 aster-rights = { path = "kernel/libs/aster-rights" }
 aster-rights-proc = { path = "kernel/libs/aster-rights-proc" }
-aster-util = { path = "kernel/libs/aster-util" }
+aster-util = { path = "kernel/libs/aster-util", default-features = false }
 atomic-integer-wrapper = { path = "kernel/libs/atomic-integer-wrapper" }
 cpio-decoder = { path = "kernel/libs/cpio-decoder" }
 device-id = { path = "kernel/libs/device-id" }
+framevm-abi = { path = "kernel/libs/framevm-abi" }
 io-util = { path = "kernel/libs/io-util" }
 jhash = { path = "kernel/libs/jhash" }
 keyable-arc = { path = "kernel/libs/keyable-arc" }
@@ -196,6 +278,7 @@ xarray = { path = "kernel/libs/xarray" }
 
 # Crates under kernel/libs/comp-sys
 component = { path = "kernel/libs/comp-sys/component" }
+controlled = { path = "kernel/libs/comp-sys/controlled" }
 
 # Crates under osdk/deps
 osdk-frame-allocator = { path = "osdk/deps/frame-allocator" }
@@ -210,7 +293,9 @@ multiboot2 = "0.24.0"
 num-traits = { version = "0.2", default-features = false }
 sbi-rt = "0.0.3"
 serde = { version = "1.0.192", default-features = false, features = ["alloc", "derive"] }
+sha2 = { version = "0.10.8", default-features = false, features = ["force-soft"] }
 smallvec = "1.13.2"
+toml = "0.8.8"
 uart_16550 = "0.3.0"
 uefi = { version = "0.37.0", features = ["global_allocator", "panic_handler", "logger", "qemu"]}
 uefi-raw = "0.14.0"

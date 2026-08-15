@@ -6,8 +6,9 @@ mod qcow2;
 
 use std::{
     ffi::OsString,
+    fs,
     path::{Path, PathBuf},
-    process,
+    process::{self, Command},
     time::SystemTime,
 };
 
@@ -20,7 +21,7 @@ use crate::{
     bundle::{
         Bundle,
         bin::{AsterBin, AsterBinType, AsterElfMeta},
-        file::BundleFile,
+        file::{BundleFile, FrameVmSymbols, Initramfs},
     },
     cli::BuildArgs,
     config::{
@@ -31,7 +32,7 @@ use crate::{
     error_msg,
     util::{
         CrateInfo, DirGuard, get_cargo_metadata, get_current_crates, get_kernel_crate,
-        get_target_directory,
+        get_target_directory, new_command_checked_exists,
     },
 };
 
@@ -75,6 +76,49 @@ pub fn create_base_and_cached_build(
     action: ActionChoice,
     rustflags: &[&str],
 ) -> Bundle {
+    create_base_and_cached_build_with_options(
+        target_crate,
+        bundle_path,
+        osdk_output_directory,
+        cargo_target_directory,
+        config,
+        action,
+        rustflags,
+        BundleBuildOptions::default(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BundleBuildOptions {
+    pub(crate) kernel_symbols_module: KernelSymbolsModule,
+    pub(crate) final_crate_retention: FinalCrateRetention,
+    pub(crate) quiet_cargo_success: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum KernelSymbolsModule {
+    #[default]
+    Auto,
+    Omit,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum FinalCrateRetention {
+    #[default]
+    LinkDeadCode,
+    DemandDrivenOnly,
+}
+
+pub(crate) fn create_base_and_cached_build_with_options(
+    target_crate: CrateInfo,
+    bundle_path: impl AsRef<Path>,
+    osdk_output_directory: impl AsRef<Path>,
+    cargo_target_directory: impl AsRef<Path>,
+    config: &Config,
+    action: ActionChoice,
+    rustflags: &[&str],
+    options: BundleBuildOptions,
+) -> Bundle {
     let base_crate_path = new_base_crate(
         match action {
             ActionChoice::Run => BaseCrateType::Run,
@@ -93,6 +137,7 @@ pub fn create_base_and_cached_build(
         config,
         action,
         rustflags,
+        options,
     )
 }
 
@@ -101,15 +146,19 @@ fn get_reusable_existing_bundle(
     config: &Config,
     action: ActionChoice,
 ) -> Option<Bundle> {
-    let existing_bundle = Bundle::load(&bundle_path);
+    let bundle_path = bundle_path.as_ref();
+    if !bundle_path.join("bundle.toml").exists() {
+        info!("building a new bundle: no cached bundle found");
+        return None;
+    }
+
+    let existing_bundle = Bundle::load(bundle_path, true);
     let Some(existing_bundle) = existing_bundle else {
-        info!(
-            "Building a new bundle: No cached bundle found or validation of the existing bundle failed"
-        );
+        info!("building a new bundle: validation of the cached bundle failed");
         return None;
     };
     if let Err(e) = existing_bundle.can_run_with_config(config, action) {
-        info!("Building a new bundle: {}", e);
+        info!("building a new bundle: {}", e);
         return None;
     }
     let workspace_root = {
@@ -117,7 +166,7 @@ fn get_reusable_existing_bundle(
         PathBuf::from(meta.get("workspace_root").unwrap().as_str().unwrap())
     };
     if existing_bundle.last_modified_time() < get_last_modified_time(&workspace_root) {
-        info!("Building a new bundle: workspace_root has been updated");
+        info!("building a new bundle: workspace_root has been updated");
         return None;
     }
     Some(existing_bundle)
@@ -131,8 +180,9 @@ pub fn do_cached_build(
     config: &Config,
     action: ActionChoice,
     rustflags: &[&str],
+    options: BundleBuildOptions,
 ) -> Bundle {
-    let (build, boot, grub) = match action {
+    let (build, boot, grub_cfg) = match action {
         ActionChoice::Run => (&config.run.build, &config.run.boot, &config.run.grub),
         ActionChoice::Test => (&config.test.build, &config.test.boot, &config.test.grub),
     };
@@ -147,6 +197,8 @@ pub fn do_cached_build(
         &build.override_configs[..],
         &cargo_target_directory,
         &rustflags,
+        options.final_crate_retention,
+        options.quiet_cargo_success,
     );
 
     // Check the existing bundle's reusability
@@ -158,7 +210,7 @@ pub fn do_cached_build(
     }
 
     // Build a new bundle
-    info!("Building a new bundle");
+    info!("building a new bundle");
     if bundle_path.as_ref().exists() {
         std::fs::remove_dir_all(&bundle_path).unwrap();
     }
@@ -169,10 +221,25 @@ pub fn do_cached_build(
     match boot.method {
         BootMethod::GrubRescueIso | BootMethod::GrubQcow2 => {
             info!("Building boot device image");
+            let initramfs_path = boot.initramfs.as_ref().map(|path| path.as_path());
+            let binary_module_path = if matches!(grub_cfg.boot_protocol, BootProtocol::Multiboot2)
+                && options.kernel_symbols_module == KernelSymbolsModule::Auto
+            {
+                generate_kernel_symbols_module(&aster_elf)
+            } else {
+                None
+            };
             let bootdev_image = grub::create_bootdev_image(
                 &osdk_output_directory,
-                &boot_elf,
-                boot.initramfs.as_ref(),
+                &aster_elf,
+                initramfs_path,
+                {
+                    if let Some(path) = &binary_module_path {
+                        info!("Embedding kernel symbols module: {:?}", path);
+                    }
+                    binary_module_path.as_deref()
+                },
+                None,
                 config,
                 action,
             );
@@ -185,7 +252,7 @@ pub fn do_cached_build(
             bundle.consume_aster_bin(aster_elf);
         }
         BootMethod::QemuDirect => {
-            let aster_bin = match grub.boot_protocol {
+            let aster_bin = match grub_cfg.boot_protocol {
                 BootProtocol::Linux => make_install_bzimage(
                     &osdk_output_directory,
                     &osdk_output_directory,
@@ -202,6 +269,120 @@ pub fn do_cached_build(
     bundle
 }
 
+pub(crate) fn refresh_grub_bootdev_image_with_framevm_symbols(
+    bundle: &mut Bundle,
+    osdk_output_directory: impl AsRef<Path>,
+    config: &Config,
+    action: ActionChoice,
+    framevm_symbols_path: &Path,
+) -> Result<(), String> {
+    let action_config = match action {
+        ActionChoice::Run => &config.run,
+        ActionChoice::Test => &config.test,
+    };
+    if !matches!(
+        action_config.boot.method,
+        BootMethod::GrubRescueIso | BootMethod::GrubQcow2
+    ) {
+        return Err(
+            "FrameVM symbol tables require a GRUB boot method with module support".to_string(),
+        );
+    }
+    if action_config.grub.boot_protocol != BootProtocol::Multiboot2 {
+        return Err("FrameVM symbol tables require the Multiboot2 GRUB boot protocol".to_string());
+    }
+
+    let aster_bin = bundle
+        .aster_bin_metadata()
+        .ok_or_else(|| "selected bundle does not contain a host kernel ELF".to_string())?;
+    let aster_bin = AsterBin::new(
+        bundle
+            .aster_bin_path()
+            .ok_or_else(|| "selected bundle does not contain a host kernel ELF".to_string())?,
+        aster_bin.arch(),
+        aster_bin.typ().clone(),
+        aster_bin.version().clone(),
+        aster_bin.stripped(),
+    );
+    let mut boot_config = config.clone();
+    let initramfs_path = if let Some(initramfs_path) = action_config.boot.initramfs.as_deref() {
+        bundle.replace_initramfs(Initramfs::new(initramfs_path));
+        let initramfs_path = bundle
+            .initramfs_path()
+            .ok_or_else(|| "selected bundle does not contain an initramfs".to_string())?;
+        match action {
+            ActionChoice::Run => boot_config.run.boot.initramfs = Some(initramfs_path.clone()),
+            ActionChoice::Test => boot_config.test.boot.initramfs = Some(initramfs_path.clone()),
+        }
+        Some(initramfs_path)
+    } else {
+        None
+    };
+    let bootdev_image = grub::create_bootdev_image(
+        osdk_output_directory,
+        &aster_bin,
+        initramfs_path.as_deref(),
+        None,
+        Some(framevm_symbols_path),
+        &boot_config,
+        action,
+    );
+    if matches!(action_config.boot.method, BootMethod::GrubQcow2) {
+        let qcow2_image = qcow2::convert_iso_to_qcow2(bootdev_image);
+        bundle.replace_vm_image(qcow2_image);
+    } else {
+        bundle.replace_vm_image(bootdev_image);
+    }
+    bundle.replace_framevm_symbols(FrameVmSymbols::new(framevm_symbols_path));
+    Ok(())
+}
+
+fn generate_kernel_symbols_module(aster_elf: &AsterBin) -> Option<PathBuf> {
+    let mut symbols_path = aster_elf.path().to_path_buf();
+    symbols_path.set_extension("sym");
+
+    let symbols_outdated = match fs::metadata(&symbols_path) {
+        Ok(metadata) => match metadata.modified() {
+            Ok(modified) => modified < *aster_elf.modified_time(),
+            Err(_) => true,
+        },
+        Err(_) => true,
+    };
+
+    if symbols_outdated {
+        info!(
+            "generating kernel symbols file at {:?} via rust-objcopy",
+            symbols_path
+        );
+        let mut cmd = new_command_checked_exists("rust-objcopy");
+        cmd.arg("--only-keep-debug")
+            .arg(aster_elf.path())
+            .arg(&symbols_path);
+        match cmd.status() {
+            Ok(status) if status.success() => {
+                if let Ok(size) = fs::metadata(&symbols_path).and_then(|m| Ok(m.len())) {
+                    info!("Kernel symbols file generated ({} bytes)", size);
+                }
+            }
+            Ok(status) => {
+                warn!(
+                    "rust-objcopy exited with status {:?}; skipping kernel symbols module",
+                    status.code()
+                );
+                return None;
+            }
+            Err(err) => {
+                warn!("Failed to run rust-objcopy for kernel symbols: {}", err);
+                return None;
+            }
+        }
+    } else {
+        info!("reusing existing kernel symbols file at {:?}", symbols_path);
+    }
+
+    Some(symbols_path)
+}
+
 fn build_kernel_elf(
     arch: Arch,
     profile: &str,
@@ -210,15 +391,21 @@ fn build_kernel_elf(
     override_configs: &[String],
     cargo_target_directory: impl AsRef<Path>,
     rustflags: &[&str],
+    final_crate_retention: FinalCrateRetention,
+    quiet_cargo_success: bool,
 ) -> AsterBin {
     let target_os_string = OsString::from(&arch.triple());
     let rustc_linker_script_arg = format!("-C link-arg=-T{}.ld", arch);
 
-    let mut rustflags = Vec::from(rustflags);
+    let (mut rustflags, final_crate_rustflags) =
+        partition_final_crate_rustflags(rustflags, final_crate_retention);
     // Asterinas does not support PIC yet.
     rustflags.extend([
         &rustc_linker_script_arg,
         "-C relocation-model=static",
+        "-Z relax-elf-relocations=no",
+        "-Zplt=yes",
+        "-C link-arg=-no-pie",
         "-C relro-level=off",
         // Even if we disabled unwinding on panic, we need to specify this to show backtraces.
         "-C force-unwind-tables=yes",
@@ -233,6 +420,7 @@ fn build_kernel_elf(
     ]);
 
     if matches!(arch, Arch::X86_64) {
+        rustflags.extend(["-C code-model=kernel", "-Z direct-access-external-data=yes"]);
         // This is a workaround for <https://github.com/asterinas/asterinas/issues/839>.
         // It makes running on Intel CPUs after Ivy Bridge (2012) faster, but much slower
         // on older CPUs.
@@ -263,7 +451,10 @@ fn build_kernel_elf(
     );
 
     command.env("RUSTFLAGS", rustflags.join(" "));
-    command.arg("build");
+    command.arg("rustc");
+    if quiet_cargo_success {
+        command.arg("--quiet");
+    }
     command.arg("--features").arg(features.join(" "));
     if no_default_features {
         command.arg("--no-default-features");
@@ -278,9 +469,30 @@ fn build_kernel_elf(
         command.arg("--config").arg(override_config);
     }
 
+    if !final_crate_rustflags.is_empty()
+        || final_crate_retention == FinalCrateRetention::LinkDeadCode
+    {
+        // Use `cargo rustc` so the final crate keeps unused symbols without
+        // rebuilding the standard library with link-dead-code.
+        command.arg("--");
+        for rustflag in final_crate_rustflags {
+            let (option, value) = rustflag
+                .split_once(' ')
+                .expect("final-crate rustflags must contain an option and value");
+            command.arg(option).arg(value);
+        }
+    }
+    if final_crate_retention == FinalCrateRetention::LinkDeadCode {
+        command.arg("-Clink-dead-code");
+    }
+
     const CFLAGS: &str = "CFLAGS_x86_64-unknown-none";
     let mut env_cflags = std::env::var(CFLAGS).unwrap_or_default();
-    env_cflags += " -fPIC";
+    if !env_cflags.is_empty() {
+        env_cflags.push(' ');
+    }
+    // 需要禁用
+    env_cflags += "-fno-PIE -fno-pic -fno-plt";
 
     if features.contains(&"coverage".to_string()) {
         // This is a workaround for minicov <https://github.com/Amanieu/minicov/issues/29>,
@@ -290,14 +502,10 @@ fn build_kernel_elf(
 
     command.env(CFLAGS, env_cflags);
 
-    info!("Building kernel ELF using command: {:#?}", command);
-    info!("Building directory: {:?}", std::env::current_dir().unwrap());
+    debug!("building kernel elf using command: {:#?}", command);
+    debug!("building directory: {:?}", std::env::current_dir().unwrap());
 
-    let status = command.status().unwrap();
-    if !status.success() {
-        error_msg!("Cargo build failed");
-        process::exit(Errno::ExecuteCommand as _);
-    }
+    run_kernel_build_command(command, quiet_cargo_success);
 
     let aster_bin_path = cargo_target_directory
         .as_ref()
@@ -319,6 +527,51 @@ fn build_kernel_elf(
     )
 }
 
+fn partition_final_crate_rustflags<'a>(
+    rustflags: &[&'a str],
+    final_crate_retention: FinalCrateRetention,
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    if final_crate_retention != FinalCrateRetention::DemandDrivenOnly {
+        return (rustflags.to_vec(), Vec::new());
+    }
+
+    rustflags
+        .iter()
+        .copied()
+        .partition(|rustflag| !rustflag.starts_with("-C link-arg="))
+}
+
+fn run_kernel_build_command(mut command: Command, quiet_success: bool) {
+    if quiet_success {
+        let output = command.output().unwrap_or_else(|error| {
+            error_msg!("failed to execute cargo build: {error}");
+            process::exit(Errno::ExecuteCommand as _);
+        });
+        if output.status.success() {
+            return;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        error_msg!(
+            "cargo build failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        );
+        process::exit(output.status.code().unwrap_or(Errno::ExecuteCommand as _));
+    }
+
+    let status = command.status().unwrap_or_else(|error| {
+        error_msg!("failed to execute cargo build: {error}");
+        process::exit(Errno::ExecuteCommand as _);
+    });
+    if !status.success() {
+        error_msg!("cargo build failed");
+        process::exit(Errno::ExecuteCommand as _);
+    }
+}
+
 fn get_last_modified_time(path: impl AsRef<Path>) -> SystemTime {
     if path.as_ref().is_file() {
         return path.as_ref().metadata().unwrap().modified().unwrap();
@@ -338,4 +591,27 @@ fn get_last_modified_time(path: impl AsRef<Path>) -> SystemTime {
         }
     }
     last_modified
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FinalCrateRetention, partition_final_crate_rustflags};
+
+    #[test]
+    fn demand_driven_link_args_apply_only_to_the_final_crate() {
+        let rustflags = [
+            "-C symbol-mangling-version=v0",
+            "-C link-arg=@retention.rsp",
+            "-C link-arg=libcore.rlib",
+        ];
+
+        let (dependency_flags, final_crate_flags) =
+            partition_final_crate_rustflags(&rustflags, FinalCrateRetention::DemandDrivenOnly);
+
+        assert_eq!(dependency_flags, ["-C symbol-mangling-version=v0"]);
+        assert_eq!(
+            final_crate_flags,
+            ["-C link-arg=@retention.rsp", "-C link-arg=libcore.rlib"]
+        );
+    }
 }

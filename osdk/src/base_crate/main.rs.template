@@ -22,6 +22,7 @@ mod default_frame_allocator {
     // SAFETY: The name does not collide with other symbols.
     #[unsafe(no_mangle)]
     #[linkage = "weak"]
+    #[used]
     static __GLOBAL_FRAME_ALLOCATOR_REF: &'static dyn GlobalFrameAllocator = &FRAME_ALLOCATOR;
 }
 
@@ -34,6 +35,7 @@ mod default_heap_allocator {
     // SAFETY: The name does not collide with other symbols.
     #[unsafe(no_mangle)]
     #[linkage = "weak"]
+    #[used]
     static __GLOBAL_HEAP_ALLOCATOR_REF: &'static dyn GlobalHeapAllocator = &HEAP_ALLOCATOR;
 
     // SAFETY: The name does not collide with other symbols.
@@ -44,4 +46,9 @@ mod default_heap_allocator {
     ) -> Option<ostd::mm::heap::SlotInfo> {
         type_from_layout(layout)
     }
+
+    #[used]
+    static KEEP_SLOT_MAP: extern "Rust" fn(
+        core::alloc::Layout,
+    ) -> Option<ostd::mm::heap::SlotInfo> = __global_heap_slot_info_from_layout;
 }

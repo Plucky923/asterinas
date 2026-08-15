@@ -113,6 +113,7 @@ pub static KTEST_CRATE_WHITELIST: Option<&[&str]> = Some(&{:#?});
         config,
         ActionChoice::Test,
         &["--cfg ktest", "-C panic=unwind"],
+        Default::default(),
     );
     drop(dir_guard);
 

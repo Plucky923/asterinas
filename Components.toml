@@ -1,5 +1,9 @@
 # template
 [components]
+nix = { name = "aster-nix" }
+virtio = { name = "aster-virtio" }
+framevisor = { name = "aster-framevisor" }
+input = { name = "aster-input" }
 block = { name = "aster-block" }
 cmdline = { name = "aster-cmdline" }
 console = { name = "aster-console" }
@@ -13,9 +17,65 @@ network = { name = "aster-network" }
 nvme = { name = "aster-nvme" }
 pci = { name = "aster-pci" }
 softirq = { name = "aster-softirq" }
+framevm_block = { name = "aster-framevm-block" }
+framevm_bigtcp = { name = "aster-framevm-bigtcp" }
+framevm_cmdline = { name = "aster-framevm-cmdline" }
+framevm_network = { name = "aster-framevm-network" }
+framevm_nvme = { name = "aster-framevm-nvme" }
+framevm_pci = { name = "aster-framevm-pci" }
+framev_blk_frontend = { name = "framev-blk-frontend" }
+framev_net_frontend = { name = "framev-net-frontend" }
+framev_pci = { name = "framev-pci" }
+framev_console_frontend = { name = "framev-console-frontend" }
+framev_rng_frontend = { name = "framev-rng-frontend" }
+framev_sock_frontend = { name = "framev-sock-frontend" }
+framevm = { name = "aster-framevm" }
+framevm_softirq = { name = "aster-framevm-softirq" }
+framevm_systree = { name = "aster-framevm-systree" }
+framevm_time = { name = "aster-framevm-time" }
 systree = { name = "aster-systree" }
 time = { name = "aster-time" }
 uart = { name = "aster-uart" }
-virtio = { name = "aster-virtio" }
+
+[profiles]
+kernel = [
+    "aster-block",
+    "aster-cmdline",
+    "aster-console",
+    "aster-framebuffer",
+    "aster-framevisor",
+    "aster-i8042",
+    "aster-input",
+    "aster-core",
+    "aster-logger",
+    "aster-mlsdisk",
+    "aster-network",
+    "aster-nix",
+    "aster-nvme",
+    "aster-pci",
+    "aster-softirq",
+    "aster-systree",
+    "aster-time",
+    "aster-uart",
+    "aster-virtio",
+]
+framevm = [
+    "aster-framevm",
+    "aster-framevm-block",
+    "aster-framevm-bigtcp",
+    "aster-framevm-cmdline",
+    "aster-framevm-nvme",
+    "aster-framevm-network",
+    "aster-framevm-pci",
+    "aster-framevm-softirq",
+    "aster-framevm-systree",
+    "aster-framevm-time",
+    "framev-pci",
+    "framev-blk-frontend",
+    "framev-net-frontend",
+    "framev-console-frontend",
+    "framev-rng-frontend",
+    "framev-sock-frontend",
+]
 
 [whitelist]

@@ -1,0 +1,23 @@
+[package]
+name = "aster-framevm-block"
+version = "0.1.0"
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+align_ext.workspace = true
+aster-util = { package = "aster-framevisor-util", path = "../../../../kernel/comps/framevisor-ostd/libs/aster-util", default-features = false }
+bitvec.workspace = true
+component.workspace = true
+device-id.workspace = true
+id-alloc.workspace = true
+int-to-c-enum.workspace = true
+io-util.workspace = true
+ostd = { path = "../../../../kernel/comps/framevisor-ostd", package = "aster-framevisor-ostd" }
+ostd-pod.workspace = true
+spin.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true

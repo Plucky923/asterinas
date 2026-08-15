@@ -1,0 +1,15 @@
+[package]
+name = "aster-framevm-cmdline"
+version = "0.1.0"
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+component.workspace = true
+inventory.workspace = true
+ostd = { path = "../../../../kernel/comps/framevisor-ostd", package = "aster-framevisor-ostd" }
+spin.workspace = true
+
+[lints]
+workspace = true

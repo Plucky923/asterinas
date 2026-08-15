@@ -1,0 +1,17 @@
+[package]
+name = "aster-framevm-bigtcp"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+aster-softirq = { path = "../softirq", package = "aster-framevm-softirq" }
+bitflags.workspace = true
+int-to-c-enum.workspace = true
+jhash.workspace = true
+ostd = { path = "../../../../kernel/comps/framevisor-ostd", package = "aster-framevisor-ostd" }
+smoltcp.workspace = true
+spin.workspace = true
+takeable.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "aster-framevm-time"
+version = "0.1.0"
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+aster-util = { package = "aster-framevisor-util", path = "../../../../kernel/comps/framevisor-ostd/libs/aster-util", default-features = false }
+bitflags.workspace = true
+component.workspace = true
+ostd = { path = "../../../../kernel/comps/framevisor-ostd", package = "aster-framevisor-ostd" }
+spin.workspace = true
+
+[target.riscv64imac-unknown-none-elf.dependencies]
+chrono = { version = "0.4.38", default-features = false }
+
+[lints]
+workspace = true

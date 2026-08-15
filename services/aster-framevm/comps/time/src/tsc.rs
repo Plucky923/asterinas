@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! This module provide a instance of `ClockSource` based on TSC.
+
+use alloc::sync::Arc;
+use core::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+
+use ostd::{
+    arch::tsc_freq,
+    timer::{self, TIMER_FREQ},
+};
+use spin::Once;
+
+use crate::{START_TIME, VDSO_DATA_HIGH_RES_UPDATE_FN, clocksource::ClockSource};
+
+/// An instance of the TSC clocksource.
+pub(super) static CLOCK: Once<Arc<ClockSource>> = Once::new();
+
+/// Initializes the TSC clocksource module.
+pub(super) fn init() {
+    init_clock();
+    calibrate();
+    init_timer();
+}
+
+fn init_clock() {
+    CLOCK.call_once(|| Arc::new(ClockSource::new(tsc_freq())));
+}
+
+/// Calibrates the TSC and system time based on the RTC time.
+fn calibrate() {
+    let clock = CLOCK.get().unwrap();
+    clock.calibrate();
+    START_TIME.call_once(|| crate::RTC_DRIVER.get().unwrap().read_rtc());
+}
+
+/// Reads the current TSC-based monotonic duration.
+pub(super) fn read_instant() -> Duration {
+    let clock = CLOCK.get().unwrap();
+    clock.read_instant()
+}
+
+fn update_clocksource() {
+    let clock = CLOCK.get().unwrap();
+    clock.update();
+
+    // Update vDSO data.
+    if let Some(update_fn) = VDSO_DATA_HIGH_RES_UPDATE_FN.get() {
+        let (last_instant, last_cycles) = clock.last_record();
+        update_fn(last_instant, last_cycles);
+    }
+}
+
+static TSC_UPDATE_COUNTER: AtomicU64 = AtomicU64::new(1);
+const VDSO_UPDATE_FREQ: u64 = 10;
+const TSC_UPDATE_INTERVAL: u64 = TIMER_FREQ / VDSO_UPDATE_FREQ;
+
+fn update_timer_clocksource() {
+    let counter = TSC_UPDATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if counter.is_multiple_of(TSC_UPDATE_INTERVAL) {
+        update_clocksource();
+    }
+}
+
+fn init_timer() {
+    // This must be frequent enough to provide values accurate to the second
+    // for the time fields in vDSO. We choose 10 Hz, which results in a
+    // worst-case staleness of ~100 ms.
+    // TODO: Implement a more complete and efficient timekeeping mechanism,
+    // then align this update frequency with Linux.
+    // TODO: Re-organize the code structure and use the `Timer` to achieve the updating.
+    timer::register_callback_on_cpu(update_timer_clocksource);
+}

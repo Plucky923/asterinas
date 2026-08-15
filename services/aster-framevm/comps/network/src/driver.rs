@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: MPL-2.0
+
+use alloc::vec;
+
+use aster_bigtcp::{
+    device::{self, NotifyDevice},
+    time::Instant,
+};
+
+use crate::{AnyNetworkDevice, buffer::RxBuffer};
+
+impl device::Device for dyn AnyNetworkDevice {
+    type RxToken<'a> = RxToken;
+    type TxToken<'a> = TxToken<'a>;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.can_receive() && self.can_send() {
+            let rx_buffer = self.receive().unwrap();
+            Some((RxToken(rx_buffer), TxToken(self)))
+        } else {
+            None
+        }
+    }
+
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        if self.can_send() {
+            Some(TxToken(self))
+        } else {
+            None
+        }
+    }
+
+    fn capabilities(&self) -> device::DeviceCapabilities {
+        self.capabilities()
+    }
+}
+
+impl NotifyDevice for dyn AnyNetworkDevice {
+    fn notify_poll_end(&mut self) {
+        self.notify_poll_end();
+    }
+}
+
+pub struct RxToken(RxBuffer);
+
+impl device::RxToken for RxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        self.0.consume_payload(f)
+    }
+}
+
+pub struct TxToken<'a>(&'a mut dyn AnyNetworkDevice);
+
+impl device::TxToken for TxToken<'_> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buffer = vec![0u8; len];
+        let res = f(&mut buffer);
+        // A nonblocking device may become unavailable after `transmit` grants
+        // a token. Dropping this frame lets the protocol retry without turning
+        // ordinary backpressure into a kernel panic.
+        let _ = self.0.send(&buffer);
+        res
+    }
+}

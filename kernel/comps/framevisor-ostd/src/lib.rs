@@ -324,9 +324,9 @@ pub mod framev {
     /// Low-level FrameV-net transport hooks used by `framev-pci`.
     pub mod net {
         pub use aster_framevisor::framev_net::{
-            current_net_config, has_completed_buffer_claimed, is_endpoint_lost_claimed,
-            poll_receive_claimed, post_receive_buffer_claimed, send_claimed,
-            take_completed_buffer_claimed, take_reclaimed_buffer_claimed,
+            allocate_receive_buffer_claimed, current_net_config, has_completed_buffer_claimed,
+            is_endpoint_lost_claimed, poll_receive_claimed, post_receive_buffer_claimed,
+            send_claimed, take_completed_buffer_claimed, take_reclaimed_buffer_claimed,
         };
     }
 }

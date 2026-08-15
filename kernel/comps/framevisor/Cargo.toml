@@ -1,0 +1,27 @@
+[package]
+name = "aster-framevisor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+host-ostd = { package = "ostd", path = "../../../ostd" }
+aster-console = { workspace = true }
+aster-pci = { workspace = true }
+aster-softirq = { workspace = true }
+aster-time = { workspace = true }
+component = { workspace = true }
+framev-blk-common = { workspace = true }
+framev-console-common = { workspace = true }
+framev-net-common = { workspace = true }
+framev-pci-common = { workspace = true }
+framev-rng-common = { workspace = true }
+aster-framevisor-macros = { workspace = true }
+aster-framevisor-exchangeable = { workspace = true, features = ["ostd-domain"] }
+framev-sock-common.workspace = true
+log = { workspace = true }
+spin = { workspace = true }
+hashbrown = { workspace = true }
+time = { workspace = true }
+
+[lints]
+workspace = true

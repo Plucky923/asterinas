@@ -198,3 +198,20 @@ i8042.exist
 i8042.exist=1
 i8042.exist=0
 ```
+
+### `framevm.pci_reserve`
+
+Reserve a PCI requester group at boot for later assignment to a FrameVM. The
+parameter may be specified multiple times. Reserved functions are kept away
+from Host drivers and remain quiesced until a successful FrameVM start claims
+them.
+
+The value uses the hexadecimal `segment:bus:device.function` PCI address
+syntax. The current implementation accepts only segment `0000`, function `0`,
+and singleton requester groups.
+
+Example:
+
+```text
+framevm.pci_reserve=0000:00:0b.0
+```

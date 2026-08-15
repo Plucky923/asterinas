@@ -7,6 +7,14 @@ while adding a stronger isolation boundary than process-based containers.
 This chapter introduces how VM-based container runtimes can use Asterinas
 as a guest kernel.
 
+For the FrameV virtual-device architecture,
+see [FrameV Protocol: Atomic Interface Stages](framev-design.md).
+For native NVMe driver reuse with mediated PCI resource custody, see
+[NVMe Mediated Passthrough: Assignment and I/O Protocol](nvme-passthrough-design.md).
+For FrameVM CPU, memory, lifecycle, mediated PCI assignment, and the control
+file ABI, see [FrameVM Design: CPU, Memory, and I/O Virtualization](framevm-architecture.md)
+and [FrameVM Control Device](framevm.md).
+
 ## Why Asterinas?
 
 Asterinas is a good fit for VM-based containers

@@ -8,14 +8,15 @@ use core::{any::Any, borrow::Borrow, ops::Deref};
 use host_ostd::task::{CurrentTask as OstdCurrentTask, Task as OstdTask};
 
 use super::{
-    binding::{HOST_TASK_OPS, current_frame_vcpu_id},
-    frame_task::{FrameTaskData, FrameTaskKind},
+    FrameTaskKind, FrameTaskState,
+    binding::build_host_task,
+    current::{clear_current_task, current_state, current_state_for_current_task, install_current_task},
     scheduler::{self, info::TaskScheduleInfo},
 };
 use crate::{
     error::Error,
     prelude::Result,
-    vm::{self, FrameVcpuId},
+    vm::{FrameSchedGroup, FrameVm},
 };
 
 /// Wrapper for the current task.
@@ -24,144 +25,122 @@ pub struct CurrentTask {
     current: OstdCurrentTask,
 }
 
-/// A task that executes a function to the end.
+/// A FrameVisor task carried by one OSTD task.
 #[derive(Debug)]
 pub struct Task {
     pub(super) inner: Arc<OstdTask>,
+    pub(super) state: Arc<FrameTaskState>,
+}
+
+/// Opaque local data stored in a Host carrier.
+///
+/// The declaration order is intentional: Rust drops fields in declaration
+/// order, so service-owned local data (and its drop glue) is released before
+/// the final task-state reference. Once `FrameTaskState` owns the service
+/// image lease, this is what keeps that image mapped through every local-data
+/// destructor without making a second lifecycle authority.
+#[doc(hidden)]
+pub struct FrameTaskLocalData {
+    payload: Box<dyn Any + Send>,
+    _state: Arc<FrameTaskState>,
+}
+
+impl FrameTaskLocalData {
+    fn new(payload: Box<dyn Any + Send>, state: Arc<FrameTaskState>) -> Self {
+        Self {
+            payload,
+            _state: state,
+        }
+    }
+
+    fn payload(&self) -> &(dyn Any + Send) {
+        &*self.payload
+    }
+
+    pub(super) fn state(&self) -> Arc<FrameTaskState> {
+        self._state.clone()
+    }
 }
 
 impl Task {
-    /// Gets the current task if available.
+    /// Gets the current FrameVM task if available.
     pub fn current() -> Option<CurrentTask> {
         let current = OstdTask::current()?;
-        let ostd_task = current.cloned();
-        let task_data = ostd_task.extension().downcast_ref::<FrameTaskData>()?;
+        let carrier = current.cloned();
+        let state = current_state(&carrier)?;
+        // Bootstrap owns a private Host carrier solely to establish the
+        // FrameVM execution domain.  It is not a service task: retaining it
+        // here would make the first service task observe a Frame-only current
+        // task that main OSTD does not expose during bootstrap.
+        if state.kind() == FrameTaskKind::Bootstrap {
+            return None;
+        }
         Some(CurrentTask {
-            task: task_data.task(ostd_task.clone()),
+            task: state.task(carrier),
             current,
         })
     }
 
-    /// Yields the current task.
+    /// Yields the current FrameVM task.
     pub fn yield_now() {
-        if let Some(current) = OstdTask::current() {
-            let current_ostd_task = current.cloned();
-            if let Some(task_data) = current_ostd_task
-                .extension()
-                .downcast_ref::<FrameTaskData>()
-                && let Some(scheduler) = task_data.frame_vm.scheduler()
-            {
-                scheduler.mut_local_rq_on_cpu_with(
-                    crate::cpu::CpuId::from_raw(task_data.frame_vcpu_id().vcpu_index() as u32),
-                    &mut |runqueue| {
-                        if runqueue
-                            .current()
-                            .is_some_and(|task| Arc::ptr_eq(task.ostd_task(), &current_ostd_task))
-                            && runqueue.update_current(scheduler::UpdateFlags::Yield)
-                        {
-                            let _ = runqueue.try_pick_next();
-                        }
-                    },
-                );
-            }
-        }
-        OstdTask::yield_now();
-    }
-
-    /// Returns whether this task has finished executing.
-    pub fn is_completed(&self) -> bool {
-        self.ostd_task().is_completed()
+        scheduler::yield_current();
     }
 
     /// Returns the task data.
     pub fn data(&self) -> &Box<dyn Any + Send + Sync> {
-        let extension = self.ostd_task().extension();
-        extension
-            .downcast_ref::<FrameTaskData>()
-            .map_or(extension, |task_data| &task_data.data)
-    }
-
-    /// Returns the task extension data.
-    pub fn extension(&self) -> &Box<dyn Any + Send + Sync> {
-        let extension = self.ostd_task().extension();
-        extension
-            .downcast_ref::<FrameTaskData>()
-            .map_or(extension, |task_data| &task_data.extension)
+        self.state.data()
     }
 
     /// Returns the task scheduling information.
     pub fn schedule_info(&self) -> &TaskScheduleInfo {
-        &self
-            .ostd_task()
-            .extension()
-            .downcast_ref::<FrameTaskData>()
-            .expect("FrameVM task metadata is missing")
-            .schedule_info
+        self.state.schedule_info()
+    }
+
+    #[doc(hidden)]
+    pub fn host_task(&self) -> &Arc<OstdTask> {
+        &self.inner
     }
 
     pub(crate) fn ostd_task(&self) -> &Arc<OstdTask> {
-        &self.inner
+        self.host_task()
+    }
+
+    pub(crate) fn state(&self) -> &Arc<FrameTaskState> {
+        &self.state
     }
 
     /// Runs this task.
     pub fn run(self: &Arc<Self>) {
-        let task_data = self.ostd_task().extension().downcast_ref::<FrameTaskData>();
-        let is_service_task = task_data.is_some_and(|data| data.kind() == FrameTaskKind::Service);
-        if let Some(task_data) = task_data {
-            let frame_vcpu_id = task_data.frame_vcpu_id();
-            crate::early_println!(
-                "[FrameVM] task run: task={:p}, host={:p}, kind={:?}, vm={}, vcpu={}, inner_cpu={:?}",
-                Arc::as_ptr(self),
-                Arc::as_ptr(self.ostd_task()),
-                task_data.kind(),
-                frame_vcpu_id.vm_id(),
-                frame_vcpu_id.vcpu_index(),
-                task_data.schedule_info.cpu.get(),
-            );
-            task_data.set_task(self);
+        self.state.set_task(self);
+        match self.state.kind() {
+            FrameTaskKind::Bootstrap => {
+                let group = self
+                    .state
+                    .group()
+                    .expect("a bootstrap task must retain its one outer group");
+                group
+                    .install_initial_continuation(self.clone())
+                    .expect("a FrameVM vCPU may install exactly one bootstrap continuation");
+                // `Task::run` is submitted by a Host workqueue. Before the
+                // Host scheduler has selected this carrier, its enqueue path
+                // can still enter FrameVisor synchronization on that worker.
+                // Publish the bootstrap state only for this bounded handoff;
+                // the carrier entry publishes itself before service code runs.
+                let host_current = OstdTask::current().map(|current| current.cloned());
+                if let Some(host_current) = &host_current {
+                    install_current_task(host_current, &self.state);
+                }
+                // Host `Task::run` performs the unchanged Spawn publication.
+                // The Host ClassScheduler recognizes this Frame carrier and
+                // enqueues its already-committed outer group, never the
+                // carrier as an ordinary Host entity.
+                self.ostd_task().run();
+                if host_current.is_some() {
+                    clear_current_task();
+                }
+            }
+            FrameTaskKind::Service => scheduler::run_task(self),
         }
-        let bootstrap_publishes_service_task = is_service_task
-            && OstdTask::current().is_some_and(|current| {
-                current
-                    .extension()
-                    .downcast_ref::<FrameTaskData>()
-                    .is_some_and(|data| data.kind() == FrameTaskKind::Bootstrap)
-            });
-        let host_preempt_guard = host_ostd::task::disable_preempt();
-        let enqueue_result = scheduler::enqueue_task(self.clone(), scheduler::EnqueueFlags::Spawn);
-        if let Some(task_data) = task_data {
-            crate::early_println!(
-                "[FrameVM] task inner enqueue: kind={:?}, inner_cpu={:?}, ok={}",
-                task_data.kind(),
-                task_data.schedule_info.cpu.get(),
-                enqueue_result.is_ok(),
-            );
-        }
-        if bootstrap_publishes_service_task {
-            enqueue_result
-                .expect("bootstrap task must publish the service task to its inner runqueue");
-        }
-        if let Some(task_data) = task_data {
-            crate::early_println!(
-                "[FrameVM] task host run begin: kind={:?}, host={:p}",
-                task_data.kind(),
-                Arc::as_ptr(self.ostd_task()),
-            );
-        }
-        self.ostd_task().run();
-        drop(host_preempt_guard);
-        if let Some(task_data) = task_data {
-            crate::early_println!(
-                "[FrameVM] task host run returned: kind={:?}, host={:p}",
-                task_data.kind(),
-                Arc::as_ptr(self.ostd_task()),
-            );
-        }
-    }
-
-    /// Wakes up the task.
-    pub fn wake_up(self: &Arc<Self>) {
-        scheduler::unpark_target(self.clone());
     }
 }
 
@@ -174,9 +153,13 @@ impl Deref for CurrentTask {
 }
 
 impl CurrentTask {
-    /// Returns the local data of the current task.
+    /// Returns the local data of the current FrameVM task.
     pub fn local_data(&self) -> &(dyn Any + Send) {
-        self.current.local_data()
+        self.current
+            .local_data()
+            .downcast_ref::<FrameTaskLocalData>()
+            .map(FrameTaskLocalData::payload)
+            .expect("FrameVM task local data is missing")
     }
 
     /// Returns a cloned task handle.
@@ -197,13 +180,11 @@ impl Borrow<Task> for CurrentTask {
     }
 }
 
-/// Builder for creating tasks.
+/// Builder for creating service tasks in the current FrameVM.
 pub struct TaskOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
     data: Option<Box<dyn Any + Send + Sync>>,
-    extension: Option<Box<dyn Any + Send + Sync>>,
     local_data: Option<Box<dyn Any + Send>>,
-    frame_task: Option<(FrameVcpuId, FrameTaskKind)>,
 }
 
 impl TaskOptions {
@@ -215,123 +196,63 @@ impl TaskOptions {
         Self {
             func: Some(Box::new(entry)),
             data: None,
-            extension: None,
             local_data: None,
-            frame_task: None,
         }
     }
 
-    /// Binds a task to a FrameVM vCPU while the service scheduler is bootstrapping.
-    pub fn bootstrap_vcpu(mut self, frame_vcpu_id: FrameVcpuId) -> Self {
-        self.frame_task = Some((frame_vcpu_id, FrameTaskKind::Bootstrap));
+    /// Sets the function that represents the entry point of the task.
+    pub fn func<F>(mut self, func: F) -> Self
+    where
+        F: Fn() + Send + 'static,
+    {
+        self.func = Some(Box::new(func));
         self
     }
 
     /// Sets task-specific data.
-    pub fn data<T>(self, data: T) -> Self
+    pub fn data<T>(mut self, data: T) -> Self
     where
         T: Any + Send + Sync + 'static,
     {
-        self.data_any(Box::new(data))
-    }
-
-    /// Sets task-specific data from an already-boxed value.
-    pub fn data_any(mut self, data: Box<dyn Any + Send + Sync>) -> Self {
-        self.data = Some(data);
-        self
-    }
-
-    /// Sets task extension data.
-    pub fn extension<T>(self, extension: T) -> Self
-    where
-        T: Any + Send + Sync + 'static,
-    {
-        self.extension_any(Box::new(extension))
-    }
-
-    /// Sets task extension data from an already-boxed value.
-    pub fn extension_any(mut self, extension: Box<dyn Any + Send + Sync>) -> Self {
-        self.extension = Some(extension);
+        self.data = Some(Box::new(data));
         self
     }
 
     /// Sets current-task local data.
-    pub fn local_data<T>(self, local_data: T) -> Self
+    pub fn local_data<T>(mut self, local_data: T) -> Self
     where
         T: Any + Send + 'static,
     {
-        self.local_data_any(Box::new(local_data))
-    }
-
-    /// Sets current-task local data from an already-boxed value.
-    pub fn local_data_any(mut self, local_data: Box<dyn Any + Send>) -> Self {
-        self.local_data = Some(local_data);
+        self.local_data = Some(Box::new(local_data));
         self
     }
 
     /// Builds and returns the task.
     pub fn build(mut self) -> Result<Task> {
-        let func = self.func.take().ok_or(Error::InvalidArgs)?;
-        let task_kind = self.frame_task.map(|(_, kind)| kind);
-        let exits_scheduler_bootstrap = task_kind == Some(FrameTaskKind::Bootstrap);
-        let frame_vcpu_id = self
-            .frame_task
-            .map(|(frame_vcpu_id, _)| frame_vcpu_id)
-            .or_else(current_frame_vcpu_id);
-        let data = self.data.take().unwrap_or_else(|| Box::new(()));
-        let extension = self.extension.take().unwrap_or_else(|| Box::new(()));
-        let local_data = self.local_data.take().unwrap_or_else(|| Box::new(()));
-        let task_func = Box::new(move || {
-            if let Some(frame_vcpu_id) = frame_vcpu_id {
-                let host_task = OstdTask::current().map(|current| current.cloned());
-                crate::early_println!(
-                    "[FrameVM] task entry: task={:p}, host={:p}, kind={:?}, vm={}, vcpu={}",
-                    Task::current()
-                        .as_ref()
-                        .map_or(core::ptr::null(), |current| Arc::as_ptr(&current.cloned())),
-                    host_task
-                        .as_ref()
-                        .map_or(core::ptr::null(), |task| Arc::as_ptr(task)),
-                    task_kind.unwrap_or(FrameTaskKind::Service),
-                    frame_vcpu_id.vm_id(),
-                    frame_vcpu_id.vcpu_index(),
-                );
-            }
-            if exits_scheduler_bootstrap
-                && let Some(current_task) = OstdTask::current()
-                && let Some(group) =
-                    super::bootstrap_frame_sched_group_for_ostd_task(current_task.as_ref())
-            {
-                group.begin_bootstrap();
-            }
-            func();
-            scheduler::exit_current_task();
-        });
-
-        let task = if let Some(frame_vcpu_id) = frame_vcpu_id {
-            let frame_vm = vm::get_vm_by_id(frame_vcpu_id.vm_id()).ok_or(Error::InvalidArgs)?;
-            let sched_group = frame_vm
-                .sched_group(frame_vcpu_id.vcpu_index())
-                .ok_or(Error::InvalidArgs)?;
-            let kind = task_kind.unwrap_or(FrameTaskKind::Service);
-            let extension = Box::new(FrameTaskData::try_new(
-                &frame_vm,
-                sched_group,
-                kind,
-                data,
-                extension,
-            )?) as Box<dyn Any + Send + Sync>;
-
-            let host_task_ops = HOST_TASK_OPS.get().ok_or(Error::InvalidArgs)?;
-            (host_task_ops.create_task)(task_func, extension, local_data, Some(frame_vcpu_id))?
-        } else {
-            let options = host_ostd::task::TaskOptions::new(task_func)
-                .data_any(data)
-                .extension_any(extension)
-                .local_data_any(local_data);
-            Arc::new(options.build().map_err(Error::from)?)
-        };
-        Ok(Task { inner: task })
+        // The private execution-domain projection remains available while a
+        // bootstrap carrier runs, even though the public `Task::current()` is
+        // intentionally `None`. This is the only source from which a normal
+        // service task may inherit its immutable FrameVM owner and exact
+        // vCPU placement.
+        let current_state = current_state_for_current_task().ok_or(Error::InvalidArgs)?;
+        let frame_vm = current_state.frame_vm();
+        let vcpu_id = current_state
+            .bound_frame_vcpu_id()
+            .ok_or(Error::InvalidArgs)?;
+        let state = Arc::new(FrameTaskState::try_new(
+            &frame_vm,
+            FrameTaskKind::Service,
+            self.data.take().unwrap_or_else(|| Box::new(())),
+        )?);
+        state
+            .schedule_info()
+            .cpu
+            .set_anyway(crate::cpu::CpuId::from_raw(vcpu_id.vcpu_index() as u32));
+        build_task(
+            self.func.take().ok_or(Error::InvalidArgs)?,
+            state,
+            self.local_data.take().unwrap_or_else(|| Box::new(())),
+        )
     }
 
     /// Builds a new task and runs it immediately.
@@ -340,4 +261,69 @@ impl TaskOptions {
         task.run();
         Ok(task)
     }
+}
+
+/// Builds the initial FrameVM service task for an explicit VM and group.
+///
+/// This is a Host integration entry point, not part of the service-facing
+/// task builder. Bootstrap placement can therefore never be inherited from an
+/// unrelated Host task.
+pub fn build_bootstrap_task<F>(
+    frame_vm: &Arc<FrameVm>,
+    group: &Arc<FrameSchedGroup>,
+    entry: F,
+) -> Result<Task>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let state = Arc::new(FrameTaskState::try_new(
+        frame_vm,
+        FrameTaskKind::Bootstrap,
+        Box::new(()),
+    )?);
+    state
+        .schedule_info()
+        .cpu
+        .set_anyway(crate::cpu::CpuId::from_raw(group.vcpu_index() as u32));
+    build_task(Box::new(entry), state, Box::new(()))
+}
+
+fn build_task(
+    func: Box<dyn FnOnce() + Send>,
+    state: Arc<FrameTaskState>,
+    local_data: Box<dyn Any + Send>,
+) -> Result<Task> {
+    // A Frame task normally retires through the injected scheduler. Its final
+    // stopping-vCPU path first detaches the outer continuation and then uses
+    // OSTD's Host exit path. Do not capture `state` in this non-returning
+    // closure: OSTD exits without unwinding this stack, so an entry capture
+    // would keep the service-image lease alive after its carrier had exited.
+    let task_func = Box::new(move || {
+        // Publish the exact current carrier before running any service or
+        // bootstrap code. The Host post-schedule hook maintains the same
+        // projection for ordinary switches, but this closes the task-entry
+        // window in which OSTD-shaped service initialization can access its
+        // vCPU-local state.
+        let current = OstdTask::current()
+            .expect("a FrameVM carrier must be current before its entry runs");
+        let task_state = current
+            .local_data()
+            .downcast_ref::<FrameTaskLocalData>()
+            .map(FrameTaskLocalData::state)
+            .expect("a FrameVM carrier must retain Frame task local data");
+        install_current_task(&current.cloned(), &task_state);
+        drop(task_state);
+        func();
+        scheduler::exit_current_task();
+    });
+
+    let carrier = build_host_task(
+        task_func,
+        state.clone(),
+        FrameTaskLocalData::new(local_data, state.clone()),
+    )?;
+    Ok(Task {
+        inner: carrier,
+        state,
+    })
 }

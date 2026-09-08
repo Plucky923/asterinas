@@ -1285,6 +1285,8 @@ pub fn claim_current_function(
 
 #[cfg(ktest)]
 mod tests {
+    use framev_blk_common::FrameVBlkConfigFlags;
+
     use super::*;
     use crate::prelude::ktest;
 
@@ -1296,9 +1298,7 @@ mod tests {
     #[ktest]
     fn multiple_block_functions_keep_stable_ids_and_distinct_configs() {
         let writable = FrameVBlkConfig::new(8, 512, FrameVBlkConfigFlags::EMPTY).unwrap();
-        let readonly =
-            FrameVBlkConfig::new(16, 512, framev_blk_common::FrameVBlkConfigFlags::READONLY)
-                .unwrap();
+        let readonly = FrameVBlkConfig::new(16, 512, FrameVBlkConfigFlags::READONLY).unwrap();
         let space =
             VirtualPciBus::new(crate::vm::VmId::new(1), 1, 3, &[writable, readonly], None).unwrap();
 

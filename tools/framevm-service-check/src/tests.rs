@@ -37,7 +37,7 @@ impl Drop for TempRepo {
 fn test_config() -> Config {
     Config {
         service_path: PathBuf::from("services/aster-framevm"),
-        kernel_src_path: PathBuf::from("kernel/src"),
+        kernel_src_path: PathBuf::from("kernel/core/src"),
         facade_path: PathBuf::from("kernel/comps/framevisor-ostd"),
         host_ostd_path: PathBuf::from("ostd"),
         framevisor_backend_device_root: PathBuf::from("kernel/comps/framevisor/src/device"),
@@ -55,7 +55,7 @@ fn test_config() -> Config {
         service_side_trimmed_comps: Vec::from([TrimmedCompConfig {
             name: "block".to_owned(),
             service_path: PathBuf::from("services/aster-framevm/comps/block"),
-            kernel_path: PathBuf::from("kernel/comps/block"),
+            kernel_path: PathBuf::from("kernel/core/comps/block"),
             package: "aster-framevm-block".to_owned(),
             dependency_key: "aster-block".to_owned(),
         }]),
@@ -87,7 +87,7 @@ fn write_retained_pair(
         .path()
         .join("services/aster-framevm/src")
         .join(relative);
-    let kernel_file = repo.path().join("kernel/src").join(relative);
+    let kernel_file = repo.path().join("kernel/core/src").join(relative);
     fs::create_dir_all(service_file.parent().unwrap())
         .expect("failed to create service retained fixture directory");
     fs::create_dir_all(kernel_file.parent().unwrap())
@@ -111,7 +111,7 @@ fn source_trim_manifest_entry(relative: &str, kind: &str) -> String {
         r#"
 [[entries]]
 service_path = "services/aster-framevm/src/{relative}"
-kernel_path = "kernel/src/{relative}"
+kernel_path = "kernel/core/src/{relative}"
 kind = "{kind}"
 reason = "fixture difference"
 "#
@@ -302,10 +302,12 @@ impl FrameSchedGroup {{
         .expect("failed to create IRQ handler fixture directory");
     fs::write(
         &handler,
-        r#"
-//! interrupt_log owns bounded notification/control work.
+        format!(
+            r#"
+//! {frame_group_comment}
 //! Device protocol work remains in the service scheduler.
-"#,
+"#
+        ),
     )
     .expect("failed to write IRQ handler fixture");
 
@@ -366,7 +368,9 @@ pub use types::{EnqueueFlags, LocalRunQueue, Scheduler, UpdateFlags};
 }
 
 fn write_host_fair_boundary_fixture(repo: &TempRepo, body: &str) {
-    let path = repo.path().join("kernel/src/sched/sched_class/fair.rs");
+    let path = repo
+        .path()
+        .join("kernel/core/src/sched/sched_class/fair.rs");
     fs::create_dir_all(path.parent().unwrap()).expect("failed to create fair scheduler fixture");
     fs::write(
         path,
@@ -771,6 +775,64 @@ fn rejects_stale_trim_manifest_entry() {
         "expected stale manifest diagnostic, got `{}`",
         error.message
     );
+}
+
+#[test]
+fn accepts_trim_manifest_entries_for_configured_component_roots() {
+    let repo = TempRepo::new("configured-component-manifest-roots");
+    let service_block = repo
+        .path()
+        .join("services/aster-framevm/comps/block/src/lib.rs");
+    let kernel_block = repo.path().join("kernel/core/comps/block/src/lib.rs");
+    let service_network = repo
+        .path()
+        .join("services/aster-framevm/comps/network/src/lib.rs");
+    let kernel_network = repo.path().join("kernel/core/comps/network/src/lib.rs");
+
+    for path in [
+        &service_block,
+        &kernel_block,
+        &service_network,
+        &kernel_network,
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).expect("failed to create component fixture");
+    }
+    fs::write(&service_block, "pub fn framevm_block() {}\n")
+        .expect("failed to write service block fixture");
+    fs::write(&kernel_block, "pub fn kernel_block() {}\n")
+        .expect("failed to write kernel block fixture");
+    fs::write(&service_network, "pub fn framevm_network() {}\n")
+        .expect("failed to write service network fixture");
+    fs::write(&kernel_network, "pub fn kernel_network() {}\n")
+        .expect("failed to write kernel network fixture");
+
+    let mut config = test_config();
+    config.service_side_trimmed_comps[0].kernel_path = PathBuf::from("kernel/core/comps/block");
+    config.shared_source_comps = Vec::from([SharedSourceCompConfig {
+        name: "network".to_owned(),
+        host_source_path: PathBuf::from("kernel/core/comps/network/src"),
+        service_source_path: PathBuf::from("services/aster-framevm/comps/network/src"),
+        service_path_prefix: PathBuf::from("../../../../../kernel/core/comps/network/src"),
+        shared_modules: BTreeSet::from([PathBuf::from("lib.rs")]),
+    }]);
+    write_trim_manifest(
+        &repo,
+        r#"
+[[entries]]
+service_path = "services/aster-framevm/comps/block/src/lib.rs"
+kernel_path = "kernel/core/comps/block/src/lib.rs"
+kind = "mechanical-adaptation"
+reason = "fixture difference"
+
+[[entries]]
+service_path = "services/aster-framevm/comps/network/src/lib.rs"
+kernel_path = "kernel/core/comps/network/src/lib.rs"
+kind = "mechanical-adaptation"
+reason = "fixture difference"
+"#,
+    );
+
+    validate_trim_manifest(repo.path(), &config).expect("manifest should use configured roots");
 }
 
 #[test]
@@ -1248,9 +1310,9 @@ default-members = ["services/aster-framevm/comps/block"]
         &repo,
         r#"aster-block = { path = "comps/block", package = "aster-framevm-block" }"#,
     );
-    fs::create_dir_all(repo.path().join("kernel/comps/block/src"))
+    fs::create_dir_all(repo.path().join("kernel/core/comps/block/src"))
         .expect("failed to create kernel comp fixture");
-    fs::write(repo.path().join("kernel/comps/block/src/lib.rs"), "")
+    fs::write(repo.path().join("kernel/core/comps/block/src/lib.rs"), "")
         .expect("failed to write kernel comp fixture");
     let comp_dir = repo.path().join("services/aster-framevm/comps/block");
     fs::create_dir_all(comp_dir.join("src")).expect("failed to create comp fixture");
@@ -1557,7 +1619,7 @@ fn rejects_nvme_post_bio_payload_staging() {
     let repo = TempRepo::new("nvme-post-bio-payload-staging");
     let path = repo
         .path()
-        .join("kernel/comps/nvme/src/device/block_device.rs");
+        .join("kernel/core/comps/nvme/src/device/block_device.rs");
     fs::create_dir_all(path.parent().unwrap()).expect("failed to create NVMe fixture directory");
     fs::write(
         &path,
@@ -1713,7 +1775,7 @@ edition = "2024"
 }
 
 #[test]
-fn rejects_service_first_frame_sched_group_pick() {
+fn rejects_inner_scheduler_frame_sched_group_pick() {
     let repo = TempRepo::new("frame-sched-group");
     let file = repo
         .path()
@@ -1723,15 +1785,10 @@ fn rejects_service_first_frame_sched_group_pick() {
         &file,
         r#"
 impl FrameSchedGroup {
-    /// Interrupt-first is part of the FrameSchedGroup contract. Do not reverse it.
+    /// Returns the committed continuation. This is not an inner scheduler pick;
+    /// a staged target must remain private until commit.
     pub fn pick_task(&self) -> Option<Arc<HostTask>> {
-        if let Some(task) = self.try_pick_service() {
-            return Some(task);
-        }
-        if self.interrupt_handler.has_deliverable_work() {
-            return Some(task);
-        }
-        None
+        self.try_pick_service()
     }
 }
 "#,
@@ -1740,8 +1797,8 @@ impl FrameSchedGroup {
 
     let error = validate_frame_sched_group_contract(repo.path()).expect_err("fixture must fail");
     assert!(
-        error.message.contains("must remain interrupt-first"),
-        "expected interrupt-first diagnostic, got `{}`",
+        error.message.contains("committed continuation"),
+        "expected committed-continuation diagnostic, got `{}`",
         error.message
     );
 }
@@ -1749,15 +1806,12 @@ impl FrameSchedGroup {
 #[test]
 fn rejects_missing_irq_discipline_comment() {
     let repo = TempRepo::new("irq-discipline-comment");
-    write_irq_discipline_fixture(
-        &repo,
-        "Interrupt-first is part of the FrameSchedGroup contract. Do not reverse it.",
-    );
+    write_irq_discipline_fixture(&repo, "missing notification boundary");
 
     let error = check_irq_control_boundary(repo.path()).expect_err("fixture must fail");
     assert!(
-        error.message.contains("notification/control"),
-        "expected callback-discipline comment diagnostic, got `{}`",
+        error.message.contains("single interrupt-log owner"),
+        "expected interrupt-log diagnostic, got `{}`",
         error.message
     );
 }
@@ -1864,7 +1918,8 @@ fn accepts_host_fair_cgroup_accounting_boundary() {
         "if matches!(flags, UpdateFlags::Tick) {\n            state.task_group().account_system_tick(self.cpu);\n        }",
     );
 
-    validate_host_scheduler_cgroup_boundary(repo.path()).expect("fixture must pass");
+    validate_host_scheduler_cgroup_boundary(repo.path(), &test_config())
+        .expect("fixture must pass");
 }
 
 #[test]
@@ -1875,7 +1930,8 @@ fn rejects_host_fair_timer_requeue_in_accounting_boundary() {
         "if matches!(flags, UpdateFlags::Tick) {\n            state.task_group().account_system_tick(self.cpu);\n            group.record_timer_tick();\n        }",
     );
 
-    let error = validate_host_scheduler_cgroup_boundary(repo.path()).expect_err("fixture fails");
+    let error = validate_host_scheduler_cgroup_boundary(repo.path(), &test_config())
+        .expect_err("fixture fails");
     assert!(error.message.contains("feed a drained FrameVM timer tick"));
 }
 
@@ -2254,7 +2310,7 @@ allowed_imports = ["cpio_decoder"]
 #[test]
 fn rejects_final_cpio_rootfs_loader_fallback() {
     let repo = TempRepo::new("cpio-loader");
-    let loader_path = repo.path().join("kernel/src/vmm/mod.rs");
+    let loader_path = repo.path().join("kernel/core/src/vmm/mod.rs");
     fs::create_dir_all(loader_path.parent().unwrap())
         .expect("failed to create loader fixture directory");
     fs::write(

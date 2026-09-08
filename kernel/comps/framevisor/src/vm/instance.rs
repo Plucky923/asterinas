@@ -5,7 +5,7 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     alloc::Layout,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 use host_ostd::sync::{RwLock, WaitQueue};
@@ -287,16 +287,35 @@ pub struct FrameVm {
     irq: Arc<Irq>,
     /// Host observer for service-originated lifecycle events.
     event_sink: SpinLock<Option<Arc<dyn FrameVmEventSink>>>,
+    /// Blocks Host teardown until another service carrier has left its image.
+    ///
+    /// Teardown must sleep here rather than repeatedly yield: a freshly
+    /// spawned cleanup task otherwise competes with the FrameSchedGroup that
+    /// owns the service carriers it is waiting for.
+    service_task_exit_wait: WaitQueue,
+    /// Number of task states whose service-defined values may still execute
+    /// destructors from this VM image.
+    service_image_task_count: AtomicUsize,
     /// Immutable boot information installed for this VM image.
     boot_info: SpinLock<Option<&'static crate::boot::BootInfo>>,
     /// VM-owned CPU-local state for FrameVM service code.
     cpu_local: CpuLocalDomain,
     /// Admission state shared by all FrameVM service tasks.
     task_admission: Arc<TaskAdmission>,
-    /// Host scheduler selected for this FrameVM.
+    /// Exact service scheduler selected for this FrameVM.
+    ///
+    /// Host policy has no companion scheduler view: it schedules only opaque
+    /// vCPU groups and crosses the processor boundary after an inner choice.
     scheduler: RwLock<Option<&'static dyn Scheduler<Task>>>,
     /// Service entry points installed for this service image.
     service_entry_points: ServiceEntryPoints,
+    /// Startup image waiting for the bootstrap task to load it.
+    ///
+    /// The bootstrap task takes this exactly once, then drops its copy before
+    /// entering the non-returning service entry point. Keeping it in the VM
+    /// rather than in that task's closure prevents a stopped carrier from
+    /// retaining a complete ELF image until Host task reclamation.
+    service_image: SpinLock<Option<Arc<[u8]>>>,
     /// Loaded service program used by this VM's tasks.
     program: SpinLock<Option<Arc<host_ostd::loader::Program>>>,
     /// OSTD provider cells relocated into this VM's service image.
@@ -340,10 +359,9 @@ impl FrameVm {
             #[cfg(not(target_arch = "x86_64"))]
             false,
         )?;
-        // The loader keeps its own clone of the image and command line while
-        // the VM is being created. They are deliberately consumed here rather
-        // than retained as a second mutable configuration object on `FrameVm`.
-        drop(program_image);
+        // The bootstrap task consumes the image exactly once. Keep it only in
+        // the private startup slot rather than duplicating it in the loader or
+        // a non-returning service-carrier closure.
         drop(cmdline_append);
         validate_create_args(vcpu_count, share)?;
         let memory =
@@ -381,11 +399,14 @@ impl FrameVm {
             devices,
             irq,
             event_sink: SpinLock::new(None),
+            service_task_exit_wait: WaitQueue::new(),
+            service_image_task_count: AtomicUsize::new(0),
             boot_info: SpinLock::new(None),
             cpu_local: CpuLocalDomain::new(vcpu_count),
             task_admission: Arc::new(TaskAdmission::new()),
             scheduler: RwLock::new(None),
             service_entry_points: ServiceEntryPoints::new(),
+            service_image: SpinLock::new(Some(program_image)),
             program: SpinLock::new(None),
             allocator: Once::new(),
             control_memory_charge_bytes,
@@ -451,6 +472,26 @@ impl FrameVm {
         if let Some(sink) = self.event_sink.lock().as_ref().cloned() {
             sink.on_power_event(action, status_code);
         }
+    }
+
+    /// Delivers the final service-carrier exit boundary to the Host observer.
+    pub(crate) fn notify_service_task_exit(&self) {
+        // Publish the image-membership change before waking a Host cleanup
+        // task that may be waiting to release this VM.
+        self.service_task_exit_wait.wake_all();
+    }
+
+    pub(crate) fn acquire_service_image_task_lease(&self) {
+        self.service_image_task_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn release_service_image_task_lease(&self) {
+        let previous = self.service_image_task_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous != 0,
+            "service image task leases must not underflow"
+        );
+        self.service_task_exit_wait.wake_all();
     }
 
     /// Quiesces service allocator state after every service task has exited.
@@ -565,7 +606,7 @@ impl FrameVm {
         }
     }
 
-    /// Installs the service scheduler for this VM.
+    /// Installs the OSTD-shaped service scheduler for this VM.
     pub(crate) fn install_scheduler(&self, scheduler: &'static dyn Scheduler<Task>) -> bool {
         let mut scheduler_slot = self.scheduler.write();
         if scheduler_slot.is_some() {
@@ -575,7 +616,7 @@ impl FrameVm {
         true
     }
 
-    /// Returns the service scheduler for this VM.
+    /// Returns this VM's exact service scheduler.
     pub(crate) fn scheduler(&self) -> Option<&'static dyn Scheduler<Task>> {
         *self.scheduler.read()
     }
@@ -669,6 +710,7 @@ impl FrameVm {
         if let Some(allocator) = self.allocator.get() {
             allocator.deactivate();
         }
+        drop(self.service_image.lock().take());
         drop(self.program.lock().take());
     }
 
@@ -692,7 +734,16 @@ impl FrameVm {
         if let Some(allocator) = self.allocator.get() {
             allocator.deactivate();
         }
+        drop(self.service_image.lock().take());
         drop(self.program.lock().take());
+    }
+
+    /// Takes the image to be loaded by this VM's bootstrap task.
+    ///
+    /// This is a one-shot startup handoff, not a reload facility. Once taken,
+    /// the image must be dropped before the task enters service code.
+    pub fn take_service_image(&self) -> Option<Arc<[u8]>> {
+        self.service_image.lock().take()
     }
 
     /// Clears task entry points and scheduler state after image teardown.
@@ -757,7 +808,7 @@ impl FrameVm {
         self.status() == VmStatus::Running
     }
 
-    /// Starts all vCPU interrupt-handler tasks.
+    /// Starts all vCPU event owners.
     pub fn start(&self) -> Result<()> {
         let cleanup = self.claim_stop_cleanup();
         if self
@@ -799,18 +850,6 @@ impl FrameVm {
         self.devices.reset_for_start();
         for vcpu in &self.vcpus {
             vcpu.sched_group().open_admission();
-            vcpu.interrupt_handler().reset_after_exit();
-        }
-
-        for vcpu in &self.vcpus {
-            if let Err(error) = irq::start_interrupt_handler(vcpu.interrupt_handler().clone()) {
-                self.rollback_start(cleanup);
-                return Err(error);
-            }
-        }
-
-        for vcpu in &self.vcpus {
-            vcpu.interrupt_handler().wait_until_started();
         }
 
         if let Err(error) = self.devices.mark_ready_all() {
@@ -836,7 +875,6 @@ impl FrameVm {
 
     fn rollback_start(&self, cleanup: StopCleanupGuard<'_>) {
         self.request_stop();
-        self.wait_for_interrupt_exit();
         self.finish_stop(
             cleanup,
             #[cfg(target_arch = "x86_64")]
@@ -844,79 +882,24 @@ impl FrameVm {
         );
     }
 
-    fn wait_for_interrupt_exit(&self) {
-        for vcpu in &self.vcpus {
-            let handler = vcpu.interrupt_handler();
-            if handler.has_task() {
-                handler.wait_for_exit();
-            }
-        }
-    }
-
     /// Waits until every tracked service task has left the loaded image.
     pub fn wait_for_service_task_exit(&self) {
         let mut reported_wait = false;
-        let mut reported_counts = None;
-        loop {
-            let service_tasks = self
-                .vcpus
-                .iter()
-                .flat_map(|vcpu| vcpu.sched_group().service_tasks_snapshot())
-                .collect::<Vec<_>>();
-            let completed_tasks = service_tasks
-                .iter()
-                .filter(|task| task.is_completed())
-                .count();
-            if completed_tasks == service_tasks.len() {
-                return;
-            }
-            let counts = (service_tasks.len(), completed_tasks);
-            if reported_counts != Some(counts) {
-                crate::early_println!(
-                    "[FrameVM] service task exit progress: vm={}, total={}, completed={}",
-                    self.id,
-                    counts.0,
-                    counts.1
-                );
-                if reported_wait {
-                    for task in service_tasks.iter().filter(|task| !task.is_completed()) {
-                        let task_data = task
-                            .extension()
-                            .downcast_ref::<crate::task::FrameTaskData>();
-                        crate::early_println!(
-                            "[FrameVM] pending service task after progress: ptr={:p}, kind={:?}, vcpu={:?}, host_cpu={:?}",
-                            Arc::as_ptr(task),
-                            task_data.map(crate::task::FrameTaskData::kind),
-                            task_data.map(crate::task::FrameTaskData::frame_vcpu_id),
-                            task.schedule_info().cpu.get(),
-                        );
-                    }
-                }
-                reported_counts = Some(counts);
+        self.service_task_exit_wait.wait_until(|| {
+            let active_tasks = self.service_image_task_count.load(Ordering::Acquire);
+            if active_tasks == 0 {
+                return Some(());
             }
             if !reported_wait {
                 crate::early_println!(
-                    "[FrameVM] waiting for service task exit: vm={}, total={}, completed={}",
+                    "[FrameVM] waiting for service task exit: vm={}, active_tasks={}",
                     self.id,
-                    service_tasks.len(),
-                    completed_tasks
+                    active_tasks
                 );
-                for task in service_tasks.iter().filter(|task| !task.is_completed()) {
-                    let task_data = task
-                        .extension()
-                        .downcast_ref::<crate::task::FrameTaskData>();
-                    crate::early_println!(
-                        "[FrameVM] pending service task: ptr={:p}, kind={:?}, vcpu={:?}, host_cpu={:?}",
-                        Arc::as_ptr(task),
-                        task_data.map(crate::task::FrameTaskData::kind),
-                        task_data.map(crate::task::FrameTaskData::frame_vcpu_id),
-                        task.schedule_info().cpu.get(),
-                    );
-                }
                 reported_wait = true;
             }
-            host_ostd::task::Task::yield_now();
-        }
+            None
+        });
     }
 
     /// Stops a VM after its service completes orderly shutdown work.
@@ -937,7 +920,6 @@ impl FrameVm {
         self.begin_orderly_stop();
         self.request_execution_stop();
 
-        self.wait_for_interrupt_exit();
         self.finish_stop(
             cleanup,
             #[cfg(target_arch = "x86_64")]
@@ -955,7 +937,6 @@ impl FrameVm {
         if self.status() != VmStatus::Stopping {
             self.request_stop();
         }
-        self.wait_for_interrupt_exit();
         self.finish_stop(
             cleanup,
             #[cfg(target_arch = "x86_64")]
@@ -969,7 +950,6 @@ impl FrameVm {
         self.stop_cleanup.request_pci_quarantine();
         let cleanup = self.claim_stop_cleanup();
         self.request_stop();
-        self.wait_for_interrupt_exit();
         self.finish_stop(cleanup, AssignedPciStop::Quarantine)
     }
 
@@ -989,11 +969,12 @@ impl FrameVm {
         // service vtable after its backing pages have been unmapped.
         self.irq.clear();
         self.clear_timer_runtime();
-        // The interrupt handler retains the stopped task and its pending
-        // notifications. Reset it while
-        // the service image and its provider cells are still valid.
+        // Pending owner-scoped events are no longer deliverable after
+        // admission closes. Clear them while the service image and callback
+        // registries are still valid; there is no interrupt task to join or
+        // reset.
         for vcpu in &self.vcpus {
-            vcpu.interrupt_handler().reset_after_exit();
+            vcpu.interrupt_handler().clear_pending();
         }
         self.clear_task_state();
         self.cpu_local.start_teardown();
@@ -1137,9 +1118,6 @@ impl FrameVm {
     }
 
     fn request_execution_stop(&self) {
-        for vcpu in &self.vcpus {
-            vcpu.interrupt_handler().signal_exit();
-        }
         for vcpu in &self.vcpus {
             vcpu.sched_group().close_admission();
         }

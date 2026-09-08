@@ -121,6 +121,15 @@ in stdenvNoCC.mkDerivation {
     }
     EOF
     $CC -O2 -static -o "$root/init" framevm-init.c
+    cat > framevm-load-exit.S <<'EOF'
+    .global _start
+    .section .text
+    _start:
+        mov $60, %rax
+        xor %rdi, %rdi
+        syscall
+    EOF
+    $CC -nostdlib -static -Wl,-e,_start -o "$root/bin/framevm-load-exit" framevm-load-exit.S
     cat > framevm-test-runner.c <<'EOF'
     #define _GNU_SOURCE
 
@@ -1095,7 +1104,8 @@ in stdenvNoCC.mkDerivation {
     printf 'framevm-rootfs-0000\n' > "$root/tmp/framevm-persist"
 
     chmod 0755 "$root/bin/busybox" "$root/bin/framev_vsock_echo" \
-      "$root/bin/framevm-test-runner" "$root/bin/framevm_reboot" "$root/init"
+      "$root/bin/framevm-load-exit" "$root/bin/framevm-test-runner" \
+      "$root/bin/framevm_reboot" "$root/init"
     chmod 1777 "$root/tmp"
 
     cat > "$root/etc/framevm-nginx.conf" <<'EOF'

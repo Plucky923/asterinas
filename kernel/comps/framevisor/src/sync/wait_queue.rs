@@ -8,8 +8,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
-use host_ostd::sync as host_sync;
-
 use super::{LocalIrqDisabled, SpinLock};
 use crate::task::{Task, scheduler};
 
@@ -121,7 +119,6 @@ pub struct Waiter {
 /// A waker associated with a task.
 pub struct Waker {
     has_woken: AtomicBool,
-    host_wait_queue: host_sync::WaitQueue,
     task: Arc<Task>,
 }
 
@@ -131,7 +128,6 @@ impl Waiter {
         let task = Task::current().unwrap().cloned();
         let waker = Arc::new(Waker {
             has_woken: AtomicBool::new(false),
-            host_wait_queue: host_sync::WaitQueue::new(),
             task,
         });
         let waiter = Self {
@@ -196,28 +192,28 @@ impl Waker {
             return false;
         }
 
+        // This is the one exact-inner `Wake` transition. In particular, a
+        // Frame waiter never parks or wakes the Host carrier that happens to
+        // be executing its committed continuation.
         scheduler::unpark_target(self.task.clone());
-        self.host_wait_queue.wake_all();
         true
     }
 
     #[track_caller]
     fn do_wait(&self) {
         while !self.has_woken.swap(false, Ordering::Acquire) {
-            let parked = scheduler::park_current(|| self.has_woken.load(Ordering::Acquire));
-            if parked && self.has_woken.load(Ordering::Acquire) {
-                scheduler::unpark_target(self.task.clone());
-            }
-            self.host_wait_queue
-                .wait_until(|| self.has_woken.load(Ordering::Acquire).then_some(()));
-            if self.has_woken.load(Ordering::Acquire) {
-                scheduler::unpark_target(self.task.clone());
-            }
+            // `park_current` performs the final wake check and the inner
+            // `Wait`/dequeue update under the same local runqueue lock. That
+            // is the usual OSTD lost-wakeup proof; crossing into a Host wait
+            // queue here would split the proof across two schedulers.
+            scheduler::park_current(|| self.has_woken.load(Ordering::Acquire));
         }
     }
 
     fn close(&self) {
+        // Keep the observable OSTD close semantics exactly: closing only
+        // consumes future wake attempts. It is not a scheduling event, so it
+        // must not drive the private Host wait bridge.
         let _ = self.has_woken.swap(true, Ordering::Acquire);
-        self.host_wait_queue.wake_all();
     }
 }

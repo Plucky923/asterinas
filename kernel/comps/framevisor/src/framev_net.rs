@@ -44,16 +44,14 @@ fn retain_host_buffer_charge(
     // address can be reused between the storage reclaimer and the guard's
     // release callback, while the token remains unique to this charge.
     let token = NEXT_HOST_BUFFER_CHARGE.fetch_add(1, Ordering::Relaxed);
-    host_buffer_charges()
-        .lock()
-        .insert(
-            token,
-            HostBufferCharge {
-                vm_id,
-                buffer_address,
-                _charge: charge,
-            },
-        );
+    host_buffer_charges().lock().insert(
+        token,
+        HostBufferCharge {
+            vm_id,
+            buffer_address,
+            _charge: charge,
+        },
+    );
     BufferDropGuard::new(token, release_host_buffer_charge)
 }
 
@@ -130,9 +128,7 @@ pub fn post_receive_buffer_claimed(
 /// may later move back to the service without a bridge copy. Its reclamation
 /// capability remains bound to Host, and its memory charge is released when
 /// the buffer is finally dropped.
-pub fn allocate_receive_buffer_claimed(
-    claim: &FunctionClaim,
-) -> Result<OwnedNetworkBuffer> {
+pub fn allocate_receive_buffer_claimed(claim: &FunctionClaim) -> Result<OwnedNetworkBuffer> {
     let _call = claim.enter(FrameVFunctionFamily::Net)?;
     let frame_vcpu_id = task::current_frame_vcpu_id().ok_or(Error::InvalidArgs)?;
     let vm = vm::get_vm_by_id(frame_vcpu_id.vm_id()).ok_or(Error::InvalidArgs)?;
@@ -149,11 +145,7 @@ pub fn allocate_receive_buffer_claimed(
 
     let host_storage = host_storage.into_boxed_slice();
     let buffer_address = host_storage.as_ptr() as usize;
-    let drop_guard = retain_host_buffer_charge(
-        frame_vcpu_id.vm_id(),
-        buffer_address,
-        host_charge,
-    );
+    let drop_guard = retain_host_buffer_charge(frame_vcpu_id.vm_id(), buffer_address, host_charge);
     Ok(OwnedNetworkBuffer::from_boxed_slice_with_drop_guard(
         host_storage,
         drop_guard,

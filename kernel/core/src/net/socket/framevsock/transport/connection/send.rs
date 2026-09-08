@@ -8,7 +8,7 @@ use framev_sock_common::{FrameVsockPacket, flow_control::MAX_PKT_BUF_SIZE};
 use super::{Connected, TxState};
 use crate::{
     events::IoEvents,
-    net::socket::{framevsock::backend, util::SendRecvFlags},
+    net::socket::{framevsock::backend, util::SendFlags},
     prelude::*,
     util::MultiRead,
 };
@@ -30,7 +30,7 @@ impl Connected {
     pub fn try_send(
         &self,
         reader: &mut dyn MultiRead,
-        _flags: SendRecvFlags,
+        _flags: SendFlags,
         pending_packet: &mut Option<RRef<FrameVsockPacket>>,
     ) -> Result<usize> {
         self.check_send_allowed()?;

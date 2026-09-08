@@ -360,11 +360,6 @@ pub trait LocalRunQueue<T = Task> {
     /// Gets the current runnable task.
     fn current(&self) -> Option<&Arc<T>>;
 
-    /// Returns whether this runqueue has runnable work.
-    fn has_runnable(&self) -> bool {
-        self.current().is_some()
-    }
-
     /// Updates the current runnable task's scheduling statistics and
     /// potentially its position in the runqueue.
     ///
@@ -491,13 +486,9 @@ where
 
 /// Unblocks a target task.
 pub(crate) fn unpark_target(runnable: Arc<Task>) {
-    if runnable.is_completed() {
-        return;
-    }
-
     let preempt_cpu = scheduler_singleton().enqueue(runnable, EnqueueFlags::Wake);
     if let Some(preempt_cpu_id) = preempt_cpu {
-        set_need_preempt(preempt_cpu_id);
+        request_preemption_on_cpu(preempt_cpu_id);
     }
 }
 
@@ -508,7 +499,7 @@ pub(crate) fn unpark_target(runnable: Arc<Task>) {
 pub(super) fn run_new_task(runnable: Arc<Task>) {
     let preempt_cpu = scheduler_singleton().enqueue(runnable, EnqueueFlags::Spawn);
     if let Some(preempt_cpu_id) = preempt_cpu {
-        set_need_preempt(preempt_cpu_id);
+        request_preemption_on_cpu(preempt_cpu_id);
     }
 
     might_preempt();
@@ -518,7 +509,7 @@ pub(super) fn run_new_task(runnable: Arc<Task>) {
 ///
 /// This is used when a resource-policy update invalidates the placement of a
 /// task that may currently be running on another CPU.
-pub fn request_preemption_on_cpu(cpu_id: CpuId) {
+pub(crate) fn request_preemption_on_cpu(cpu_id: CpuId) {
     let preempt_guard = disable_preempt();
 
     if preempt_guard.current_cpu() == cpu_id {
@@ -530,33 +521,33 @@ pub fn request_preemption_on_cpu(cpu_id: CpuId) {
     }
 }
 
-fn set_need_preempt(cpu_id: CpuId) {
-    request_preemption_on_cpu(cpu_id);
-}
-
 /// Dequeues the current task from its runqueue.
 ///
 /// This should only be called if the current is to exit.
 #[track_caller]
 pub(super) fn exit_current() -> ! {
     let mut is_first_try = true;
+    cpu_local::clear_need_preempt();
 
-    reschedule(|local_rq: &mut dyn LocalRunQueue| {
-        let next_task_opt = if is_first_try {
-            is_first_try = false;
-            let should_pick_next = local_rq.update_current(UpdateFlags::Exit);
-            let _current = local_rq.dequeue_current();
-            should_pick_next.then(|| local_rq.pick_next())
-        } else {
-            local_rq.try_pick_next()
-        };
-
-        if let Some(next_task) = next_task_opt {
-            ReschedAction::SwitchTo(next_task.clone())
-        } else {
-            ReschedAction::Retry
+    let next_task = loop {
+        let mut next_task = None;
+        scheduler_singleton().mut_local_rq_with(&mut |local_rq| {
+            let next_task_opt = if is_first_try {
+                is_first_try = false;
+                let should_pick_next = local_rq.update_current(UpdateFlags::Exit);
+                let _current = local_rq.dequeue_current();
+                should_pick_next.then(|| local_rq.pick_next())
+            } else {
+                local_rq.try_pick_next()
+            };
+            next_task = next_task_opt.cloned();
+        });
+        if let Some(next_task) = next_task {
+            break next_task;
         }
-    });
+    };
+
+    processor::switch_to_task(next_task);
 
     unreachable!()
 }

@@ -166,8 +166,13 @@ framevm_run_with_drive_arg() {
     test_name="$2"
     extra_init_args="${3:-}"
     drive=${drive_arg#file=}
+    if [ "$test_name" = "load" ]; then
+        init_command="init=/bin/framevm-load-exit"
+    else
+        init_command="init=/bin/framevm-test-runner FRAMEVM_TEST=${test_name} ${extra_init_args}"
+    fi
     framevm_run "${FRAMEVM_VCPUS:-1}" "$drive" \
-        "init=/bin/framevm-test-runner FRAMEVM_TEST=${test_name} ${extra_init_args}"
+        "$init_command"
 }
 
 framevm_run() {

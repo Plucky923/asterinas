@@ -97,8 +97,9 @@ impl LineDiscipline {
         &mut self,
         ch: u8,
         mut signal_callback: F1,
-        echo_callback: F2,
+        mut echo_callback: F2,
     ) -> Result<()> {
+        let mut echo = Vec::new();
         let ch = if self.termios.input_flags().contains(CInputFlags::ICRNL) && ch == b'\r' {
             b'\n'
         } else {
@@ -118,17 +119,20 @@ impl LineDiscipline {
             }
 
             if self.termios.local_flags().contains(CLocalFlags::ECHO) {
-                self.output_char(ch, echo_callback);
+                self.output_char(ch, &mut echo);
             }
 
             // The signal character itself is consumed, not delivered to readers.
+            if !echo.is_empty() {
+                echo_callback(&echo);
+            }
             return Ok(());
         }
 
         // Typically, a TTY in raw mode does not echo. But the TTY can also be in a CBREAK mode,
         // with ICANON closed and ECHO opened.
         if self.termios.local_flags().contains(CLocalFlags::ECHO) {
-            self.output_char(ch, echo_callback);
+            self.output_char(ch, &mut echo);
         }
 
         if self.is_full() {
@@ -167,6 +171,10 @@ impl LineDiscipline {
         if is_printable_char(ch) {
             // Printable character
             self.current_line.push_char(ch);
+        }
+
+        if !echo.is_empty() {
+            echo_callback(&echo);
         }
 
         Ok(())

@@ -6,6 +6,14 @@
 
 framevm_case_start rootfs
 
+discard_case_artifacts() {
+    if [ "${FRAMEVM_KEEP_ARTIFACTS:-0}" = "1" ]; then
+        return 0
+    fi
+
+    rm -f "$@"
+}
+
 run_write_flush_smoke() {
     framevm_prepare_drive rootfs-write
     drive="$FRAMEVM_PREPARED_DRIVE"
@@ -46,6 +54,12 @@ run_write_flush_smoke() {
         framevm_dump_log_tail "$log_file"
         return 1
     fi
+
+    # Each prepared drive is 720 MiB. Reclaim a successful run before the
+    # next one instead of keeping all rootfs inputs alive until this child
+    # shell exits; `all.sh` continues with lifecycle coverage in the same
+    # Host boot.
+    discard_case_artifacts "$drive" "$log_file"
 }
 
 if ! run_write_flush_smoke; then
@@ -60,8 +74,10 @@ if ! framevm_run_load FRAMEVM_WALL_CLOCK_OK wall-clock; then
     framevm_finish_host
     exit 1
 fi
+discard_case_artifacts "$FRAMEVM_PREPARED_DRIVE"
 
 if framevm_run_load "${FRAMEVM_ROOTFS_MARKER}" rootfs; then
+    discard_case_artifacts "$FRAMEVM_PREPARED_DRIVE"
     framevm_case_pass rootfs
     framevm_finish_host
     exit 0

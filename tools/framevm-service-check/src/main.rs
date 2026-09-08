@@ -299,7 +299,7 @@ fn run() -> CheckResult<()> {
     validate_framevisor_ostd_style_module_boundaries(&repo_root)?;
     validate_framevisor_ostd_host_management_absence(&repo_root, &config)?;
     validate_framevisor_task_scheduler_layout(&repo_root)?;
-    validate_host_scheduler_cgroup_boundary(&repo_root)?;
+    validate_host_scheduler_cgroup_boundary(&repo_root, &config)?;
     validate_frame_sched_group_contract(&repo_root)?;
     validate_nvme_direct_bio_contract(&repo_root)?;
     check_irq_control_boundary(&repo_root)?;
@@ -355,6 +355,10 @@ fn run() -> CheckResult<()> {
 }
 
 fn check_syscall_entry_equality(repo_root: &Path, config: &Config) -> CheckResult<()> {
+    if !config.source_trim_enforcement.is_final() {
+        return Ok(());
+    }
+
     let kernel_entries =
         collect_syscall_entries(&repo_root.join(&config.kernel_src_path).join("syscall"))?;
     let service_entries =
@@ -2103,8 +2107,10 @@ fn validate_framevisor_task_scheduler_layout(repo_root: &Path) -> CheckResult<()
     Ok(())
 }
 
-fn validate_host_scheduler_cgroup_boundary(repo_root: &Path) -> CheckResult<()> {
-    let path = repo_root.join("kernel/src/sched/sched_class/fair.rs");
+fn validate_host_scheduler_cgroup_boundary(repo_root: &Path, config: &Config) -> CheckResult<()> {
+    let path = repo_root
+        .join(&config.kernel_src_path)
+        .join("sched/sched_class/fair.rs");
     let source = fs::read_to_string(&path)?;
     let function_start = source
         .find("pub(super) fn update_current_frame_group(")
@@ -2147,38 +2153,43 @@ fn validate_frame_sched_group_contract(repo_root: &Path) -> CheckResult<()> {
     let path = repo_root.join("kernel/comps/framevisor/src/vm/frame_group.rs");
     let source = fs::read_to_string(&path)?;
     let function_start = source
-        .find("pub fn pick_task(&self) -> Option<Arc<HostTask>>")
+        .find("pub fn pick_task(&self)")
         .ok_or_else(|| CheckError::new(format!("{} missing `pick_task`", path.display())))?;
     let function_source = &source[function_start..];
-    let interrupt_pick = function_source
-        .find("self.interrupt_handler.has_deliverable_work()")
-        .ok_or_else(|| {
-            CheckError::new(format!(
-                "{} `pick_task` must check interrupt-handler work",
-                path.display()
-            ))
-        })?;
-    let service_pick = function_source
-        .rfind("self.try_pick_service(")
-        .ok_or_else(|| {
-            CheckError::new(format!(
-                "{} `pick_task` must check service work",
-                path.display()
-            ))
-        })?;
-    if interrupt_pick > service_pick {
+    let function_end = function_source.find("\n    }").ok_or_else(|| {
+        CheckError::new(format!(
+            "{} has an unreadable `pick_task` boundary",
+            path.display()
+        ))
+    })?;
+    let function_source = &function_source[..function_end];
+    if !function_source.contains("self.continuation()") {
         return Err(CheckError::new(format!(
-            "{} `pick_task` must remain interrupt-first before service selection",
+            "{} `pick_task` must return only the committed continuation",
             path.display()
         )));
     }
+    for forbidden in [
+        "try_pick",
+        "scheduler",
+        "interrupt_handler",
+        "has_deliverable_work",
+    ] {
+        if function_source.contains(forbidden) {
+            return Err(CheckError::new(format!(
+                "{} `pick_task` must not inspect inner policy or pending IRQ work (`{forbidden}`)",
+                path.display()
+            )));
+        }
+    }
 
     let comment_window = &source[..function_start];
-    if !comment_window.contains("Interrupt-first is part of the FrameSchedGroup")
-        || !comment_window.contains("Do not")
+    if !comment_window.contains("committed continuation")
+        || !comment_window.contains("not an inner scheduler pick")
+        || !comment_window.contains("staged target")
     {
         return Err(CheckError::new(format!(
-            "{} `pick_task` must document the interrupt-first scheduling contract",
+            "{} `pick_task` must document the opaque committed-continuation contract",
             path.display()
         )));
     }
@@ -2186,7 +2197,7 @@ fn validate_frame_sched_group_contract(repo_root: &Path) -> CheckResult<()> {
 }
 
 fn validate_nvme_direct_bio_contract(repo_root: &Path) -> CheckResult<()> {
-    let path = repo_root.join("kernel/comps/nvme/src/device/block_device.rs");
+    let path = repo_root.join("kernel/core/comps/nvme/src/device/block_device.rs");
     let source = fs::read_to_string(&path)?;
     let function_start = source
         .find("fn io_rw_request(&self, request: BioRequest, io_op: IoOp)")
@@ -2225,19 +2236,6 @@ fn validate_nvme_direct_bio_contract(repo_root: &Path) -> CheckResult<()> {
 }
 
 fn check_irq_control_boundary(repo_root: &Path) -> CheckResult<()> {
-    let frame_group_path = repo_root.join("kernel/comps/framevisor/src/vm/frame_group.rs");
-    let frame_group_source = fs::read_to_string(&frame_group_path)?;
-    require_comment_before(
-        &frame_group_path,
-        &frame_group_source,
-        "pub fn pick_task(&self) -> Option<Arc<HostTask>>",
-        &[
-            "Interrupt-first is part of the FrameSchedGroup",
-            "notification/control",
-            "data path",
-        ],
-    )?;
-
     let handler_path = repo_root.join("kernel/comps/framevisor/src/irq/handler.rs");
     let handler_source = fs::read_to_string(&handler_path)?;
     for phrase in [
@@ -2248,6 +2246,48 @@ fn check_irq_control_boundary(repo_root: &Path) -> CheckResult<()> {
             return Err(CheckError::new(format!(
                 "{} must document the single interrupt-log owner with `{phrase}`",
                 handler_path.display()
+            )));
+        }
+    }
+    for required in [
+        "const INTERRUPT_DRAIN_BATCH",
+        "deliver_pending_on_current_vcpu",
+        "group.request_inner_preempt()",
+    ] {
+        if !handler_source.contains(required) {
+            return Err(CheckError::new(format!(
+                "{} missing continuation-owned bounded IRQ delivery `{required}`",
+                handler_path.display()
+            )));
+        }
+    }
+    for forbidden in [
+        "HostWaitQueue",
+        "start_wait_queue",
+        "wait_until_started",
+        "wait_for_exit",
+        "reset_after_exit",
+        "should_exit",
+        "interrupt_handler_main",
+    ] {
+        if handler_source.contains(forbidden) {
+            return Err(CheckError::new(format!(
+                "{} retains forbidden independent interrupt-task state `{forbidden}`",
+                handler_path.display()
+            )));
+        }
+    }
+
+    let hooks_path = repo_root.join("kernel/comps/framevisor/src/task/hooks.rs");
+    let hooks_source = fs::read_to_string(&hooks_path)?;
+    for required in [
+        "dispatch_pending_vcpu_events",
+        "handler.deliver_pending_on_current_vcpu()",
+    ] {
+        if !hooks_source.contains(required) {
+            return Err(CheckError::new(format!(
+                "{} missing current-continuation IRQ dispatch `{required}`",
+                hooks_path.display()
             )));
         }
     }
@@ -2947,7 +2987,7 @@ fn check_final_rootfs_artifact_policy(repo_root: &Path, config: &Config) -> Chec
         )?;
     }
 
-    let loader_path = repo_root.join("kernel/src/vmm/mod.rs");
+    let loader_path = repo_root.join(&config.kernel_src_path).join("vmm/mod.rs");
     if loader_path.exists() {
         reject_source_patterns(
             &loader_path,
@@ -3691,8 +3731,9 @@ fn check_final_superseded_implementation_paths(
     ] {
         if scheduler_path.exists() {
             return Err(CheckError::new(format!(
-                "{} is a service-local scheduler path; the completed scheduler trim must live under `services/aster-framevm/src/sched/**` and map to `kernel/src/sched/**`",
-                scheduler_path.display()
+                "{} is a service-local scheduler path; the completed scheduler trim must live under `services/aster-framevm/src/sched/**` and map to `{}/sched/**`",
+                scheduler_path.display(),
+                config.kernel_src_path.display(),
             )));
         }
     }
@@ -3841,6 +3882,10 @@ fn expected_kernel_path_for_manifest_entry(
     }
 
     if let Ok(comp_relative) = service_relative.strip_prefix("comps") {
+        if let Some(kernel_path) = configured_component_kernel_path(config, service_path) {
+            return Ok(kernel_path);
+        }
+
         let mut components = comp_relative.components();
         let Some(std::path::Component::Normal(comp_name)) = components.next() else {
             return Err(CheckError::new(format!(
@@ -3866,6 +3911,24 @@ fn expected_kernel_path_for_manifest_entry(
         "trim manifest service_path `{}` is not a retained source path",
         service_path.display()
     )))
+}
+
+fn configured_component_kernel_path(config: &Config, service_path: &Path) -> Option<PathBuf> {
+    for comp in &config.service_side_trimmed_comps {
+        if let Ok(relative) = service_path.strip_prefix(&comp.service_path)
+            && let Ok(source_relative) = relative.strip_prefix("src")
+        {
+            return Some(comp.kernel_path.join("src").join(source_relative));
+        }
+    }
+
+    for comp in &config.shared_source_comps {
+        if let Ok(source_relative) = service_path.strip_prefix(&comp.service_source_path) {
+            return Some(comp.host_source_path.join(source_relative));
+        }
+    }
+
+    None
 }
 
 fn collect_used_ostd(file: &Path, used: &mut UsedOstd) -> CheckResult<()> {

@@ -4,7 +4,7 @@
 
 #![warn(unused)]
 
-use alloc::{boxed::Box, collections::BTreeMap, sync::Arc};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use core::{fmt, ops::Bound, sync::atomic::Ordering};
 
 use aster_framevisor::FrameVcpuId;
@@ -42,9 +42,9 @@ mod stop;
 
 pub(crate) use self::{
     fair::DEFAULT_CGROUP_WEIGHT,
-    task_group::{TaskGroup, root_task_group},
     policy::{LinuxSchedPolicy, SchedPolicy},
     real_time::{RealTimePolicy, RealTimePriority},
+    task_group::{TaskGroup, root_task_group},
 };
 use self::{
     policy::{SchedPolicyKind, SchedPolicyState},
@@ -54,7 +54,6 @@ use self::{
 type SchedEntity = (Arc<Task>, Arc<Thread>);
 
 static CLASS_SCHEDULER: spin::Once<&'static ClassScheduler> = spin::Once::new();
-
 // The scheduler-owned FrameVM state map serializes registration, placement,
 // admission, and removal. Placement paths acquire it before a per-CPU
 // runqueue; ordinary picks use the `Arc<FrameSchedEntityState>` already held
@@ -148,6 +147,48 @@ fn enable_framevisor_preemption_on_cpu(cpu: CpuId) {
 pub(crate) fn unregister_frame_sched_groups(vm_id: aster_framevisor::VmId) {
     if let Some(scheduler) = CLASS_SCHEDULER.get().copied() {
         scheduler.unregister_frame_sched_groups(vm_id);
+    }
+}
+
+/// Commits the concrete continuation of the current opaque FrameSchedGroup
+/// after OSTD's processor has physically arrived on `carrier`.
+///
+/// The Host local runqueue lock is acquired before the group's continuation
+/// slot. This is the sole place that transfers Host CPU metadata and replaces
+/// the concrete half of `(outer group, concrete carrier)`; outer accounting
+/// and runtime state remain untouched.
+pub(crate) fn classify_framevm_continuation_arrival(
+    carrier: &Arc<Task>,
+    state: &Arc<aster_framevisor::task::FrameTaskState>,
+) -> FrameContinuationArrival {
+    let guard = disable_local();
+    let cpu = guard.current_cpu();
+    let Some(scheduler) = CLASS_SCHEDULER.get().copied() else {
+        panic!("a Frame continuation arrived before the Host scheduler initialized");
+    };
+    scheduler.rqs[cpu.as_usize()]
+        .lock()
+        .classify_framevm_continuation_arrival(carrier, state, cpu)
+}
+
+/// The only two valid arrivals on a FrameSchedGroup outer current pair.
+pub(crate) enum FrameContinuationArrival {
+    /// Host policy resumed the already-committed continuation unchanged.
+    OuterResume,
+    /// The exact staged inner A -> B processor handoff has committed.
+    Committed,
+}
+
+/// Re-enqueues a Host task after a scheduler-owned resource update.
+///
+/// This is intentionally a kernel scheduler command instead of an OSTD task
+/// method: OSTD's public task API has no raw wake operation.
+pub(crate) fn wake_task(task: Arc<Task>) {
+    let Some(scheduler) = CLASS_SCHEDULER.get().copied() else {
+        return;
+    };
+    if let Some(cpu) = scheduler.enqueue(task, EnqueueFlags::Wake) {
+        ostd::task::__private::request_preemption_on_cpu(cpu);
     }
 }
 
@@ -320,13 +361,11 @@ impl SchedAttr {
 
 impl Scheduler for ClassScheduler {
     fn enqueue(&self, task: Arc<Task>, flags: EnqueueFlags) -> Option<CpuId> {
-        if task.is_completed() {
-            return None;
-        }
-
         let thread = task.as_thread()?.clone();
 
-        if let Some(group) = aster_framevisor::task::frame_sched_group_for_ostd_task(task.as_ref())
+        let frame_task_state = thread.framevm_task_state().cloned();
+        if let Some(frame_task_state) = frame_task_state
+            && let Some(group) = frame_task_state.group()
         {
             return self.enqueue_frame_sched_group_task(task, thread, group, flags);
         }
@@ -544,16 +583,8 @@ impl ClassScheduler {
         task: Arc<Task>,
         thread: Arc<Thread>,
         group: Arc<aster_framevisor::FrameSchedGroup>,
-        flags: EnqueueFlags,
+        _flags: EnqueueFlags,
     ) -> Option<CpuId> {
-        let group = if flags == EnqueueFlags::Wake {
-            let _ = aster_framevisor::task::scheduler::enqueue_service_task_from_host_wake(
-                task.clone(),
-            );
-            aster_framevisor::task::frame_sched_group_for_ostd_task(task.as_ref()).unwrap_or(group)
-        } else {
-            group
-        };
         let state = {
             let states = self.frame_group_states.lock();
             states.get(&group.id())?.clone()
@@ -568,30 +599,19 @@ impl ClassScheduler {
         if !state.allows_host_cpu(cpu) {
             return None;
         }
-        if Task::current()
-            .and_then(|current| {
-                aster_framevisor::task::frame_sched_group_for_ostd_task(current.as_ref()).or_else(
-                    || {
-                        aster_framevisor::task::bootstrap_frame_sched_group_for_ostd_task(
-                            current.as_ref(),
-                        )
-                    },
-                )
-            })
-            .is_some_and(|current_group| Arc::ptr_eq(&current_group, &group))
-        {
-            let _ = task.cpu().set_if_is_none(cpu);
-            thread.sched_attr().set_last_cpu(cpu);
-            return Some(cpu);
-        }
         // The FrameVM runqueue must be inspected without either Host scheduler
         // lock or the FrameVM state-map lock. Virtual interrupt delivery and
         // Host wakeups can otherwise acquire these locks in the opposite order.
+        //
+        // A bootstrap carrier has FrameVM state but is itself a regular Host
+        // task, rather than a FrameSchedGroup current entity. Its service task
+        // must therefore publish the group before bootstrap exits; membership
+        // in the same VM alone is not evidence that the group is already
+        // visible to the Host scheduler.
         let rq = self.rqs[cpu.as_usize()].lock();
         let _ = task.cpu().set_if_is_none(cpu);
         thread.sched_attr().set_last_cpu(cpu);
-        let current_group = rq.is_current_frame_group(&state);
-        if current_group {
+        if rq.is_current_frame_group(&state) {
             return None;
         }
         if !group.has_runnable_work() {
@@ -615,7 +635,7 @@ impl ClassScheduler {
             .iter()
             .filter(|(id, _)| id.vm_id() == vm_id)
             .map(|(_, state)| state.clone())
-            .collect::<alloc::vec::Vec<_>>();
+            .collect::<Vec<_>>();
         for state in states {
             self.update_frame_sched_group_cpu_affinity(state, cpu_affinity);
         }
@@ -696,13 +716,13 @@ impl ClassScheduler {
                 };
                 drop(source_rq);
                 if did_enqueue {
-                    ostd::task::scheduler::request_preemption_on_cpu(source_cpu);
+                    ostd::task::__private::request_preemption_on_cpu(source_cpu);
                 }
                 return;
             }
             if source_rq.is_current_frame_group(&state) {
                 drop(source_rq);
-                ostd::task::scheduler::request_preemption_on_cpu(source_cpu);
+                ostd::task::__private::request_preemption_on_cpu(source_cpu);
                 Task::yield_now();
                 continue;
             }
@@ -742,25 +762,137 @@ impl ClassScheduler {
                 enable_framevisor_preemption_on_cpu(destination_cpu);
             }
             if did_enqueue {
-                ostd::task::scheduler::request_preemption_on_cpu(destination_cpu);
+                ostd::task::__private::request_preemption_on_cpu(destination_cpu);
             }
             return;
         }
     }
 
     fn unregister_frame_sched_groups(&self, vm_id: aster_framevisor::VmId) {
-        let mut states = self.frame_group_states.lock();
-        states.retain(|id, state| {
-            if id.vm_id() != vm_id {
-                return true;
+        let removed = {
+            let mut states = self.frame_group_states.lock();
+            let mut removed = Vec::new();
+            states.retain(|id, state| {
+                if id.vm_id() != vm_id {
+                    return true;
+                }
+                // Closing admission first makes a concurrent pick reject this
+                // carrier. The stopped FrameVM has already waited for every
+                // service task to exit before it reaches this teardown path.
+                state.stop_admission();
+                removed.push(state.clone());
+                false
+            });
+            removed
+        };
+
+        // Registration is not just the state-map entry: every admitted group
+        // can also own one entity in the selected CPU's hierarchical fair
+        // queue. Leaving that entity behind poisons the queue accounting and
+        // can make a later FrameVM in the same Host boot pick a dead group.
+        // Placement always removes the source entry before rebinding a group,
+        // so its final host CPU is the only queue that can retain it here.
+        for state in removed {
+            // Every caller retains the FrameVm through this cleanup. A current
+            // carrier also retains FrameTaskState, which retains that FrameVm,
+            // so an expired group here would be a lifecycle-order bug rather
+            // than an entity that may safely be skipped.
+            let group = state
+                .group()
+                .expect("FrameVM group must outlive Host scheduler cleanup");
+            // Admission is closed before this loop starts. The next scheduling
+            // boundary on `host_cpu` must therefore replace this outer entity:
+            // `frame_group::update_current` observes the disallowed placement
+            // even when the stopped group has no runnable inner task, and the
+            // requeue path removes rather than republishes its fair entry.
+            //
+            // A fair dequeue alone cannot remove an entity that is currently
+            // selected by this CPU. Ask the owning CPU to reach that boundary,
+            // then wait until its runqueue has committed the replacement. The
+            // preemption helper delivers an IPI when `host_cpu` is remote;
+            // yielding here only yields the teardown task and gives the local
+            // scheduler a chance to run while the remote CPU handles that IPI.
+            let host_cpu = group.host_cpu();
+            loop {
+                let rq = self.rqs[host_cpu.as_usize()].lock();
+                if !rq.is_current_frame_group(&state) {
+                    let _ = rq.fair.lock().try_dequeue_frame_sched_group(&state);
+                    break;
+                }
+                drop(rq);
+
+                ostd::task::__private::request_preemption_on_cpu(host_cpu);
+                Task::yield_now();
             }
-            state.stop_admission();
-            false
-        });
+        }
     }
 }
 
 impl PerCpuClassRqSet {
+    fn classify_framevm_continuation_arrival(
+        &mut self,
+        carrier: &Arc<Task>,
+        state: &Arc<aster_framevisor::task::FrameTaskState>,
+        cpu: CpuId,
+    ) -> FrameContinuationArrival {
+        let to = state.task_for_host_carrier(carrier.clone());
+        let (current, _) = self
+            .current
+            .as_mut()
+            .expect("a Frame carrier must arrive with a current Host outer pair");
+        let CurrentOuterEntity::FrameSchedGroup(outer_state) = &current.outer else {
+            panic!("a Frame carrier may not arrive through an ordinary Host entity");
+        };
+        let group = outer_state
+            .group()
+            .expect("the current Host FrameSchedGroup must remain alive");
+        if state.frame_vm().id() != group.id().vm_id()
+            || state.frame_vcpu_id().vcpu_index() != group.id().vcpu_index()
+        {
+            panic!("an arriving Frame carrier belongs to a different virtual CPU");
+        }
+        let from = group
+            .continuation()
+            .expect("a current outer FrameSchedGroup must retain a continuation");
+        if !Arc::ptr_eq(current.task(), from.host_task()) || !Arc::ptr_eq(carrier, to.host_task()) {
+            panic!("a Frame carrier arrived without matching the Host outer pair");
+        }
+
+        // An outer Tick may suspend then resume A while A -> B remains
+        // staged. A remains committed until B's processor arrival, so this
+        // is a valid physical resume rather than a stale handoff.
+        if Arc::ptr_eq(carrier, from.host_task()) {
+            return FrameContinuationArrival::OuterResume;
+        }
+        if carrier
+            .schedule_info()
+            .cpu
+            .get()
+            .is_some_and(|carrier_cpu| carrier_cpu != cpu)
+        {
+            panic!("an arriving Frame continuation is bound to a different Host CPU");
+        }
+        let next_thread = carrier
+            .as_thread()
+            .cloned()
+            .expect("a Frame continuation must carry a Host thread");
+
+        group
+            .commit_continuation_switch(&from, &to)
+            .expect("a non-committed Frame arrival must match the exact staged A -> B pair");
+        current.task().schedule_info().cpu.set_to_none();
+        if carrier.schedule_info().cpu.get().is_none() {
+            carrier
+                .schedule_info()
+                .cpu
+                .set_if_is_none(cpu)
+                .expect("a checked unbound continuation must bind to the current Host CPU");
+        }
+        next_thread.sched_attr().set_last_cpu(cpu);
+        current.concrete = (carrier.clone(), next_thread);
+        FrameContinuationArrival::Committed
+    }
+
     fn is_current_frame_group(&self, state: &Arc<frame_group::FrameSchedEntityState>) -> bool {
         self.current.as_ref().is_some_and(|(entity, _)| {
             matches!(
@@ -772,11 +904,6 @@ impl PerCpuClassRqSet {
     }
 
     fn sched_entity_from_task(task: Arc<Task>) -> Option<PickedSchedEntity> {
-        if task.is_completed() {
-            task.schedule_info().cpu.set_to_none();
-            return None;
-        }
-
         let thread = task.as_thread()?.clone();
         Some(PickedSchedEntity {
             concrete: (task, thread),
@@ -881,9 +1008,15 @@ impl PerCpuClassRqSet {
         let fair_queue_len = self.fair.lock().total_queued_task_count();
         let queue_len = (self.stop.len() + self.real_time.len() + fair_queue_len) as u32;
         let is_idle = match &self.current {
-            Some((entity, _)) => {
-                entity.thread().sched_attr().policy_kind() == SchedPolicyKind::Idle
-            }
+            Some((entity, _)) => match &entity.outer {
+                // Host accounting is about the outer entity. A virtual idle
+                // continuation keeps a scheduled Frame vCPU non-idle until
+                // its explicit outer halt dequeues the group.
+                CurrentOuterEntity::FrameSchedGroup(_) => false,
+                CurrentOuterEntity::Task => {
+                    entity.thread().sched_attr().policy_kind() == SchedPolicyKind::Idle
+                }
+            },
             None => true,
         };
         PerCpuLoadStats { queue_len, is_idle }
@@ -893,14 +1026,6 @@ impl PerCpuClassRqSet {
 impl LocalRunQueue for PerCpuClassRqSet {
     fn current(&self) -> Option<&Arc<Task>> {
         self.current.as_ref().map(|(entity, _)| entity.task())
-    }
-
-    fn has_runnable(&self) -> bool {
-        self.current.is_some()
-            || !self.stop.is_empty()
-            || !self.real_time.is_empty()
-            || !self.fair.lock().is_empty()
-            || !self.idle.is_empty()
     }
 
     fn try_pick_next(&mut self) -> Option<&Arc<Task>> {
@@ -940,13 +1065,6 @@ impl LocalRunQueue for PerCpuClassRqSet {
 
         let next = self.pick_next_entity();
         let Some(next) = next else {
-            if previous.as_ref().is_some_and(|(entity, _)| {
-                matches!(&entity.outer, CurrentOuterEntity::FrameSchedGroup(_))
-            }) {
-                ostd::early_println!(
-                    "[FrameVM] Host scheduler found no successor after service task"
-                );
-            }
             debug_assert!(previous.is_none() || !current_can_compete_on_pick);
             self.current = previous;
             return None;
@@ -956,17 +1074,6 @@ impl LocalRunQueue for PerCpuClassRqSet {
         let picked_same_frame_group = previous
             .as_ref()
             .is_some_and(|(previous_entity, _)| Self::is_same_frame_group(previous_entity, &next));
-        if !picked_same_frame_group
-            && previous.as_ref().is_some_and(|(entity, _)| {
-                matches!(entity.outer, CurrentOuterEntity::FrameSchedGroup(_))
-            })
-        {
-            ostd::early_println!(
-                "[FrameVM] Host scheduler selected successor: task={:p}, frame_group={}",
-                Arc::as_ptr(next.task()),
-                matches!(&next.outer, CurrentOuterEntity::FrameSchedGroup(_)),
-            );
-        }
 
         // `current` is published while this CPU's runqueue lock is held. It
         // is the sole handoff record between the two scheduling stages: until
@@ -1040,18 +1147,6 @@ impl LocalRunQueue for PerCpuClassRqSet {
             || (lookahead >= 2 && !self.real_time.is_empty())
             || (lookahead >= 3 && !self.fair.lock().is_empty())
             || (lookahead >= 4 && !self.idle.is_empty());
-        if matches!(flags, UpdateFlags::Exit)
-            && self.current.as_ref().is_some_and(|(entity, _)| {
-                matches!(&entity.outer, CurrentOuterEntity::FrameSchedGroup(_))
-            })
-        {
-            ostd::early_println!(
-                "[FrameVM] Host service exit update: should_pick={}, fair_empty={}, idle_empty={}",
-                should_pick_next,
-                self.fair.lock().is_empty(),
-                self.idle.is_empty(),
-            );
-        }
         self.current_can_compete_on_pick = false;
         if should_pick_next
             && matches!(flags, UpdateFlags::Tick)
@@ -1063,27 +1158,10 @@ impl LocalRunQueue for PerCpuClassRqSet {
     }
 
     fn dequeue_current(&mut self) -> Option<Arc<Task>> {
-        let current_task = Task::current();
-        let current_task = current_task?.cloned();
-        let (entity, runtime) = self.current.take()?;
-        if !Arc::ptr_eq(entity.task(), &current_task) {
-            if matches!(&entity.outer, CurrentOuterEntity::FrameSchedGroup(_)) {
-                ostd::early_println!(
-                    "[FrameVM] Host service dequeue mismatch: actual={:p}, selected={:p}",
-                    Arc::as_ptr(&current_task),
-                    Arc::as_ptr(entity.task()),
-                );
-            }
-            self.current = Some((entity, runtime));
-            return None;
-        }
-
-        if matches!(&entity.outer, CurrentOuterEntity::FrameSchedGroup(_)) {
-            ostd::debug!(
-                "[FrameVM] Host service dequeue matched: task={:p}",
-                Arc::as_ptr(&current_task),
-            );
-        }
+        // OSTD calls this only for the task represented by this runqueue's
+        // `current` slot. Looking up a second, cross-layer current task here
+        // can retain the slot while a FrameVM carrier is leaving it.
+        let (entity, _) = self.current.take()?;
 
         self.remove_queued_task(entity.task());
         let cur_task = entity.concrete.0;

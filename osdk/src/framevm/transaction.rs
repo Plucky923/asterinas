@@ -395,7 +395,7 @@ impl FrameVmTransaction {
         if !host_validation.is_exact_match() {
             let host_symbol_files =
                 timings.measure("fallback_host_symbol_rlib_selection", || {
-                    retention::find_policy_rlib_candidates(
+                    retention::find_existing_policy_rlib_candidates(
                         &self.cargo_target_dir,
                         &staging_config.target,
                         &staging_config.osdk_config.run.build.profile,
@@ -404,7 +404,7 @@ impl FrameVmTransaction {
                 })?;
             let supplemental_archives =
                 timings.measure("fallback_host_archive_rlib_selection", || {
-                    retention::find_policy_rlib_candidates(
+                    retention::find_existing_policy_rlib_candidates(
                         &self.cargo_target_dir,
                         &staging_config.target,
                         &staging_config.osdk_config.run.build.profile,
@@ -1020,6 +1020,17 @@ impl FrameVmTransaction {
             return Ok(());
         }
 
+        let mut upstream_check =
+            process::command(self.workspace_root.join("tools/sync_framevm_from_main.sh"));
+        upstream_check
+            .arg("--check")
+            .current_dir(&self.workspace_root);
+        process::run_status(
+            upstream_check,
+            "checking FrameVM upstream synchronization",
+            FrameVmStageError::ServiceCheck,
+        )?;
+
         let input_hash =
             identity::compute_service_check_input_hash(&self.workspace_root, &self.config)?;
         if let Some(record) = self.read_service_check_cache_record()?
@@ -1198,7 +1209,7 @@ impl FrameVmTransaction {
             ActionChoice::Run,
             rustflags,
             BundleBuildOptions {
-                final_crate_retention: FinalCrateRetention::DemandDrivenOnly,
+                final_crate_retention: FinalCrateRetention::LinkDeadCode,
                 kernel_symbols_module: KernelSymbolsModule::Omit,
                 quiet_cargo_success: true,
             },

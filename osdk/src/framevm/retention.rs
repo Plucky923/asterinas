@@ -210,6 +210,25 @@ pub(super) fn find_policy_rlib_candidates(
     }
 }
 
+/// Finds policy rlibs that are already present in one target directory.
+///
+/// Unlike `find_policy_rlib_candidates`, this never falls back to the
+/// FrameVM service-symbol target. The final Host retry must only retain
+/// symbols whose crate identities belong to the Host dependency graph; mixing
+/// in a service-side rlib can pull a second copy of OSTD into the Host link.
+pub(super) fn find_existing_policy_rlib_candidates(
+    target_dir: &Path,
+    target: &str,
+    profile: &str,
+    crate_names: &[String],
+) -> Result<Vec<PathBuf>, FrameVmStageError> {
+    let mut files = Vec::new();
+    for crate_name in crate_names {
+        files.extend(find_crate_rlibs(target_dir, target, profile, crate_name)?);
+    }
+    Ok(files)
+}
+
 fn find_policy_rlib_candidates_in(
     target_dir: &Path,
     target: &str,
@@ -383,7 +402,7 @@ fn retention_request(
     let retention_archives =
         matching_retention_archives(imports, host_side_symbols, supplemental_archives)?;
     let retention_archives = materialize_stable_archives(&retention_archives, response_file)?;
-    write_linker_response_file(response_file, &requested_symbols)?;
+    write_linker_response_file(response_file, &requested_symbols, &retention_archives)?;
 
     let mut rustflags = shared_rustflags
         .iter()
@@ -392,10 +411,6 @@ fn retention_request(
     if !requested_symbols.is_empty() {
         rustflags.push(format!("-C link-arg=@{}", response_file.display()));
     }
-    for archive in retention_archives {
-        rustflags.push(format!("-C link-arg={}", archive.display()));
-    }
-
     Ok(HostRetentionRequest {
         rustflags,
         requested_symbols,
@@ -539,6 +554,7 @@ fn requested_retention_symbols(
 fn write_linker_response_file(
     response_file: &Path,
     requested_symbols: &BTreeSet<String>,
+    retention_archives: &[PathBuf],
 ) -> Result<(), FrameVmStageError> {
     let mut response = String::new();
     for raw_name in requested_symbols {
@@ -550,6 +566,19 @@ fn write_linker_response_file(
 
         response.push_str("-u\n");
         response.push_str(raw_name);
+        response.push('\n');
+    }
+    for archive in retention_archives {
+        response.push_str(
+            archive
+                .to_str()
+                .ok_or_else(|| {
+                    FrameVmStageError::ObjectBuild(format!(
+                        "host retention archive is not valid UTF-8: {}",
+                        archive.display()
+                    ))
+                })?,
+        );
         response.push('\n');
     }
 
@@ -959,7 +988,9 @@ fn path_modified_time(path: &Path) -> SystemTime {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{find_policy_rlib_candidates, rlib_crate_name};
+    use super::{
+        find_existing_policy_rlib_candidates, find_policy_rlib_candidates, rlib_crate_name,
+    };
 
     #[test]
     fn parses_cargo_rlib_crate_name() {
@@ -1000,6 +1031,31 @@ mod tests {
                 "x86_64-unknown-none",
                 "dev",
                 &["core".to_string()]
+            )
+            .unwrap(),
+            vec![regular_rlib]
+        );
+    }
+
+    #[test]
+    fn existing_policy_rlibs_do_not_mix_in_the_dedicated_target() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target_dir = temp_dir.path().join("target");
+        let regular_deps = target_dir.join("x86_64-unknown-none/debug/deps");
+        fs::create_dir_all(&regular_deps).unwrap();
+        let regular_rlib = regular_deps.join("libcore-regular.rlib");
+        fs::write(&regular_rlib, []).unwrap();
+
+        let dedicated_deps = target_dir.join("framevm-host-symbols/x86_64-unknown-none/debug/deps");
+        fs::create_dir_all(&dedicated_deps).unwrap();
+        fs::write(dedicated_deps.join("libaster_kernel-service.rlib"), []).unwrap();
+
+        assert_eq!(
+            find_existing_policy_rlib_candidates(
+                &target_dir,
+                "x86_64-unknown-none",
+                "dev",
+                &["core".to_string(), "aster_kernel".to_string()]
             )
             .unwrap(),
             vec![regular_rlib]

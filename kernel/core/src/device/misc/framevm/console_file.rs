@@ -8,12 +8,8 @@ use core::{
 use crate::{
     events::IoEvents,
     fs::{
-        file::{
-            AccessMode, AtomicStatusFlags, CreationFlags, FileLike, StatusFlags,
-            file_table::FdFlags,
-        },
+        file::{AccessMode, CreationFlags, FileCommon, FileLike, StatusFlags, file_table::FdFlags},
         pseudofs::AnonInodeFs,
-        vfs::path::Path,
     },
     prelude::*,
     process::signal::{PollHandle, Pollable, Pollee},
@@ -28,20 +24,19 @@ pub(super) struct FrameVmConsoleFile {
     has_seen_vm: AtomicBool,
     output_callback_registered: AtomicBool,
     pollee: Pollee,
-    status_flags: AtomicStatusFlags,
-    pseudo_path: Path,
+    common: FileCommon,
 }
 
 impl FrameVmConsoleFile {
     pub(super) fn new(cursor: u64, control: Arc<FrameVmControl>) -> Arc<Self> {
+        let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:[framevm-console]".to_string());
         Arc::new(Self {
             cursor: Mutex::new(cursor),
             control,
             has_seen_vm: AtomicBool::new(false),
             output_callback_registered: AtomicBool::new(false),
             pollee: Pollee::new(),
-            status_flags: AtomicStatusFlags::new(StatusFlags::empty()),
-            pseudo_path: AnonInodeFs::new_path(|_| "anon_inode:[framevm-console]".to_string()),
+            common: FileCommon::new(pseudo_path, AccessMode::O_RDWR, StatusFlags::empty()),
         })
     }
 
@@ -101,25 +96,13 @@ impl FrameVmConsoleFile {
     ) -> Result<usize> {
         loop {
             let offset = *self.cursor.lock();
-            ostd::early_println!("[FrameVM] console read waiting: offset={}", offset);
             let output = match vm
                 .devices()
                 .console()
                 .wait_output_from(offset, writer.avail())
             {
-                Ok(output) => {
-                    ostd::early_println!(
-                        "[FrameVM] console read woke: offset={}, bytes={}, lost={}",
-                        offset,
-                        output.bytes().len(),
-                        output.lost_bytes(),
-                    );
-                    output
-                }
-                Err(_) => {
-                    ostd::early_println!("[FrameVM] console read stopped: offset={}", offset);
-                    return Ok(0);
-                }
+                Ok(output) => output,
+                Err(_) => return Ok(0),
             };
 
             let mut cursor = self.cursor.lock();
@@ -214,7 +197,7 @@ impl FileLike for FrameVmConsoleFile {
             return self.no_console_read_result();
         };
 
-        if self.status_flags().contains(StatusFlags::O_NONBLOCK) {
+        if self.common.is_nonblocking() {
             let read_len = self.read_available(writer, &vm)?;
             if read_len == 0 {
                 return_errno_with_message!(Errno::EAGAIN, "no FrameVM console output is available");
@@ -239,7 +222,7 @@ impl FileLike for FrameVmConsoleFile {
         let copied_len = reader.read_fallible(&mut bytes.as_mut_slice().into())?;
         bytes.truncate(copied_len);
 
-        let written_len = if self.status_flags().contains(StatusFlags::O_NONBLOCK) {
+        let written_len = if self.common.is_nonblocking() {
             vm.devices().inject_console_input(&bytes)?
         } else {
             match vm.devices().inject_console_input_blocking(&bytes) {
@@ -254,24 +237,8 @@ impl FileLike for FrameVmConsoleFile {
         Ok(written_len)
     }
 
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::O_RDWR
-    }
-
-    fn path(&self) -> &Path {
-        &self.pseudo_path
-    }
-
-    fn status_flags(&self) -> StatusFlags {
-        self.status_flags.load(Ordering::Relaxed)
-    }
-
-    fn set_status_flags(&self, new_flags: StatusFlags) -> Result<()> {
-        self.status_flags.store(
-            new_flags & (StatusFlags::O_NONBLOCK | StatusFlags::O_ASYNC),
-            Ordering::Relaxed,
-        );
-        Ok(())
+    fn common(&self) -> &FileCommon {
+        &self.common
     }
 
     fn dump_proc_fdinfo(self: Arc<Self>, fd_flags: FdFlags) -> Box<dyn Display> {
@@ -282,8 +249,8 @@ impl FileLike for FrameVmConsoleFile {
 
         impl Display for FdInfo {
             fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                let mut flags = self.inner.access_mode() as u32;
-                flags |= u32::from(self.inner.status_flags());
+                let mut flags = self.inner.common.access_mode() as u32;
+                flags |= u32::from(self.inner.common.status_flags());
                 if self.fd_flags.contains(FdFlags::CLOEXEC) {
                     flags |= CreationFlags::O_CLOEXEC.bits();
                 }

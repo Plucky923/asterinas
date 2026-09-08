@@ -11,6 +11,14 @@ framevm_case_start lifecycle
 FRAMEVM_LIFECYCLE_MARKER=FRAMEVM_LIFECYCLE_OK
 FRAMEVM_CASE_TIMEOUT=${FRAMEVM_CASE_TIMEOUT:-60}
 
+discard_case_artifacts() {
+    if [ "${FRAMEVM_KEEP_ARTIFACTS:-0}" = "1" ]; then
+        return 0
+    fi
+
+    rm -f "$1" "$2"
+}
+
 run_framevmm_test() {
     case_name="$1"
     test_name="$2"
@@ -86,6 +94,13 @@ run_expect_success() {
         framevm_dump_log_tail "$log_file"
         return 1
     fi
+
+    # Each rootfs image is 720 MiB.  This script runs several independent
+    # framevmm instances, so retaining successful case inputs until the final
+    # EXIT trap exhausts the outer test kernel before the lifecycle coverage
+    # can finish.  The instance has exited and its log has been checked; its
+    # artifacts no longer participate in the next case.
+    discard_case_artifacts "$drive" "$log_file"
 }
 
 run_expect_failure() {
@@ -115,6 +130,8 @@ run_expect_failure() {
         framevm_dump_log_tail "$log_file"
         return 1
     fi
+
+    discard_case_artifacts "$drive" "$log_file"
 }
 
 run_marker_missing_case() {
@@ -135,6 +152,8 @@ run_marker_missing_case() {
         framevm_dump_log_tail "$log_file"
         return 1
     fi
+
+    discard_case_artifacts "$drive" "$log_file"
 }
 
 run_console_eof_before_terminal_case() {
@@ -172,6 +191,8 @@ run_console_eof_before_terminal_case() {
         framevm_dump_log_tail "$log_file"
         return 1
     fi
+
+    discard_case_artifacts "$drive" "$log_file"
 }
 
 run_host_stop_case() {
@@ -222,6 +243,8 @@ run_host_stop_case() {
         framevm_dump_log_tail "$log_file"
         return 1
     fi
+
+    discard_case_artifacts "$drive" "$log_file"
 }
 
 if ! run_expect_success exit-zero exit-zero "FrameVM terminal status: exited code=0"; then

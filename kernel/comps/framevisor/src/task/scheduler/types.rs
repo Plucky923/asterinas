@@ -13,8 +13,6 @@ pub enum EnqueueFlags {
     Spawn,
     /// A task became runnable after a wake operation.
     Wake,
-    /// A Host context made a service task runnable.
-    HostWake,
 }
 
 /// Flags that explain why the current task is being updated.
@@ -32,6 +30,14 @@ pub enum UpdateFlags {
 
 /// A SMP-aware task scheduler.
 pub trait Scheduler<T = Task>: Send + Sync {
+    /// Registers the currently executing bootstrap continuation.
+    ///
+    /// A FrameVM starts in a Host-carried bootstrap task, before the service
+    /// has constructed its first ordinary thread. The service scheduler must
+    /// retain that continuation so a newly spawned worker can block and
+    /// resume bootstrap initialization.
+    fn install_bootstrap_task(&self, bootstrap: Arc<T>);
+
     /// Enqueues a runnable task.
     fn enqueue(&self, runnable: Arc<T>, flags: EnqueueFlags) -> Option<CpuId>;
 
@@ -40,21 +46,12 @@ pub trait Scheduler<T = Task>: Send + Sync {
 
     /// Gives mutable access to the local runqueue of the current CPU.
     fn mut_local_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue<T>));
-
-    /// Gives immutable access to the local runqueue of a specific FrameVM CPU.
-    fn local_rq_on_cpu_with(&self, cpu_id: CpuId, f: &mut dyn FnMut(&dyn LocalRunQueue<T>));
-
-    /// Gives mutable access to the local runqueue of a specific FrameVM CPU.
-    fn mut_local_rq_on_cpu_with(&self, cpu_id: CpuId, f: &mut dyn FnMut(&mut dyn LocalRunQueue<T>));
 }
 
 /// A per-CPU local runqueue.
 pub trait LocalRunQueue<T = Task> {
     /// Returns the current task, if any.
     fn current(&self) -> Option<&Arc<T>>;
-
-    /// Returns whether this runqueue has runnable service work.
-    fn has_runnable(&self) -> bool;
 
     /// Updates the current task and returns whether another task should run.
     fn update_current(&mut self, flags: UpdateFlags) -> bool;

@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 use core::{ptr::NonNull, sync::atomic::Ordering};
 
-use super::{POST_SCHEDULE_HANDLER, PRE_SCHEDULE_HANDLER, Task};
+use super::{POST_SCHEDULE_HANDLER, Task};
 use crate::{
     arch::task::{context_switch, first_context_switch},
     cpu_local_cell,
@@ -37,6 +37,29 @@ pub(super) fn current_task() -> Option<NonNull<Task>> {
 /// local IRQ disabled.
 #[track_caller]
 pub(super) fn switch_to_task(next_task: Arc<Task>) {
+    switch_to_task_impl(next_task, |irq_guard| {
+        if let Some(handler) = super::PRE_SCHEDULE_HANDLER.get() {
+            handler(irq_guard);
+        }
+    });
+}
+
+/// Switches to `next_task` after running a private processor-boundary hook.
+///
+/// The hook runs after OSTD has entered the physical scheduling boundary and
+/// performed its ordinary pre-schedule work, but before the current-task
+/// pointer changes. This is the only seam through which the kernel can later
+/// commit a nested scheduler's exact A -> B transition alongside this real
+/// processor switch.
+#[track_caller]
+pub(super) fn switch_to_task_with_pre_switch(
+    next_task: Arc<Task>,
+    pre_switch: impl FnOnce(&DisabledLocalIrqGuard),
+) {
+    switch_to_task_impl(next_task, pre_switch);
+}
+
+fn switch_to_task_impl(next_task: Arc<Task>, pre_switch: impl FnOnce(&DisabledLocalIrqGuard)) {
     super::atomic_mode::might_sleep();
 
     // SAFETY: RCU read-side critical sections disables preemption. By the time
@@ -47,7 +70,7 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
 
     let irq_guard = crate::irq::disable_local();
 
-    before_switching_to(&next_task, &irq_guard);
+    before_switching_to(&next_task, &irq_guard, pre_switch);
 
     // `before_switching_to` guarantees that from now on, and while the next task is running on the
     // CPU, its context can be used exclusively.
@@ -92,10 +115,15 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
     unsafe { after_switching_to() };
 }
 
-fn before_switching_to(next_task: &Task, irq_guard: &DisabledLocalIrqGuard) {
-    if let Some(handler) = PRE_SCHEDULE_HANDLER.get() {
-        handler(irq_guard);
-    }
+fn before_switching_to(
+    next_task: &Task,
+    irq_guard: &DisabledLocalIrqGuard,
+    pre_switch: impl FnOnce(&DisabledLocalIrqGuard),
+) {
+    // The caller selects precisely one PRE kind. Ordinary Host scheduling
+    // supplies the physical Host hook; a nested FrameVM A -> B switch
+    // supplies its logical hook instead. No persistent switch mode is needed.
+    pre_switch(irq_guard);
 
     // Ensure that the mapping to the kernel stack is valid.
     next_task.kstack.flush_tlb(irq_guard);

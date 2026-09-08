@@ -45,11 +45,20 @@ impl AtomicCpuId {
 
     /// Gets the CPU ID.
     pub fn get(&self) -> Option<CpuId> {
+        self.get_for_cpu_count(crate::cpu::num_cpus())
+    }
+
+    /// Gets the CPU ID against an explicit owning CPU count.
+    ///
+    /// FrameVM bootstrap runs on a Host worker before there is a current
+    /// FrameVM execution context. Callers that already own a VM must use its
+    /// vCPU count rather than deriving the count from that Host worker.
+    pub(crate) fn get_for_cpu_count(&self, cpu_count: usize) -> Option<CpuId> {
         let value = self.0.load(Ordering::Relaxed);
         if value == Self::NONE {
             None
         } else {
-            ((value as usize) < crate::cpu::num_cpus()).then_some(CpuId::from_raw(value))
+            ((value as usize) < cpu_count).then_some(CpuId::from_raw(value))
         }
     }
 }
@@ -70,4 +79,21 @@ impl CommonSchedInfo for Task {
 pub trait CommonSchedInfo {
     /// Gets the CPU that the task is running on or most recently ran on.
     fn cpu(&self) -> &AtomicCpuId;
+}
+
+#[cfg(test)]
+mod tests {
+    use host_ostd::prelude::ktest;
+
+    use super::AtomicCpuId;
+    use crate::cpu::CpuId;
+
+    #[ktest]
+    fn explicit_cpu_count_resolves_bootstrap_placement_without_current_vm() {
+        let cpu = AtomicCpuId::default();
+        cpu.set_anyway(CpuId::from_raw(0));
+
+        assert_eq!(cpu.get_for_cpu_count(1), Some(CpuId::from_raw(0)));
+        assert_eq!(cpu.get_for_cpu_count(0), None);
+    }
 }

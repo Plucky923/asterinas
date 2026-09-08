@@ -2,10 +2,7 @@
 
 //! Host-side stream socket wrapper for FrameVsock.
 
-use core::{
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use core::time::Duration;
 
 use aster_framevisor_exchangeable::RRef;
 use framev_sock_common::{FrameVsockPacket, flow_control::DEFAULT_BUF_ALLOC};
@@ -13,7 +10,7 @@ use framev_sock_common::{FrameVsockPacket, flow_control::DEFAULT_BUF_ALLOC};
 use super::{connected::Connected, connecting::Connecting, init::Init, listen::Listen};
 use crate::{
     events::IoEvents,
-    fs::{file::FileLike, pseudofs::SockFs, vfs::path::Path},
+    fs::file::{FileCommon, FileLike},
     net::socket::{
         Socket,
         framevsock::{
@@ -21,23 +18,23 @@ use crate::{
             addr::{self, FrameVsockAddr},
             transport::{DEFAULT_CONNECT_TIMEOUT, FrameVsockSpace},
         },
+        new_socket_common,
         options::{Error as SocketError, SocketOption, macros::sock_option_mut},
         private::SocketPrivate,
         util::{
-            MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr,
+            MessageHeader, RecvFlags, RecvOutput, SendFlags, SockShutdownCmd, SocketAddr,
             options::{GetSocketLevelOption, SetSocketLevelOption, SocketOptionSet},
         },
     },
     prelude::*,
     process::signal::{PollHandle, Pollable, Poller},
     thread::Thread,
-    util::{MultiRead, MultiWrite},
+    util::{MultiRead, MultiWrite, net::SockType},
 };
 
 pub struct FrameVsockStreamSocket {
     status: RwLock<Status>,
-    is_nonblocking: AtomicBool,
-    pseudo_path: Path,
+    common: Arc<FileCommon>,
     options: RwLock<SocketOptionSet>,
     pending_send: Mutex<PendingSend>,
 }
@@ -68,21 +65,23 @@ const SEND_QUEUE_BLOCK_TIMEOUT_MAX_MS: u64 = 16;
 
 impl FrameVsockStreamSocket {
     pub fn new(nonblocking: bool) -> Result<Self> {
+        Self::new_with_common(Arc::new(new_socket_common(nonblocking)))
+    }
+
+    pub(crate) fn new_with_common(common: Arc<FileCommon>) -> Result<Self> {
         let init = Arc::new(Init::new());
         Ok(Self {
             status: RwLock::new(Status::Init(init)),
-            is_nonblocking: AtomicBool::new(nonblocking),
-            pseudo_path: SockFs::new_path(),
+            common,
             options: RwLock::new(SocketOptionSet::default()),
             pending_send: Mutex::new(PendingSend::default()),
         })
     }
 
-    pub(super) fn new_from_connected(connected: Arc<Connected>) -> Self {
+    pub(super) fn new_from_connected(connected: Arc<Connected>, common: Arc<FileCommon>) -> Self {
         Self {
             status: RwLock::new(Status::Connected(connected)),
-            is_nonblocking: AtomicBool::new(false),
-            pseudo_path: SockFs::new_path(),
+            common,
             options: RwLock::new(SocketOptionSet::default()),
             pending_send: Mutex::new(PendingSend::default()),
         }
@@ -257,7 +256,7 @@ impl FrameVsockStreamSocket {
         Ok(())
     }
 
-    fn try_accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
+    fn try_accept(&self, is_nonblocking: bool) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
         let listen = match &*self.status.read() {
             Status::Listen(listen) => listen.clone(),
             Status::Init(_) | Status::Connecting(_) | Status::Connected(_) => {
@@ -269,11 +268,14 @@ impl FrameVsockStreamSocket {
 
         let peer_addr = addr::to_socketaddr(connected.peer_addr())?;
 
-        let socket = Arc::new(FrameVsockStreamSocket::new_from_connected(connected));
+        let socket = Arc::new(FrameVsockStreamSocket::new_from_connected(
+            connected,
+            Arc::new(new_socket_common(is_nonblocking)),
+        ));
         Ok((socket, peer_addr))
     }
 
-    fn send(&self, reader: &mut dyn MultiRead, flags: SendRecvFlags) -> Result<usize> {
+    fn send(&self, reader: &mut dyn MultiRead, flags: SendFlags) -> Result<usize> {
         let connected = self.connected_for_io()?;
         let mut pending_send = self.pending_send.lock();
 
@@ -363,7 +365,7 @@ impl FrameVsockStreamSocket {
     fn try_recv(
         &self,
         writer: &mut dyn MultiWrite,
-        _flags: SendRecvFlags,
+        _flags: RecvFlags,
     ) -> Result<(usize, SocketAddr)> {
         let connected = self.connected_for_io()?;
 
@@ -402,15 +404,15 @@ impl Pollable for FrameVsockStreamSocket {
 
 impl SocketPrivate for FrameVsockStreamSocket {
     fn is_nonblocking(&self) -> bool {
-        self.is_nonblocking.load(Ordering::Relaxed)
-    }
-
-    fn set_nonblocking(&self, nonblocking: bool) {
-        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
+        self.common.is_nonblocking()
     }
 }
 
 impl GetSocketLevelOption for FrameVsockStreamSocket {
+    fn socket_type(&self) -> SockType {
+        SockType::SOCK_STREAM
+    }
+
     fn is_listening(&self) -> bool {
         matches!(&*self.status.read(), Status::Listen(_))
     }
@@ -483,8 +485,8 @@ impl Socket for FrameVsockStreamSocket {
         Ok(())
     }
 
-    fn accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
-        self.block_on(IoEvents::IN, || self.try_accept())
+    fn accept(&self, is_nonblocking: bool) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
+        self.block_on(IoEvents::IN, None, || self.try_accept(is_nonblocking))
     }
 
     fn shutdown(&self, cmd: SockShutdownCmd) -> Result<()> {
@@ -512,7 +514,7 @@ impl Socket for FrameVsockStreamSocket {
         &self,
         reader: &mut dyn MultiRead,
         message_header: MessageHeader,
-        flags: SendRecvFlags,
+        flags: SendFlags,
     ) -> Result<usize> {
         // TODO: Deal with flags
         if !flags.is_all_supported() {
@@ -552,18 +554,19 @@ impl Socket for FrameVsockStreamSocket {
     fn recvmsg(
         &self,
         writer: &mut dyn MultiWrite,
-        flags: SendRecvFlags,
-    ) -> Result<(usize, MessageHeader)> {
+        flags: RecvFlags,
+    ) -> Result<(RecvOutput, MessageHeader)> {
         // TODO: Deal with flags
         if !flags.is_all_supported() {
             warn!("unsupported flags: {:?}", flags);
         }
 
-        let (received_bytes, _) = self.block_on(IoEvents::IN, || self.try_recv(writer, flags))?;
+        let (received_bytes, _) =
+            self.block_on(IoEvents::IN, None, || self.try_recv(writer, flags))?;
 
         let message_header = MessageHeader::new(None, Vec::new());
 
-        Ok((received_bytes, message_header))
+        Ok((RecvOutput::new_for_stream(received_bytes), message_header))
     }
 
     fn addr(&self) -> Result<SocketAddr> {
@@ -581,8 +584,8 @@ impl Socket for FrameVsockStreamSocket {
         addr::to_socketaddr(self.connected_for_io()?.peer_addr())
     }
 
-    fn pseudo_path(&self) -> &Path {
-        &self.pseudo_path
+    fn common(&self) -> &FileCommon {
+        &self.common
     }
 }
 

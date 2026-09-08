@@ -63,11 +63,8 @@ impl InterruptLevel {
 /// Disables Host preemption and the current FrameVM vCPU's virtual IRQs.
 pub fn disable_local() -> DisabledLocalIrqGuard {
     let guard = disable_preempt();
-    let handler = host_ostd::task::Task::current()
-        .and_then(|current| {
-            let data = current.extension().downcast_ref::<task::FrameTaskData>()?;
-            (data.kind() != task::FrameTaskKind::Interrupt).then(|| data.frame_vcpu_id())
-        })
+    let handler = task::current_state_for_current_task()
+        .and_then(|state| state.bound_frame_vcpu_id())
         .and_then(|id| {
             let frame_vm = crate::vm::get_vm_by_id(id.vm_id())?;
             let handler = frame_vm.interrupt_handler(id.vcpu_index())?;

@@ -1,7 +1,7 @@
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::slice;
 
-use crate::{Result, early_println};
+use crate::Result;
 
 mod memory;
 mod metadata;
@@ -19,7 +19,7 @@ use service_object::ServiceObject;
 use symbol::{EntryPoint, find_entry_point};
 
 pub(super) fn invalid_args(message: impl core::fmt::Display) -> crate::Error {
-    early_println!("[Loader] ERROR: {}", message);
+    crate::error!("[Loader] {}", message);
     crate::Error::InvalidArgs
 }
 
@@ -339,6 +339,15 @@ impl Program {
     /// provider-dependent symbol policy without exposing loader internals to
     /// the service API.
     pub fn load_with_context(elf_data: &[u8], context: &FrameVmLoadContext<'_>) -> Result<Self> {
+        macro_rules! load_stage {
+            ($stage:literal, $operation:expr) => {
+                $operation.map_err(|error| {
+                    crate::error!("[Loader] {} failed: {:?}", $stage, error);
+                    error
+                })?
+            };
+        }
+
         log::info!("[Loader] Loading service module...");
         let aligned_storage;
         let elf_data = if (elf_data.as_ptr() as usize).is_multiple_of(align_of::<u64>()) {
@@ -347,36 +356,59 @@ impl Program {
             aligned_storage = aligned_elf_copy(elf_data);
             aligned_elf_bytes(elf_data, &aligned_storage)
         };
-        let service_object = ServiceObject::parse(elf_data)?;
+        let service_object = load_stage!("parsing service object", ServiceObject::parse(elf_data));
         let elf_file = service_object.elf_file();
-        validate_framevm_metadata(&service_object)?;
+        load_stage!(
+            "validating FrameVM metadata",
+            validate_framevm_metadata(&service_object)
+        );
 
-        let layout = SectionLayout::plan(elf_file)?;
-        let section_memory = Arc::new(alloc_section_memory_with(
-            &layout,
-            context.allocate_segment,
-        )?);
-        let loaded_sections: Vec<Option<LoadedSection>> =
-            load_section_data(elf_file, &layout, &section_memory)?;
-        let deferred_relocations = relocate_sections_with(
-            &service_object,
-            &loaded_sections,
-            context.resolve_symbol,
-            context.defer_symbol,
-        )?;
-        symbol::observe_defined_symbols(
-            &service_object,
-            &loaded_sections,
-            &section_memory,
-            context.observe_symbol,
-        )?;
-        deferred_relocations.resolve_and_apply(context.resolve_symbol)?;
-        section_memory
-            .protect_final_permissions()
-            .map_err(|_| invalid_args("failed to protect service module section permissions"))?;
+        let layout = load_stage!("planning service sections", SectionLayout::plan(elf_file));
+        let section_memory = Arc::new(load_stage!(
+            "allocating service section backing",
+            alloc_section_memory_with(&layout, context.allocate_segment)
+        ));
+        let loaded_sections: Vec<Option<LoadedSection>> = load_stage!(
+            "loading service sections",
+            load_section_data(elf_file, &layout, &section_memory)
+        );
+        let deferred_relocations = load_stage!(
+            "relocating service sections",
+            relocate_sections_with(
+                &service_object,
+                &loaded_sections,
+                context.resolve_symbol,
+                context.defer_symbol,
+            )
+        );
+        load_stage!(
+            "observing service-defined symbols",
+            symbol::observe_defined_symbols(
+                &service_object,
+                &loaded_sections,
+                &section_memory,
+                context.observe_symbol,
+            )
+        );
+        load_stage!(
+            "resolving deferred relocations",
+            deferred_relocations.resolve_and_apply(context.resolve_symbol)
+        );
+        load_stage!(
+            "protecting service sections",
+            section_memory
+                .protect_final_permissions()
+                .map_err(|_| invalid_args("failed to protect service module section permissions"))
+        );
 
-        let entry_point = find_entry_point(&service_object, &loaded_sections)?
-            .ok_or_else(|| invalid_args("service program entry point is missing"))?;
+        let entry_point = load_stage!(
+            "finding service entry point",
+            find_entry_point(&service_object, &loaded_sections)
+        )
+        .ok_or_else(|| {
+            crate::error!("[Loader] service program entry point is missing");
+            invalid_args("service program entry point is missing")
+        })?;
         let addr = entry_point.addr();
         log::info!("[Loader] Entry point found at: 0x{:x}", addr);
 

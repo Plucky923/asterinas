@@ -89,6 +89,18 @@ where
     submit_work_item(work_item, work_priority);
 }
 
+/// Submits a function to a global work queue pinned to one Host CPU.
+pub(crate) fn submit_work_func_on_cpu<F>(cpu: CpuId, work_func: F, work_priority: WorkPriority)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    let mut work_item = WorkItem::new(Box::new(work_func));
+    *Arc::get_mut(&mut work_item)
+        .expect("a new work item must be uniquely owned")
+        .cpu_affinity_mut() = CpuSet::from(cpu);
+    submit_work_item(work_item, work_priority);
+}
+
 /// Submit a work item to a global work queue.
 pub(crate) fn submit_work_item(work_item: Arc<WorkItem>, work_priority: WorkPriority) -> bool {
     match work_priority {

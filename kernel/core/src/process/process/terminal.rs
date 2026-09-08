@@ -239,7 +239,7 @@ impl dyn Terminal {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub enum TerminalSide {
+pub(crate) enum TerminalSide {
     Master,
     Slave,
 }

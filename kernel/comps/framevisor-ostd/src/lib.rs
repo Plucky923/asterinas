@@ -357,6 +357,14 @@ pub mod task {
     pub fn current_task_admission() -> aster_framevisor::Result<Arc<TaskAdmission>> {
         aster_framevisor::current_task_admission()
     }
+
+    /// FrameVM runtime-only hooks for physical outer continuation switches.
+    #[doc(hidden)]
+    pub mod __private {
+        pub use aster_framevisor::task::{
+            inject_physical_post_schedule_handler, inject_physical_pre_schedule_handler,
+        };
+    }
     pub use host_ostd::task::halt_cpu;
 
     /// OSTD-shaped atomic-mode facade.
@@ -368,7 +376,7 @@ pub mod task {
     pub mod scheduler {
         pub use aster_framevisor::task::scheduler::{
             EnqueueFlags, LocalRunQueue, Scheduler, UpdateFlags, enable_preemption_on_cpu,
-            inject_scheduler,
+            inject_scheduler, install_current_bootstrap_task,
         };
 
         /// OSTD-shaped scheduler info facade.

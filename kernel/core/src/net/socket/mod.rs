@@ -18,13 +18,13 @@ use crate::{
     util::{MultiRead, MultiWrite, ioctl::RawIoctl},
 };
 
+pub(crate) mod framevsock;
 pub(crate) mod ip;
 pub(crate) mod netlink;
 pub(crate) mod options;
 pub(crate) mod unix;
 pub(crate) mod util;
 pub(crate) mod vsock;
-pub(crate) mod framevsock;
 pub(crate) mod vsock_mux;
 
 mod private {

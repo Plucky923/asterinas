@@ -8,7 +8,8 @@
 extern crate alloc;
 
 pub use host_aster_util::{
-    coeff, dup, field_ptr, fixed_point, mem_obj_slice, printer, ranged_integer, safe_ptr, slot_vec,
+    coeff, dup, field_ptr, fixed_point, fixed_str, mem_obj_slice, printer, ranged_integer,
+    safe_ptr, slot_vec,
 };
 
 pub mod per_cpu_counter;

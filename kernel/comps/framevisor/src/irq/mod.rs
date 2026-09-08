@@ -23,8 +23,8 @@ use crate::{
 mod handler;
 mod host;
 
-pub use handler::{InterruptHandler, interrupt_handler_main, register_interrupt_task_creator};
-pub(crate) use handler::{enqueue_physical_irq, enqueue_virtual_irq, start_interrupt_handler};
+pub use handler::InterruptHandler;
+pub(crate) use handler::{enqueue_physical_irq, enqueue_virtual_irq};
 pub use host::{DisabledLocalIrqGuard, InterruptLevel, disable_local, make_synthetic_trapframe};
 
 /// IRQ number range for the IRQ allocator.

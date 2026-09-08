@@ -20,7 +20,7 @@ pub fn symbols_table_init() {
     } else {
         early_print!("[ostd] No symbols were provided by the bootloader.");
     }
-    framevm::init_from_boot_payload(sources.framevm_fvsymtb());
+    framevm::init_from_boot_payload(crate::boot::retained_framevm_symbol_image());
 }
 
 /// A single entry within the kernel symbol table.

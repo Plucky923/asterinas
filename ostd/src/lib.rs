@@ -87,6 +87,8 @@ unsafe fn init() {
     // and after memory regions are initialized.
     unsafe { mm::frame::allocator::init_early_allocator() };
 
+    boot::retain_framevm_symbol_image();
+
     let early_cmdline = boot::parse_early_cmdline();
 
     #[cfg(target_arch = "x86_64")]

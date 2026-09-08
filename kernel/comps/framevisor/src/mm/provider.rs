@@ -513,8 +513,12 @@ impl FrameVmAllocator {
         Ok(frame)
     }
 
-    /// Allocates a service-visible OSTD segment through this VM's provider.
-    pub(crate) fn alloc_service_segment<M: AnyFrameMeta, F>(
+    /// Allocates one Host-loader section backed by this VM's memory domain.
+    ///
+    /// The section is part of the loaded image, not a service-owned OSTD
+    /// allocation.  Marking it as service-owned would make the image's own
+    /// backing prevent `Program` from being dropped at stop time.
+    pub(crate) fn alloc_loader_segment<M: AnyFrameMeta, F>(
         &self,
         nframes: usize,
         mut metadata_fn: F,
@@ -575,9 +579,11 @@ impl FrameVmAllocator {
         if zeroed {
             segment.zero();
         }
-        let accepted = self.accept_segment(OstdSegment::<dyn AnyFrameMeta>::from_unsized(
-            segment.clone(),
-        ));
+        let accepted = ownership::adopt_existing_segment_for_loader(
+            OstdSegment::<dyn AnyFrameMeta>::from_unsized(segment.clone()),
+            self.vm_id,
+            &self.domain,
+        );
         if !accepted {
             // See the frame path above: OSTD drops the public segment after
             // a rejected acceptance callback.  Custom providers keep the
@@ -644,7 +650,9 @@ impl FrameVmAllocator {
     /// Keeping the cells live while a grant or provider-owned frame remains is
     /// therefore the only safe fallback: a later lifecycle retry can still
     /// execute the provider's own drop path, while an image unload cannot
-    /// leave a stale vtable behind.
+    /// leave a stale vtable behind. An image-local provider *pointer* alone
+    /// is not retained state: static provider cells do not own Host resources
+    /// until FrameVisor records a grant or a provider-managed frame.
     pub(crate) fn deactivate_if_quiescent(&self) -> bool {
         if self.has_retained_opaque_state() {
             return false;
@@ -655,7 +663,7 @@ impl FrameVmAllocator {
 
     /// Returns whether opaque provider state still anchors image-backed state.
     pub(crate) fn has_retained_opaque_state(&self) -> bool {
-        // A failed image load clears the observed cells, but a custom
+        // A failed image load clears the observed cells, but an image-local
         // provider may already have received a grant or published an opaque
         // frame record. Those records still require the image to stay mapped
         // even though the cell itself is no longer reachable.
@@ -688,15 +696,13 @@ impl FrameVmAllocator {
     }
 
     fn custom_state_retained(&self) -> bool {
-        // OSTD has no provider-wide teardown callback.  Once an image
-        // installs a custom provider, its private caches may still contain
-        // image-owned metadata even when FrameVisor has not observed a
-        // provider-managed physical record.  Keep the image mapped until a
-        // future explicit teardown protocol can drain that state; guessing
-        // that an empty-looking range is safe would make a later drop call
-        // into unmapped image code.
-        self.has_custom_provider()
-            || self.provider_faulted.load(Ordering::Acquire)
+        // Provider cells are only pointers into the service image. They do
+        // not themselves retain a Host allocation, and image statics are not
+        // dropped during program unload. Physical ownership is represented
+        // exhaustively by grants and provider-managed owner records, so only
+        // those records (or a fault that makes their state ambiguous) require
+        // the image to stay mapped.
+        self.provider_faulted.load(Ordering::Acquire)
             || !self.granted_ranges.lock().is_empty()
             || ownership::has_provider_managed_for_vm(self.vm_id)
     }
@@ -1519,7 +1525,6 @@ pub(crate) extern "Rust" fn framevm_alloc_error_handler(size: usize, align: usiz
         align
     );
     crate::task::scheduler::exit_current_task();
-    host_ostd::task::exit_current_task();
 }
 
 /// Adapts `alloc::alloc::handle_alloc_error` to the isolated service exit path.
@@ -2097,11 +2102,11 @@ mod tests {
     }
 
     #[ktest]
-    fn built_in_untyped_segment_can_drain_after_quiesce() {
+    fn loader_segment_does_not_anchor_its_service_image() {
         let vm_id = VmId::new(65);
         let domain = MemoryDomain::new_with_minimum(PAGE_SIZE * 2, 0).unwrap();
         let allocator = FrameVmAllocator::new(domain.clone(), vm_id);
-        let segment = allocator.alloc_service_segment(2, |_| (), false).unwrap();
+        let segment = allocator.alloc_loader_segment(2, |_| (), false).unwrap();
         let start = segment.paddr();
 
         drop(segment);
@@ -2110,8 +2115,27 @@ mod tests {
         allocator.quiesce();
         allocator.deactivate();
 
-        assert_eq!(ownership::release_service_owned_for_vm(vm_id).unwrap(), 2);
+        assert!(!ownership::has_service_owned_for_vm(vm_id));
+        assert_eq!(ownership::release_quiesced_for_vm(vm_id).unwrap(), 2);
         assert_eq!(domain.stats().committed, 0);
         assert_eq!(ownership::owner_of(start), None);
+    }
+
+    #[ktest]
+    fn provider_cells_without_owned_resources_do_not_anchor_image() {
+        let allocator = FrameVmAllocator::new(
+            MemoryDomain::new_with_minimum(PAGE_SIZE, 0).unwrap(),
+            VmId::new(72),
+        );
+
+        // An image-local provider cell is a borrowed pointer into the image,
+        // not an owner of physical memory. The image may retire when no grant
+        // or provider-managed frame has been recorded for it.
+        allocator
+            .custom_frame_provider
+            .store(true, Ordering::Release);
+        assert!(!allocator.has_retained_opaque_state());
+        assert!(allocator.deactivate_if_quiescent());
+        assert!(!allocator.active.load(Ordering::Acquire));
     }
 }

@@ -21,15 +21,6 @@ pub(crate) fn main() {
     ostd::early_println!("OSTD initialized. Preparing components.");
     let init_process_config = init_framevm_components(InitStage::Bootstrap)
         .expect("bootstrap must produce the init-process configuration");
-    ostd::early_println!(
-        "[framevm diagnostic] cmdline={:?} init={:?}",
-        ostd::boot::boot_info().kernel_cmdline,
-        init_process_config.executable_path(),
-    );
-    ostd::early_println!(
-        "[framevm diagnostic] envp={:?}",
-        init_process_config.args().envp()
-    );
     if let Err(error) = init() {
         ostd::error!("[kernel] FrameVM initialization failed: {:?}", error);
         ostd::panic::abort();

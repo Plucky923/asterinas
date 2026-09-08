@@ -91,6 +91,13 @@ pub(crate) struct CachePageMeta {
     // TODO: Add a reverse mapping from the page to VMO for eviction.
 }
 
+impl CachePageMeta {
+    /// Checks whether the page is uninitialized.
+    pub(super) fn is_uninit(&self) -> bool {
+        self.state.load(Ordering::Acquire).is_uninit()
+    }
+}
+
 impl Default for CachePageMeta {
     fn default() -> Self {
         Self {

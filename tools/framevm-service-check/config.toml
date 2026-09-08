@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 
 service_path = "services/aster-framevm"
-kernel_src_path = "kernel/src"
+kernel_src_path = "kernel/core/src"
 facade_path = "kernel/comps/framevisor-ostd"
 host_ostd_path = "ostd"
 framevisor_backend_device_root = "kernel/comps/framevisor/src/device"
@@ -10,7 +10,10 @@ component_metadata_path = "Components.toml"
 kernel_component_profile = "kernel"
 framevm_component_profile = "framevm"
 
-source_trim_enforcement = "final"
+# The service is still being synchronized with the current kernel tree. Enforce
+# every FrameVM ownership/facade boundary now, while deferring whole-tree
+# source-diff closure until that migration is complete.
+source_trim_enforcement = "migration"
 
 entry_trim_files = [
     "src/lib.rs",
@@ -50,23 +53,22 @@ allowed_provider_facade_paths = [
 
 [[shared_source_comps]]
 name = "pci"
-host_source_path = "kernel/comps/pci/src"
+host_source_path = "kernel/core/comps/pci/src"
 service_source_path = "services/aster-framevm/comps/pci/src"
-service_path_prefix = "../../../../../kernel/comps/pci/src"
+service_path_prefix = "../../../../../kernel/core/comps/pci/src"
 shared_modules = [
     "bus.rs",
     "capability/mod.rs",
     "cfg_space.rs",
     "common_device.rs",
     "device_info.rs",
-    "enumeration.rs",
 ]
 
 [[shared_source_comps]]
 name = "nvme"
-host_source_path = "kernel/comps/nvme/src"
+host_source_path = "kernel/core/comps/nvme/src"
 service_source_path = "services/aster-framevm/comps/nvme/src"
-service_path_prefix = "../../../../../kernel/comps/nvme/src"
+service_path_prefix = "../../../../../kernel/core/comps/nvme/src"
 shared_modules = [
     "device/mod.rs",
     "msix.rs",
@@ -96,9 +98,9 @@ shared_modules = [
 
 [[shared_source_comps]]
 name = "network"
-host_source_path = "kernel/comps/network/src"
+host_source_path = "kernel/core/comps/network/src"
 service_source_path = "services/aster-framevm/comps/network/src"
-service_path_prefix = "../../../../../kernel/comps/network/src"
+service_path_prefix = "../../../../../kernel/core/comps/network/src"
 shared_modules = [
     "buffer.rs",
     "dma_pool.rs",
@@ -108,35 +110,35 @@ shared_modules = [
 [[service_side_trimmed_comps]]
 name = "block"
 service_path = "services/aster-framevm/comps/block"
-kernel_path = "kernel/comps/block"
+kernel_path = "kernel/core/comps/block"
 package = "aster-framevm-block"
 dependency_key = "aster-block"
 
 [[service_side_trimmed_comps]]
 name = "cmdline"
 service_path = "services/aster-framevm/comps/cmdline"
-kernel_path = "kernel/comps/cmdline"
+kernel_path = "kernel/core/comps/cmdline"
 package = "aster-framevm-cmdline"
 dependency_key = "aster-cmdline"
 
 [[service_side_trimmed_comps]]
 name = "softirq"
 service_path = "services/aster-framevm/comps/softirq"
-kernel_path = "kernel/comps/softirq"
+kernel_path = "kernel/core/comps/softirq"
 package = "aster-framevm-softirq"
 dependency_key = "aster-softirq"
 
 [[service_side_trimmed_comps]]
 name = "systree"
 service_path = "services/aster-framevm/comps/systree"
-kernel_path = "kernel/comps/systree"
+kernel_path = "kernel/core/comps/systree"
 package = "aster-framevm-systree"
 dependency_key = "aster-systree"
 
 [[service_side_trimmed_comps]]
 name = "time"
 service_path = "services/aster-framevm/comps/time"
-kernel_path = "kernel/comps/time"
+kernel_path = "kernel/core/comps/time"
 package = "aster-framevm-time"
 dependency_key = "aster-time"
 

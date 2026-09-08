@@ -55,6 +55,21 @@ pub enum BaseCrateType {
     Other,
 }
 
+// `ostd-test` declares these symbols for the test base crate to define. A
+// regular run base normally does not retain the corresponding code, but the
+// FrameVM host-symbol build uses `-Clink-dead-code` to retain its service ABI.
+// Define the ordinary-run defaults in that base as well so the retention pass
+// remains linkable after a clean build directory.
+const RUN_KTEST_DEFAULTS: &str = r#"
+
+// SAFETY: The names are reserved for the OSDK-generated base crate.
+#[unsafe(no_mangle)]
+pub static KTEST_TEST_WHITELIST: Option<&[&str]> = None;
+// SAFETY: The names are reserved for the OSDK-generated base crate.
+#[unsafe(no_mangle)]
+pub static KTEST_CRATE_WHITELIST: Option<&[&str]> = None;
+"#;
+
 /// Create a new base crate that will be built by cargo.
 ///
 /// The dependencies of the base crate will be the target crate. If
@@ -83,6 +98,7 @@ pub fn new_base_crate(
         // Reuse the existing base crate if it is identical to the new one.
         let base_crate_tmp_path = base_crate_path.join("tmp");
         do_new_base_crate(
+            base_type,
             &base_crate_tmp_path,
             dep_crate_name,
             &dep_crate_path,
@@ -103,6 +119,7 @@ pub fn new_base_crate(
         }
     }
     do_new_base_crate(
+        base_type,
         &base_crate_path,
         dep_crate_name,
         dep_crate_path,
@@ -113,6 +130,7 @@ pub fn new_base_crate(
 }
 
 fn do_new_base_crate(
+    base_type: BaseCrateType,
     base_crate_path: impl AsRef<Path>,
     dep_crate_name: &str,
     dep_crate_path: impl AsRef<Path>,
@@ -177,11 +195,8 @@ fn do_new_base_crate(
     // here when OSTD is ready
     include_linker_script!(["x86_64.ld", "riscv64.ld", "loongarch64.ld"]);
 
-    // Overwrite the main.rs file
-    let main_rs = include_str!("main.rs.template");
-    // Replace all occurrence of `#TARGET_NAME#` with the `dep_crate_name`
-    let main_rs = main_rs.replace("#TARGET_NAME#", &dep_crate_name.replace('-', "_"));
-    fs::write("src/main.rs", main_rs).unwrap();
+    // Overwrite the main.rs file.
+    fs::write("src/main.rs", render_main_rs(dep_crate_name, base_type)).unwrap();
 
     // Add dependencies to the Cargo.toml
     add_manifest_dependency(dep_crate_name, dep_crate_path, link_unit_test_kernel);
@@ -204,6 +219,15 @@ fn do_new_base_crate(
 
     // Get back to the original directory
     std::env::set_current_dir(original_dir).unwrap();
+}
+
+fn render_main_rs(dep_crate_name: &str, base_type: BaseCrateType) -> String {
+    let mut main_rs = include_str!("main.rs.template")
+        .replace("#TARGET_NAME#", &dep_crate_name.replace('-', "_"));
+    if base_type == BaseCrateType::Run {
+        main_rs.push_str(RUN_KTEST_DEFAULTS);
+    }
+    main_rs
 }
 
 fn add_manifest_dependency(
@@ -341,4 +365,25 @@ fn add_feature_entries(
 
     let content = toml::to_string(&manifest).unwrap();
     fs::write(manifest_path, content).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BaseCrateType, render_main_rs};
+
+    #[test]
+    fn run_base_defines_ktest_defaults() {
+        let main_rs = render_main_rs("asterinas", BaseCrateType::Run);
+
+        assert!(main_rs.contains("pub static KTEST_TEST_WHITELIST"));
+        assert!(main_rs.contains("pub static KTEST_CRATE_WHITELIST"));
+    }
+
+    #[test]
+    fn non_run_base_does_not_define_ktest_defaults() {
+        let main_rs = render_main_rs("asterinas", BaseCrateType::Test);
+
+        assert!(!main_rs.contains("pub static KTEST_TEST_WHITELIST"));
+        assert!(!main_rs.contains("pub static KTEST_CRATE_WHITELIST"));
+    }
 }

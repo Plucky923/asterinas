@@ -3,10 +3,9 @@
 use std::{
     fmt,
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::fd::{AsRawFd, OwnedFd},
     process::ExitCode,
-    thread,
 };
 
 use framevm_abi::{
@@ -28,6 +27,8 @@ const EXT2_LOG_BLOCK_SIZE_OFFSET: u64 = EXT2_SUPERBLOCK_OFFSET + 24;
 const EXT2_MAGIC_OFFSET: u64 = EXT2_SUPERBLOCK_OFFSET + 56;
 const EXT2_MAGIC: u16 = 0xef53;
 const REQUIRED_EXT2_BLOCK_SIZE: u32 = 4_096;
+const EVENT_POLL_INTERVAL_MS: libc::c_int = 100;
+const CONSOLE_BUFFER_SIZE: usize = 4_096;
 
 pub(crate) fn run(configuration: VmConfig) -> Result<ExitCode, RuntimeError> {
     let resources = PreparedResources::open(&configuration)?;
@@ -101,11 +102,8 @@ pub(crate) fn run(configuration: VmConfig) -> Result<ExitCode, RuntimeError> {
     let running = draft
         .start()
         .map_err(|error| RuntimeError::io("start FrameVM", error))?;
-    let console_output = forward_console(console)?;
-    let exit_code = wait_for_terminal(&running)?;
-    drop(running);
-    console_output.finish()?;
-    Ok(exit_code)
+    let exit_status = relay_console_until_terminal(&running, console)?;
+    Ok(ExitCode::from(exit_status as u8))
 }
 
 struct PreparedResources {
@@ -218,57 +216,29 @@ fn read_exact_at<const N: usize>(file: &mut File, offset: u64) -> Result<[u8; N]
     Ok(bytes)
 }
 
-struct ConsoleOutput {
-    output: thread::JoinHandle<io::Result<u64>>,
-}
-
-impl ConsoleOutput {
-    fn finish(self) -> Result<(), RuntimeError> {
-        self.output
-            .join()
-            .map_err(|_| RuntimeError::new("FrameVM console output thread panicked"))?
-            .map_err(|error| RuntimeError::io("forward FrameVM console output", error))?;
-        Ok(())
-    }
-}
-
-fn forward_console(console: OwnedFd) -> Result<ConsoleOutput, RuntimeError> {
-    let output = File::from(
-        console
-            .try_clone()
-            .map_err(|error| RuntimeError::io("clone console output fd", error))?,
-    );
-    let input = File::from(console);
-    let stdout = File::from(
+fn relay_console_until_terminal(
+    running: &RunningVm,
+    console: OwnedFd,
+) -> Result<i32, RuntimeError> {
+    let mut console = File::from(console);
+    let mut stdout = File::from(
         duplicate_fd(io::stdout().as_raw_fd())
             .map_err(|error| RuntimeError::io("duplicate console output fd", error))?,
     );
-    let stdin = File::from(
+    let mut stdin = File::from(
         duplicate_fd(io::stdin().as_raw_fd())
             .map_err(|error| RuntimeError::io("duplicate console input fd", error))?,
     );
-    let output_thread = thread::Builder::new()
-        .name("framevmm-console-output".into())
-        .spawn(move || {
-            let mut output = output;
-            let mut stdout = stdout;
-            io::copy(&mut output, &mut stdout)
-        })
-        .map_err(|error| RuntimeError::io("start console output forwarding", error))?;
-    thread::Builder::new()
-        .name("framevmm-console-input".into())
-        .spawn(move || {
-            let mut input = input;
-            let mut stdin = stdin;
-            let _ = io::copy(&mut stdin, &mut input);
-        })
-        .map_err(|error| RuntimeError::io("start console input forwarding", error))?;
-    Ok(ConsoleOutput {
-        output: output_thread,
-    })
+    relay_loop(running, &mut console, &mut stdout, &mut stdin)
 }
 
-fn wait_for_terminal(running: &RunningVm) -> Result<ExitCode, RuntimeError> {
+fn relay_loop(
+    running: &RunningVm,
+    console: &mut File,
+    stdout: &mut File,
+    stdin: &mut File,
+) -> Result<i32, RuntimeError> {
+    let mut stdin_open = true;
     loop {
         let status = running
             .status()
@@ -279,7 +249,7 @@ fn wait_for_terminal(running: &RunningVm) -> Result<ExitCode, RuntimeError> {
                 state_name(status.state()),
                 status.code(),
             );
-            return Ok(exit_code(status));
+            return Ok(normalize_exit_status(status.code()));
         }
         if let Some(signal) = termination_signal() {
             // `SIGHUP` abandons the owner fd so the kernel performs its
@@ -289,14 +259,76 @@ fn wait_for_terminal(running: &RunningVm) -> Result<ExitCode, RuntimeError> {
                     .stop()
                     .map_err(|error| RuntimeError::io("stop FrameVM", error))?;
             }
-            return Ok(ExitCode::from((128 + signal).min(255) as u8));
+            return Ok((128 + signal).min(255));
         }
-        match running.wait_for_event() {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(RuntimeError::io("wait for FrameVM status", error)),
+
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: running.event_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: console.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stdin_open { stdin.as_raw_fd() } else { -1 },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `poll_fds` contains three initialized descriptors for the
+        // duration of the call; a negative descriptor is intentionally ignored.
+        let poll_result = unsafe {
+            libc::poll(
+                poll_fds.as_mut_ptr(),
+                poll_fds.len() as libc::nfds_t,
+                EVENT_POLL_INTERVAL_MS,
+            )
+        };
+        if poll_result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(RuntimeError::io("wait for FrameVM or console input", error));
+            }
+            continue;
+        }
+        if poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            forward_console_output(console, stdout)?;
+        }
+        if stdin_open && poll_fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            stdin_open = forward_console_input(stdin, console)?;
         }
     }
+}
+
+fn forward_console_output(console: &mut File, stdout: &mut File) -> Result<(), RuntimeError> {
+    let mut bytes = [0; CONSOLE_BUFFER_SIZE];
+    let count = console
+        .read(&mut bytes)
+        .map_err(|error| RuntimeError::io("read FrameVM console output", error))?;
+    if count != 0 {
+        stdout
+            .write_all(&bytes[..count])
+            .map_err(|error| RuntimeError::io("forward FrameVM console output", error))?;
+    }
+    Ok(())
+}
+
+fn forward_console_input(stdin: &mut File, console: &mut File) -> Result<bool, RuntimeError> {
+    let mut bytes = [0; CONSOLE_BUFFER_SIZE];
+    let count = stdin
+        .read(&mut bytes)
+        .map_err(|error| RuntimeError::io("read FrameVM console input", error))?;
+    if count == 0 {
+        return Ok(false);
+    }
+    console
+        .write_all(&bytes[..count])
+        .map_err(|error| RuntimeError::io("forward FrameVM console input", error))?;
+    Ok(true)
 }
 
 fn is_terminal(state: u32) -> bool {
@@ -313,14 +345,14 @@ fn state_name(state: u32) -> &'static str {
     }
 }
 
-fn exit_code(status: FrameVmStatus) -> ExitCode {
-    if status.code() == 0 {
-        return ExitCode::SUCCESS;
+fn normalize_exit_status(status: i32) -> i32 {
+    if status == 0 {
+        return 0;
     }
-    if (1..=255).contains(&status.code()) {
-        ExitCode::from(status.code() as u8)
+    if (1..=255).contains(&status) {
+        status
     } else {
-        ExitCode::FAILURE
+        1
     }
 }
 
@@ -367,8 +399,8 @@ mod tests {
         let guest_failure = FrameVmStatus::new(FRAMEVM_STATE_EXITED, 7);
         let invalid_failure = FrameVmStatus::new(FRAMEVM_STATE_EXITED, -1);
 
-        assert_eq!(exit_code(success), ExitCode::SUCCESS);
-        assert_eq!(exit_code(guest_failure), ExitCode::from(7));
-        assert_eq!(exit_code(invalid_failure), ExitCode::FAILURE);
+        assert_eq!(normalize_exit_status(success.code()), 0);
+        assert_eq!(normalize_exit_status(guest_failure.code()), 7);
+        assert_eq!(normalize_exit_status(invalid_failure.code()), 1);
     }
 }

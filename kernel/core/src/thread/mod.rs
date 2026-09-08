@@ -14,6 +14,7 @@ use ostd::{
     sync::Rcu,
     task::Task,
 };
+use spin::Once;
 
 use crate::{
     prelude::*,
@@ -23,11 +24,11 @@ mod stats;
 use stats::CONTEXT_SWITCH_COUNTER;
 pub(crate) use stats::collect_context_switch_count;
 pub(crate) mod exception;
+mod framevm_task;
 pub(crate) mod kernel_thread;
 pub(crate) mod oops;
 pub(crate) mod task;
 pub(crate) mod work_queue;
-mod framevm_task;
 
 pub(crate) type Tid = u32;
 
@@ -35,32 +36,69 @@ fn pre_schedule_handler(irq_guard: &DisabledLocalIrqGuard) {
     let Some(task) = Task::current() else {
         return;
     };
+    if task
+        .as_thread()
+        .is_some_and(|thread| thread.framevm_task_state().is_some())
+    {
+        aster_framevisor::task::dispatch_physical_pre_schedule(irq_guard);
+        return;
+    }
     let Some(thread_local) = task.as_thread_local() else {
-        let _ = aster_framevisor::task::dispatch_pre_schedule(irq_guard);
         return;
     };
 
     thread_local.supp_user_context().before_schedule(irq_guard);
 }
 
-fn post_schedule_handler() -> bool {
-    // No races because preemption shouldn't happen in pre-/post-schedule handlers.
+fn post_schedule_handler() {
+    let task = Task::current().expect("scheduled context must have a current task");
+    let carrier = task.cloned();
+    if let Some(state) = task
+        .as_thread()
+        .and_then(|thread| thread.framevm_task_state())
+    {
+        // Continuation classification reads FrameSchedGroup state protected by
+        // virtual-preemption locks. Publish the projection for this exact
+        // current carrier first so those locks have a vCPU identity; the
+        // classifier immediately below still verifies that the carrier is the
+        // committed or staged continuation of the current outer group.
+        aster_framevisor::task::install_current_task(&carrier, state);
+        match sched::classify_framevm_continuation_arrival(&carrier, state) {
+            sched::FrameContinuationArrival::Committed => {
+                // This is B's first post-switch action. Only the direct nested
+                // processor path can satisfy the exact pending pair, so only it
+                // installs the logical Frame current and dispatches logical POST.
+                let _ = aster_framevisor::task::dispatch_post_schedule();
+            }
+            sched::FrameContinuationArrival::OuterResume => {
+                // An ordinary Host resume returns to the already-committed A.
+                // It restores only private physical Frame runtime state and must
+                // not look like a logical service task switch.
+                aster_framevisor::task::dispatch_physical_post_schedule();
+            }
+        }
+        CONTEXT_SWITCH_COUNTER
+            .get()
+            .unwrap()
+            .add_on_cpu(CpuId::current_racy(), 1);
+        return;
+    }
+    aster_framevisor::task::clear_current_task();
+
+    // No races because preemption shouldn't happen in post-schedule handlers.
     CONTEXT_SWITCH_COUNTER
         .get()
         .unwrap()
         .add_on_cpu(CpuId::current_racy(), 1);
 
-    let task = Task::current().unwrap();
     let Some(thread_local) = task.as_thread_local() else {
-        return aster_framevisor::task::dispatch_post_schedule();
+        return;
     };
 
     let vmar = thread_local.vmar().borrow();
     if let Some(vmar) = vmar.as_ref() {
         vmar.vm_space().activate()
     }
-
-    true
 }
 
 pub(super) fn init() {
@@ -72,11 +110,14 @@ pub(super) fn init() {
 }
 
 /// A thread is a wrapper on top of task.
-#[derive(Debug)]
 pub(crate) struct Thread {
     // immutable part
     /// Low-level info
-    task: Weak<Task>,
+    ///
+    /// The ordinary constructors bind this while constructing the thread. FrameVM
+    /// carriers bind it after their fallible OSTD task construction succeeds, but
+    /// before the task can be published to a scheduler.
+    task: Once<Weak<Task>>,
     /// Data: Posix thread info/Kernel thread Info
     data: Box<dyn Send + Sync + Any>,
 
@@ -108,14 +149,39 @@ impl Thread {
         cpu_affinity: CpuSet,
         sched_policy: SchedPolicy,
     ) -> Self {
+        let thread = Self::new_unbound(data, cpu_affinity, sched_policy);
+        thread.bind_task(task);
+        thread
+    }
+
+    /// Creates a thread whose task is not bound yet.
+    ///
+    /// This is only for a task constructor that must first complete a fallible
+    /// OSTD task build. The caller must bind the returned thread before making
+    /// that task reachable by the scheduler or any other concurrent observer.
+    fn new_unbound(
+        data: impl Send + Sync + Any,
+        cpu_affinity: CpuSet,
+        sched_policy: SchedPolicy,
+    ) -> Self {
         Thread {
-            task: task.clone(),
+            task: Once::new(),
             data: Box::new(data),
             is_exited: AtomicBool::new(false),
             cpu_affinity: AtomicCpuSet::new(cpu_affinity),
             sched_attr: SchedAttr::new(sched_policy),
             task_group: Rcu::new(sched::root_task_group().clone()),
         }
+    }
+
+    /// Binds the OSTD task exactly once during construction.
+    fn bind_task(&self, task: Weak<Task>) {
+        let mut is_new = false;
+        self.task.call_once(|| {
+            is_new = true;
+            task
+        });
+        assert!(is_new, "a thread task may only be bound once");
     }
 
     /// Returns the current thread.
@@ -129,13 +195,22 @@ impl Thread {
     /// Returns the task associated with this thread.
     #[expect(dead_code)]
     pub(crate) fn task(&self) -> Arc<Task> {
-        self.task.upgrade().unwrap()
+        self.task
+            .get()
+            .expect("a thread task must be bound before use")
+            .upgrade()
+            .unwrap()
     }
 
     /// Runs this thread at once.
     #[track_caller]
     pub(crate) fn run(&self) {
-        self.task.upgrade().unwrap().run();
+        self.task
+            .get()
+            .expect("a thread task must be bound before use")
+            .upgrade()
+            .unwrap()
+            .run();
     }
 
     /// Returns whether the thread is exited.

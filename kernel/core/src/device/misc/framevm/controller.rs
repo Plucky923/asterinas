@@ -7,7 +7,7 @@ use crate::{
     events::IoEvents,
     fs::{
         file::{PerOpenFileOps, StatusFlags, file_table::FdFlags},
-        vfs::inode::FileOps,
+        vfs::{inode::FileOps, path::Path},
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
@@ -81,7 +81,7 @@ impl PerOpenFileOps for FrameVmControllerFile {
         false
     }
 
-    fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
+    fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
         use ioctl_defs::*;
 
         dispatch_ioctl!(match raw_ioctl {

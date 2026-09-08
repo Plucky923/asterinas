@@ -61,6 +61,11 @@ pub fn init() {
     // We set this after injecting the scheduler into ostd,
     // so that the loadavg statistics are updated after the scheduler is used.
     set_stats_from_scheduler(scheduler);
+
+    // The first service instruction executes in a FrameVisor bootstrap
+    // carrier, rather than a service `Thread`. Keep that continuation
+    // selectable until the service has published its first ordinary task.
+    ostd::task::scheduler::install_current_bootstrap_task();
 }
 
 pub fn init_on_each_cpu() {
@@ -89,6 +94,9 @@ struct PerCpuClassRqSet {
     fair: Arc<SpinLock<fair::FairClassRq>>,
     idle: idle::IdleClassRq,
     current: Option<(SchedEntity, CurrentRuntime)>,
+    /// The host-carried continuation that runs service bootstrap code before
+    /// there is an ordinary service thread to represent it.
+    bootstrap: Option<Arc<Task>>,
 }
 
 /// Stores the runtime information of the current task.
@@ -223,21 +231,55 @@ impl SchedAttr {
 }
 
 impl Scheduler for ClassScheduler {
+    fn install_bootstrap_task(&self, bootstrap: Arc<Task>) {
+        let cpu = bootstrap
+            .schedule_info()
+            .cpu
+            .get()
+            .expect("a bootstrap task must retain its vCPU placement");
+        let mut rq = self.rqs[cpu.as_usize()].lock();
+        assert!(
+            rq.bootstrap.is_none() && rq.current.is_none(),
+            "a FrameVM vCPU may register exactly one initial bootstrap continuation"
+        );
+        rq.bootstrap = Some(bootstrap);
+    }
+
     fn enqueue(&self, task: Arc<Task>, flags: EnqueueFlags) -> Option<CpuId> {
+        let cpu_id = self.select_cpu_for_enqueue(&task, flags)?;
+        self.enqueue_on_cpu(task, cpu_id, flags)
+    }
+
+    fn mut_local_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue)) {
+        let guard = disable_local();
+        let mut lock = self.rqs[guard.current_cpu().as_usize()].lock();
+        f(&mut *lock)
+    }
+
+    fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
+        let guard = disable_local();
+        f(&*self.rqs[guard.current_cpu().as_usize()].lock())
+    }
+}
+
+impl ClassScheduler {
+    fn select_cpu_for_enqueue(&self, task: &Task, flags: EnqueueFlags) -> Option<CpuId> {
+        let thread = task.as_thread()?;
+        Some(self.select_cpu(task, thread, flags))
+    }
+
+    fn enqueue_on_cpu(&self, task: Arc<Task>, cpu: CpuId, flags: EnqueueFlags) -> Option<CpuId> {
         let thread = task.as_thread()?.clone();
 
-        let (still_in_rq, cpu) = {
-            let selected_cpu_id = self.select_cpu(&task, &thread, flags);
-
-            if let Err(task_cpu_id) = task.cpu().set_if_is_none(selected_cpu_id) {
-                if matches!(flags, EnqueueFlags::Spawn | EnqueueFlags::HostWake) {
-                    (false, task_cpu_id)
-                } else {
-                    (true, task_cpu_id)
-                }
-            } else {
-                (false, selected_cpu_id)
-            }
+        let still_in_rq = match task.cpu().set_if_is_none(cpu) {
+            Ok(()) => false,
+            // FrameVisor binds a newly constructed service task to the vCPU
+            // that owns its execution context. This is placement metadata,
+            // not evidence that `Spawn` has already published the task to an
+            // inner runqueue. The first spawn must therefore enqueue it.
+            Err(task_cpu_id) if task_cpu_id == cpu && flags == EnqueueFlags::Spawn => false,
+            Err(task_cpu_id) if task_cpu_id == cpu && flags == EnqueueFlags::Wake => true,
+            Err(_) => return None,
         };
 
         let mut rq = self.rqs[cpu.as_usize()].lock();
@@ -257,35 +299,13 @@ impl Scheduler for ClassScheduler {
 
         thread.sched_attr().set_last_cpu(cpu);
         rq.enqueue_entity((task, thread), Some(flags));
-        if should_preempt {
-            let _ = rq.try_pick_next();
-        }
-
+        // Only the outer FrameSchedGroup may commit an inner selection to a
+        // Host carrier. Replacing `current` here would make the inner
+        // runqueue describe a carrier that the Host has not switched to yet.
+        // The FrameVisor bridge records the reschedule request and consumes it
+        // at the outer selection point.
         should_preempt.then_some(cpu)
     }
-
-    fn mut_local_rq_with(&self, f: &mut dyn FnMut(&mut dyn LocalRunQueue)) {
-        let guard = disable_local();
-        let mut lock = self.rqs[guard.current_cpu().as_usize()].lock();
-        f(&mut *lock)
-    }
-
-    fn local_rq_with(&self, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
-        let guard = disable_local();
-        f(&*self.rqs[guard.current_cpu().as_usize()].lock())
-    }
-
-    fn mut_local_rq_on_cpu_with(&self, cpu_id: CpuId, f: &mut dyn FnMut(&mut dyn LocalRunQueue)) {
-        let mut lock = self.rqs[cpu_id.as_usize()].lock();
-        f(&mut *lock)
-    }
-
-    fn local_rq_on_cpu_with(&self, cpu_id: CpuId, f: &mut dyn FnMut(&dyn LocalRunQueue)) {
-        f(&*self.rqs[cpu_id.as_usize()].lock())
-    }
-}
-
-impl ClassScheduler {
     pub fn new() -> Self {
         let root_task_group = init_root_task_group(ostd::cpu::num_cpus());
         let class_rq = |cpu| {
@@ -295,6 +315,7 @@ impl ClassScheduler {
                 fair: root_task_group.fair_queue(cpu).clone(),
                 idle: idle::IdleClassRq::new(),
                 current: None,
+                bootstrap: None,
             })
         };
         ClassScheduler {
@@ -304,7 +325,14 @@ impl ClassScheduler {
     }
 
     // TODO: Implement a better algorithm and replace the current naive implementation.
-    fn select_cpu(&self, task: &Task, thread: &Thread, flags: EnqueueFlags) -> CpuId {
+    fn select_cpu(&self, task: &Task, thread: &Thread, _flags: EnqueueFlags) -> CpuId {
+        // FrameVisor gives each service task an immutable vCPU placement
+        // while it is constructed. Prefer it over the current virtual CPU:
+        // the initial Spawn runs during the bootstrap-to-service handoff,
+        // before the target task itself has become current.
+        if let Some(cpu) = task.cpu().get() {
+            return cpu;
+        }
         let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
         let last_cpu = thread.sched_attr().last_cpu();
         if let Some(last_cpu) = last_cpu
@@ -312,11 +340,7 @@ impl ClassScheduler {
         {
             return last_cpu;
         }
-        let mut selected = if flags == EnqueueFlags::HostWake {
-            task.schedule_info().cpu.get().unwrap_or(CpuId::bsp())
-        } else {
-            disable_local().current_cpu()
-        };
+        let mut selected = disable_local().current_cpu();
         let mut minimum_load = u32::MAX;
 
         // Set `selected` as `candidate` if the candidate's load is smaller.
@@ -361,6 +385,20 @@ impl ClassScheduler {
 }
 
 impl PerCpuClassRqSet {
+    /// Reports runnable non-idle work to the Host projection.
+    fn has_runnable(&self) -> bool {
+        self.bootstrap.is_some()
+            || self.current.as_ref().is_some_and(|((_task, thread), _)| {
+            thread.sched_attr().policy_kind() != SchedPolicyKind::Idle
+        }) || !self.stop.is_empty()
+            || !self.real_time.is_empty()
+            || !self.fair.lock().is_empty()
+    }
+
+    fn has_queued_task(&self) -> bool {
+        !self.stop.is_empty() || !self.real_time.is_empty() || !self.fair.lock().is_empty()
+    }
+
     fn pick_next_entity(&mut self) -> Option<SchedEntity> {
         loop {
             let task = self
@@ -369,11 +407,9 @@ impl PerCpuClassRqSet {
                 .or_else(|| self.real_time.pick_next())
                 .or_else(|| self.fair.lock().pick_next())
                 .or_else(|| self.idle.pick_next())?;
-            if task.is_completed() {
-                task.schedule_info().cpu.set_to_none();
+            let Some(thread) = task.as_thread().cloned() else {
                 continue;
-            }
-            let thread = task.as_thread()?.clone();
+            };
             return Some((task, thread));
         }
     }
@@ -392,7 +428,7 @@ impl PerCpuClassRqSet {
         let queue_len = (self.stop.len() + self.real_time.len() + fair_queue_len) as u32;
         let is_idle = match &self.current {
             Some(((_, thread), _)) => thread.sched_attr().policy_kind() == SchedPolicyKind::Idle,
-            None => true,
+            None => self.bootstrap.is_none(),
         };
         PerCpuLoadStats { queue_len, is_idle }
     }
@@ -400,48 +436,34 @@ impl PerCpuClassRqSet {
 
 impl LocalRunQueue for PerCpuClassRqSet {
     fn current(&self) -> Option<&Arc<Task>> {
-        self.current.as_ref().map(|((task, _), _)| task)
-    }
-
-    fn has_runnable(&self) -> bool {
-        self.current.as_ref().is_some_and(|((task, thread), _)| {
-            !task.is_completed() && thread.sched_attr().policy_kind() != SchedPolicyKind::Idle
-        }) || !self.stop.is_empty()
-            || !self.real_time.is_empty()
-            || !self.fair.lock().is_empty()
+        self.current
+            .as_ref()
+            .map(|((task, _), _)| task)
+            .or(self.bootstrap.as_ref())
     }
 
     fn try_pick_next(&mut self) -> Option<&Arc<Task>> {
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|((task, _), _)| task.is_completed())
-        {
-            if let Some(((task, _), _)) = self.current.take() {
-                task.schedule_info().cpu.set_to_none();
-            }
+        let Some(next) = self.pick_next_entity() else {
+            return self.bootstrap.as_ref();
+        };
+        // A task can occur only once in this local runqueue, so the selected
+        // task cannot also be its current entry.  This is the ordinary OSTD
+        // local-rq transition; the outer FrameSchedGroup never participates
+        // in this decision.
+        if let Some((old, _)) = self.current.replace((next, CurrentRuntime::new())) {
+            self.enqueue_entity(old, None);
         }
-
-        if let Some((current, _)) = &self.current
-            && Task::current().is_some_and(|actual| {
-                actual.schedule_info().cpu.get().is_some()
-                    && !Arc::ptr_eq(&actual.cloned(), &current.0)
-            })
-        {
-            return self.current.as_ref().map(|((task, _), _)| task);
-        }
-
-        self.pick_next_entity().and_then(|next| {
-            // We guarantee that a task can appear at once in a `PerCpuClassRqSet`. So, the `next` cannot be the same
-            // as the current task here.
-            if let Some((old, _)) = self.current.replace((next, CurrentRuntime::new())) {
-                self.enqueue_entity(old, None);
-            }
-            self.current.as_ref().map(|((task, _), _)| task)
-        })
+        self.current.as_ref().map(|((task, _), _)| task)
     }
 
     fn update_current(&mut self, flags: UpdateFlags) -> bool {
+        if self.current.is_none() && self.bootstrap.is_some() {
+            // Bootstrap has no service `Thread` metadata. It remains the
+            // fallback continuation while normal service tasks are queued;
+            // exiting bootstrap removes it through `dequeue_current` below.
+            return self.has_queued_task();
+        }
+
         let (should_preempt, mut lookahead) = if let Some(((_, cur), rt)) = &mut self.current {
             rt.update();
             let attr = &cur.sched_attr();
@@ -465,15 +487,28 @@ impl LocalRunQueue for PerCpuClassRqSet {
             || (lookahead >= 2 && !self.real_time.is_empty())
             || (lookahead >= 3 && !self.fair.lock().is_empty())
             || (lookahead >= 4 && !self.idle.is_empty())
+            // A regular service task can block or exit while the only
+            // remaining continuation is the Host-carried bootstrap task.
+            // `try_pick_next` already returns that continuation; include it
+            // in the decision here so the FrameVisor exit/park loop does not
+            // spin forever before it gets a chance to choose it.
+            || (matches!(flags, UpdateFlags::Wait | UpdateFlags::Exit)
+                && self.bootstrap.is_some())
     }
 
     fn dequeue_current(&mut self) -> Option<Arc<Task>> {
-        self.current.take().map(|((cur_task, _), _)| {
-            cur_task.schedule_info().cpu.set_to_none();
-            cur_task
-        })
+        // A Frame task's CPU field is its immutable vCPU ownership, not the
+        // transient Host-runqueue placement used by main.  Clearing it while
+        // the task blocks or exits would make a still-current Frame carrier
+        // lose the identity required by virtual IRQ and preemption guards.
+        self.current
+            .take()
+            .map(|((cur_task, _), _)| cur_task)
+            .or_else(|| self.bootstrap.take())
     }
 }
+
+impl PerCpuClassRqSet {}
 
 /// Holds per-CPU load information.
 struct PerCpuLoadStats {

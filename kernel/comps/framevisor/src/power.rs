@@ -64,8 +64,13 @@ pub fn poweroff(code: ExitCode) -> ! {
 }
 
 fn halt_system() -> ! {
+    // Mark the VM as stopping before the final service carrier leaves its
+    // inner runqueue. That lets the scheduler retire a vCPU with no successor
+    // into the Host scheduler instead of waiting forever for new service work.
+    if let Some(frame_vm) = crate::task::current_frame_vm() {
+        frame_vm.request_stop();
+    }
     crate::task::scheduler::exit_current_task();
-    host_ostd::task::exit_current_task();
 }
 
 const fn status_code_from_exit_code(code: ExitCode) -> i32 {

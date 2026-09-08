@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 aster-softirq = { path = "../softirq", package = "aster-framevm-softirq" }
+aster-util = { package = "aster-framevisor-util", path = "../../../../kernel/comps/framevisor-ostd/libs/aster-util", default-features = false }
 bitflags.workspace = true
 int-to-c-enum.workspace = true
 jhash.workspace = true

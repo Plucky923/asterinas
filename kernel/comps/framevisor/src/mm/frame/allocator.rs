@@ -619,7 +619,7 @@ impl FrameAllocOptions {
         {
             return frame_vm
                 .allocator()
-                .alloc_service_segment(nframes, |_| (), self.zeroed);
+                .alloc_loader_segment(nframes, |_| (), self.zeroed);
         }
         ownership::cache_idle_for_vm(vm_id)?;
         if nframes == 0 {
@@ -661,7 +661,7 @@ impl FrameAllocOptions {
         {
             return frame_vm
                 .allocator()
-                .alloc_service_segment(nframes, metadata_fn, self.zeroed);
+                .alloc_loader_segment(nframes, metadata_fn, self.zeroed);
         }
         ownership::cache_idle_for_vm(vm_id)?;
         if nframes == 0 {

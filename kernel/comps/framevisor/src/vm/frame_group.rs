@@ -5,21 +5,22 @@
 use alloc::{
     collections::BTreeSet,
     sync::{Arc, Weak},
-    vec::Vec,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use host_ostd::{
     cpu::{CpuId as HostCpuId, PinCurrentCpu},
-    sync::{LocalIrqDisabled as HostLocalIrqDisabled, SpinLock as HostSpinLock},
-    task::{Task as HostTask, disable_preempt},
+    sync::{
+        LocalIrqDisabled as HostLocalIrqDisabled, SpinLock as HostSpinLock, Waker as HostWaker,
+    },
+    task::disable_preempt,
     timer,
 };
 
 use super::VmId;
 use crate::{
-    cpu::CpuId,
     irq::InterruptHandler,
-    task::scheduler::{self, UpdateFlags},
+    task::{Task, scheduler::UpdateFlags},
 };
 
 /// Identifies the host scheduling domain for one FrameVM vCPU.
@@ -53,7 +54,11 @@ pub struct FrameSchedGroup {
     host_cpu: HostSpinLock<HostCpuId, HostLocalIrqDisabled>,
     interrupt_handler: Arc<InterruptHandler>,
     state: HostSpinLock<RunState, HostLocalIrqDisabled>,
-    service_tasks: HostSpinLock<Vec<Weak<HostTask>>, HostLocalIrqDisabled>,
+    continuation: HostSpinLock<ContinuationState<Task>, HostLocalIrqDisabled>,
+    /// The Host wake edge published only while the current continuation is
+    /// parking this opaque vCPU through virtual `halt_cpu`.
+    outer_halt_waker: HostSpinLock<Option<Arc<HostWaker>>, HostLocalIrqDisabled>,
+    inner_preempt_pending: AtomicBool,
     timer_host_cpus: HostSpinLock<BTreeSet<usize>, HostLocalIrqDisabled>,
 }
 
@@ -71,7 +76,9 @@ impl FrameSchedGroup {
             host_cpu: HostSpinLock::new(host_cpu),
             interrupt_handler,
             state: HostSpinLock::new(RunState::new()),
-            service_tasks: HostSpinLock::new(Vec::new()),
+            continuation: HostSpinLock::new(ContinuationState::new()),
+            outer_halt_waker: HostSpinLock::new(None),
+            inner_preempt_pending: AtomicBool::new(false),
             timer_host_cpus: HostSpinLock::new(BTreeSet::new()),
         }
     }
@@ -106,6 +113,151 @@ impl FrameSchedGroup {
         *self.host_cpu.lock() = host_cpu;
     }
 
+    /// Returns the FrameVM task whose Host carrier is committed as this
+    /// group's outer continuation.
+    ///
+    /// This is intentionally a committed value: staging an A -> B processor
+    /// switch does not make B observable here until the processor has
+    /// switched to B and the outer scheduler commits that exact pair.
+    #[doc(hidden)]
+    pub fn continuation(&self) -> Option<Arc<Task>> {
+        self.continuation.lock().continuation()
+    }
+
+    /// Installs the one initial continuation owned by this group.
+    ///
+    /// Bootstrap construction is the sole caller in the converged scheduler;
+    /// an already committed continuation cannot be replaced through this
+    /// path.
+    pub(crate) fn install_initial_continuation(
+        &self,
+        task: Arc<Task>,
+    ) -> Result<(), ContinuationTransitionError> {
+        self.continuation.lock().install_initial(task)
+    }
+
+    /// Stages one exact A -> B switch without changing the committed
+    /// continuation.
+    ///
+    /// The slot is deliberately single-entry. A second inner selection cannot
+    /// overwrite the pair that the processor is about to switch, and the
+    /// outer scheduler later commits by pointer identity rather than by an
+    /// epoch or a task ID.
+    pub(crate) fn stage_continuation_switch(
+        &self,
+        from: &Arc<Task>,
+        to: Arc<Task>,
+    ) -> Result<(), ContinuationTransitionError> {
+        self.continuation.lock().stage(from, to)
+    }
+
+    /// Commits the staged A -> B switch after the processor has reached B.
+    ///
+    /// Both arguments are checked against the staged pair. In particular, an
+    /// old post-switch callback cannot commit a newer transition, nor can it
+    /// commit after the slot has already been consumed.
+    #[doc(hidden)]
+    pub fn commit_continuation_switch(
+        &self,
+        from: &Arc<Task>,
+        to: &Arc<Task>,
+    ) -> Result<(), ContinuationTransitionError> {
+        self.continuation.lock().commit(from, to)
+    }
+
+    /// Releases this group's committed continuation during final teardown.
+    ///
+    /// The caller must first remove the group from Host scheduler visibility
+    /// and ensure that no execution can remain in the group. This method
+    /// enforces the local half of that protocol by requiring the exact
+    /// committed task and by rejecting a transition that is still pending.
+    pub(crate) fn release_committed_continuation(
+        &self,
+        expected: &Arc<Task>,
+    ) -> Result<Arc<Task>, ContinuationTransitionError> {
+        self.continuation.lock().release(expected)
+    }
+
+    /// Records that this virtual CPU must consume an exact-inner preemption
+    /// request at its next service preemption point.
+    ///
+    /// This is virtual processor state, not a Host scheduler request.  A
+    /// producer may set it for a vCPU that is not physically running; only
+    /// that vCPU's continuation may consume it.
+    pub(crate) fn request_inner_preempt(&self) {
+        self.inner_preempt_pending.store(true, Ordering::Release);
+        self.ring_outer_halt();
+    }
+
+    /// Consumes one pending exact-inner preemption request.
+    pub(crate) fn take_inner_preempt(&self) -> bool {
+        self.inner_preempt_pending.swap(false, Ordering::AcqRel)
+    }
+
+    /// Returns whether work published before an outer halt must keep the
+    /// current continuation running.
+    pub(crate) fn has_virtual_halt_work(&self) -> bool {
+        self.inner_preempt_pending.load(Ordering::Acquire)
+            || self.interrupt_handler.has_deliverable_work()
+            || !self.state.lock().admits_work
+    }
+
+    /// Publishes the one Host Waker that can restore this opaque group.
+    pub(crate) fn register_outer_halt(
+        &self,
+        carrier: &Arc<host_ostd::task::Task>,
+        waker: Arc<HostWaker>,
+    ) {
+        let continuation = self
+            .continuation()
+            .expect("an outer halt requires a committed continuation");
+        assert!(
+            Arc::ptr_eq(continuation.ostd_task(), carrier),
+            "only the committed Frame continuation may halt its outer group"
+        );
+
+        let mut registered = self.outer_halt_waker.lock();
+        assert!(
+            registered.is_none(),
+            "one Frame vCPU may publish only one outer-halt Waker"
+        );
+        *registered = Some(waker);
+    }
+
+    /// Removes the exact outer-halt registration after its waiter returns or
+    /// the final pre-park work check cancels the halt.
+    pub(crate) fn unregister_outer_halt(&self, expected: &Arc<HostWaker>) {
+        let mut registered = self.outer_halt_waker.lock();
+        let current = registered
+            .as_ref()
+            .expect("an outer-halt Waker must remain registered until its waiter returns");
+        assert!(
+            Arc::ptr_eq(current, expected),
+            "a stale waiter cannot remove a newer outer-halt registration"
+        );
+        *registered = None;
+    }
+
+    /// Returns whether a Host wake names the exact continuation currently
+    /// parked by virtual `halt_cpu`.
+    pub fn accepts_outer_halt_wake(&self, carrier: &Arc<host_ostd::task::Task>) -> bool {
+        let Some(continuation) = self.continuation() else {
+            return false;
+        };
+        Arc::ptr_eq(continuation.ostd_task(), carrier) && self.outer_halt_waker.lock().is_some()
+    }
+
+    fn is_outer_halted(&self) -> bool {
+        self.outer_halt_waker.lock().is_some()
+    }
+
+    fn ring_outer_halt(&self) {
+        let waker = self.outer_halt_waker.lock().clone();
+        if let Some(waker) = waker {
+            let _ = waker.wake_up();
+        }
+    }
+
     pub(crate) fn enable_timer_on_current_cpu(self: &Arc<Self>) {
         let host_cpu = disable_preempt().current_cpu();
         if host_cpu != self.host_cpu() {
@@ -135,27 +287,26 @@ impl FrameSchedGroup {
     }
 
     fn has_service_work_inner(&self) -> bool {
-        let Some(vm) = super::get_vm_by_id(self.vm_id()) else {
-            return false;
-        };
-        let Some(scheduler) = vm.scheduler() else {
-            return self.state.lock().bootstrap_service_task.is_some();
-        };
-        let mut has_runnable = false;
-        scheduler.local_rq_on_cpu_with(CpuId::from_raw(self.vcpu_index() as u32), &mut |rq| {
-            has_runnable = rq.has_runnable();
-        });
-        has_runnable || self.state.lock().bootstrap_service_task.is_some()
+        // The Host may observe only the committed continuation.  Looking into
+        // an inner runqueue here would make outer policy choose an inner task
+        // and would expose a staged B before its processor switch commits.
+        self.continuation().is_some()
     }
 
     /// Returns whether service work can keep this group runnable.
     pub fn has_service_work_for_outer(&self) -> bool {
+        if self.is_outer_halted() {
+            return false;
+        }
         let admits_work = self.state.lock().admits_work;
         admits_work && self.has_service_work_inner()
     }
 
     /// Returns whether this group has work for the Host scheduler.
     pub fn has_runnable_work(&self) -> bool {
+        if self.is_outer_halted() {
+            return false;
+        }
         if !self.state.lock().admits_work {
             return self.interrupt_handler.has_deliverable_work() || self.has_service_work_inner();
         }
@@ -166,24 +317,6 @@ impl FrameSchedGroup {
     pub(crate) fn open_admission(&self) {
         let mut state = self.state.lock();
         state.admits_work = true;
-        state.service_handoff_pending = false;
-    }
-
-    /// Prevents inner work from becoming an outer scheduling entity during bootstrap.
-    pub(crate) fn begin_bootstrap(&self) {
-        let mut state = self.state.lock();
-        // The bootstrap task may yield after it installs the service scheduler
-        // but before it exits. Give the first service task one handoff before
-        // interrupt-first arbitration resumes.
-        state.service_handoff_pending = true;
-    }
-
-    /// Opens outer scheduling after the bootstrap task finishes.
-    pub(crate) fn complete_bootstrap(&self) {
-        let mut state = self.state.lock();
-        state.bootstrap_service_task = None;
-        // Let the initial service task finish startup before interrupt-first arbitration resumes.
-        state.service_handoff_pending = true;
     }
 
     /// Closes admission for new service and interrupt work.
@@ -191,173 +324,329 @@ impl FrameSchedGroup {
         {
             let mut state = self.state.lock();
             state.admits_work = false;
-            state.service_handoff_pending = false;
         }
-        self.wake_service_tasks();
+        // A halted idle continuation must resume once to observe closure and
+        // retire the virtual CPU. The durable closed state is published
+        // before the optional Host wake edge is rung.
+        self.request_inner_preempt();
     }
 
-    /// Retains the scheduler-bootstrap task until its entry function returns.
-    pub(crate) fn enqueue_bootstrap_service_task(&self, task: Arc<HostTask>) {
-        self.state.lock().bootstrap_service_task = Some(task);
-    }
-
-    /// Adds a service task that may need a Host wakeup for this vCPU.
-    pub(crate) fn add_service_task(&self, task: &Arc<HostTask>) {
-        let mut service_tasks = self.service_tasks.lock();
-        service_tasks.retain(|weak_task| weak_task.strong_count() != 0);
-        let task_ptr = Arc::as_ptr(task);
-        if service_tasks
-            .iter()
-            .any(|weak_task| weak_task.as_ptr() == task_ptr)
-        {
-            return;
-        }
-
-        service_tasks.push(Arc::downgrade(task));
-    }
-
-    /// Removes a service task that no longer belongs to this vCPU.
-    pub(crate) fn remove_service_task(&self, task: &Arc<HostTask>) {
-        let task_ptr = Arc::as_ptr(task);
-        self.service_tasks
-            .lock()
-            .retain(|weak_task| weak_task.strong_count() != 0 && weak_task.as_ptr() != task_ptr);
-    }
-
-    /// Returns strong references to service tasks still associated with this vCPU.
-    pub(crate) fn service_tasks_snapshot(&self) -> Vec<Arc<HostTask>> {
-        let mut service_tasks = self.service_tasks.lock();
-        service_tasks.retain(|weak_task| weak_task.strong_count() != 0);
-        service_tasks.iter().filter_map(Weak::upgrade).collect()
-    }
-
-    /// Publishes service waiters after this vCPU delivers service-owned work.
-    pub fn wake_service_tasks(&self) {
-        let current_task = HostTask::current().map(|current| current.cloned());
-        let tasks = {
-            let mut service_tasks = self.service_tasks.lock();
-            service_tasks.retain(|weak_task| weak_task.strong_count() != 0);
-            service_tasks
-                .iter()
-                .filter_map(Weak::upgrade)
-                .filter(|task| {
-                    current_task
-                        .as_ref()
-                        .is_none_or(|current| !Arc::ptr_eq(current, task))
-                })
-                .filter(|task| !task.is_completed())
-                .collect::<Vec<_>>()
-        };
-
-        // Wake the Host backing tasks after releasing the group-local lock. The
-        // timer and interrupt paths call this outside the Host runqueue lock.
-        for task in tasks {
-            task.wake_up();
-        }
-    }
-
-    /// Requests one service-task handoff after a bounded interrupt batch.
-    pub fn request_service_handoff(&self) {
-        self.state.lock().service_handoff_pending = true;
-    }
-
-    /// Mirrors a Host current-task update into the FrameVM scheduler.
+    /// Accounts an outer scheduling event without interpreting it as an
+    /// inner task transition.
     ///
-    /// Returns whether the Host scheduler must select another task for this
-    /// group.
-    pub fn update_current(&self, task: &Arc<HostTask>, flags: UpdateFlags) -> bool {
-        if matches!(flags, UpdateFlags::Wait) {
-            let _ = scheduler::park_service_task(task);
+    /// Direct Frame task switches never call this method: they replace only
+    /// the concrete continuation in the already-current outer pair at the
+    /// processor boundary.  Consequently, an outer `Yield`, `Wait`, or
+    /// `Exit` must not be forwarded to the injected inner scheduler.
+    pub fn update_current(
+        &self,
+        _task: &Arc<host_ostd::task::Task>,
+        _state: &Arc<crate::task::FrameTaskState>,
+        flags: UpdateFlags,
+    ) -> bool {
+        match flags {
+            UpdateFlags::Tick => self.has_interrupt_work(),
+            UpdateFlags::Yield | UpdateFlags::Wait | UpdateFlags::Exit => self.has_runnable_work(),
         }
-
-        let has_interrupt_work = self.has_interrupt_work();
-        let has_runnable_work = matches!(
-            flags,
-            UpdateFlags::Yield | UpdateFlags::Wait | UpdateFlags::Exit
-        ) && self.has_runnable_work();
-        has_interrupt_work || has_runnable_work
     }
 
-    /// Selects the next task, giving interrupt delivery priority and handing
-    /// off to service work after each delivered interrupt request.
-    /// Interrupt-first is part of the FrameSchedGroup notification/control data path contract.
-    /// Do not let service selection bypass a runnable interrupt task.
-    pub fn pick_task(&self) -> Option<Arc<HostTask>> {
-        let (admits_work, service_handoff_required) = {
-            let mut state = self.state.lock();
-            let service_handoff_required = state.service_handoff_pending;
-            state.service_handoff_pending = false;
-            (state.admits_work, service_handoff_required)
-        };
-        if admits_work && service_handoff_required {
-            if let Some(task) = self.try_pick_service() {
-                return Some(task);
-            }
-            self.state.lock().service_handoff_pending = true;
-        }
-        let interrupt_is_runnable = if admits_work {
-            self.interrupt_handler.has_deliverable_work()
-        } else {
-            self.interrupt_handler.has_pending_exit()
-        };
-        let interrupt_task = interrupt_is_runnable
-            .then(|| self.interrupt_handler.task())
-            .flatten();
-        if let Some(task) = interrupt_task {
-            return Some(task);
-        }
+    /// Returns the Host context of the committed continuation.
+    ///
+    /// This is deliberately not an inner scheduler pick. A staged target
+    /// remains private until the physical processor has switched to it and
+    /// the post-switch path commits that exact pair.
+    pub fn pick_task(&self) -> Option<Arc<host_ostd::task::Task>> {
+        self.continuation().map(|task| task.ostd_task().clone())
+    }
+}
 
-        if !admits_work {
-            let bootstrap_task = self.state.lock().bootstrap_service_task.clone();
-            return bootstrap_task.or_else(|| self.try_pick_service());
-        }
+/// The committed continuation and the one processor switch awaiting commit.
+///
+/// `T` is generic only so the identity protocol can be unit-tested without a
+/// live FrameVM. `FrameSchedGroup` always instantiates it as `Task`.
+enum ContinuationState<T: ?Sized> {
+    Vacant,
+    Active {
+        continuation: Arc<T>,
+        pending: Option<PendingSwitch<T>>,
+    },
+    Released,
+}
 
-        if let Some(task) = self.try_pick_service() {
-            return Some(task);
-        }
-
-        None
+impl<T: ?Sized> ContinuationState<T> {
+    const fn new() -> Self {
+        Self::Vacant
     }
 
-    fn try_pick_service(&self) -> Option<Arc<HostTask>> {
-        let vm = super::get_vm_by_id(self.vm_id())?;
-        let Some(scheduler) = vm.scheduler() else {
-            let task = self.state.lock().bootstrap_service_task.clone()?;
-            return Some(task);
-        };
+    fn continuation(&self) -> Option<Arc<T>> {
+        match self {
+            Self::Active { continuation, .. } => Some(continuation.clone()),
+            Self::Vacant | Self::Released => None,
+        }
+    }
 
-        let mut picked_task = None;
-        // Lock order: the Host scheduler picks the outer group first, then
-        // enters the explicitly selected FrameVM vCPU runqueue.
-        scheduler.mut_local_rq_on_cpu_with(CpuId::from_raw(self.vcpu_index() as u32), &mut |rq| {
-            if !rq.has_runnable() {
-                return;
+    fn install_initial(&mut self, task: Arc<T>) -> Result<(), ContinuationTransitionError> {
+        match self {
+            Self::Vacant => {
+                *self = Self::Active {
+                    continuation: task,
+                    pending: None,
+                };
+                Ok(())
             }
-            picked_task = rq
-                .current()
-                .filter(|task| !task.is_completed())
-                .map(|task| task.ostd_task().clone())
-                .or_else(|| rq.try_pick_next().map(|task| task.ostd_task().clone()));
+            Self::Active { .. } => {
+                Err(ContinuationTransitionError::InitialContinuationAlreadyInstalled)
+            }
+            Self::Released => Err(ContinuationTransitionError::ContinuationAlreadyReleased),
+        }
+    }
+
+    fn stage(&mut self, from: &Arc<T>, to: Arc<T>) -> Result<(), ContinuationTransitionError> {
+        let Self::Active {
+            continuation,
+            pending,
+        } = self
+        else {
+            return Err(ContinuationTransitionError::CommittedContinuationMismatch);
+        };
+        if !Arc::ptr_eq(continuation, from) {
+            return Err(ContinuationTransitionError::CommittedContinuationMismatch);
+        }
+        if pending.is_some() {
+            return Err(ContinuationTransitionError::PendingSwitchOccupied);
+        }
+        if Arc::ptr_eq(from, &to) {
+            return Err(ContinuationTransitionError::NoContinuationChange);
+        }
+
+        *pending = Some(PendingSwitch {
+            from: Arc::downgrade(from),
+            to,
         });
-
-        picked_task
-            .filter(|task| !task.is_completed())
-            .or_else(|| self.state.lock().bootstrap_service_task.clone())
+        Ok(())
     }
+
+    fn commit(&mut self, from: &Arc<T>, to: &Arc<T>) -> Result<(), ContinuationTransitionError> {
+        let Self::Active {
+            continuation,
+            pending,
+        } = self
+        else {
+            return Err(ContinuationTransitionError::CommittedContinuationMismatch);
+        };
+        if !Arc::ptr_eq(continuation, from) {
+            return Err(ContinuationTransitionError::CommittedContinuationMismatch);
+        }
+
+        let Some(pending_switch) = pending.as_ref() else {
+            return Err(ContinuationTransitionError::PendingSwitchMissing);
+        };
+        if !pending_switch
+            .from
+            .upgrade()
+            .is_some_and(|pending_from| Arc::ptr_eq(&pending_from, from))
+        {
+            return Err(ContinuationTransitionError::PendingSourceMismatch);
+        }
+        if !Arc::ptr_eq(&pending_switch.to, to) {
+            return Err(ContinuationTransitionError::PendingTargetMismatch);
+        }
+
+        let pending_switch = pending
+            .take()
+            .expect("a checked pending continuation switch must still exist");
+        *continuation = pending_switch.to;
+        Ok(())
+    }
+
+    fn release(&mut self, expected: &Arc<T>) -> Result<Arc<T>, ContinuationTransitionError> {
+        let Self::Active {
+            continuation,
+            pending,
+        } = self
+        else {
+            return Err(ContinuationTransitionError::CommittedContinuationMismatch);
+        };
+        if !Arc::ptr_eq(continuation, expected) {
+            return Err(ContinuationTransitionError::CommittedContinuationMismatch);
+        }
+        if pending.is_some() {
+            return Err(ContinuationTransitionError::PendingSwitchOccupied);
+        }
+
+        let Self::Active { continuation, .. } = core::mem::replace(self, Self::Released) else {
+            unreachable!("a checked active continuation state must remain active");
+        };
+        Ok(continuation)
+    }
+}
+
+/// The one exact processor handoff waiting to arrive on its target stack.
+struct PendingSwitch<T: ?Sized> {
+    from: Weak<T>,
+    to: Arc<T>,
+}
+
+/// Why an exact continuation transition was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum ContinuationTransitionError {
+    /// Bootstrap attempted to replace the group's already-installed initial continuation.
+    InitialContinuationAlreadyInstalled,
+    /// Teardown has released the group's continuation permanently.
+    ContinuationAlreadyReleased,
+    /// The caller's source task is not the committed continuation.
+    CommittedContinuationMismatch,
+    /// A different staged switch is already awaiting commit.
+    PendingSwitchOccupied,
+    /// The staged switch has already committed or was never staged.
+    PendingSwitchMissing,
+    /// The staged source no longer names the caller's exact continuation.
+    PendingSourceMismatch,
+    /// The processor reported a target different from the staged target.
+    PendingTargetMismatch,
+    /// The virtual scheduler tried to stage a switch to the already-current task.
+    NoContinuationChange,
 }
 
 struct RunState {
     admits_work: bool,
-    bootstrap_service_task: Option<Arc<HostTask>>,
-    service_handoff_pending: bool,
 }
 
 impl RunState {
     const fn new() -> Self {
-        Self {
-            admits_work: false,
-            bootstrap_service_task: None,
-            service_handoff_pending: false,
-        }
+        Self { admits_work: false }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use host_ostd::prelude::ktest;
+
+    use super::{ContinuationState, ContinuationTransitionError};
+
+    #[ktest]
+    fn continuation_switch_rejects_pointer_mismatch() {
+        let committed = Arc::new(());
+        let staged_target = Arc::new(());
+        let distinct_same_value = Arc::new(());
+        let mut state = ContinuationState::new();
+
+        state.install_initial(committed.clone()).unwrap();
+
+        assert_eq!(
+            state.stage(&distinct_same_value, staged_target.clone()),
+            Err(ContinuationTransitionError::CommittedContinuationMismatch)
+        );
+        state.stage(&committed, staged_target.clone()).unwrap();
+        assert_eq!(
+            state.commit(&committed, &distinct_same_value),
+            Err(ContinuationTransitionError::PendingTargetMismatch)
+        );
+
+        assert!(Arc::ptr_eq(&state.continuation().unwrap(), &committed));
+    }
+
+    #[ktest]
+    fn continuation_switch_rejects_stale_commit() {
+        let first = Arc::new(());
+        let second = Arc::new(());
+        let mut state = ContinuationState::new();
+
+        state.install_initial(first.clone()).unwrap();
+        state.stage(&first, second.clone()).unwrap();
+        state.commit(&first, &second).unwrap();
+
+        assert_eq!(
+            state.commit(&first, &second),
+            Err(ContinuationTransitionError::CommittedContinuationMismatch)
+        );
+        assert_eq!(
+            state.commit(&second, &first),
+            Err(ContinuationTransitionError::PendingSwitchMissing)
+        );
+        assert!(Arc::ptr_eq(&state.continuation().unwrap(), &second));
+    }
+
+    #[ktest]
+    fn continuation_switch_has_one_pending_slot() {
+        let first = Arc::new(());
+        let second = Arc::new(());
+        let third = Arc::new(());
+        let mut state = ContinuationState::new();
+
+        state.install_initial(first.clone()).unwrap();
+        state.stage(&first, second.clone()).unwrap();
+
+        assert_eq!(
+            state.stage(&first, third),
+            Err(ContinuationTransitionError::PendingSwitchOccupied)
+        );
+        assert!(Arc::ptr_eq(&state.continuation().unwrap(), &first));
+
+        state.commit(&first, &second).unwrap();
+        assert!(Arc::ptr_eq(&state.continuation().unwrap(), &second));
+    }
+
+    #[ktest]
+    fn continuation_release_rejects_wrong_expected_task() {
+        let committed = Arc::new(());
+        let wrong = Arc::new(());
+        let mut state = ContinuationState::new();
+
+        state.install_initial(committed.clone()).unwrap();
+
+        assert_eq!(
+            state.release(&wrong),
+            Err(ContinuationTransitionError::CommittedContinuationMismatch)
+        );
+        assert!(Arc::ptr_eq(&state.continuation().unwrap(), &committed));
+    }
+
+    #[ktest]
+    fn continuation_release_rejects_pending_switch() {
+        let committed = Arc::new(());
+        let pending = Arc::new(());
+        let mut state = ContinuationState::new();
+
+        state.install_initial(committed.clone()).unwrap();
+        state.stage(&committed, pending).unwrap();
+
+        assert_eq!(
+            state.release(&committed),
+            Err(ContinuationTransitionError::PendingSwitchOccupied)
+        );
+        assert!(Arc::ptr_eq(&state.continuation().unwrap(), &committed));
+    }
+
+    #[ktest]
+    fn continuation_release_returns_exact_task_and_empties_state() {
+        let committed = Arc::new(());
+        let mut state = ContinuationState::new();
+
+        state.install_initial(committed.clone()).unwrap();
+
+        let released = state.release(&committed).unwrap();
+
+        assert!(Arc::ptr_eq(&released, &committed));
+        assert!(state.continuation().is_none());
+    }
+
+    #[ktest]
+    fn continuation_release_is_terminal() {
+        let initial = Arc::new(());
+        let replacement = Arc::new(());
+        let mut state = ContinuationState::new();
+
+        state.install_initial(initial.clone()).unwrap();
+        state.release(&initial).unwrap();
+
+        assert_eq!(
+            state.install_initial(replacement),
+            Err(ContinuationTransitionError::ContinuationAlreadyReleased)
+        );
+        assert!(state.continuation().is_none());
     }
 }

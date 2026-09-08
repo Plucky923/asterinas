@@ -595,15 +595,14 @@ clean:
 
 .PHONY: framevm_service_check
 framevm_service_check:
+	@tools/sync_framevm_from_main.sh --check
 	@cargo run --quiet -p framevm-service-check -- tools/framevm-service-check/config.toml
 
 .PHONY: framevm
-framevm: CONSOLE = ttyS0
 framevm: $(CARGO_OSDK)
 	@cd kernel && $(CARGO_OSDK) osdk framevm build $(CARGO_OSDK_BUILD_ARGS) $(FRAMEVM_OSDK_ARGS)
 
 .PHONY: run_framevm
-run_framevm: CONSOLE = ttyS0
 run_framevm: $(CARGO_OSDK)
 	@cd kernel && STDIO_SERIAL_ONLY=on $(CARGO_OSDK) osdk framevm run $(CARGO_OSDK_BUILD_ARGS) \
 		$(FRAMEVM_OSDK_ARGS) $(FRAMEVM_OSDK_MEMORY_ARGS) --framevm-load-init $(FRAMEVM_LOAD_INIT)
@@ -613,11 +612,11 @@ run_framevm: $(CARGO_OSDK)
 			tail --lines 200 qemu.log | tr -d '\r' | grep "FrameVM terminal status:" | tail --lines 1 || true; \
 			echo "qemu.log tail:"; \
 			tail --lines 80 qemu.log | tr -d '\r'; \
+			exit 1; \
 		fi; \
 	done
 
 .PHONY: run_framevm_no_build
-run_framevm_no_build: CONSOLE = ttyS0
 run_framevm_no_build: $(CARGO_OSDK)
 	@cd kernel && STDIO_SERIAL_ONLY=on $(CARGO_OSDK) osdk framevm run --no-build $(CARGO_OSDK_BUILD_ARGS) \
 		$(FRAMEVM_OSDK_ARGS) $(FRAMEVM_OSDK_MEMORY_ARGS) --framevm-load-init $(FRAMEVM_LOAD_INIT)

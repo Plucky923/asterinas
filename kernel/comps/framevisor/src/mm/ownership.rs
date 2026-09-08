@@ -243,6 +243,19 @@ pub(crate) fn adopt_existing_segment_for_service(
     adopt_existing_segment_with_policy(segment, vm_id, domain, false, true)
 }
 
+/// Records a segment owned by the Host loader while it maps one service image.
+///
+/// Loader sections carry only Host `()` metadata.  They are charged to the
+/// target VM for isolation, but are not values allocated by service code and
+/// therefore must not keep their own image mapped during teardown.
+pub(crate) fn adopt_existing_segment_for_loader(
+    segment: OstdSegment<dyn AnyFrameMeta>,
+    vm_id: VmId,
+    domain: &MemoryDomain,
+) -> bool {
+    adopt_existing_segment_with_policy(segment, vm_id, domain, false, false)
+}
+
 /// Records a segment whose cache policy remains opaque to FrameVisor.
 pub(crate) fn adopt_existing_segment_with_provider(
     segment: OstdSegment<dyn AnyFrameMeta>,

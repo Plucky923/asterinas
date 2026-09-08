@@ -15,7 +15,7 @@ use core::{
     cell::{Cell, SyncUnsafeCell},
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::AtomicBool,
 };
 
 use kernel_stack::KernelStack;
@@ -35,7 +35,7 @@ use crate::{
 
 static PRE_SCHEDULE_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 
-static POST_SCHEDULE_HANDLER: Once<fn() -> bool> = Once::new();
+static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
 
 /// Injects a handler to be executed before scheduling.
 pub fn inject_pre_schedule_handler(handler: fn(&DisabledLocalIrqGuard)) {
@@ -43,8 +43,48 @@ pub fn inject_pre_schedule_handler(handler: fn(&DisabledLocalIrqGuard)) {
 }
 
 /// Injects a handler to be executed after scheduling.
-pub fn inject_post_schedule_handler(handler: fn() -> bool) {
+pub fn inject_post_schedule_handler(handler: fn()) {
     POST_SCHEDULE_HANDLER.call_once(|| handler);
+}
+
+/// Private kernel integration points that are not part of OSTD's task API.
+#[doc(hidden)]
+pub mod __private {
+    use super::{Task, processor, scheduler};
+    use crate::prelude::*;
+
+    /// Requests a scheduling decision at the next preemption boundary.
+    ///
+    /// Host scheduling integrations use this when their own resource policy
+    /// changes a task's placement. It is not part of the OSTD scheduler API.
+    #[doc(hidden)]
+    pub fn request_preemption_on_cpu(cpu_id: crate::cpu::CpuId) {
+        scheduler::request_preemption_on_cpu(cpu_id);
+    }
+
+    /// Switches at OSTD's real processor boundary after running a private
+    /// nested-scheduler pre-switch action.
+    ///
+    /// This is not an OSTD scheduling API. The kernel uses it only after it
+    /// has staged an exact nested A -> B transition; the ordinary processor
+    /// bookkeeping still runs through the same switch sequence.
+    #[doc(hidden)]
+    pub fn switch_to_task_with_pre_switch(
+        next_task: Arc<Task>,
+        pre_switch: impl FnOnce(&crate::irq::DisabledLocalIrqGuard),
+    ) {
+        processor::switch_to_task_with_pre_switch(next_task, pre_switch);
+    }
+
+    /// Exits the current task through OSTD's ordinary Host scheduler path.
+    ///
+    /// A nested scheduler may call this only after it has detached its own
+    /// scheduling entity from the current carrier. The kernel uses that final
+    /// handoff when a FrameVM vCPU has no remaining continuation.
+    #[doc(hidden)]
+    pub fn exit_current_task() -> ! {
+        scheduler::exit_current();
+    }
 }
 
 /// A task that executes a function to the end.
@@ -57,9 +97,8 @@ pub struct Task {
     #[expect(clippy::type_complexity)]
     func: ForceSync<Cell<Option<Box<dyn FnOnce() + Send>>>>,
 
-    local_data: ForceSync<Box<dyn Any + Send>>,
     data: Box<dyn Any + Send + Sync>,
-    extension: Box<dyn Any + Send + Sync>,
+    local_data: ForceSync<Box<dyn Any + Send>>,
 
     ctx: SyncUnsafeCell<TaskContext>,
     /// kernel stack, note that the top is SyscallFrame/TrapFrame
@@ -70,8 +109,6 @@ pub struct Task {
     /// This is to enforce not context switching to an already running task.
     /// See [`processor::switch_to_task`] for more details.
     switched_to_cpu: AtomicBool,
-    completed: AtomicBool,
-
     schedule_info: TaskScheduleInfo,
 }
 
@@ -107,28 +144,9 @@ impl Task {
         scheduler::run_new_task(self.clone());
     }
 
-    /// Re-enqueues a parked task through the scheduler.
-    #[track_caller]
-    pub fn wake_up(self: &Arc<Self>) {
-        if self.is_completed() {
-            return;
-        }
-        scheduler::unpark_target(self.clone());
-    }
-
-    /// Returns whether this task has finished its task function.
-    pub fn is_completed(&self) -> bool {
-        self.completed.load(Ordering::Acquire)
-    }
-
     /// Returns the task data.
     pub fn data(&self) -> &Box<dyn Any + Send + Sync> {
         &self.data
-    }
-
-    /// Returns the type-erased extension data attached to the task.
-    pub fn extension(&self) -> &Box<dyn Any + Send + Sync> {
-        &self.extension
     }
 
     /// Get the attached scheduling information.
@@ -137,21 +155,10 @@ impl Task {
     }
 }
 
-/// Terminates the current task without returning.
-///
-/// Stack-local destructors are not run. Callers must release guards and other
-/// resources whose drop behavior is required before invoking this function.
-pub fn exit_current_task() -> ! {
-    let current_task = Task::current().expect("current task must exist before task exit");
-    current_task.completed.store(true, Ordering::Release);
-    scheduler::exit_current();
-}
-
 /// Options to create or spawn a new task.
 pub struct TaskOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
     data: Option<Box<dyn Any + Send + Sync>>,
-    extension: Option<Box<dyn Any + Send + Sync>>,
     local_data: Option<Box<dyn Any + Send>>,
 }
 
@@ -164,7 +171,6 @@ impl TaskOptions {
         Self {
             func: Some(Box::new(func)),
             data: None,
-            extension: None,
             local_data: None,
         }
     }
@@ -179,49 +185,30 @@ impl TaskOptions {
     }
 
     /// Sets the data associated with the task.
-    pub fn data<T>(self, data: T) -> Self
+    pub fn data<T>(mut self, data: T) -> Self
     where
         T: Any + Send + Sync,
     {
-        self.data_any(Box::new(data))
-    }
-
-    /// Sets the data associated with the task, but with an already-boxed value.
-    pub fn data_any(mut self, data: Box<dyn Any + Send + Sync>) -> Self {
-        self.data = Some(data);
-        self
-    }
-
-    /// Sets the extension data associated with the task.
-    pub fn extension<T>(self, extension: T) -> Self
-    where
-        T: Any + Send + Sync,
-    {
-        self.extension_any(Box::new(extension))
-    }
-
-    /// Sets the extension data associated with the task, but with an already-boxed value.
-    pub fn extension_any(mut self, extension: Box<dyn Any + Send + Sync>) -> Self {
-        self.extension = Some(extension);
+        self.data = Some(Box::new(data));
         self
     }
 
     /// Sets the local data associated with the task.
-    pub fn local_data<T>(self, data: T) -> Self
+    pub fn local_data<T>(mut self, data: T) -> Self
     where
         T: Any + Send,
     {
-        self.local_data_any(Box::new(data))
-    }
-
-    /// Sets the local data associated with the task, but with an already-boxed value.
-    pub fn local_data_any(mut self, data: Box<dyn Any + Send>) -> Self {
-        self.local_data = Some(data);
+        self.local_data = Some(Box::new(data));
         self
     }
 
     /// Builds a new task without running it immediately.
     pub fn build(self) -> Result<Task> {
+        let kstack = KernelStack::new_with_guard_page()?;
+        Ok(self.build_with_kernel_stack(kstack))
+    }
+
+    fn build_with_kernel_stack(self, kstack: KernelStack) -> Task {
         // All tasks will enter this function. It is meant to execute the `task_fn` in `Task`.
         //
         // We provide an assembly wrapper for this function as the end of call stack so we
@@ -247,8 +234,6 @@ impl TaskOptions {
                 .take()
                 .expect("task function is `None` when trying to run");
             task_func();
-            current_task.completed.store(true, Ordering::Release);
-
             // Manually drop all the on-stack variables to prevent memory leakage!
             // This is needed because `scheduler::exit_current()` will never return.
             //
@@ -257,8 +242,6 @@ impl TaskOptions {
 
             scheduler::exit_current();
         }
-
-        let kstack = KernelStack::new_with_guard_page()?;
 
         let mut ctx = TaskContext::new();
         ctx.set_instruction_pointer(
@@ -277,19 +260,17 @@ impl TaskOptions {
 
         let new_task = Task {
             func: ForceSync::new(Cell::new(self.func)),
-            local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),
             data: self.data.unwrap_or_else(|| Box::new(())),
-            extension: self.extension.unwrap_or_else(|| Box::new(())),
+            local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),
             ctx: SyncUnsafeCell::new(ctx),
             kstack,
             switched_to_cpu: AtomicBool::new(false),
-            completed: AtomicBool::new(false),
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },
         };
 
-        Ok(new_task)
+        new_task
     }
 
     /// Builds a new task and runs it immediately.

@@ -17,8 +17,6 @@ use framevm_abi::{
 };
 
 const FRAMEVM_DEVICE: &str = "/dev/framevm";
-const EVENT_POLL_INTERVAL_MS: libc::c_int = 100;
-
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
 const IOC_SIZEBITS: u32 = 14;
@@ -188,21 +186,8 @@ impl RunningVm {
         ioctl_no_data(self.fd.as_raw_fd(), STOP).map(drop)
     }
 
-    pub(crate) fn wait_for_event(&self) -> io::Result<()> {
-        let mut poll_fd = libc::pollfd {
-            fd: self.fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // A process-directed signal may be handled by either console-forwarding
-        // thread, so the status thread cannot rely on `poll` being interrupted.
-        // SAFETY: `poll_fd` points to one initialized `pollfd` for the duration of the call.
-        let result = unsafe { libc::poll(&mut poll_fd, 1, EVENT_POLL_INTERVAL_MS) };
-        if result >= 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+    pub(crate) fn event_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }
 

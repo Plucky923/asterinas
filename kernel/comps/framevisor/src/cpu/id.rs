@@ -35,8 +35,11 @@ impl CpuId {
 
     /// Returns the current CPU ID.
     pub fn current_racy() -> Self {
-        let frame_vcpu_id =
-            crate::task::current_frame_vcpu_id().expect("FrameVM CPU identity is missing");
+        let state = crate::task::current_state_for_current_task()
+            .expect("the current Host task has no FrameVM carrier state");
+        let frame_vcpu_id = state
+            .bound_frame_vcpu_id()
+            .expect("the current FrameVM carrier has no vCPU binding");
         Self::from_raw(frame_vcpu_id.vcpu_index() as u32)
     }
 

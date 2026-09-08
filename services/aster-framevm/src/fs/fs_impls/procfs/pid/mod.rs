@@ -172,7 +172,7 @@ impl ProcFileOps for StatFileOps {
         let comm = posix_thread
             .thread_name()
             .lock()
-            .name()
+            .as_cstr()
             .to_string_lossy()
             .into_owned();
         let state = if thread.is_exited() { 'Z' } else { 'R' };
@@ -252,7 +252,11 @@ impl ProcFileOps for StatusFileOps {
         writeln!(
             printer,
             "Name:\t{}",
-            posix_thread.thread_name().lock().name().to_string_lossy()
+            posix_thread
+                .thread_name()
+                .lock()
+                .as_cstr()
+                .to_string_lossy()
         )?;
         writeln!(printer, "State:\t{}", state)?;
         writeln!(printer, "Tgid:\t{}", pid)?;

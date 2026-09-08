@@ -12,13 +12,13 @@ use ostd::{
 };
 use spin::Once;
 
-use super::{PosixThread, ThreadLocal};
+use super::{PosixThread, ThreadLocal, ThreadName};
 use crate::{
     fs::{file::file_table::FileTable, thread_info::ThreadFsInfo},
     prelude::*,
     process::{
         Credentials, NsProxy, Process, UserNamespace,
-        posix_thread::{name::ThreadName, thread_local::SuppUserContext},
+        posix_thread::thread_local::SuppUserContext,
         signal::{sig_mask::AtomicSigMask, sig_queues::SigQueues},
     },
     sched::{Nice, SchedPolicy},

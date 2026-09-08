@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MPL-2.0
+
+# FrameVM is a downstream fork of the Asterinas core kernel. The source tree
+# remains independently editable; this file records the main revision from
+# which it was last synchronized.
+[upstream]
+base_commit = "437365615c653bb0ad3993fd3c4afc30d033af46"
+upstream_ref = "main"
+source_path = "kernel/core/src"
+service_path = "services/aster-framevm/src"

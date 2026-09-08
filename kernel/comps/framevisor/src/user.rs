@@ -14,6 +14,16 @@ impl<F: FnMut() -> bool> UserModeHooks for KernelEventHooks<F> {
     fn has_kernel_event(&self) -> bool {
         (self.0.borrow_mut())()
     }
+
+    fn pre_user_run(&self, guard: &host_ostd::irq::DisabledLocalIrqGuard) {
+        // `UserMode::execute` is an OSTD boundary: before it enters the
+        // service user context, FrameVisor must restore the current
+        // FrameVM's VMAR and per-thread CPU state.  Leaving this hook at
+        // OSTD's no-op default lets the Host context leak into the service
+        // task, so an otherwise initialized FrameVM can never run its first
+        // userspace instruction.
+        let _ = crate::task::dispatch_pre_user_run(guard);
+    }
 }
 
 /// Code execution in user mode.

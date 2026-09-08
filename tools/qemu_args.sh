@@ -64,13 +64,20 @@ fi
 VIRTIO_NET_FEATURES=",csum=off,ctrl_guest_offloads=off,ctrl_mac_addr=off,ctrl_rx_extra=off,ctrl_rx=off,ctrl_vlan=off,ctrl_vq=off,event_idx=off,guest_announce=off,guest_csum=off,guest_ecn=off,guest_tso4=off,guest_tso6=off,guest_ufo=off,guest_uso4=off,guest_uso6=off,host_ecn=off,host_tso4=off,host_tso6=off,host_ufo=off,host_uso=off,indirect_desc=off,mrg_rxbuf=off,queue_reset=off"
 
 if [ "${STDIO_SERIAL_ONLY:-off}" = "on" ]; then
-    STDIO_CHARDEV_ARGS="-chardev stdio,id=serial0,signal=off,logfile=qemu.log"
+    # QEMU assigns the implicit chardev created by `-serial file=...` the
+    # name `serial0`. Keep the virtio-console chardev distinct so that an
+    # hvc0 console can still redirect the unused UART to a file.
+    STDIO_CHARDEV_ID="serial0"
+    if [ "$CONSOLE" = "hvc0" ]; then
+        STDIO_CHARDEV_ID="virtconsole0"
+    fi
+    STDIO_CHARDEV_ARGS="-chardev stdio,id=$STDIO_CHARDEV_ID,signal=off,logfile=qemu.log"
     MONITOR_ARGS="-monitor none"
     if [ "$CONSOLE" = "hvc0" ]; then
         # Kernel logs are printed to all consoles. Redirect serial output to a file to avoid duplicate logs.
-        CONSOLE_ARGS="-device virtconsole,chardev=serial0 -serial file:qemu-serial.log"
+        CONSOLE_ARGS="-device virtconsole,chardev=$STDIO_CHARDEV_ID -serial file:qemu-serial.log"
     else
-        CONSOLE_ARGS="-serial chardev:serial0"
+        CONSOLE_ARGS="-serial chardev:$STDIO_CHARDEV_ID"
     fi
 else
     STDIO_CHARDEV_ARGS="-chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log"

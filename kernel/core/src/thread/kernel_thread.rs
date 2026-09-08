@@ -19,7 +19,6 @@ pub(crate) struct ThreadOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
     cpu_affinity: CpuSet,
     sched_policy: SchedPolicy,
-    extension: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl ThreadOptions {
@@ -34,7 +33,6 @@ impl ThreadOptions {
             func: Some(Box::new(func)),
             cpu_affinity,
             sched_policy,
-            extension: None,
         }
     }
 
@@ -50,20 +48,6 @@ impl ThreadOptions {
         self
     }
 
-    /// Sets the extension data associated with the task.
-    pub fn extension<T>(self, extension: T) -> Self
-    where
-        T: Any + Send + Sync,
-    {
-        self.extension_any(Box::new(extension))
-    }
-
-    /// Sets the extension data associated with the task, but with an already-boxed value.
-    pub fn extension_any(mut self, extension: Box<dyn Any + Send + Sync>) -> Self {
-        self.extension = Some(extension);
-        self
-    }
-
     /// Builds a new kernel thread without running it immediately.
     pub(crate) fn build(mut self) -> Arc<Task> {
         let task_fn = self.func.take().unwrap();
@@ -73,7 +57,6 @@ impl ThreadOptions {
             current_thread!().exit();
         };
 
-        let extension = self.extension;
         let cpu_affinity = self.cpu_affinity;
         let sched_policy = self.sched_policy;
 
@@ -88,11 +71,7 @@ impl ThreadOptions {
                 ))
             };
 
-            let mut options = TaskOptions::new(thread_fn).data(thread);
-            if let Some(extension) = extension {
-                options = options.extension_any(extension);
-            }
-            options.build().unwrap()
+            TaskOptions::new(thread_fn).data(thread).build().unwrap()
         })
     }
 

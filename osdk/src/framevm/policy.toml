@@ -105,7 +105,7 @@ on_demand_rlibs = ["alloc"]
 rlibs = [
     "align_ext",
     "alloc",
-    "aster_kernel",
+    "asterinas",
     "aster_framevisor",
     "bitflags",
     "cfg_if",

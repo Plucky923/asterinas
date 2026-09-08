@@ -241,14 +241,13 @@ impl FileLike for TimerfdFile {
 
     fn set_status_flags(&self, new_flags: StatusFlags) -> Result<()> {
         self.flags
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |flags| {
+            .update(Ordering::Relaxed, Ordering::Relaxed, |flags| {
                 if new_flags.contains(StatusFlags::O_NONBLOCK) {
-                    Some(flags | TFDFlags::TFD_NONBLOCK)
+                    flags | TFDFlags::TFD_NONBLOCK
                 } else {
-                    Some(flags & !TFDFlags::TFD_NONBLOCK)
+                    flags & !TFDFlags::TFD_NONBLOCK
                 }
-            })
-            .unwrap();
+            });
 
         Ok(())
     }

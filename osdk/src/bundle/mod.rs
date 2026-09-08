@@ -366,14 +366,14 @@ impl Bundle {
             wait_until_guest_kernel_shutdown(config, &mut qemu_monitor_stream);
             info!("VM is paused (shutdown)");
 
-            self.post_run_action(config, Some(&mut qemu_monitor_stream));
+            self.post_run_action(config, action_config, Some(&mut qemu_monitor_stream));
 
             let _ = qemu_monitor_stream.write_all(b"quit\n");
             qemu_child.wait().unwrap()
         } else {
             info!("Running QEMU: {qemu_cmd:#?}");
             let exit_status = qemu_cmd.status().unwrap();
-            self.post_run_action(config, None);
+            self.post_run_action(config, action_config, None);
             exit_status
         };
 
@@ -415,6 +415,10 @@ impl Bundle {
     ) -> Result<ExitStatus, String> {
         self.can_run_with_config(config, action)?;
 
+        let action_config = match action {
+            ActionChoice::Run => &config.run,
+            ActionChoice::Test => &config.test,
+        };
         let qemu_log = config.work_dir.join("qemu.log");
         let _ = std::fs::remove_file(&qemu_log);
         let mut qemu_cmd = self.build_qemu_command(config, action);
@@ -427,7 +431,7 @@ impl Bundle {
         loop {
             match qemu_child.try_wait() {
                 Ok(Some(exit_status)) => {
-                    self.post_run_action(config, None);
+                    self.post_run_action(config, action_config, None);
                     // QEMU may flush its logfile while its process is
                     // shutting down.  Re-read the completed log before
                     // treating a clean exit as a failed marker run.
@@ -451,7 +455,7 @@ impl Bundle {
                 Err(error) => {
                     let _ = qemu_child.kill();
                     let _ = qemu_child.wait();
-                    self.post_run_action(config, None);
+                    self.post_run_action(config, action_config, None);
                     return Err(format!("failed to poll QEMU status: {error}"));
                 }
             }
@@ -459,7 +463,7 @@ impl Bundle {
             if Instant::now() >= deadline {
                 let _ = qemu_child.kill();
                 let _ = qemu_child.wait();
-                self.post_run_action(config, None);
+                self.post_run_action(config, action_config, None);
                 let log_summary = std::fs::read_to_string(&qemu_log)
                     .map(|content| describe_log_failure(&content))
                     .unwrap_or_else(|error| {

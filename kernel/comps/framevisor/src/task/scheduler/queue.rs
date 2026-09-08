@@ -1,310 +1,257 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Service task enqueue, park, and wake bridges.
+//! Exact-main scheduling transitions for Frame tasks.
+//!
+//! The injected Frame scheduler owns every enqueue, update, dequeue, and
+//! pick.  This module mirrors OSTD's generic control flow and replaces only
+//! its final `processor::switch_to_task` call with the nested processor seam.
+//! In particular, it never asks the Host scheduler to choose, wait, yield, or
+//! exit on behalf of an inner task.
 
 use alloc::sync::Arc;
 
-use host_ostd::task::Task as OstdTask;
-
-use super::types::{EnqueueFlags, UpdateFlags};
+use super::{EnqueueFlags, LocalRunQueue, UpdateFlags};
 use crate::{
-    cpu::CpuId,
-    prelude::Result,
     task::{self, Task},
-    vm::{self, FrameVcpuId},
+    vm::FrameVcpuId,
 };
 
-pub(crate) fn enqueue_task(runnable: Arc<Task>, flags: EnqueueFlags) -> Result<()> {
-    let owner_frame_vcpu_id = runnable
-        .ostd_task()
-        .extension()
-        .downcast_ref::<task::FrameTaskData>()
-        .map(task::FrameTaskData::frame_vcpu_id)
-        .or_else(task::current_frame_vcpu_id)
-        .ok_or(crate::Error::InvalidArgs)?;
-    let vm_id = owner_frame_vcpu_id.vm_id();
-    let frame_vm = vm::get_vm_by_id(vm_id).ok_or(crate::Error::InvalidArgs)?;
-    let scheduler = frame_vm.scheduler();
-    let scheduler_is_installed = scheduler.is_some();
-    let initial_cpu = runnable
-        .ostd_task()
-        .extension()
-        .downcast_ref::<task::FrameTaskData>()
-        .and_then(|data| data.schedule_info.cpu.get())
-        .unwrap_or_else(|| CpuId::from_raw(owner_frame_vcpu_id.vcpu_index() as u32));
-    let initial_vcpu_index = initial_cpu.as_usize();
-    if initial_vcpu_index >= frame_vm.vcpu_count() {
-        return Err(crate::Error::InvalidArgs);
-    }
-    let initial_frame_vcpu_id = FrameVcpuId::new(vm_id, initial_vcpu_index);
-    let is_bootstrap_task = runnable
-        .ostd_task()
-        .extension()
-        .downcast_ref::<task::FrameTaskData>()
-        .is_some_and(|data| data.kind() == task::FrameTaskKind::Bootstrap);
-    if is_bootstrap_task {
-        task::bind_vcpu_runtime(runnable.ostd_task().clone(), initial_frame_vcpu_id)?;
-        return Ok(());
-    }
+/// Enqueues a newly built Frame task with the exact `Spawn` protocol.
+pub(crate) fn run_task(runnable: &Arc<Task>) {
+    let state = runnable.state().clone();
+    let scheduler = state
+        .frame_vm()
+        .scheduler()
+        .expect("a runnable Frame task must retain its injected scheduler");
 
-    if flags == EnqueueFlags::HostWake {
-        runnable.schedule_info().cpu.set_anyway(initial_cpu);
+    if let Some(preempt_cpu) = scheduler.enqueue(runnable.clone(), EnqueueFlags::Spawn) {
+        request_virtual_preemption(&state, preempt_cpu);
     }
-
-    // Publish the Host/vCPU binding before the service scheduler can expose
-    // the task on an inner runqueue. Another Host CPU may pick it immediately
-    // after `enqueue` returns.
-    task::bind_vcpu_runtime(runnable.ostd_task().clone(), initial_frame_vcpu_id)?;
-    let target_cpu = scheduler
-        .and_then(|scheduler| scheduler.enqueue(runnable.clone(), flags))
-        .or_else(|| {
-            runnable
-                .ostd_task()
-                .extension()
-                .downcast_ref::<task::FrameTaskData>()
-                .and_then(|data| data.schedule_info.cpu.get())
-        })
-        .unwrap_or(initial_cpu);
-
-    let target_vcpu_index = target_cpu.as_usize();
-    if target_vcpu_index >= frame_vm.vcpu_count() {
-        return Err(crate::Error::InvalidArgs);
-    }
-    let target_frame_vcpu_id = FrameVcpuId::new(vm_id, target_vcpu_index);
-    if !scheduler_is_installed && let Some(group) = frame_vm.sched_group(target_vcpu_index) {
-        group.enqueue_bootstrap_service_task(runnable.ostd_task().clone());
-    }
-    if target_frame_vcpu_id != initial_frame_vcpu_id {
-        task::bind_vcpu_runtime(runnable.ostd_task().clone(), target_frame_vcpu_id)?;
-    }
-    Ok(())
+    // As in main, spawn reaches the current virtual CPU's ordinary
+    // preemption point after publication.  A remote target keeps its request
+    // until that vCPU is resumed by its outer group/doorbell mechanism.
+    might_preempt();
 }
 
-pub(crate) fn park_current(has_unparked: impl Fn() -> bool) -> bool {
-    if has_unparked() {
-        return false;
-    }
-
-    let Some(current_task) = Task::current() else {
-        return false;
-    };
-    let current_ostd_task = current_task.ostd_task().clone();
-    let Some(task_data) = current_ostd_task
-        .extension()
-        .downcast_ref::<task::FrameTaskData>()
-    else {
-        return false;
-    };
-    let Some(scheduler) = task_data.frame_vm.scheduler() else {
-        return false;
-    };
-
-    let mut parked = false;
-    scheduler.mut_local_rq_on_cpu_with(
-        CpuId::from_raw(task_data.frame_vcpu_id().vcpu_index() as u32),
-        &mut |runqueue| {
-            if has_unparked()
-                || runqueue
-                    .current()
-                    .is_none_or(|task| !Arc::ptr_eq(task.ostd_task(), &current_ostd_task))
-            {
-                return;
-            }
-
-            runqueue.update_current(UpdateFlags::Wait);
-            parked = runqueue.dequeue_current().is_some();
-        },
-    );
-    parked
-}
-
-/// Mirrors a backing Host task's wait transition into the service scheduler.
-///
-/// FrameVisor synchronization primitives park the service task before blocking
-/// its backing task. A Host implementation called across the service boundary
-/// can instead block directly through Host OSTD. In that case, the outer
-/// scheduler calls this bridge while it owns the Host runqueue lock.
-pub(crate) fn park_service_task(ostd_task: &Arc<OstdTask>) -> bool {
-    let Some(task_data) = ostd_task.extension().downcast_ref::<task::FrameTaskData>() else {
-        return false;
-    };
-    if task_data.schedule_info.cpu.get().is_none() {
-        // FrameVisor synchronization parks the inner task before its backing
-        // Host task enters a Host wait queue. Only Host-originated waits still
-        // carry an inner CPU here and need the compatibility bridge below.
-        return false;
-    }
-    let Some(frame_vcpu_id) = ostd_task
-        .extension()
-        .downcast_ref::<task::FrameTaskData>()
-        .map(task::FrameTaskData::frame_vcpu_id)
-    else {
-        return false;
-    };
-    let Some(frame_vm) = vm::get_vm_by_id(frame_vcpu_id.vm_id()) else {
-        return false;
-    };
-    let Some(scheduler) = frame_vm.scheduler() else {
-        return false;
-    };
-    let mut parked = false;
-    scheduler.mut_local_rq_on_cpu_with(
-        CpuId::from_raw(frame_vcpu_id.vcpu_index() as u32),
-        &mut |rq| {
-            if rq
-                .current()
-                .is_none_or(|task| !Arc::ptr_eq(task.ostd_task(), ostd_task))
-            {
-                return;
-            }
-
-            let _ = rq.update_current(UpdateFlags::Wait);
-            parked = rq.dequeue_current().is_some();
-        },
-    );
-    parked
-}
-
-/// Mirrors a backing Host task's wake transition into the service scheduler.
-///
-/// The Host scheduler serializes this call with
-/// [`park_service_task`] using its runqueue lock. The service
-/// enqueue is intentionally separate from waking the backing task: the Host
-/// wake path already owns that operation.
-pub fn enqueue_service_task_from_host_wake(ostd_task: Arc<OstdTask>) -> bool {
-    let Some(task_data) = ostd_task.extension().downcast_ref::<task::FrameTaskData>() else {
-        return false;
-    };
-    if task_data.kind() != task::FrameTaskKind::Service
-        || task_data.schedule_info.cpu.get().is_some()
-    {
-        return false;
-    }
-    let runnable = task_data.task(ostd_task.clone());
-    enqueue_task(runnable, EnqueueFlags::HostWake).is_ok()
-}
-
-/// Dequeues the current service task from the FrameVM scheduler before its backing task exits.
-pub(crate) fn exit_current_task() {
-    let Some(current_task) = Task::current() else {
-        return;
-    };
-    let current_ostd_task = current_task.ostd_task().clone();
-    let Some(task_data) = current_ostd_task
-        .extension()
-        .downcast_ref::<task::FrameTaskData>()
-    else {
-        return;
-    };
-
-    let current_kind = task_data.kind();
-    let frame_vcpu_id = task_data.frame_vcpu_id();
-    crate::early_println!(
-        "[FrameVM] service task exit: ptr={:p}, kind={:?}, vm={}, vcpu={}, completed={}",
-        Arc::as_ptr(&current_ostd_task),
-        current_kind,
-        frame_vcpu_id.vm_id(),
-        frame_vcpu_id.vcpu_index(),
-        current_ostd_task.is_completed(),
-    );
-    let service_group = (current_kind != task::FrameTaskKind::Interrupt)
-        .then(|| task_data.group())
-        .flatten();
-    crate::early_println!(
-        "[FrameVM] service task exit resolving scheduler: kind={:?}, vm={}, vcpu={}",
-        current_kind,
-        frame_vcpu_id.vm_id(),
-        frame_vcpu_id.vcpu_index(),
-    );
-
-    let mut next_to_wake = None;
-    if let Some(frame_vm) = vm::get_vm_by_id(frame_vcpu_id.vm_id())
-        && let Some(scheduler) = frame_vm.scheduler()
-    {
-        crate::early_println!(
-            "[FrameVM] service task exit entering inner scheduler: kind={:?}, vm={}, vcpu={}",
-            current_kind,
-            frame_vcpu_id.vm_id(),
-            frame_vcpu_id.vcpu_index(),
-        );
-        let exits_scheduler_bootstrap = current_kind == task::FrameTaskKind::Bootstrap;
-        if exits_scheduler_bootstrap
-            && let Some(group) = task::bootstrap_frame_sched_group_for_ostd_task(&current_ostd_task)
-        {
-            group.complete_bootstrap();
-            crate::early_println!("[FrameVM] service bootstrap state completed");
-        }
-        crate::early_println!("[FrameVM] service task exit locking inner runqueue");
-        scheduler.mut_local_rq_on_cpu_with(
-            CpuId::from_raw(frame_vcpu_id.vcpu_index() as u32),
-            &mut |rq| {
-                crate::early_println!("[FrameVM] service task exit entered inner runqueue");
-                if rq
-                    .current()
-                    .is_some_and(|task| Arc::ptr_eq(task.ostd_task(), &current_ostd_task))
-                {
-                    crate::early_println!("[FrameVM] service task exit removing inner current");
-                    let _ = rq.update_current(UpdateFlags::Exit);
-                    let _ = rq.dequeue_current();
-                }
-
-                if exits_scheduler_bootstrap
-                    && let Some(current) = rq.current()
-                    && !Arc::ptr_eq(current.ostd_task(), &current_ostd_task)
-                {
-                    // Installing the service scheduler can make the init task the
-                    // inner current while the bootstrap backing task is still
-                    // running. Wake that backing task at the bootstrap exit boundary
-                    // so the Host scheduler observes the cross-level handoff.
-                    next_to_wake = Some(current.ostd_task().clone());
-                    return;
-                }
-
-                crate::early_println!("[FrameVM] service task exit leaving inner runqueue");
-            },
-        );
-        crate::early_println!(
-            "[FrameVM] service task exit inner scheduler finished: kind={:?}, vm={}, vcpu={}",
-            current_kind,
-            frame_vcpu_id.vm_id(),
-            frame_vcpu_id.vcpu_index(),
-        );
-        if exits_scheduler_bootstrap {
-            for vcpu_index in 0..frame_vm.vcpu_count() {
-                if let Some(group) = frame_vm.sched_group(vcpu_index) {
-                    group.wake_service_tasks();
-                }
-            }
-        }
-    }
-
-    if let Some(group) = service_group {
-        group.remove_service_task(&current_ostd_task);
-        crate::early_println!(
-            "[FrameVM] service task removed from group: kind={:?}, vm={}, vcpu={}",
-            current_kind,
-            frame_vcpu_id.vm_id(),
-            frame_vcpu_id.vcpu_index(),
-        );
-    }
-    if let Some(next) = next_to_wake {
-        next.wake_up();
-    }
-}
-
-/// Makes a parked task runnable again.
+/// Enqueues a woken Frame task with the exact `Wake` protocol.
 pub(crate) fn unpark_target(runnable: Arc<Task>) {
-    let task_data = runnable
-        .ostd_task()
-        .extension()
-        .downcast_ref::<task::FrameTaskData>();
-    if task_data.is_some_and(|data| data.schedule_info.cpu.get().is_none()) {
-        let flags = if task::current_frame_vcpu_id().is_some() {
-            EnqueueFlags::Wake
-        } else {
-            EnqueueFlags::HostWake
-        };
-        let _ = enqueue_task(runnable.clone(), flags);
+    let state = runnable.state().clone();
+    let scheduler = state
+        .frame_vm()
+        .scheduler()
+        .expect("a Frame waiter must retain its injected scheduler until wake");
+
+    if let Some(preempt_cpu) = scheduler.enqueue(runnable, EnqueueFlags::Wake) {
+        request_virtual_preemption(&state, preempt_cpu);
     }
-    runnable.ostd_task().wake_up();
+}
+
+/// Executes main OSTD's `might_preempt` algorithm for the running virtual
+/// CPU.  A Frame scheduler's preemption bit is distinct from the Host's bit.
+pub(crate) fn might_preempt() {
+    let Some(current) = task::current_task_for_scheduler() else {
+        return;
+    };
+    let Some(group) = running_group(&current) else {
+        return;
+    };
+    if !group.take_inner_preempt() {
+        return;
+    }
+
+    reschedule(|local_rq| match local_rq.try_pick_next() {
+        Some(next_task) => ReschedAction::SwitchTo(next_task.clone()),
+        None => ReschedAction::DoNothing,
+    });
+}
+
+/// Applies main OSTD's `Task::yield_now` transition.
+pub(crate) fn yield_current() {
+    reschedule(|local_rq| {
+        let should_pick_next = local_rq.update_current(UpdateFlags::Yield);
+        if should_pick_next {
+            // `update_current` promises that a successor is available.
+            ReschedAction::SwitchTo(local_rq.pick_next().clone())
+        } else {
+            ReschedAction::DoNothing
+        }
+    });
+}
+
+/// Applies main OSTD's lost-wakeup-safe `park_current` transition.
+pub(crate) fn park_current<F>(has_unparked: F)
+where
+    F: Fn() -> bool,
+{
+    let mut current = None;
+    let mut is_first_try = true;
+
+    reschedule(|local_rq| {
+        let next_task = if is_first_try {
+            if has_unparked() {
+                return ReschedAction::DoNothing;
+            }
+            is_first_try = false;
+
+            // The final predicate check, `Wait` update, and dequeue are
+            // serialized by this same exact local runqueue.  `Wake` can only
+            // enqueue after the dequeue has become visible.
+            let should_pick_next = local_rq.update_current(UpdateFlags::Wait);
+            current = local_rq.dequeue_current();
+            should_pick_next.then(|| local_rq.pick_next().clone())
+        } else {
+            local_rq.try_pick_next().cloned()
+        };
+
+        match next_task {
+            Some(next_task) if Arc::ptr_eq(current.as_ref().unwrap(), &next_task) => {
+                ReschedAction::DoNothing
+            }
+            Some(next_task) => ReschedAction::SwitchTo(next_task),
+            None => ReschedAction::Retry,
+        }
+    });
+}
+
+/// Applies main OSTD's non-returning current-task exit transition.
+///
+/// A normal inner exit selects another Frame task and crosses the nested
+/// processor boundary. If a stopping vCPU has no successor, its bootstrap
+/// continuation is the final carrier of the outer group. Release that exact
+/// continuation before asking OSTD to retire the carrier as an ordinary Host
+/// task; otherwise the Host scheduler could pick the already-finished Frame
+/// carrier again.
+pub(crate) fn exit_current_task() -> ! {
+    let current = task::current_task_for_scheduler()
+        .expect("a FrameVM task entry must retain a current Frame task until exit");
+    clear_virtual_preemption(&current);
+
+    let scheduler = current
+        .state()
+        .frame_vm()
+        .scheduler()
+        .expect("a running FrameVM task must retain its exact scheduler");
+    let mut next_task = None;
+    scheduler.mut_local_rq_with(&mut |local_rq| {
+        let should_pick_next = local_rq.update_current(UpdateFlags::Exit);
+        let _current = local_rq.dequeue_current();
+        next_task = should_pick_next.then(|| local_rq.pick_next().clone());
+    });
+
+    if let Some(next_task) = next_task {
+        switch_selected(current, next_task);
+        unreachable!("an exited FrameVM task must never resume");
+    }
+
+    assert!(
+        current.state().frame_vm().status() == crate::vm::VmStatus::Stopping,
+        "a live FrameVM vCPU must retain an inner successor after task exit"
+    );
+    let group = running_group(&current)
+        .expect("the final FrameVM task must retain its exact outer group");
+    let released = group
+        .release_committed_continuation(&current)
+        .expect("the final FrameVM task must release its exact outer continuation");
+    assert!(
+        Arc::ptr_eq(&released, &current),
+        "the final FrameVM task must release itself as the outer continuation"
+    );
+    // OSTD task exit does not unwind this stack. Release every temporary
+    // Frame-task owner before entering the Host exit path so the service-image
+    // lease can drain once the processor drops the previous carrier.
+    drop(released);
+    drop(group);
+    drop(current);
+    host_ostd::task::__private::exit_current_task();
+}
+
+/// Mirrors OSTD's `reschedule` helper with a Frame processor backend.
+fn reschedule<F>(mut decide: F)
+where
+    F: FnMut(&mut dyn LocalRunQueue<Task>) -> ReschedAction,
+{
+    let Some(current) = task::current_task_for_scheduler() else {
+        return;
+    };
+    clear_virtual_preemption(&current);
+    let scheduler = current
+        .state()
+        .frame_vm()
+        .scheduler()
+        .expect("a FrameVM task entry must retain the injected scheduler for its lifetime");
+
+    let next_task = loop {
+        let mut action = ReschedAction::DoNothing;
+        scheduler.mut_local_rq_with(&mut |local_rq| {
+            action = decide(local_rq);
+        });
+        match action {
+            ReschedAction::DoNothing => return,
+            ReschedAction::Retry => continue,
+            ReschedAction::SwitchTo(next_task) => break next_task,
+        }
+    };
+
+    if !Arc::ptr_eq(&current, &next_task) {
+        switch_selected(current, next_task);
+    }
+}
+
+/// Stages a completed inner A -> B choice and crosses the processor boundary.
+fn switch_selected(from: Arc<Task>, to: Arc<Task>) {
+    let group = running_group(&from)
+        .expect("an exact inner switch requires the current outer FrameSchedGroup");
+    let target_cpu = to
+        .schedule_info()
+        .cpu
+        .get()
+        .expect("an inner-selected FrameVM task must have a virtual CPU");
+    let target = FrameVcpuId::new(to.state().frame_vm().id(), target_cpu.as_usize());
+    assert_eq!(
+        target,
+        group.id(),
+        "an exact local runqueue may only select its owning vCPU's task"
+    );
+
+    group
+        .stage_continuation_switch(&from, to.clone())
+        .expect("one FrameVM vCPU may stage only its exact current switch");
+    let to_host = to.ostd_task().clone();
+    // A direct processor switch never unwinds the source stack. The group
+    // owns both sides of the staged transition, so these temporary handles
+    // must be released before crossing that boundary; otherwise an exited
+    // service task would retain its image lease forever.
+    drop(to);
+    drop(from);
+    host_ostd::task::__private::switch_to_task_with_pre_switch(to_host, |guard| {
+        // Logical PRE is owned by this direct A -> B processor entry;
+        // ordinary Host suspension of the outer group never reaches it.
+        let _ = crate::task::dispatch_pre_schedule(guard);
+    });
+}
+
+fn request_virtual_preemption(state: &crate::task::FrameTaskState, cpu: crate::cpu::CpuId) {
+    if let Some(group) = state.frame_vm().sched_group(cpu.as_usize()) {
+        group.request_inner_preempt();
+    }
+}
+
+fn clear_virtual_preemption(current: &Arc<Task>) {
+    if let Some(group) = running_group(current) {
+        let _ = group.take_inner_preempt();
+    }
+}
+
+fn running_group(current: &Arc<Task>) -> Option<Arc<crate::vm::FrameSchedGroup>> {
+    let current_id = task::current_frame_vcpu_id()?;
+    let frame_vm = current.state().frame_vm();
+    (current_id.vm_id() == frame_vm.id())
+        .then(|| frame_vm.sched_group(current_id.vcpu_index()).cloned())
+        .flatten()
+}
+
+enum ReschedAction {
+    DoNothing,
+    Retry,
+    SwitchTo(Arc<Task>),
 }

@@ -130,8 +130,8 @@ pub(crate) struct FrameVmControl {
     self_ref: Weak<FrameVmControl>,
     cpu_placement: Arc<CpuPlacement>,
     state: Mutex<FrameVmControlState>,
-    terminal_task: Mutex<Option<Arc<Task>>>,
     cleanup_task: Mutex<Option<Arc<Task>>>,
+    cleanup_queued: AtomicBool,
     cleanup_started: AtomicBool,
     retained_console_output: Mutex<Option<RetainedConsoleOutput>>,
     terminal_pollee: Pollee,
@@ -152,8 +152,8 @@ impl FrameVmControl {
                 vm_id: None,
                 pending_exit_code: None,
             }),
-            terminal_task: Mutex::new(None),
             cleanup_task: Mutex::new(None),
+            cleanup_queued: AtomicBool::new(false),
             cleanup_started: AtomicBool::new(false),
             retained_console_output: Mutex::new(None),
             terminal_pollee: Pollee::new(),
@@ -201,10 +201,8 @@ impl FrameVmControl {
     }
 
     pub(crate) fn publish_terminal(&self, code: i32) -> bool {
-        ostd::early_println!("[FrameVM] terminal status acquiring state lock");
         let did_publish = {
             let mut control = self.state.lock();
-            ostd::early_println!("[FrameVM] terminal status state lock acquired");
             if control.state.is_terminal() {
                 false
             } else {
@@ -212,14 +210,8 @@ impl FrameVmControl {
                 true
             }
         };
-        ostd::early_println!(
-            "[FrameVM] terminal status state lock released: publish={}",
-            did_publish
-        );
         if did_publish {
-            ostd::early_println!("[FrameVM] notifying terminal pollers");
             self.terminal_pollee.notify(IoEvents::IN | IoEvents::HUP);
-            ostd::early_println!("[FrameVM] terminal pollers notified");
         }
         did_publish
     }
@@ -235,18 +227,11 @@ impl FrameVmControl {
             }
         };
         if did_set {
-            let current_task = Task::current().map(|task| task.cloned());
-            ostd::early_println!(
-                "[FrameVM] terminal event accepted: code={}, current_task={}",
-                code,
-                current_task.is_some()
-            );
             info!(
                 "[FrameVM] terminal event accepted: code={}, current_task={}",
                 code,
-                current_task.is_some()
+                Task::current().is_some()
             );
-            *self.terminal_task.lock() = current_task;
         }
         did_set
     }
@@ -264,14 +249,12 @@ impl FrameVmControl {
                 true
             }
         };
-        if can_set {
-            *self.terminal_task.lock() = Task::current().map(|task| task.cloned());
-        }
         can_set
     }
 
     fn take_pending_exit(&self) -> Option<i32> {
-        self.state.lock().pending_exit_code.take()
+        let mut control = self.state.lock();
+        control.pending_exit_code.take()
     }
 
     pub(crate) fn retain_console_output(&self, vm: &aster_framevisor::vm::FrameVm) {
@@ -356,32 +339,41 @@ impl FrameVmControl {
     fn start_terminal_cleanup(&self) {
         let cleanup_task = self.cleanup_task.lock().take();
         let Some(cleanup_task) = cleanup_task else {
-            ostd::early_println!("[FrameVM] terminal cleanup task is unavailable");
             warn!("[FrameVM] terminal cleanup task is unavailable");
             return;
         };
-        ostd::early_println!("[FrameVM] starting terminal cleanup task");
         info!("[FrameVM] starting terminal cleanup task");
         cleanup_task.run();
     }
 
-    /// Waits until the task that reported the terminal state has exited.
+    /// Defers cleanup to a normal Host worker.
     ///
-    /// A service power request reports its terminal state before entering its
-    /// non-returning exit path. The loaded service image must remain valid
-    /// until the reporting task has left it.
-    fn wait_for_terminal_task_exit(&self) {
-        let task = self.terminal_task.lock().clone();
-        if let Some(task) = task {
-            ostd::early_println!("[FrameVM] waiting for terminal task to exit");
-            info!("[FrameVM] waiting for terminal task to exit");
-            while !task.is_completed() {
-                Task::yield_now();
-            }
-            ostd::early_println!("[FrameVM] terminal task exited");
-            info!("[FrameVM] terminal task exited");
+    /// The worker may begin before the reporting carrier leaves the CPU, but
+    /// it blocks on service-image ownership before it can tear down the VM.
+    /// Keeping submission outside the carrier-exit path avoids scheduling
+    /// work after OSTD has already dequeued that carrier.
+    fn queue_terminal_cleanup(&self) {
+        if self
+            .cleanup_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
         }
-        self.terminal_task.lock().take();
+        let control_ref = self.self_ref.clone();
+        work_queue::submit_work_func(
+            move || {
+                if let Some(control) = control_ref.upgrade() {
+                    control.start_terminal_cleanup();
+                }
+            },
+            // The reporting service carrier must run its non-returning exit
+            // path before this worker claims stop cleanup. A high-priority
+            // worker can preempt that carrier on a uniprocessor Host and then
+            // wait for the very service-image ownership it prevented from
+            // retiring.
+            WorkPriority::Normal,
+        );
     }
 
     fn begin_cleanup(&self) -> bool {
@@ -393,11 +385,6 @@ impl FrameVmControl {
 
 impl aster_framevisor::vm::FrameVmEventSink for FrameVmControl {
     fn on_power_event(&self, action: aster_framevisor::power::PowerAction, code: i32) {
-        ostd::early_println!(
-            "[FrameVM] Host received power event: action={:?}, code={}",
-            action,
-            code
-        );
         info!(
             "[FrameVM] service requested {:?} with exit code {}",
             action, code
@@ -406,10 +393,15 @@ impl aster_framevisor::vm::FrameVmEventSink for FrameVmControl {
             aster_framevisor::power::PowerAction::Poweroff => code,
             aster_framevisor::power::PowerAction::Restart => code.max(1),
         };
-        if !self.set_pending_exit(code) {
-            return;
+        if self.set_pending_exit(code) {
+            // A service has reached its non-returning power path, so the
+            // FrameVM control operation is complete even if its Host cleanup
+            // task must wait for service-owned state to drain. Publishing now
+            // lets a `framevmm` caller observe the terminal result and avoids
+            // making that result depend on the carrier it is retiring.
+            self.publish_terminal(code);
+            self.queue_terminal_cleanup();
         }
-        self.start_terminal_cleanup();
     }
 
     fn on_assigned_device_failure(&self) {
@@ -568,18 +560,14 @@ fn complete_terminal_framevm_cleanup(control: &Arc<FrameVmControl>) {
         return;
     }
 
-    ostd::early_println!("[FrameVM] terminal cleanup entered");
     info!("[FrameVM] terminal cleanup entered");
-    control.wait_for_terminal_task_exit();
     let exit_code = control.take_pending_exit().unwrap_or(0);
     let exit_code = if cleanup_terminal_framevm_instance(control) {
         -5
     } else {
         exit_code
     };
-    ostd::early_println!("[FrameVM] publishing terminal status: code={}", exit_code);
     control.publish_terminal(exit_code);
-    ostd::early_println!("[FrameVM] terminal status published: code={}", exit_code);
 }
 
 fn register_frame_sched_groups(
@@ -622,15 +610,10 @@ fn destroy_stopped_framevm(vm_id: aster_framevisor::VmId) -> bool {
         );
         return false;
     }
-    ostd::early_println!("[FrameVM] unregistering scheduler groups for {}", vm_id);
     crate::sched::unregister_frame_sched_groups(vm_id);
-    ostd::early_println!("[FrameVM] scheduler groups unregistered for {}", vm_id);
     boot::release_service_resources(vm_id);
-    ostd::early_println!("[FrameVM] service resources released for {}", vm_id);
     drop(framevm);
-    let destroyed = aster_framevisor::destroy_framevm(vm_id);
-    ostd::early_println!("[FrameVM] registry destroy returned for {}", vm_id);
-    destroyed
+    aster_framevisor::destroy_framevm(vm_id)
 }
 
 fn cleanup_terminal_framevm_instance(control: &Arc<FrameVmControl>) -> bool {
@@ -641,18 +624,14 @@ fn cleanup_terminal_framevm_instance(control: &Arc<FrameVmControl>) -> bool {
     let Some(framevm) = aster_framevisor::get_framevm(vm_id) else {
         return false;
     };
-    ostd::early_println!("[FrameVM] terminal cleanup stopping VM {}", vm_id);
     info!("[FrameVM] terminal cleanup stopping VM {}", vm_id);
     control.retain_console_output(&framevm);
     let assigned_pci_failed = framevm.force_stop();
-    ostd::early_println!("[FrameVM] terminal cleanup finished VM stop for {}", vm_id);
     info!("[FrameVM] terminal cleanup finished VM stop for {}", vm_id);
     drop(framevm);
     let destroyed = destroy_stopped_framevm(vm_id);
     if destroyed {
-        ostd::early_println!("[FrameVM] removing CPU placement for {}", vm_id);
         control.cpu_placement.unsubscribe_framevm(vm_id);
-        ostd::early_println!("[FrameVM] CPU placement removed for {}", vm_id);
     }
     assigned_pci_failed
 }
@@ -819,7 +798,6 @@ fn run_framevm_loader(
 
     let vcpu_count = config.vcpu_count;
     let cmdline_append = config.cmdline_append.clone();
-    let elf_data = config.program_image.clone();
     let framevm_id = aster_framevisor::create_framevm_unstarted(config).map_err(|error| {
         let error: Error = error.into();
         Error::with_message(error.error(), "FrameVM instance creation failed")
@@ -874,39 +852,79 @@ fn run_framevm_loader(
         setup_completion.fail(&error);
         return Err(error);
     }
-    let bootstrap_vcpu = aster_framevisor::FrameVcpuId::new(framevm_id, 0);
+    let bootstrap_group = framevm.sched_group(0).ok_or_else(|| {
+        Error::with_message(
+            Errno::EINVAL,
+            "FrameVM bootstrap scheduling group is unavailable",
+        )
+    });
+    let bootstrap_host_cpu = bootstrap_group
+        .as_ref()
+        .map(|group| group.host_cpu())
+        .map_err(|error| *error);
     let service_startup = framevm.begin_task_startup().ok_or_else(|| {
         Error::with_message(Errno::EINVAL, "FrameVM service startup is unavailable")
     });
-    let service_task = service_startup.and_then(|service_startup| {
-        let service_control = control.clone();
-        aster_framevisor::task::TaskOptions::new(move || {
-            let result = run_framevm_service(framevm_id, &elf_data);
-            let Err(error) = result else {
-                service_startup.complete();
-                return;
-            };
-
-            error!("[FrameVM] FrameVM service task error: {:?}", error);
-            service_startup.fail();
-            if service_control.set_pending_exit(-1) {
-                service_control.start_terminal_cleanup();
-            }
-        })
-        .bootstrap_vcpu(bootstrap_vcpu)
-        .build()
-        .map(Arc::new)
-        .map_err(|error| {
-            let error: Error = error.into();
-            Error::with_message(error.error(), "FrameVM service task startup failed")
+    let service_task = bootstrap_group.and_then(|bootstrap_group| {
+        service_startup.and_then(|service_startup| {
+            let service_control = control.clone();
+            aster_framevisor::task::build_bootstrap_task(&framevm, bootstrap_group, move || {
+                let load_result = (|| {
+                    let elf_data = aster_framevisor::get_framevm(framevm_id)
+                        .and_then(|framevm| framevm.take_service_image())
+                        .ok_or_else(|| {
+                            Error::with_message(
+                                Errno::EINVAL,
+                                "FrameVM service image is unavailable",
+                            )
+                        })?;
+                    let result = load_framevm_service(framevm_id, &elf_data);
+                    drop(elf_data);
+                    result
+                })();
+                match load_result {
+                    Ok(()) => {
+                        // A successful service entry transfers execution to
+                        // the first inner task before its bootstrap function
+                        // can return. Complete startup before that handoff so
+                        // the Host-side `framevmm` request does not wait for
+                        // the service's eventual shutdown.
+                        service_startup.complete();
+                        if let Err(error) = start_framevm_service(framevm_id) {
+                            error!("[FrameVM] FrameVM service task error: {:?}", error);
+                            let _ = service_control.set_pending_exit(-1);
+                        }
+                    }
+                    Err(error) => {
+                        error!("[FrameVM] FrameVM service load error: {:?}", error);
+                        service_startup.fail();
+                        let _ = service_control.set_pending_exit(-1);
+                    }
+                }
+            })
+            .map(Arc::new)
+            .map_err(|error| {
+                let error: Error = error.into();
+                Error::with_message(error.error(), "FrameVM service task startup failed")
+            })
         })
     });
     restore_current_thread_vm_space();
-    match service_task {
-        Ok(service_task) => {
+    match service_task.and_then(|service_task| {
+        bootstrap_host_cpu.map(|bootstrap_host_cpu| (service_task, bootstrap_host_cpu))
+    }) {
+        Ok((service_task, bootstrap_host_cpu)) => {
             if control.mark_running() {
                 setup_completion.complete();
-                work_queue::submit_work_func(move || service_task.run(), WorkPriority::Normal);
+                // The Host class scheduler owns this vCPU group on one
+                // physical CPU. Starting its first continuation from a worker
+                // on that same CPU avoids a synchronous remote-preemption
+                // handshake before the group has a runnable carrier.
+                work_queue::submit_work_func_on_cpu(
+                    bootstrap_host_cpu,
+                    move || service_task.run(),
+                    WorkPriority::Normal,
+                );
             } else {
                 let error = Error::with_message(
                     Errno::ECANCELED,
@@ -1051,8 +1069,8 @@ fn open_framevm_artifact(pathname: &str) -> Result<Arc<dyn FileLike>> {
     Ok(framevm_file)
 }
 
-/// Loads and runs FrameVM from ELF data.
-fn run_framevm_service(vm_id: aster_framevisor::VmId, elf_data: &[u8]) -> Result<()> {
+/// Loads the FrameVM service program from ELF data.
+fn load_framevm_service(vm_id: aster_framevisor::VmId, elf_data: &[u8]) -> Result<()> {
     let frame_vm = aster_framevisor::get_framevm(vm_id)
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "missing FrameVM instance"))?;
     let allocate_segment =
@@ -1064,9 +1082,14 @@ fn run_framevm_service(vm_id: aster_framevisor::VmId, elf_data: &[u8]) -> Result
             .map(|addr| addr as u64)
     };
     let observe_symbol = |symbol: &ostd::loader::DefinedSymbol<'_>| {
-        frame_vm
-            .observe_service_symbol(symbol)
-            .map_err(|_| ostd::Error::InvalidArgs)
+        frame_vm.observe_service_symbol(symbol).map_err(|error| {
+            error!(
+                "[FrameVM] rejected service provider symbol {:?}: {:?}",
+                symbol.name(),
+                error
+            );
+            ostd::Error::InvalidArgs
+        })
     };
     let load_context = ostd::loader::FrameVmLoadContext::new(
         &allocate_segment,
@@ -1077,15 +1100,24 @@ fn run_framevm_service(vm_id: aster_framevisor::VmId, elf_data: &[u8]) -> Result
     let service_program = match ostd::loader::Program::load_with_context(elf_data, &load_context) {
         Ok(program) => program,
         Err(error) => {
+            error!("[FrameVM] failed to load the service image: {:?}", error);
             frame_vm.abort_service_load();
             return Err(error.into());
         }
     };
     if let Err(error) = frame_vm.install_program(service_program) {
+        error!("[FrameVM] failed to install the service image: {:?}", error);
         frame_vm.abort_service_load();
         return Err(error.into());
     }
 
+    Ok(())
+}
+
+/// Runs a previously loaded FrameVM service program.
+fn start_framevm_service(vm_id: aster_framevisor::VmId) -> Result<()> {
+    let frame_vm = aster_framevisor::get_framevm(vm_id)
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "missing FrameVM instance"))?;
     // Invoke the entry point on the FrameVisor service task;
     // FrameVM sets up its own runtime tasks during initialization.
     if aster_framevisor::current_frame_vcpu_id().is_none() {

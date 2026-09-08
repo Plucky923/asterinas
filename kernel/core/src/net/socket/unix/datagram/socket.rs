@@ -306,7 +306,7 @@ impl Socket for UnixDatagramSocket {
             warn!("unsupported flags: {:?}", flags);
         }
 
-        let receive_fn = || self.local_receiver.try_recv(writer, flags);
+        let mut receive_fn = || self.local_receiver.try_recv(writer, flags);
         let (output, control_messages, peer_addr) = if flags.contains(RecvFlags::MSG_DONTWAIT) {
             receive_fn()
         } else {

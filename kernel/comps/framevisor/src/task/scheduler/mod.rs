@@ -8,12 +8,10 @@ mod share;
 mod timer;
 mod types;
 
-pub use queue::enqueue_service_task_from_host_wake;
-pub(crate) use queue::{
-    enqueue_task, exit_current_task, park_current, park_service_task, unpark_target,
-};
+pub(crate) use queue::{exit_current_task, park_current, run_task, unpark_target, yield_current};
 
 use crate::{task, vm};
+
 /// Installs the scheduler owned by the current FrameVM.
 pub fn inject_scheduler(scheduler: &'static dyn Scheduler<task::Task>) {
     let frame_vcpu_id =
@@ -24,6 +22,26 @@ pub fn inject_scheduler(scheduler: &'static dyn Scheduler<task::Task>) {
         frame_vm.install_scheduler(scheduler),
         "a scheduler has already been initialized"
     );
+}
+
+/// Registers the Host-carried bootstrap task with the current FrameVM's
+/// service scheduler.
+///
+/// The bootstrap task intentionally is not a service `Thread`, but it must
+/// remain selectable until startup publishes ordinary service tasks.
+pub fn install_current_bootstrap_task() {
+    let bootstrap = task::current_task_for_scheduler()
+        .expect("bootstrap scheduler registration requires a current FrameVM task");
+    assert!(
+        bootstrap.state().kind() == task::FrameTaskKind::Bootstrap,
+        "only a FrameVM bootstrap task may register the startup continuation"
+    );
+    let scheduler = bootstrap
+        .state()
+        .frame_vm()
+        .scheduler()
+        .expect("bootstrap scheduler registration requires an injected scheduler");
+    scheduler.install_bootstrap_task(bootstrap);
 }
 
 pub use share::{

@@ -33,6 +33,14 @@ pub mod work_queue;
 pub type Tid = u32;
 
 fn pre_schedule_handler(irq_guard: &DisabledLocalIrqGuard) {
+    save_supplemental_user_context(irq_guard);
+}
+
+fn physical_pre_schedule_handler(irq_guard: &DisabledLocalIrqGuard) {
+    save_supplemental_user_context(irq_guard);
+}
+
+fn save_supplemental_user_context(irq_guard: &DisabledLocalIrqGuard) {
     let Some(task) = Task::current() else {
         return;
     };
@@ -43,7 +51,11 @@ fn pre_schedule_handler(irq_guard: &DisabledLocalIrqGuard) {
     thread_local.supp_user_context().before_schedule(irq_guard);
 }
 
-fn post_schedule_handler() -> bool {
+fn physical_post_schedule_handler() {
+    activate_current_vmar();
+}
+
+fn post_schedule_handler() {
     // Scheduling statistics are best effort. The callback can be reached
     // while a task is being detached from its FrameVM, so a missing or stale
     // vCPU identity must not panic in the scheduler hook.
@@ -54,17 +66,20 @@ fn post_schedule_handler() -> bool {
         let _ = counter.add_on_cpu(vcpu_index, 1);
     }
 
-    let task = Task::current().unwrap();
-    let Some(thread_local) = task.as_thread_local() else {
-        return true;
-    };
+    activate_current_vmar();
+}
 
+fn activate_current_vmar() {
+    let Some(task) = Task::current() else {
+        return;
+    };
+    let Some(thread_local) = task.as_thread_local() else {
+        return;
+    };
     let vmar = thread_local.vmar().borrow();
     if let Some(vmar) = vmar.as_ref() {
-        vmar.vm_space().activate()
+        vmar.vm_space().activate();
     }
-
-    true
 }
 
 fn pre_user_run_handler(guard: &DisabledLocalIrqGuard) {
@@ -101,6 +116,8 @@ pub(super) fn init() -> Result<()> {
     CONTEXT_SWITCH_COUNTER.call_once(|| counter);
     ostd::task::inject_pre_schedule_handler(pre_schedule_handler);
     ostd::task::inject_post_schedule_handler(post_schedule_handler);
+    ostd::task::__private::inject_physical_pre_schedule_handler(physical_pre_schedule_handler);
+    ostd::task::__private::inject_physical_post_schedule_handler(physical_post_schedule_handler);
     ostd::task::inject_pre_user_run_handler(pre_user_run_handler);
     ostd::task::inject_shutdown_handler(shutdown_handler);
     ostd::arch::trap::inject_user_page_fault_handler(exception::page_fault_handler);
@@ -215,7 +232,7 @@ impl Thread {
     #[cfg_attr(not(ktest), expect(dead_code))]
     #[track_caller]
     pub fn join(&self) {
-        while !self.is_exited() || self.task.upgrade().is_some_and(|task| !task.is_completed()) {
+        while !self.is_exited() {
             Self::yield_now();
         }
     }

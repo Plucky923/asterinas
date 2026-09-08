@@ -20,16 +20,15 @@ use crate::{
     fs::{
         cgroupfs::{CgroupSysNode, root_cpu_placement},
         file::{
-            AccessMode, CreationFlags, FileLike, StatusFlags,
+            AccessMode, CreationFlags, FileCommon, FileLike, StatusFlags,
             file_table::{FdFlags, FileDesc},
         },
         pseudofs::AnonInodeFs,
-        vfs::path::Path,
     },
     net::socket::{
         Socket,
         unix::UnixDatagramSocket,
-        util::{MessageHeader, SendRecvFlags},
+        util::{MessageHeader, RecvFlags, SendFlags},
     },
     prelude::*,
     process::{
@@ -78,7 +77,7 @@ pub(super) struct FrameVmDriveFile {
 
 impl FrameVmDriveFile {
     pub(super) fn new(file: Arc<dyn FileLike>, readonly: bool) -> Result<Self> {
-        if !file.path().metadata().type_.is_regular_file() {
+        if !file.path().metadata()?.type_.is_regular_file() {
             return_errno_with_message!(Errno::EINVAL, "FrameVM drive must be a regular file");
         }
 
@@ -187,7 +186,7 @@ impl FramevisorNetworkEndpoint for CapturedNetworkEndpoint {
         match socket.sendmsg(
             &mut reader,
             MessageHeader::new(None, Vec::new()),
-            SendRecvFlags::MSG_DONTWAIT,
+            SendFlags::MSG_DONTWAIT,
         ) {
             Ok(written_len) if written_len == ethernet_frame.len() => Ok(()),
             Ok(_) => Err(NetworkEndpointError::Lost),
@@ -204,8 +203,8 @@ impl FramevisorNetworkEndpoint for CapturedNetworkEndpoint {
             return Err(NetworkEndpointError::Lost);
         };
         let mut writer = VmWriter::from(receive_buffer.as_mut_bytes()).to_fallible();
-        match socket.recvmsg(&mut writer, SendRecvFlags::MSG_DONTWAIT) {
-            Ok((frame_len, _)) if frame_len <= receive_buffer.len() => Ok(Some(frame_len)),
+        match socket.recvmsg(&mut writer, RecvFlags::MSG_DONTWAIT) {
+            Ok((output, _)) if output.len() <= receive_buffer.len() => Ok(Some(output.len())),
             Ok(_) => Err(NetworkEndpointError::Lost),
             Err(error) if error.error() == Errno::EAGAIN => Err(NetworkEndpointError::NotReady),
             Err(_) => Err(NetworkEndpointError::Lost),
@@ -246,7 +245,7 @@ impl Observer<IoEvents> for NetworkReadinessObserver {
 pub(super) struct FrameVmFile {
     inner: Mutex<VmInner>,
     control: Arc<FrameVmControl>,
-    pseudo_path: Path,
+    common: FileCommon,
     task_group: Arc<TaskGroup>,
 }
 
@@ -272,6 +271,8 @@ impl FrameVmFile {
             })
             .unwrap_or_else(root_cpu_placement);
 
+        let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:[framevm-vm]".to_string());
+
         Arc::new(Self {
             inner: Mutex::new(VmInner {
                 vcpu_count,
@@ -288,7 +289,7 @@ impl FrameVmFile {
                 assigned_pci: Vec::new(),
             }),
             control: FrameVmControl::new(cpu_placement.clone()),
-            pseudo_path: AnonInodeFs::new_path(|_| "anon_inode:[framevm-vm]".to_string()),
+            common: FileCommon::new(pseudo_path, AccessMode::O_RDWR, StatusFlags::empty()),
             task_group,
         })
     }
@@ -366,7 +367,6 @@ impl FrameVmFile {
         );
         match crate::vmm::start_framevm(config, self.control.clone(), self.task_group.clone()) {
             Ok(()) => {
-                ostd::early_println!("[FrameVM] START ioctl setup returned");
                 if self
                     .control
                     .vm_id()
@@ -789,12 +789,8 @@ impl FileLike for FrameVmFile {
         })
     }
 
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::O_RDWR
-    }
-
-    fn path(&self) -> &Path {
-        &self.pseudo_path
+    fn common(&self) -> &FileCommon {
+        &self.common
     }
 
     fn dump_proc_fdinfo(self: Arc<Self>, fd_flags: FdFlags) -> Box<dyn Display> {
@@ -806,7 +802,7 @@ impl FileLike for FrameVmFile {
         impl Display for FdInfo {
             fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 let inner = self.inner.inner.lock();
-                let mut flags = self.inner.access_mode() as u32;
+                let mut flags = self.inner.common.access_mode() as u32;
                 if self.fd_flags.contains(FdFlags::CLOEXEC) {
                     flags |= CreationFlags::O_CLOEXEC.bits();
                 }

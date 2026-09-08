@@ -18,6 +18,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::{alloc::Layout, ptr, slice};
 
 use memory_region::{MemoryRegion, MemoryRegionArray};
 use spin::Once;
@@ -46,6 +47,11 @@ pub fn boot_info() -> &'static BootInfo {
 }
 
 static INFO: Once<BootInfo> = Once::new();
+
+// The bootloader owns the storage backing boot modules. FrameVM keeps its
+// import table for the lifetime of the host, so retain an OSTD-owned copy
+// before the normal boot path starts using physical memory.
+static FRAMEVM_SYMBOL_IMAGE: Once<FrameVmSymbolImage> = Once::new();
 
 /// OSTD-internal symbol images supplied by the boot protocol.
 ///
@@ -171,6 +177,36 @@ pub(crate) static EARLY_INFO: Once<EarlyBootInfo> = Once::new();
 /// Returns the bootloader-provided symbol images to OSTD's symbol subsystem.
 pub(crate) fn symbol_sources() -> BootSymbolSources {
     EARLY_INFO.get().unwrap().symbol_sources
+}
+
+/// Copies the bootloader-provided FrameVM symbol payload into early-allocated
+/// memory.
+///
+/// The copy is made as soon as the early frame allocator is available. The
+/// original module remains part of the boot memory map, but it is not a sound
+/// backing store for a symbol table retained after boot initialization.
+pub(crate) fn retain_framevm_symbol_image() {
+    let Some(image) = symbol_sources().framevm_fvsymtb() else {
+        return;
+    };
+    let bytes = image.bytes();
+    let layout = Layout::from_size_align(bytes.len(), crate::mm::PAGE_SIZE).unwrap();
+    let paddr = crate::mm::frame::allocator::early_alloc(layout)
+        .expect("failed to retain the FrameVM symbol-table boot module");
+    let vaddr = crate::mm::paddr_to_vaddr(paddr) as *mut u8;
+
+    // SAFETY: `early_alloc` returns a distinct, page-aligned range large
+    // enough for `layout`; `bytes` denotes the resident boot module.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), vaddr, bytes.len()) };
+    // SAFETY: the copied range is initialized above and is retained for the
+    // whole lifetime of the kernel by the early frame allocation.
+    let retained = unsafe { slice::from_raw_parts(vaddr, bytes.len()) };
+    FRAMEVM_SYMBOL_IMAGE.call_once(|| FrameVmSymbolImage::new(retained));
+}
+
+/// Returns the FrameVM symbol payload retained by OSTD during early boot.
+pub(crate) fn retained_framevm_symbol_image() -> Option<FrameVmSymbolImage> {
+    FRAMEVM_SYMBOL_IMAGE.get().copied()
 }
 
 /// Initializes the boot information.

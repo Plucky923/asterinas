@@ -601,7 +601,7 @@ impl Vmo {
             let cached_page = self
                 .pages
                 .load(&guard, page_idx_range.start as u64)
-                .filter(|page| !page.is_uninit())
+                .filter(|page| !page.meta().is_uninit())
                 .map(|page| page.clone());
             drop(guard);
             if let Some(page) = cached_page {
@@ -819,16 +819,17 @@ impl Vmo {
                     continue;
                 }
 
-                let written_size = match reader.write_fallible(&mut locked_page.writer().skip(*page_offset)) {
-                    Ok(written_size) => written_size,
-                    Err((err, written_size)) => {
-                        // If the page is not initialized, keep it as it is on a partial write.
-                        if written_size > 0 && state.is_up_to_date() {
-                            locked_page.set_dirty();
+                let written_size =
+                    match reader.write_fallible(&mut locked_page.writer().skip(*page_offset)) {
+                        Ok(written_size) => written_size,
+                        Err((err, written_size)) => {
+                            // If the page is not initialized, keep it as it is on a partial write.
+                            if written_size > 0 && state.is_up_to_date() {
+                                locked_page.set_dirty();
+                            }
+                            return Err(Error::from(err));
                         }
-                        return Err(Error::from(err));
-                    }
-                };
+                    };
 
                 if written_size > 0 {
                     locked_page.set_dirty();

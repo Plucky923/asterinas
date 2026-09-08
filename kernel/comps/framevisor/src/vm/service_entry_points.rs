@@ -10,8 +10,9 @@ use host_ostd::sync::{LocalIrqDisabled as HostLocalIrqDisabled, SpinLock};
 
 use crate::{irq::DisabledLocalIrqGuard, prelude::Result};
 
-type PostScheduleEntryPoint = fn() -> bool;
+type PostScheduleEntryPoint = fn();
 type PreScheduleEntryPoint = fn(&DisabledLocalIrqGuard);
+type PhysicalPostScheduleEntryPoint = fn();
 type ShutdownEntryPoint = fn();
 pub(crate) type UserPageFaultEntryPoint = fn(&CpuException) -> Result<(), ()>;
 
@@ -75,6 +76,17 @@ impl ServiceEntryPoints {
         self.state.lock().entry_points.post_schedule = Some(entrypoint);
     }
 
+    pub(crate) fn install_physical_pre_schedule(&self, entrypoint: PreScheduleEntryPoint) {
+        self.state.lock().entry_points.physical_pre_schedule = Some(entrypoint);
+    }
+
+    pub(crate) fn install_physical_post_schedule(
+        &self,
+        entrypoint: PhysicalPostScheduleEntryPoint,
+    ) {
+        self.state.lock().entry_points.physical_post_schedule = Some(entrypoint);
+    }
+
     /// Installs the pre-user-run entry point.
     pub(crate) fn install_pre_user_run(&self, entrypoint: PreScheduleEntryPoint) {
         self.state.lock().entry_points.pre_user_run = Some(entrypoint);
@@ -98,6 +110,18 @@ impl ServiceEntryPoints {
     /// Admits one post-schedule call while the service image remains mapped.
     pub(crate) fn enter_post_schedule(&self) -> Option<EntryPointCall<'_, PostScheduleEntryPoint>> {
         self.enter(|entry_points| entry_points.post_schedule)
+    }
+
+    pub(crate) fn enter_physical_pre_schedule(
+        &self,
+    ) -> Option<EntryPointCall<'_, PreScheduleEntryPoint>> {
+        self.enter(|entry_points| entry_points.physical_pre_schedule)
+    }
+
+    pub(crate) fn enter_physical_post_schedule(
+        &self,
+    ) -> Option<EntryPointCall<'_, PhysicalPostScheduleEntryPoint>> {
+        self.enter(|entry_points| entry_points.physical_post_schedule)
     }
 
     /// Admits one pre-user-run call while the service image remains mapped.
@@ -160,6 +184,8 @@ impl ServiceEntryPoints {
 struct EntryPointSet {
     pre_schedule: Option<PreScheduleEntryPoint>,
     post_schedule: Option<PostScheduleEntryPoint>,
+    physical_pre_schedule: Option<PreScheduleEntryPoint>,
+    physical_post_schedule: Option<PhysicalPostScheduleEntryPoint>,
     pre_user_run: Option<PreScheduleEntryPoint>,
     shutdown: Option<ShutdownEntryPoint>,
     user_page_fault: Option<UserPageFaultEntryPoint>,

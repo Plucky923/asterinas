@@ -47,6 +47,7 @@ const FRAMEVM_SOURCE_HASH_ROOTS: &[&str] = &[
     "kernel/comps/framev-sock",
     "kernel/comps/framevisor",
     "kernel/comps/framevisor-ostd",
+    "kernel/core",
     "kernel/libs",
     "ostd/Cargo.toml",
     "ostd/libs",
@@ -64,6 +65,7 @@ const FRAMEVM_SOURCE_HASH_ROOTS: &[&str] = &[
     "test/initramfs/src/init",
     "test/initramfs/src/framevm",
     "tools/framevmm",
+    "tools/sync_framevm_from_main.sh",
     "test/initramfs/src/regression/network/vsock/framev_vsock_echo.c",
     "tools/framevm-service-check",
 ];
@@ -1421,5 +1423,13 @@ mod tests {
                 "FrameVM source hash omits service-object input {service_input}"
             );
         }
+    }
+
+    #[test]
+    fn framevm_source_hash_covers_host_scheduler_inputs() {
+        assert!(
+            FRAMEVM_SOURCE_HASH_ROOTS.contains(&"kernel/core"),
+            "FrameVM source hash must invalidate cached Host artifacts after scheduler changes"
+        );
     }
 }

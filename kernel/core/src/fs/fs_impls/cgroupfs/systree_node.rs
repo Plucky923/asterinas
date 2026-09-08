@@ -196,7 +196,7 @@ impl CgroupMembership {
         new_cgroup.controller.charge_pids();
 
         for task in queued_tasks {
-            task.wake_up();
+            crate::sched::wake_task(task);
         }
 
         // Remove the process from the old cgroup second.
@@ -251,7 +251,7 @@ impl CgroupMembership {
         let queued_tasks = new_cgroup.controller.apply_cpu_control_to_process(process);
         debug_assert!(queued_tasks.is_empty());
         for task in queued_tasks {
-            task.wake_up();
+            crate::sched::wake_task(task);
         }
 
         Ok(())
@@ -272,7 +272,7 @@ impl CgroupMembership {
             .apply_cpu_control_to_process(process);
 
         for task in queued_tasks {
-            task.wake_up();
+            crate::sched::wake_task(task);
         }
 
         self.remove_process_from_node(process, &old_cgroup);
@@ -758,7 +758,7 @@ inherit_sys_branch_node!(CgroupSystem, fields, {
                 )?;
                 drop(cgroup_guard);
                 for task in queued_tasks {
-                    task.wake_up();
+                    crate::sched::wake_task(task);
                 }
 
                 Ok(len)
@@ -897,7 +897,7 @@ inherit_sys_branch_node!(CgroupNode, fields, {
                 let queued_tasks = queued_tasks?;
                 drop(cgroup_guard);
                 for task in queued_tasks {
-                    task.wake_up();
+                    crate::sched::wake_task(task);
                 }
 
                 Ok(len)

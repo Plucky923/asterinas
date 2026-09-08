@@ -6,17 +6,16 @@
 //! outer virtio-vsock device and the inner FrameV Sock device used by FrameVM.
 //! The mux keeps the Linux socket ABI stable while choosing the transport.
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use crate::{
     events::IoEvents,
-    fs::{file::FileLike, pseudofs::SockFs, vfs::path::Path},
+    fs::file::{FileCommon, FileLike},
     net::socket::{
         Socket,
         framevsock::FrameVsockStreamSocket,
+        new_socket_common,
         options::SocketOption,
         private::SocketPrivate,
-        util::{MessageHeader, SendRecvFlags, SockShutdownCmd, SocketAddr},
+        util::{MessageHeader, RecvFlags, RecvOutput, SendFlags, SockShutdownCmd, SocketAddr},
         vsock::{VsockSocketAddr, VsockStreamSocket},
     },
     prelude::*,
@@ -26,8 +25,7 @@ use crate::{
 
 pub struct VsockMuxStreamSocket {
     state: RwLock<State>,
-    is_nonblocking: AtomicBool,
-    pseudo_path: Path,
+    common: Arc<FileCommon>,
 }
 
 enum State {
@@ -57,24 +55,24 @@ enum Provider {
 
 impl VsockMuxStreamSocket {
     pub fn new(is_nonblocking: bool) -> Result<Arc<Self>> {
+        let common = Arc::new(new_socket_common(is_nonblocking));
         Ok(Arc::new(Self {
-            state: RwLock::new(State::Init(ProviderPair::new(is_nonblocking)?)),
-            is_nonblocking: AtomicBool::new(is_nonblocking),
-            pseudo_path: SockFs::new_path(),
+            state: RwLock::new(State::Init(ProviderPair::new(common.clone())?)),
+            common,
         }))
     }
 
-    fn try_accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
+    fn try_accept(&self, is_nonblocking: bool) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
         let state = self.state.read();
         let State::Listen(pair) = &*state else {
             return_errno_with_message!(Errno::EINVAL, "the socket is not listening");
         };
 
         if pair.framev_listening && pair.framev.poll(IoEvents::IN, None).contains(IoEvents::IN) {
-            return pair.framev.accept();
+            return pair.framev.accept(is_nonblocking);
         }
         if pair.virtio_listening && pair.virtio.poll(IoEvents::IN, None).contains(IoEvents::IN) {
-            return pair.virtio.accept();
+            return pair.virtio.accept(is_nonblocking);
         }
 
         return_errno_with_message!(Errno::EAGAIN, "no pending vsock connection");
@@ -109,20 +107,15 @@ impl Clone for Provider {
 }
 
 impl ProviderPair {
-    fn new(is_nonblocking: bool) -> Result<Self> {
+    fn new(common: Arc<FileCommon>) -> Result<Self> {
         Ok(Self {
-            virtio: VsockStreamSocket::new(is_nonblocking)?,
-            framev: Arc::new(FrameVsockStreamSocket::new(is_nonblocking)?),
+            virtio: VsockStreamSocket::new_with_common(common.clone())?,
+            framev: Arc::new(FrameVsockStreamSocket::new_with_common(common)?),
             virtio_bound: false,
             framev_bound: false,
             virtio_listening: false,
             framev_listening: false,
         })
-    }
-
-    fn set_nonblocking(&self, nonblocking: bool) {
-        self.virtio.set_nonblocking(nonblocking);
-        self.framev.set_nonblocking(nonblocking);
     }
 
     fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
@@ -174,13 +167,6 @@ impl ProviderPair {
 }
 
 impl Provider {
-    fn set_nonblocking(&self, nonblocking: bool) {
-        match self {
-            Self::Virtio(socket) => socket.set_nonblocking(nonblocking),
-            Self::FrameV(socket) => socket.set_nonblocking(nonblocking),
-        }
-    }
-
     fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
         match self {
             Self::Virtio(socket) => socket.poll(mask, poller),
@@ -234,7 +220,7 @@ impl Provider {
         &self,
         reader: &mut dyn MultiRead,
         message_header: MessageHeader,
-        flags: SendRecvFlags,
+        flags: SendFlags,
     ) -> Result<usize> {
         match self {
             Self::Virtio(socket) => socket.sendmsg(reader, message_header, flags),
@@ -245,8 +231,8 @@ impl Provider {
     fn recvmsg(
         &self,
         writer: &mut dyn MultiWrite,
-        flags: SendRecvFlags,
-    ) -> Result<(usize, MessageHeader)> {
+        flags: RecvFlags,
+    ) -> Result<(RecvOutput, MessageHeader)> {
         match self {
             Self::Virtio(socket) => socket.recvmsg(writer, flags),
             Self::FrameV(socket) => socket.recvmsg(writer, flags),
@@ -268,18 +254,7 @@ impl Pollable for VsockMuxStreamSocket {
 
 impl SocketPrivate for VsockMuxStreamSocket {
     fn is_nonblocking(&self) -> bool {
-        self.is_nonblocking.load(Ordering::Relaxed)
-    }
-
-    fn set_nonblocking(&self, nonblocking: bool) {
-        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
-        let state = self.state.read();
-        match &*state {
-            State::Init(pair) | State::Listen(pair) => pair.set_nonblocking(nonblocking),
-            State::Transitioning => {}
-            State::Connecting { pair, .. } => pair.set_nonblocking(nonblocking),
-            State::Connected(provider) => provider.set_nonblocking(nonblocking),
-        }
+        self.common.is_nonblocking()
     }
 }
 
@@ -303,7 +278,7 @@ impl Socket for VsockMuxStreamSocket {
             return Ok(());
         }
 
-        *state = State::Init(ProviderPair::new(self.is_nonblocking())?);
+        *state = State::Init(ProviderPair::new(self.common.clone())?);
         virtio_result.and(framev_result)
     }
 
@@ -383,7 +358,7 @@ impl Socket for VsockMuxStreamSocket {
             pair.framev_listening = true;
         }
         if !pair.virtio_listening && !pair.framev_listening {
-            *state = State::Init(ProviderPair::new(self.is_nonblocking())?);
+            *state = State::Init(ProviderPair::new(self.common.clone())?);
             return virtio_result.and(framev_result);
         }
 
@@ -393,7 +368,7 @@ impl Socket for VsockMuxStreamSocket {
 
         let State::Init(pair) = core::mem::replace(
             &mut *state,
-            State::Init(ProviderPair::new(self.is_nonblocking())?),
+            State::Init(ProviderPair::new(self.common.clone())?),
         ) else {
             unreachable!();
         };
@@ -401,8 +376,8 @@ impl Socket for VsockMuxStreamSocket {
         Ok(())
     }
 
-    fn accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
-        self.block_on(IoEvents::IN, || self.try_accept())
+    fn accept(&self, is_nonblocking: bool) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
+        self.block_on(IoEvents::IN, None, || self.try_accept(is_nonblocking))
     }
 
     fn shutdown(&self, cmd: SockShutdownCmd) -> Result<()> {
@@ -447,7 +422,7 @@ impl Socket for VsockMuxStreamSocket {
         &self,
         reader: &mut dyn MultiRead,
         message_header: MessageHeader,
-        flags: SendRecvFlags,
+        flags: SendFlags,
     ) -> Result<usize> {
         self.connected_provider()?
             .sendmsg(reader, message_header, flags)
@@ -456,12 +431,12 @@ impl Socket for VsockMuxStreamSocket {
     fn recvmsg(
         &self,
         writer: &mut dyn MultiWrite,
-        flags: SendRecvFlags,
-    ) -> Result<(usize, MessageHeader)> {
+        flags: RecvFlags,
+    ) -> Result<(RecvOutput, MessageHeader)> {
         self.connected_provider()?.recvmsg(writer, flags)
     }
 
-    fn pseudo_path(&self) -> &Path {
-        &self.pseudo_path
+    fn common(&self) -> &FileCommon {
+        &self.common
     }
 }

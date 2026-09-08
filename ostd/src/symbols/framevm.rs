@@ -92,10 +92,17 @@ pub(super) fn lookup(raw_name: &[u8]) -> Option<usize> {
 }
 
 pub(super) fn payload_hash() -> Option<[u8; 32]> {
-    SYMBOL_TABLE
-        .get()
-        .and_then(|table| table.as_ref())
-        .map(|table| table.payload_hash)
+    match SYMBOL_TABLE.get() {
+        Some(Some(table)) => Some(table.payload_hash),
+        Some(None) => {
+            crate::error!("[ostd] FrameVM symbol table initialization was rejected");
+            None
+        }
+        None => {
+            crate::error!("[ostd] FrameVM symbol table was not initialized");
+            None
+        }
+    }
 }
 
 pub(super) fn lookup_by_addr(addr: usize) -> Option<DiagnosticSymbol<'static>> {
@@ -120,7 +127,7 @@ pub(super) fn for_each_symbol(mut callback: impl FnMut(DiagnosticSymbol<'static>
 }
 
 fn record_error(error: String) {
-    early_println!("[ostd] FrameVM symbol table unavailable: {}", error);
+    crate::error!("[ostd] FrameVM symbol table unavailable: {}", error);
     *INIT_ERROR.call_once(|| SpinLock::new(None)).lock() = Some(error);
 }
 

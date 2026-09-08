@@ -53,10 +53,7 @@ impl OwnedNetworkBuffer {
     /// the guard is released exactly once when that value is dropped. Host
     /// uses this constructor only after registering the boxed allocation and
     /// binds admission to the registered allocation identity.
-    pub fn from_boxed_slice_with_drop_guard(
-        bytes: Box<[u8]>,
-        drop_guard: BufferDropGuard,
-    ) -> Self {
+    pub fn from_boxed_slice_with_drop_guard(bytes: Box<[u8]>, drop_guard: BufferDropGuard) -> Self {
         Self {
             bytes: Some(bytes),
             reclaimer_fn: release_owned_bytes,

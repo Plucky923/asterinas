@@ -65,10 +65,8 @@ fn owned_network_buffer_releases_a_cross_domain_guard_by_token() {
     RELEASED_TOKEN.store(0, Ordering::Release);
     RELEASE_COUNT.store(0, Ordering::Release);
     let guard = BufferDropGuard::new(37, record_release);
-    let buffer = OwnedNetworkBuffer::from_boxed_slice_with_drop_guard(
-        vec![0; 4].into_boxed_slice(),
-        guard,
-    );
+    let buffer =
+        OwnedNetworkBuffer::from_boxed_slice_with_drop_guard(vec![0; 4].into_boxed_slice(), guard);
 
     drop(buffer);
 

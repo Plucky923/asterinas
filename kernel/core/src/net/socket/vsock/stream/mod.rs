@@ -31,7 +31,7 @@ pub(crate) struct VsockStreamSocket {
     // Note that for vsock, all pollee notifications and invalidations live in the transport module
     // (e.g., `super::transport`) rather than in this module.
     pollee: Pollee,
-    common: FileCommon,
+    common: Arc<FileCommon>,
 }
 
 enum State {
@@ -43,10 +43,14 @@ enum State {
 
 impl VsockStreamSocket {
     pub(crate) fn new(is_nonblocking: bool) -> Result<Arc<Self>> {
+        Self::new_with_common(Arc::new(new_socket_common(is_nonblocking)))
+    }
+
+    pub(crate) fn new_with_common(common: Arc<FileCommon>) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             state: Mutex::new(Takeable::new(State::Init(InitStream::new()))),
             pollee: Pollee::new(),
-            common: new_socket_common(is_nonblocking),
+            common,
         }))
     }
 
@@ -146,7 +150,7 @@ impl VsockStreamSocket {
         let accepted = Arc::new(Self {
             state: Mutex::new(Takeable::new(State::Connected(connected))),
             pollee,
-            common: new_socket_common(is_nonblocking),
+            common: Arc::new(new_socket_common(is_nonblocking)),
         });
 
         Ok((accepted, peer_addr))

@@ -5,10 +5,7 @@
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use aster_framevisor::{
-    FrameSchedGroup,
-    task::{FrameTaskData, FrameTaskKind, scheduler::UpdateFlags as FrameUpdateFlags},
-};
+use aster_framevisor::{FrameSchedGroup, task::scheduler::UpdateFlags as FrameUpdateFlags};
 use ostd::{
     cpu::{AtomicCpuSet, CpuSet},
     sync::SpinLock,
@@ -118,12 +115,6 @@ pub(super) fn current_can_compete(entity: &super::PickedSchedEntity) -> bool {
         return false;
     };
     state.allows_host_cpu(group.host_cpu())
-        && entity
-            .task()
-            .extension()
-            .downcast_ref::<FrameTaskData>()
-            .map(FrameTaskData::kind)
-            != Some(FrameTaskKind::Interrupt)
 }
 
 /// Returns whether enqueueing this group may preempt the Host current task.
@@ -134,15 +125,8 @@ pub(super) fn preempt_on_enqueue(
     if state.group().is_none() {
         return false;
     }
-    current.is_none_or(|current| {
-        current
-            .task()
-            .extension()
-            .downcast_ref::<FrameTaskData>()
-            .map(FrameTaskData::kind)
-            != Some(FrameTaskKind::Bootstrap)
-            && current.thread().sched_attr().policy_kind() >= SchedPolicyKind::Fair
-    })
+    current
+        .is_none_or(|current| current.thread().sched_attr().policy_kind() >= SchedPolicyKind::Fair)
 }
 
 /// Picks an inner task and publishes it as the Host scheduler's current pair.
@@ -152,10 +136,6 @@ pub(super) fn pick_task(state: &Arc<FrameSchedEntityState>) -> Option<super::Pic
         return None;
     }
     let task = group.pick_task()?;
-    if task.is_completed() {
-        return None;
-    }
-
     let thread = task.as_thread().cloned()?;
     let _ = task.cpu().set_if_is_none(group.host_cpu());
     Some(super::PickedSchedEntity {
@@ -174,26 +154,21 @@ pub(super) fn update_current(
 ) -> bool {
     let group = state.group();
     let group_should_pick = group.as_ref().is_some_and(|group| {
-        group.update_current(
-            task,
-            match flags {
-                UpdateFlags::Yield => FrameUpdateFlags::Yield,
-                UpdateFlags::Wait => FrameUpdateFlags::Wait,
-                UpdateFlags::Tick => FrameUpdateFlags::Tick,
-                UpdateFlags::Exit => FrameUpdateFlags::Exit,
-            },
-        )
+        task.as_thread()
+            .and_then(|thread| thread.framevm_task_state())
+            .is_some_and(|frame_task_state| {
+                group.update_current(
+                    task,
+                    frame_task_state,
+                    match flags {
+                        UpdateFlags::Yield => FrameUpdateFlags::Yield,
+                        UpdateFlags::Wait => FrameUpdateFlags::Wait,
+                        UpdateFlags::Tick => FrameUpdateFlags::Tick,
+                        UpdateFlags::Exit => FrameUpdateFlags::Exit,
+                    },
+                )
+            })
     });
-    if matches!(flags, UpdateFlags::Yield)
-        && task
-            .extension()
-            .downcast_ref::<FrameTaskData>()
-            .is_some_and(|data| data.kind() == FrameTaskKind::Interrupt)
-        && let Some(group) = group.as_ref()
-        && group.has_service_work_for_outer()
-    {
-        group.request_service_handoff();
-    }
     let placement_disallowed = group
         .as_ref()
         .is_none_or(|group| !state.allows_host_cpu(group.host_cpu()));
@@ -232,5 +207,30 @@ mod tests {
 
         assert!(!state.is_admitted());
         assert!(!state.allows_host_cpu(CpuId::bsp()));
+    }
+
+    #[ktest]
+    fn stopped_state_removes_a_queued_group_on_refresh() {
+        let cpu = CpuId::bsp();
+        let id = FrameVcpuId::new(0.into(), 0);
+        let group = Arc::new(FrameSchedGroup::new(
+            id,
+            WEIGHT_0 as u32,
+            cpu,
+            Arc::new(InterruptHandler::new(id)),
+        ));
+        let root = TaskGroup::new_root(1);
+        let state = Arc::new(FrameSchedEntityState::new(
+            &group,
+            root.clone(),
+            CpuSet::new_full(),
+        ));
+        let fair = root.fair_queue(cpu);
+
+        assert!(fair.lock().enqueue_frame_sched_group(state.clone()));
+        state.stop_admission();
+
+        assert!(!refresh(&state, fair));
+        assert!(!fair.lock().try_dequeue_frame_sched_group(&state));
     }
 }

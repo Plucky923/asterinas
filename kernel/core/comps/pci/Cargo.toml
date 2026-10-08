@@ -18,3 +18,6 @@ fdt.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+kernelet = []

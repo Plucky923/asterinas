@@ -2,22 +2,22 @@
 
 //! Configure the Global Descriptor Table (GDT).
 
+#[cfg(not(feature = "kernelet"))]
 use alloc::boxed::Box;
 
+use x86_64::{PrivilegeLevel, structures::gdt::SegmentSelector};
+#[cfg(not(feature = "kernelet"))]
 use x86_64::{
-    PrivilegeLevel, VirtAddr,
+    VirtAddr,
     instructions::tables::{lgdt, load_tss},
     registers::{
         model_specific::Star,
         segmentation::{CS, Segment},
     },
-    structures::{
-        DescriptorTablePointer,
-        gdt::{Descriptor, SegmentSelector},
-        tss::TaskStateSegment,
-    },
+    structures::{DescriptorTablePointer, gdt::Descriptor, tss::TaskStateSegment},
 };
 
+#[cfg(not(feature = "kernelet"))]
 use crate::cpu::local::{CpuLocal, StaticCpuLocal};
 
 /// Initializes and loads the GDT and TSS.
@@ -30,6 +30,7 @@ use crate::cpu::local::{CpuLocal, StaticCpuLocal};
 ///
 /// The caller must ensure that no preemption can occur during the method, otherwise we may
 /// accidentally load a wrong GDT and TSS that actually belongs to another CPU.
+#[cfg(not(feature = "kernelet"))]
 pub(super) unsafe fn init_on_cpu() {
     let tss_ptr = LOCAL_TSS.as_ptr();
 
@@ -96,12 +97,30 @@ pub(super) unsafe fn init_on_cpu() {
 // No other special initialization is required because the kernel stack information is stored in
 // the TSS when we start the userspace program. See `syscall.S` for details.
 // SAFETY: This is properly handled in the linker script.
+#[cfg(not(feature = "kernelet"))]
 #[unsafe(link_section = ".cpu_local_tss")]
 static LOCAL_TSS: StaticCpuLocal<TaskStateSegment> = {
     let tss = TaskStateSegment::new();
     // SAFETY: The `.cpu_local_tss` section is part of the CPU-local area.
     unsafe { CpuLocal::__new_static(tss) }
 };
+
+/// Installs the five landing stacks reserved by the image-only IDT.
+///
+/// # Safety
+/// IRQs and preemption must be disabled. Each nonzero top must name a writable
+/// Host-owned stack that remains mapped while the image IDT can be active.
+#[cfg(not(feature = "kernelet"))]
+pub(crate) unsafe fn set_carrier_stacks(tops: [usize; 5]) {
+    let tss = LOCAL_TSS.as_ptr().cast_mut();
+    // SAFETY: This CPU exclusively owns its packed TSS, and no references to
+    // these hardware IST slots coexist with the unaligned writes.
+    let slots = unsafe { core::ptr::addr_of_mut!((*tss).interrupt_stack_table) }.cast::<VirtAddr>();
+    for (index, top) in tops.into_iter().enumerate() {
+        // SAFETY: Five reserved slots are within the architectural seven-slot array.
+        unsafe { slots.add(index).write_unaligned(VirtAddr::new(top as u64)) };
+    }
+}
 
 // Kernel code and data descriptors.
 //

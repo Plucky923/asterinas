@@ -23,6 +23,7 @@ bitvec.workspace = true
 gimli.workspace = true
 id-alloc.workspace = true
 inherit-methods-macro.workspace = true
+intrusive-collections.workspace = true
 log.workspace = true
 minicov = { workspace = true, optional = true }
 num-traits.workspace = true
@@ -69,6 +70,7 @@ default = ["cvm_guest"]
 # The guest OS support for Confidential VMs (CVMs), e.g., Intel TDX
 cvm_guest = ["dep:tdx-guest"]
 coverage = ["minicov"]
+kernelet = []
 riscv_sv39_mode = []
 
 [lints]

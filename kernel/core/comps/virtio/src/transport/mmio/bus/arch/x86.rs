@@ -3,14 +3,19 @@
 use alloc::vec::Vec;
 
 use aster_cmdline::types::MmioDevice;
+#[cfg(not(feature = "kernelet"))]
+use ostd::arch::irq::IRQ_CHIP;
 pub(super) use ostd::arch::irq::MappedIrqLine;
-use ostd::{arch::irq::IRQ_CHIP, debug, info, warn};
+#[cfg(not(feature = "kernelet"))]
+use ostd::debug;
+use ostd::{info, warn};
 use spin::Once;
 
 use crate::transport::mmio::bus::MmioRegisterError;
 
 pub(super) fn probe_for_device() {
     probe_from_kernel_cmdline();
+    #[cfg(not(feature = "kernelet"))]
     probe_from_microvm_constants();
 }
 
@@ -25,6 +30,7 @@ fn probe_from_kernel_cmdline() {
         return;
     };
 
+    #[cfg(not(feature = "kernelet"))]
     let irq_chip = IRQ_CHIP.get().unwrap();
 
     for device in devices {
@@ -43,9 +49,16 @@ fn probe_from_kernel_cmdline() {
             continue;
         };
 
-        if let Err(err) = super::try_register_mmio_device(device.base()..mmio_end, |irq_line| {
+        #[cfg(feature = "kernelet")]
+        let registration =
+            super::try_register_mmio_device(device.base()..mmio_end, device.irq().get(), |line| {
+                Ok(line)
+            });
+        #[cfg(not(feature = "kernelet"))]
+        let registration = super::try_register_mmio_device(device.base()..mmio_end, |irq_line| {
             irq_chip.map_gsi_pin_to(irq_line, device.irq().get())
-        }) {
+        });
+        if let Err(err) = registration {
             warn!(
                 "Ignore MMIO command-line device at {:#x} due to an error ({:?})",
                 device.base(),
@@ -55,6 +68,7 @@ fn probe_from_kernel_cmdline() {
     }
 }
 
+#[cfg(not(feature = "kernelet"))]
 fn probe_from_microvm_constants() {
     // TODO: If ACPI tables are present, the correct method for detecting VirtIO-MMIO
     // devices is to parse the ACPI SSDT [1]. It is not supported yet, so we fall

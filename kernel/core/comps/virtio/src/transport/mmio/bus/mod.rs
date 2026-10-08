@@ -39,12 +39,15 @@ pub(super) fn init() {
 
 /// Tries to validate a potential VirtIO-MMIO device, map it to an IRQ line, and
 /// register it as a VirtIO-MMIO device.
+/// On an x86 kernelet, the command-line IRQ is a Host-assigned virtual line
+/// and must keep its numeric value for virtual-interrupt delivery.
 ///
 /// Returns `Ok(())` if the device was registered, or a specific
 /// `MmioRegisterError` otherwise.
 #[cfg_attr(target_arch = "loongarch64", expect(unused))]
 fn try_register_mmio_device<F>(
     mmio_range: Range<usize>,
+    #[cfg(all(target_arch = "x86_64", feature = "kernelet"))] irq: u32,
     map_irq_line: F,
 ) -> Result<(), MmioRegisterError>
 where
@@ -83,7 +86,13 @@ where
         Ok(_) => {}
     }
 
-    let Ok(mapped_irq_line) = IrqLine::alloc().and_then(map_irq_line) else {
+    #[cfg(all(target_arch = "x86_64", feature = "kernelet"))]
+    let irq_line = u8::try_from(irq)
+        .map_err(|_| ostd::Error::InvalidArgs)
+        .and_then(IrqLine::alloc_specific);
+    #[cfg(not(all(target_arch = "x86_64", feature = "kernelet")))]
+    let irq_line = IrqLine::alloc();
+    let Ok(mapped_irq_line) = irq_line.and_then(map_irq_line) else {
         debug!(
             "Ignore MMIO device at {:#x} because its IRQ line is not available",
             start_addr

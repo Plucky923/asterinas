@@ -44,6 +44,8 @@ mod context;
 mod cpu;
 mod device;
 mod driver;
+#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+mod endovisor;
 mod error;
 mod events;
 mod fs;

@@ -127,8 +127,16 @@ pub const LINEAR_MAPPING_VADDR_RANGE: Range<Vaddr> = LINEAR_MAPPING_BASE_VADDR..
 
 /// Convert physical address to virtual address using offset, only available inside `ostd`
 pub fn paddr_to_vaddr(pa: Paddr) -> usize {
-    debug_assert!(pa < VMALLOC_BASE_VADDR - LINEAR_MAPPING_BASE_VADDR);
-    pa + LINEAR_MAPPING_BASE_VADDR
+    #[cfg(feature = "kernelet")]
+    {
+        let base = crate::kernelet::entry::boot_args().linear_map_base as usize;
+        return pa + base;
+    }
+    #[cfg(not(feature = "kernelet"))]
+    {
+        debug_assert!(pa < VMALLOC_BASE_VADDR - LINEAR_MAPPING_BASE_VADDR);
+        pa + LINEAR_MAPPING_BASE_VADDR
+    }
 }
 
 /// The kernel page table instance.

@@ -2,7 +2,11 @@
 , enableRegressionTest ? false, conformanceTestSuite ? "ltp"
 , conformanceTestWorkDir ? "/tmp", conformanceTestSelector ? ""
 , regressionTestPlatform ? "asterinas", dnsServer ? "none", smp ? 1
-, initramfsCompressed ? true, benchmarkName ? "none", }:
+, initramfsCompressed ? true, benchmarkName ? "none", kerneletRuntime ? null
+, kerneletAgent ? null, kerneletShim ? null, }:
+assert (kerneletRuntime == null) == (kerneletAgent == null);
+assert (kerneletRuntime == null) == (kerneletShim == null);
+assert kerneletRuntime == null || target == "x86_64";
 let
   crossSystem.config = if target == "x86_64" then
     "x86_64-unknown-linux-gnu"
@@ -16,6 +20,7 @@ let
     overlays = [ ];
     inherit crossSystem;
   };
+  kerneletEnabled = kerneletRuntime != null;
 in rec {
   # Packages needed by initramfs
   busybox = pkgs.busybox;
@@ -28,6 +33,10 @@ in rec {
   };
   regression =
     pkgs.callPackage ./regression { testPlatform = regressionTestPlatform; };
+  kernelet-bash-bundle = if kerneletEnabled then
+    pkgs.callPackage ./kernelet-bash-bundle.nix { }
+  else
+    null;
 
   initramfs = pkgs.callPackage ./initramfs.nix {
     inherit busybox;
@@ -35,6 +44,23 @@ in rec {
     conformance = if enableConformanceTest then conformance else null;
     regression = if enableRegressionTest then regression else null;
     dnsServer = dnsServer;
+    kernelet = if kerneletEnabled then {
+      runtime = builtins.path {
+        path = kerneletRuntime;
+        name = "kernelet-runtime";
+      };
+      agent = builtins.path {
+        path = kerneletAgent;
+        name = "kernelet-agent";
+      };
+      shim = builtins.path {
+        path = kerneletShim;
+        name = "containerd-shim-kernelet-v2";
+      };
+      mke2fs = pkgs.pkgsStatic.e2fsprogs.override { withFuse = false; };
+      bashBundle = kernelet-bash-bundle;
+    } else
+      null;
   };
   initramfs-image = pkgs.callPackage ./initramfs-image.nix {
     inherit initramfs;

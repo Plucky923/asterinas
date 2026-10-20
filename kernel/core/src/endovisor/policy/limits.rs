@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Operator-selected per-user memory reservation limit.
+//! Operator-selected per-user memory and endpoint reservation limits.
 
 use core::str::FromStr;
 
@@ -12,8 +12,27 @@ const GRAIN_MIB: u32 = (ostd::kernelet::abi::GRAIN_SIZE / (1024 * 1024)) as u32;
 const DEFAULT_GRAINS: u32 = 1024 / GRAIN_MIB;
 static USER_MEMORY_LIMIT: Once<UserMemoryLimit> = Once::new();
 aster_cmdline::define_kv_param!("kernelet_user_memory_mib", USER_MEMORY_LIMIT);
+const DEFAULT_ENDPOINT_BYTES: usize = 16 * 1024 * 1024;
+static USER_ENDPOINT_LIMIT: Once<UserEndpointLimit> = Once::new();
+aster_cmdline::define_kv_param!("kernelet_user_endpoint_mib", USER_ENDPOINT_LIMIT);
 
 struct UserMemoryLimit(u32);
+struct UserEndpointLimit(usize);
+
+impl FromStr for UserEndpointLimit {
+    type Err = ParamError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mib: usize = value.parse().map_err(|_| ParamError::InvalidValue)?;
+        if mib == 0 {
+            return Err(ParamError::InvalidValue);
+        }
+        let bytes = mib
+            .checked_mul(1024 * 1024)
+            .ok_or(ParamError::InvalidValue)?;
+        Ok(Self(bytes))
+    }
+}
 
 impl FromStr for UserMemoryLimit {
     type Err = ParamError;
@@ -31,6 +50,12 @@ pub(super) fn max_grains_per_user() -> u32 {
     USER_MEMORY_LIMIT
         .get()
         .map_or(DEFAULT_GRAINS, |limit| limit.0)
+}
+
+pub(super) fn max_endpoint_bytes_per_user() -> usize {
+    USER_ENDPOINT_LIMIT
+        .get()
+        .map_or(DEFAULT_ENDPOINT_BYTES, |limit| limit.0)
 }
 
 #[cfg(ktest)]
@@ -55,6 +80,28 @@ mod tests {
     fn user_memory_limit_rejects_partial_grains_and_invalid_values() {
         for value in ["0", "1", "4095", "-2", "4294967296", "4G", ""] {
             assert!(value.parse::<UserMemoryLimit>().is_err());
+        }
+    }
+
+    #[ktest]
+    fn endpoint_limit_accepts_operator_budget_and_rejects_overflow() {
+        assert_eq!(
+            "16".parse::<UserEndpointLimit>().ok().unwrap().0,
+            DEFAULT_ENDPOINT_BYTES
+        );
+        assert_eq!(
+            "512".parse::<UserEndpointLimit>().ok().unwrap().0,
+            512 * 1024 * 1024
+        );
+        for value in [
+            "0",
+            "-1",
+            "512M",
+            "",
+            "18446744073709551616",
+            "18446744073709551615",
+        ] {
+            assert!(value.parse::<UserEndpointLimit>().is_err());
         }
     }
 }

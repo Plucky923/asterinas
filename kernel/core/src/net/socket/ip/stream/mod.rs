@@ -176,6 +176,9 @@ impl StreamSocket {
     ) -> Arc<Self> {
         let options = connected_stream.raw_with(|raw_tcp_socket| {
             let mut options = OptionSet::new();
+            options
+                .socket
+                .set_reuse_addr(connected_stream.bound_port().can_reuse());
 
             // Inherit socket options from `raw_tcp_socket` first, then fall
             // back to `listener_options` for options the raw socket cannot

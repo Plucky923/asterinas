@@ -13,7 +13,7 @@ pub use host::{BackendBuffer, IoRequest};
 #[cfg(feature = "kernelet-host")]
 pub use host::{HostLocalEndpoint, HostLocalGrant, HostSendCredit};
 #[cfg(feature = "kernelet-host")]
-pub(crate) use host::{Participant, dispatch_device, dispatch_net_exchange};
+pub(crate) use host::{Participant, dispatch_device, dispatch_net_exchange, dispatch_net_transmit};
 
 #[cfg(feature = "kernelet")]
 mod image;

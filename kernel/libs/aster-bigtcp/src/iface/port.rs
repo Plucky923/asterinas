@@ -16,7 +16,7 @@ enum PortKind {
     /// Allocates an ephemeral port to bind.
     Ephemeral(bool),
     /// Reuses the port of the listening socket.
-    Backlog(u16),
+    Backlog(u16, bool),
 }
 
 impl BindPortConfig {
@@ -35,10 +35,10 @@ impl BindPortConfig {
     }
 
     /// Creates a new configuration for reusing the port of a listening socket.
-    pub fn new_backlog(endpoint: IpEndpoint) -> Self {
+    pub fn new_backlog(endpoint: IpEndpoint, can_reuse: bool) -> Self {
         Self {
             addr: endpoint.addr,
-            kind: PortKind::Backlog(endpoint.port),
+            kind: PortKind::Backlog(endpoint.port, can_reuse),
         }
     }
 
@@ -49,13 +49,13 @@ impl BindPortConfig {
     pub(super) fn can_reuse(&self) -> bool {
         matches!(
             self.kind,
-            PortKind::CanReuse(..) | PortKind::Ephemeral(true)
+            PortKind::CanReuse(..) | PortKind::Ephemeral(true) | PortKind::Backlog(_, true)
         )
     }
 
     pub(super) fn port(&self) -> Option<u16> {
         match &self.kind {
-            PortKind::CanReuse(port) | PortKind::Specified(port) | PortKind::Backlog(port) => {
+            PortKind::CanReuse(port) | PortKind::Specified(port) | PortKind::Backlog(port, _) => {
                 Some(*port)
             }
             PortKind::Ephemeral(_) => None,

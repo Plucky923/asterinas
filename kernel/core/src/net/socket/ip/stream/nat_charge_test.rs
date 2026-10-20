@@ -31,6 +31,38 @@ const REMOTE: [u8; 4] = [192, 0, 2, 2];
 const LISTEN_PORT: u16 = 18080;
 const RESERVED_BYTES: usize = 2 * 1024 * 1024;
 
+// Model a device whose last TX completion arrived without another callback.
+// The production native interface and TCP listener must reclaim the completed
+// descriptor before handling the next input, without an extra IRQ or timer.
+#[ktest]
+fn completed_tx_descriptors_are_reclaimed_before_native_poll() {
+    aster_time::init_for_ktest();
+    let fixture = Fixture::new(StreamObserver::new(Pollee::new(), None));
+    {
+        let mut device = fixture.device.lock();
+        device.tx_budget = Some(0);
+        device.completed_tx_pending = true;
+    }
+    fixture.inject(tcp_packet(40000, 41, 0, 0x02));
+    fixture.iface.poll();
+    let device = fixture.device.lock();
+    let replies: Vec<_> = device
+        .outgoing
+        .iter()
+        .filter(|packet| packet.len() >= 40 && packet[33] & 0x12 == 0x12)
+        .collect();
+    assert_eq!(
+        replies.len(),
+        1,
+        "completed TX credit must be reclaimed before the native SYN/ACK"
+    );
+    assert!(!device.completed_tx_pending);
+    assert_eq!(
+        u32::from_be_bytes(replies[0][28..32].try_into().unwrap()),
+        42
+    );
+}
+
 // Exercise the native protocol owners with the production StreamObserver.
 // Only the device boundary is controlled: no socket or quota logic is replaced.
 #[ktest]
@@ -118,6 +150,7 @@ impl Fixture {
             incoming: VecDeque::new(),
             outgoing: Vec::new(),
             tx_budget: None,
+            completed_tx_pending: false,
         }));
         let iface: Arc<dyn Iface<TestExt>> = IpIface::new(
             Driver(device.clone()),
@@ -235,6 +268,8 @@ struct TestDevice {
     outgoing: Vec<Vec<u8>>,
     // None permits unlimited transmission; Some(0) models Host TX pressure.
     tx_budget: Option<usize>,
+    // A hardware completion exists, but its descriptor is not yet reclaimed.
+    completed_tx_pending: bool,
 }
 
 impl AnyNetworkDevice for TestDevice {
@@ -292,7 +327,12 @@ impl AnyNetworkDevice for TestDevice {
         FreshTxPacket::alloc(payload_len)
     }
 
-    fn free_processed_tx_buffers(&mut self) {}
+    fn free_processed_tx_buffers(&mut self) {
+        if self.completed_tx_pending {
+            self.completed_tx_pending = false;
+            self.tx_budget = Some(self.tx_budget.unwrap_or(0).checked_add(1).unwrap());
+        }
+    }
 
     fn notify_poll_end(&mut self) {}
 }

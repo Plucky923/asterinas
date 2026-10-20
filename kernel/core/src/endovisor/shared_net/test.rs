@@ -42,6 +42,7 @@ fn forwarded_nic_buffer_keeps_uid_charge_after_sender_destroy() {
     let nic = SharedNet::new(&admission, sender.clone(), endpoint, [2, 0, 0, 0, 0, 1], 32).unwrap();
     let nic_connection = nic.transport.local.connection();
     assert!(nic.transport.allocate_frame().unwrap().deliver(14));
+    assert!(nic.transport.flush_transmit());
     // Use the real Image-side RECEIVE/REDEEM/HANDOFF protocol against OSTD's
     // actual pool. Only carrier execution is omitted by the kernel-test adapter.
     let delivery = sender.test_shared_buffer_service(buffer::RECEIVE, 0, [nic_connection, 0, 0]);

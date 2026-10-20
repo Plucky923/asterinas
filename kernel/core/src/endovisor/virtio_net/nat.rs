@@ -7,10 +7,12 @@
 
 use core::{
     net::{Ipv4Addr, SocketAddrV4},
+    str::FromStr,
     time::Duration,
 };
 
 use aster_bigtcp::socket::{TCP_RECV_BUF_LEN, TCP_SEND_BUF_LEN};
+use aster_cmdline::parse::ParamError;
 use kernelet_abi::{MAX_NET_PORTS, NET_PROTOCOL_TCP, NET_PROTOCOL_UDP, NetConfigArgs};
 use ostd::kernelet::control::HostByteCharge;
 use smoltcp::{
@@ -26,6 +28,7 @@ use smoltcp::{
         IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket,
     },
 };
+use spin::Once;
 
 #[cfg(kernelet_nat_failure_diag_host)]
 use super::{
@@ -43,11 +46,41 @@ use super::{
 use crate::{events::IoEvents, prelude::*, process::signal::Poller};
 
 const MAX_FRAME: usize = MAX_FRAME_BYTES;
-const MAX_FLOWS: usize = 256;
+const DEFAULT_MAX_FLOWS: usize = 256;
 const BUFFER_BYTES: usize = 64 * 1024;
 const TCP_FORWARD_BYTES: usize = 16 * 1024;
 const FLOW_RESERVATION_BYTES: usize = 512 * 1024;
+
+/// Logical active-flow count; shared UDP frontends do not replace flow counts.
+/// Every allocation also needs its existing byte charge.
+#[derive(Clone, Copy)]
+struct NatFlowCapacity(usize);
+
+static NAT_FLOW_CAPACITY: Once<NatFlowCapacity> = Once::new();
+aster_cmdline::define_kv_param!("kernelet_nat_max_flows", NAT_FLOW_CAPACITY);
+
+impl FromStr for NatFlowCapacity {
+    type Err = ParamError;
+
+    fn from_str(value: &str) -> core::result::Result<Self, Self::Err> {
+        let capacity: usize = value.parse().map_err(|_| ParamError::InvalidValue)?;
+        if capacity == 0 || capacity.checked_mul(FLOW_RESERVATION_BYTES).is_none() {
+            return Err(ParamError::InvalidValue);
+        }
+        Ok(Self(capacity))
+    }
+}
+
+fn nat_flow_capacity() -> usize {
+    NAT_FLOW_CAPACITY
+        .get()
+        .copied()
+        .unwrap_or(NatFlowCapacity(DEFAULT_MAX_FLOWS))
+        .0
+}
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 // Other shared-buffer links can release Image import quota without a NIC IRQ.
 // Retry only that blocked condition; returned NIC buffers retain IRQ wakeups.
 const IMPORT_CREDIT_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -147,6 +180,7 @@ impl NatBackend {
                     endpoint: &model.endpoint,
                     transport,
                     prepared: None,
+                    reply: None,
                     import_blocked: false,
                 }),
             ),
@@ -196,7 +230,7 @@ fn guest_socket_error(error: impl Debug) -> Error {
 /// alive, a reused port would let a new flow collide with an existing
 /// tuple and steal its traffic. The existing socket state is the source of
 /// truth; no separate port set is kept.
-fn next_source_port(next_port: &mut u16, in_use: impl Fn(u16) -> bool) -> Option<u16> {
+fn next_source_port(next_port: &mut u16, is_in_use_fn: impl Fn(u16) -> bool) -> Option<u16> {
     (0..SOURCE_PORT_CYCLE).find_map(|_| {
         let port = *next_port;
         *next_port = if port == LAST_SOURCE_PORT {
@@ -204,7 +238,7 @@ fn next_source_port(next_port: &mut u16, in_use: impl Fn(u16) -> bool) -> Option
         } else {
             port + 1
         };
-        (!in_use(port)).then_some(port)
+        (!is_in_use_fn(port)).then_some(port)
     })
 }
 
@@ -389,8 +423,28 @@ fn run<B: FrameBackend>(
     let mut inbound_datagrams = Vec::<UdpPortFlow>::new();
     let mut next_port = FIRST_SOURCE_PORT;
     let mut accept_retry = vec![None; listeners.len()];
+    let max_flows = nat_flow_capacity();
+    #[cfg(kernelet_nat_failure_diag_host)]
+    let mut mapped_capacity_reported = false;
+    #[cfg(kernelet_nat_failure_diag_host)]
+    let mut outbound_capacity_reported = false;
+    #[cfg(kernelet_nat_failure_diag_host)]
+    let mut shared_rx_wait = None;
+    #[cfg(kernelet_nat_failure_diag_host)]
+    let mut shared_rx_wait_reports = 0;
+    #[cfg(kernelet_nat_failure_diag_host)]
+    let mut stalled_flow_reports = 0;
     let result = (|| {
         loop {
+            #[cfg(kernelet_nat_failure_diag_host)]
+            observe_shared_rx_wait(
+                model,
+                &device,
+                &sockets,
+                &tcp_flows,
+                &mut shared_rx_wait,
+                &mut shared_rx_wait_reports,
+            );
             let generation = model.endpoint.generation();
             let timestamp =
                 NetworkInstant::from_millis(now().as_millis().min(i64::MAX as u128) as i64);
@@ -416,7 +470,8 @@ fn run<B: FrameBackend>(
                     let Some(frame) = device.backend.pop_output() else {
                         break;
                     };
-                    frame.with_bytes(|bytes| {
+                    let live_flows = live_flow_count(&tcp_flows, &udp_flows, &inbound_datagrams);
+                    device.prepared_udp = frame.with_bytes(|bytes| {
                         prepare_incoming(
                             bytes,
                             &config,
@@ -424,6 +479,10 @@ fn run<B: FrameBackend>(
                             &mut sockets,
                             &mut tcp_flows,
                             &mut udp_sockets,
+                            live_flows,
+                            max_flows,
+                            #[cfg(kernelet_nat_failure_diag_host)]
+                            &mut outbound_capacity_reported,
                         )
                     })?;
                     device.received = Some(frame);
@@ -449,7 +508,17 @@ fn run<B: FrameBackend>(
                 #[cfg(kernelet_nat_failure_diag_host)]
                 let context = listener
                     .diagnostic_context("mapped_tcp_reserve_before_accept", *destination_port);
-                if tcp_flows.len() + udp_flows.len() + inbound_datagrams.len() >= MAX_FLOWS {
+                if live_flow_count(&tcp_flows, &udp_flows, &inbound_datagrams) >= max_flows {
+                    #[cfg(kernelet_nat_failure_diag_host)]
+                    log_flow_capacity_once(
+                        model,
+                        "mapped_accept",
+                        None,
+                        &sockets,
+                        &tcp_flows,
+                        max_flows,
+                        &mut mapped_capacity_reported,
+                    );
                     #[cfg(kernelet_nat_failure_diag_host)]
                     model.record_diagnostic(NatEvent::FlowCapacity, context, None);
                     break;
@@ -510,7 +579,7 @@ fn run<B: FrameBackend>(
                     let flow_index = if let Some(index) = existing {
                         index
                     } else {
-                        if tcp_flows.len() + udp_flows.len() + inbound_datagrams.len() >= MAX_FLOWS
+                        if live_flow_count(&tcp_flows, &udp_flows, &inbound_datagrams) >= max_flows
                         {
                             continue;
                         }
@@ -550,6 +619,17 @@ fn run<B: FrameBackend>(
             for flow in &mut tcp_flows {
                 let previous = flow.last_active;
                 flow.forward(model, sockets.get_mut::<tcp::Socket>(flow.handle));
+                #[cfg(kernelet_nat_failure_diag_host)]
+                if stalled_flow_reports < 8
+                    && flow.report_stall(
+                        model,
+                        sockets.get::<tcp::Socket>(flow.handle),
+                        interface.context(),
+                        device.backend.diagnostic_buffers(),
+                    )
+                {
+                    stalled_flow_reports += 1;
+                }
                 progressed |= flow.last_active != previous;
             }
             for (destination, frontend) in &udp_sockets {
@@ -561,7 +641,7 @@ fn run<B: FrameBackend>(
                     let source = SocketAddrV4::new(source_ip, metadata.endpoint.port);
                     let key = (source, *destination);
                     if !udp_flows.contains_key(&key) {
-                        if udp_flows.len() + tcp_flows.len() + inbound_datagrams.len() >= MAX_FLOWS
+                        if live_flow_count(&tcp_flows, &udp_flows, &inbound_datagrams) >= max_flows
                         {
                             continue;
                         }
@@ -601,7 +681,7 @@ fn run<B: FrameBackend>(
                 }
             }
             udp_flows.retain(|(source, _), flow| {
-                if elapsed(flow.last_active) > Duration::from_secs(60) {
+                if elapsed(flow.last_active) > UDP_IDLE_TIMEOUT {
                     return false;
                 }
                 let mut packet = [0; 1472];
@@ -616,7 +696,7 @@ fn run<B: FrameBackend>(
                 true
             });
             inbound_datagrams.retain_mut(|flow| {
-                if elapsed(flow.last_active) > Duration::from_secs(60) {
+                if elapsed(flow.last_active) > UDP_IDLE_TIMEOUT {
                     sockets.remove(flow.handle);
                     return false;
                 }
@@ -630,15 +710,12 @@ fn run<B: FrameBackend>(
                 }
                 true
             });
-            udp_sockets.retain(|_, frontend| {
-                let used = udp_flows
-                    .values()
-                    .any(|flow| flow.handle == frontend.handle);
-                if !used {
-                    sockets.remove(frontend.handle);
-                }
-                used
-            });
+            retain_udp_frontends(
+                &mut udp_sockets,
+                &udp_flows,
+                &mut sockets,
+                device.prepared_udp,
+            );
             progressed |= interface.poll(timestamp, &mut device, &mut sockets) != PollResult::None;
             tcp_flows.retain(|flow| {
                 let socket = sockets.get::<tcp::Socket>(flow.handle);
@@ -647,9 +724,7 @@ fn run<B: FrameBackend>(
                 let reset_pending = !flow.alive
                     && socket.state() == tcp::State::Closed
                     && socket.remote_endpoint().is_some();
-                if (!flow.alive && !reset_pending)
-                    || elapsed(flow.last_active) > Duration::from_secs(300)
-                {
+                if (!flow.alive && !reset_pending) || elapsed(flow.last_active) > TCP_IDLE_TIMEOUT {
                     sockets.remove(flow.handle);
                     false
                 } else {
@@ -658,6 +733,8 @@ fn run<B: FrameBackend>(
             });
             // Publish before a possibly indefinite poll wait; logging owns no
             // socket, device-register or ledger guard.
+            // Publish even a short owning batch before this worker can wait.
+            progressed |= device.backend.flush_transmit();
             #[cfg(kernelet_nat_failure_diag_host)]
             model.endpoint.emit_diagnostics();
             if progressed {
@@ -666,13 +743,17 @@ fn run<B: FrameBackend>(
             let current = now();
             let mut timeout = tcp_flows
                 .iter()
-                .map(|flow| (flow.last_active + Duration::from_secs(300)).saturating_sub(current))
-                .chain(udp_flows.values().map(|flow| {
-                    (flow.last_active + Duration::from_secs(60)).saturating_sub(current)
-                }))
-                .chain(inbound_datagrams.iter().map(|flow| {
-                    (flow.last_active + Duration::from_secs(60)).saturating_sub(current)
-                }))
+                .map(|flow| (flow.last_active + TCP_IDLE_TIMEOUT).saturating_sub(current))
+                .chain(
+                    udp_flows
+                        .values()
+                        .map(|flow| (flow.last_active + UDP_IDLE_TIMEOUT).saturating_sub(current)),
+                )
+                .chain(
+                    inbound_datagrams
+                        .iter()
+                        .map(|flow| (flow.last_active + UDP_IDLE_TIMEOUT).saturating_sub(current)),
+                )
                 .min();
             if let Some(delay) = interface.poll_delay(timestamp, &sockets) {
                 let delay = Duration::from_millis(delay.total_millis());
@@ -680,8 +761,12 @@ fn run<B: FrameBackend>(
                     timeout = Some(timeout.map_or(delay, |previous| previous.min(delay)));
                 }
             }
-            for deadline in accept_retry.iter().flatten() {
-                let delay = deadline.saturating_sub(current);
+            if let Some(delay) = accept_retry_delay(
+                &accept_retry,
+                current,
+                live_flow_count(&tcp_flows, &udp_flows, &inbound_datagrams),
+                max_flows,
+            ) {
                 timeout = Some(timeout.map_or(delay, |previous| previous.min(delay)));
             }
             if let Some(delay) = device.backend.transmit_retry_delay() {
@@ -695,18 +780,14 @@ fn run<B: FrameBackend>(
                 .endpoint
                 .poll_change(generation, poller.as_handle_mut())
                 .is_empty();
-            if tcp_flows.len() + udp_flows.len() + inbound_datagrams.len() < MAX_FLOWS {
-                for (index, (listener, _)) in listeners.iter().enumerate() {
-                    if accept_retry[index].is_none() {
-                        ready |= !listener.poll(Some(poller.as_handle_mut())).is_empty();
-                    }
-                }
-                for (listener, _) in &datagram_listeners {
-                    ready |= !listener
-                        .poll(IoEvents::IN, poller.as_handle_mut())
-                        .is_empty();
-                }
-            }
+            ready |= poll_listeners(
+                &listeners,
+                &datagram_listeners,
+                &accept_retry,
+                live_flow_count(&tcp_flows, &udp_flows, &inbound_datagrams),
+                max_flows,
+                &mut poller,
+            );
             for flow in &tcp_flows {
                 if !flow.alive {
                     continue;
@@ -743,6 +824,12 @@ fn run<B: FrameBackend>(
             }
         }
     })();
+    #[cfg(kernelet_nat_failure_diag_host)]
+    if let Some(wait) = shared_rx_wait.take() {
+        if now().saturating_sub(wait.since) >= Duration::from_secs(1) {
+            log_shared_rx_wait(model, "worker_exit", &wait, &device, &sockets, &tcp_flows);
+        }
+    }
     drop(sockets);
     drop(tcp_flows);
     drop(udp_flows);
@@ -793,7 +880,87 @@ struct TcpFlow {
     requested: Option<(IpEndpoint, IpEndpoint)>,
     write_closed: bool,
     _charge: FlowCharge,
+    #[cfg(kernelet_nat_failure_diag_host)]
+    stall_reported: bool,
 }
+
+// Snapshot worker-owned flow state only at the first capacity failure of each
+// direction. No native socket getter, ledger lock or device lock is involved.
+#[cfg(kernelet_nat_failure_diag_host)]
+fn log_flow_capacity_once(
+    model: &NetWorker,
+    stage: &'static str,
+    requested: Option<(IpEndpoint, IpEndpoint)>,
+    sockets: &SocketSet<'static>,
+    flows: &[TcpFlow],
+    max_flows: usize,
+    reported: &mut bool,
+) {
+    if *reported {
+        return;
+    }
+    // Existing SYN retransmissions still belong to an admitted socket. Report
+    // only a SYN that needs a new flow when testing the capacity-failure path.
+    if requested.is_some_and(|(source, destination)| {
+        flows.iter().any(|flow| {
+            let socket = sockets.get::<tcp::Socket>(flow.handle);
+            flow.requested == Some((source, destination))
+                || socket.remote_endpoint() == Some(source)
+                    && socket.local_endpoint() == Some(destination)
+        })
+    }) {
+        return;
+    }
+    *reported = true;
+    let mut states = [0usize; 11];
+    let mut counters = [0usize; 9];
+    for flow in flows {
+        let socket = sockets.get::<tcp::Socket>(flow.handle);
+        let index = match socket.state() {
+            tcp::State::Closed => 0,
+            tcp::State::Listen => 1,
+            tcp::State::SynSent => 2,
+            tcp::State::SynReceived => 3,
+            tcp::State::Established => 4,
+            tcp::State::FinWait1 => 5,
+            tcp::State::FinWait2 => 6,
+            tcp::State::CloseWait => 7,
+            tcp::State::Closing => 8,
+            tcp::State::LastAck => 9,
+            tcp::State::TimeWait => 10,
+        };
+        states[index] += 1;
+        for (index, condition) in [
+            flow.host.is_some(),
+            flow.guest_eof,
+            flow.host_eof,
+            flow.alive,
+            flow.requested.is_some(),
+            flow.requested.is_none(),
+            !flow.to_host.is_empty(),
+            socket.recv_queue() != 0,
+            socket.send_queue() != 0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            counters[index] += usize::from(condition);
+        }
+    }
+    error!(
+        "kernelet NAT flow_capacity version=2 cid={} stage={} requested={:?} new_flow_required={} socket_count={} tcp_count={} limit={} states_closed_listen_synsent_synreceived_established_finwait1_finwait2_closewait_closing_lastack_timewait={:?} counts_host_guest_eof_host_eof_alive_outbound_mapped_to_host_recv_send={:?}",
+        model.endpoint.diagnostic_cid(),
+        stage,
+        requested,
+        requested.is_some(),
+        sockets.iter().count(),
+        flows.len(),
+        max_flows,
+        states,
+        counters,
+    );
+}
+
 impl TcpFlow {
     fn new(handle: SocketHandle, host: TcpStream, charge: FlowCharge) -> Self {
         Self {
@@ -809,7 +976,61 @@ impl TcpFlow {
             requested: None,
             write_closed: false,
             _charge: charge,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            stall_reported: false,
         }
+    }
+    #[cfg(kernelet_nat_failure_diag_host)]
+    fn report_stall(
+        &mut self,
+        model: &NetWorker,
+        guest: &tcp::Socket,
+        context: &mut smoltcp::iface::Context,
+        buffers: Option<SharedFrameBuffers>,
+    ) -> bool {
+        let connecting = self.host.as_ref().is_some_and(TcpStream::is_connecting);
+        let pending = connecting
+            || !self.to_host.is_empty()
+            || guest.recv_queue() != 0
+            || guest.send_queue() != 0
+            || matches!(
+                guest.state(),
+                tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived
+            );
+        if self.stall_reported
+            || !self.alive
+            || !pending
+            || elapsed(self.last_active) < Duration::from_secs(5)
+        {
+            return false;
+        }
+        self.stall_reported = true;
+        let next_poll = guest.poll_at(context);
+        let native = self.host.as_ref().map(TcpStream::error_diagnostic);
+        error!(
+            "kernelet NAT stalled_flow version=2 cid={} observed_at={:?} inactive_for={:?} handle={:?} requested={:?} guest_local={:?} guest_remote={:?} state={:?} host_present={} host_connecting={} host_eof={} guest_eof={} write_closed={} to_host_bytes={} recv_bytes={} send_bytes={} guest_can_send={} next_poll={:?} buffers={:?} native={:?}",
+            model.endpoint.diagnostic_cid(),
+            now(),
+            elapsed(self.last_active),
+            self.handle,
+            self.requested,
+            guest.local_endpoint(),
+            guest.remote_endpoint(),
+            guest.state(),
+            self.host.is_some(),
+            connecting,
+            self.host_eof,
+            self.guest_eof,
+            self.write_closed,
+            self.to_host.len(),
+            guest.recv_queue(),
+            guest.send_queue(),
+            guest.can_send(),
+            next_poll,
+            buffers,
+            native,
+        );
+        true
     }
     #[cfg(kernelet_nat_failure_diag)]
     fn log_failure(
@@ -911,7 +1132,7 @@ impl TcpFlow {
         if self.host.is_none() {
             // The native background already owns the orderly close. The Guest
             // socket still completes its existing FIN/ACK retirement policy.
-            self.alive = guest.is_open();
+            self.alive = guest.state() != tcp::State::Closed;
             return;
         }
         if guest.state() == tcp::State::Closed {
@@ -1150,7 +1371,7 @@ impl TcpFlow {
             drop(self.host.take());
             self.to_host = VecDeque::new();
             drop(self.drain_charge.take());
-            self.alive = guest.is_open();
+            self.alive = guest.state() != tcp::State::Closed;
         } else if self.host_eof && !self.guest_eof {
             // A Host-first EOF must still reach a Guest that waits for it
             // before sending its remaining data and FIN.
@@ -1180,6 +1401,74 @@ struct UdpFlow {
     _charge: FlowCharge,
 }
 
+fn live_flow_count(
+    tcp: &[TcpFlow],
+    udp: &BTreeMap<(SocketAddrV4, SocketAddrV4), UdpFlow>,
+    mapped_udp: &[UdpPortFlow],
+) -> usize {
+    tcp.len() + udp.len() + mapped_udp.len()
+}
+
+fn retain_udp_frontends(
+    frontends: &mut BTreeMap<SocketAddrV4, UdpFrontend>,
+    flows: &BTreeMap<(SocketAddrV4, SocketAddrV4), UdpFlow>,
+    sockets: &mut SocketSet<'static>,
+    pending: Option<SocketHandle>,
+) {
+    frontends.retain(|_, frontend| {
+        let used = pending == Some(frontend.handle)
+            || flows.values().any(|flow| flow.handle == frontend.handle);
+        if !used {
+            sockets.remove(frontend.handle);
+        }
+        used
+    });
+}
+
+fn accept_retry_delay(
+    retries: &[Option<Duration>],
+    current: Duration,
+    live_flows: usize,
+    max_flows: usize,
+) -> Option<Duration> {
+    // Admission does not run while the table is full. Its expired deadlines
+    // must not turn the otherwise blocked worker into a zero-timeout loop.
+    if live_flows >= max_flows {
+        return None;
+    }
+    retries
+        .iter()
+        .flatten()
+        .map(|deadline| deadline.saturating_sub(current))
+        .min()
+}
+
+fn poll_listeners(
+    tcp_listeners: &[(TcpListener, u16)],
+    udp_listeners: &[(UdpSocket, u16)],
+    accept_retry: &[Option<Duration>],
+    live_flows: usize,
+    max_flows: usize,
+    poller: &mut Poller,
+) -> bool {
+    let mut ready = false;
+    if live_flows < max_flows {
+        for (index, (listener, _)) in tcp_listeners.iter().enumerate() {
+            if accept_retry[index].is_none() {
+                ready |= !listener.poll(Some(poller.as_handle_mut())).is_empty();
+            }
+        }
+    }
+    // Existing UDP peers can make progress without admitting a flow.
+    // The receive path drains and rejects new peers when capacity is full.
+    for (listener, _) in udp_listeners {
+        ready |= !listener
+            .poll(IoEvents::IN, poller.as_handle_mut())
+            .is_empty();
+    }
+    ready
+}
+
 fn prepare_incoming(
     frame: &[u8],
     config: &NetConfigArgs,
@@ -1187,21 +1476,24 @@ fn prepare_incoming(
     sockets: &mut SocketSet<'static>,
     tcp_flows: &mut Vec<TcpFlow>,
     udp_sockets: &mut BTreeMap<SocketAddrV4, UdpFrontend>,
-) -> Result<()> {
+    live_flows: usize,
+    max_flows: usize,
+    #[cfg(kernelet_nat_failure_diag_host)] capacity_reported: &mut bool,
+) -> Result<Option<SocketHandle>> {
     let ethernet = match EthernetFrame::new_checked(frame) {
         Ok(packet) if packet.ethertype() == EthernetProtocol::Ipv4 => packet,
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
     let ipv4 = match Ipv4Packet::new_checked(ethernet.payload()) {
         Ok(packet) => packet,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
     if ipv4.src_addr() != GUEST
         || !ipv4.verify_checksum()
         || ipv4.frag_offset() != 0
         || ipv4.more_frags()
     {
-        return Ok(());
+        return Ok(None);
     }
     match ipv4.next_header() {
         IpProtocol::Tcp => {
@@ -1218,7 +1510,7 @@ fn prepare_incoming(
                 {
                     packet
                 }
-                _ => return Ok(()),
+                _ => return Ok(None),
             };
             let source = IpEndpoint::new(IpAddress::Ipv4(ipv4.src_addr()), packet.src_port());
             let destination = IpEndpoint::new(IpAddress::Ipv4(ipv4.dst_addr()), packet.dst_port());
@@ -1232,7 +1524,7 @@ fn prepare_incoming(
                 ));
                 context
             };
-            if sockets.iter().count() >= MAX_FLOWS
+            if live_flows >= max_flows
                 || tcp_flows.iter().any(|flow| {
                     let socket = sockets.get::<tcp::Socket>(flow.handle);
                     flow.requested == Some((source, destination))
@@ -1241,17 +1533,26 @@ fn prepare_incoming(
                 })
             {
                 #[cfg(kernelet_nat_failure_diag_host)]
-                if sockets.iter().count() >= MAX_FLOWS {
+                if live_flows >= max_flows {
+                    log_flow_capacity_once(
+                        model,
+                        "outbound_syn",
+                        Some((source, destination)),
+                        sockets,
+                        tcp_flows,
+                        max_flows,
+                        capacity_reported,
+                    );
                     model.record_diagnostic(NatEvent::FlowCapacity, context, None);
                 }
-                return Ok(());
+                return Ok(None);
             }
             let Ok(mut charge) = FlowCharge::new(
                 model,
                 #[cfg(kernelet_nat_failure_diag_host)]
                 context,
             ) else {
-                return Ok(());
+                return Ok(None);
             };
             let host = match TcpStream::connect(
                 translate_destination(
@@ -1281,7 +1582,7 @@ fn prepare_incoming(
                         _error.error(),
                         _error,
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
             };
             let mut socket = tcp_socket();
@@ -1303,40 +1604,45 @@ fn prepare_incoming(
                 {
                     packet
                 }
-                _ => return Ok(()),
+                _ => return Ok(None),
             };
             let destination = SocketAddrV4::new(ipv4.dst_addr(), packet.dst_port());
-            if sockets.iter().count() >= MAX_FLOWS
+            if let Some(frontend) = udp_sockets.get(&destination) {
+                return Ok(Some(frontend.handle));
+            }
+            if live_flows >= max_flows
                 || sockets.iter().any(|(_, socket)| {
                     matches!(socket, Socket::Udp(socket)
                     if socket.endpoint().port == destination.port()
                     && socket.endpoint().addr == Some(IpAddress::Ipv4(*destination.ip())))
                 })
             {
-                return Ok(());
+                return Ok(None);
             }
             let Ok(charge) = FlowCharge::new(
                 model,
                 #[cfg(kernelet_nat_failure_diag_host)]
                 NatContext::new("udp_frontend_reserve"),
             ) else {
-                return Ok(());
+                return Ok(None);
             };
             let mut socket = udp_socket();
             socket
                 .bind((ipv4.dst_addr(), packet.dst_port()))
                 .map_err(guest_socket_error)?;
+            let handle = sockets.add(socket);
             udp_sockets.insert(
                 destination,
                 UdpFrontend {
-                    handle: sockets.add(socket),
+                    handle,
                     _charge: charge,
                 },
             );
+            return Ok(Some(handle));
         }
         _ => {}
     }
-    Ok(())
+    Ok(None)
 }
 #[cfg(kernelet_nat_failure_diag_host)]
 fn ipv4_endpoint(endpoint: IpEndpoint) -> Option<SocketAddrV4> {
@@ -1405,6 +1711,23 @@ trait FrameBackend {
     fn prepare_transmit(&mut self) -> bool;
     fn transmit(&mut self) -> Option<Self::Transmit<'_>>;
 
+    fn receive_transmit(&mut self) -> Option<Self::Transmit<'_>> {
+        self.transmit()
+    }
+
+    fn can_receive_transmit(&self) -> bool {
+        self.can_transmit()
+    }
+
+    fn flush_transmit(&self) -> bool {
+        false
+    }
+
+    #[cfg(kernelet_nat_failure_diag_host)]
+    fn diagnostic_buffers(&self) -> Option<SharedFrameBuffers> {
+        None
+    }
+
     fn transmit_retry_delay(&mut self) -> Option<Duration> {
         None
     }
@@ -1446,7 +1769,26 @@ struct SharedFrames<'a> {
     // Unconsumed tokens borrow this slot, so the complete grant/import-credit
     // reservation survives the RX poll and can be used by its next reply.
     prepared: Option<SharedTxFrame>,
+    // Ordinary egress cannot consume this paired ingress reply reservation.
+    reply: Option<SharedTxFrame>,
     import_blocked: bool,
+}
+
+#[cfg(kernelet_nat_failure_diag_host)]
+#[derive(Clone, Copy, Debug)]
+struct SharedFrameBuffers {
+    host_free: usize,
+    empty_returns: usize,
+    prepared: bool,
+    import_blocked: bool,
+    can_transmit: bool,
+}
+
+#[cfg(kernelet_nat_failure_diag_host)]
+struct SharedRxWait {
+    since: Duration,
+    first: SharedFrameBuffers,
+    reported: bool,
 }
 
 impl SharedFrames<'_> {
@@ -1474,13 +1816,30 @@ impl FrameBackend for SharedFrames<'_> {
         self.active() && (self.prepared.is_some() || self.transport.can_transmit())
     }
 
+    #[cfg(kernelet_nat_failure_diag_host)]
+    fn diagnostic_buffers(&self) -> Option<SharedFrameBuffers> {
+        let (host_free, empty_returns) = self.transport.diagnostic_buffer_counts();
+        Some(SharedFrameBuffers {
+            host_free,
+            empty_returns,
+            prepared: self.prepared.is_some(),
+            import_blocked: self.import_blocked,
+            can_transmit: self.can_transmit(),
+        })
+    }
+
     fn prepare_transmit(&mut self) -> bool {
         if !self.active() {
             self.import_blocked = false;
             return false;
         }
         if self.prepared.is_none() {
-            self.prepared = self.transport.allocate_frame();
+            if self.reply.is_none() {
+                self.reply = self.transport.allocate_frame();
+            }
+            if self.reply.is_some() {
+                self.prepared = self.transport.allocate_frame();
+            }
             self.import_blocked = self.prepared.is_none() && self.transport.has_free_buffer();
         }
         self.prepared.is_some()
@@ -1490,6 +1849,32 @@ impl FrameBackend for SharedFrames<'_> {
         self.prepare_transmit().then_some(SharedTransmit {
             prepared: &mut self.prepared,
         })
+    }
+
+    fn receive_transmit(&mut self) -> Option<SharedTransmit<'_>> {
+        if !self.active() {
+            return None;
+        }
+        if self.reply.is_none() {
+            self.reply = self
+                .prepared
+                .take()
+                .or_else(|| self.transport.allocate_frame());
+            self.import_blocked |= self.reply.is_none() && self.transport.has_free_buffer();
+        }
+        self.reply.as_ref()?;
+        Some(SharedTransmit {
+            prepared: &mut self.reply,
+        })
+    }
+
+    fn can_receive_transmit(&self) -> bool {
+        self.active()
+            && (self.reply.is_some() || self.prepared.is_some() || self.transport.can_transmit())
+    }
+
+    fn flush_transmit(&self) -> bool {
+        self.transport.flush_transmit()
     }
 
     fn transmit_retry_delay(&mut self) -> Option<Duration> {
@@ -1505,6 +1890,9 @@ impl FrameBackend for SharedFrames<'_> {
 struct FrameDevice<B: FrameBackend> {
     backend: B,
     received: Option<B::Frame>,
+    // A prepared UDP frontend belongs to the pending frame until ingress has
+    // both tokens. It must survive the flow cleanup pass during TX backpressure.
+    prepared_udp: Option<SocketHandle>,
 }
 
 impl<B: FrameBackend> FrameDevice<B> {
@@ -1512,12 +1900,92 @@ impl<B: FrameBackend> FrameDevice<B> {
         Self {
             backend,
             received: None,
+            prepared_udp: None,
         }
     }
 
     fn can_transmit(&self) -> bool {
         self.backend.can_transmit()
     }
+}
+
+// Observe the existing progress loop only. This adds no timer, retry, I/O or
+// queue mutation. Snapshot guards end before any diagnostic is published.
+#[cfg(kernelet_nat_failure_diag_host)]
+fn observe_shared_rx_wait<B: FrameBackend>(
+    model: &NetWorker,
+    device: &FrameDevice<B>,
+    sockets: &SocketSet<'static>,
+    flows: &[TcpFlow],
+    waiting: &mut Option<SharedRxWait>,
+    reports: &mut usize,
+) {
+    let Some(buffers) = device.backend.diagnostic_buffers() else {
+        return;
+    };
+    let blocked = device.received.is_some() && !device.backend.can_receive_transmit();
+    if blocked {
+        let wait = waiting.get_or_insert(SharedRxWait {
+            since: now(),
+            first: buffers,
+            reported: false,
+        });
+        if !wait.reported
+            && *reports < 4
+            && now().saturating_sub(wait.since) >= Duration::from_secs(1)
+        {
+            log_shared_rx_wait(model, "still_blocked", wait, device, sockets, flows);
+            wait.reported = true;
+            *reports += 1;
+        }
+    } else if let Some(wait) = waiting.take() {
+        if *reports < 4 && now().saturating_sub(wait.since) >= Duration::from_secs(1) {
+            log_shared_rx_wait(model, "resumed", &wait, device, sockets, flows);
+            *reports += 1;
+        }
+    }
+}
+
+#[cfg(kernelet_nat_failure_diag_host)]
+fn log_shared_rx_wait<B: FrameBackend>(
+    model: &NetWorker,
+    stage: &'static str,
+    wait: &SharedRxWait,
+    device: &FrameDevice<B>,
+    sockets: &SocketSet<'static>,
+    flows: &[TcpFlow],
+) {
+    let current = device.backend.diagnostic_buffers();
+    let mut host_connecting = 0usize;
+    let mut guest_can_send = 0usize;
+    let mut guest_rx_bytes = 0usize;
+    let mut guest_tx_bytes = 0usize;
+    let mut outbound = 0usize;
+    for flow in flows {
+        let socket = sockets.get::<tcp::Socket>(flow.handle);
+        host_connecting += usize::from(flow.host.as_ref().is_some_and(TcpStream::is_connecting));
+        guest_can_send += usize::from(socket.can_send());
+        guest_rx_bytes = guest_rx_bytes.saturating_add(socket.recv_queue());
+        guest_tx_bytes = guest_tx_bytes.saturating_add(socket.send_queue());
+        outbound += usize::from(flow.requested.is_some());
+    }
+    error!(
+        "kernelet NAT shared_rx_wait version=1 cid={} stage={} since={:?} elapsed={:?} pending_rx={} first={:?} current={:?} tcp_count={} host_connecting={} guest_can_send={} guest_rx_bytes={} guest_tx_bytes={} outbound={} mapped={}",
+        model.endpoint.diagnostic_cid(),
+        stage,
+        wait.since,
+        now().saturating_sub(wait.since),
+        device.received.is_some(),
+        wait.first,
+        current,
+        flows.len(),
+        host_connecting,
+        guest_can_send,
+        guest_rx_bytes,
+        guest_tx_bytes,
+        outbound,
+        flows.len() - outbound,
+    );
 }
 
 struct Receive<F>(F);
@@ -1560,8 +2028,8 @@ impl TxToken for SharedTransmit<'_> {
             .take()
             .expect("reserved shared transmit frame");
         let result = frame.with_bytes_mut(len, f);
-        // This worker is already running. Publish directly to the Image using
-        // the retained import credit; a concurrent close may discard delivery.
+        // Retain the admitted credit through bounded batch publication. The
+        // worker flushes even a short batch before it waits for new events.
         let _ = frame.deliver(len);
         result
     }
@@ -1578,7 +2046,8 @@ impl<B: FrameBackend> Device for FrameDevice<B> {
         Self: 'a;
     fn receive(&mut self, _: NetworkInstant) -> Option<(Receive<B::Frame>, B::Transmit<'_>)> {
         self.received.as_ref()?;
-        let transmit = self.backend.transmit()?;
+        let transmit = self.backend.receive_transmit()?;
+        self.prepared_udp = None;
         Some((Receive(self.received.take()?), transmit))
     }
     fn transmit(&mut self, _: NetworkInstant) -> Option<B::Transmit<'_>> {
@@ -1590,6 +2059,32 @@ impl<B: FrameBackend> Device for FrameDevice<B> {
         result.max_transmission_unit = MAX_FRAME;
         result.max_burst_size = Some(32);
         result
+    }
+}
+
+#[cfg(ktest)]
+mod flow_capacity_tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn unconfigured_nat_flow_capacity_preserves_256_sockets() {
+        assert_eq!(nat_flow_capacity(), 256);
+    }
+
+    #[ktest]
+    fn operator_nat_capacity_can_cover_both_proxy_connection_windows() {
+        let capacity = "512".parse::<NatFlowCapacity>().unwrap();
+        assert_eq!(capacity.0, 512);
+    }
+
+    #[ktest]
+    fn nat_capacity_rejects_zero_invalid_values_and_reservation_overflow() {
+        for value in ["0", "-1", "invalid"] {
+            assert!(value.parse::<NatFlowCapacity>().is_err());
+        }
+        assert!(usize::MAX.to_string().parse::<NatFlowCapacity>().is_err());
     }
 }
 
@@ -1637,7 +2132,7 @@ mod source_port_tests {
 }
 
 #[cfg(all(ktest, kernelet_nat_failure_diag_host))]
-mod mapped_tcp_admission_tests {
+mod network_worker_tests {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     use ostd::{
@@ -1673,6 +2168,8 @@ mod mapped_tcp_admission_tests {
     static NEXT_FIXTURE_ID: AtomicU32 = AtomicU32::new(0x6f80_0000);
     static NEXT_LISTENER_PORT: AtomicU32 = AtomicU32::new(49152);
     const TEST_WAIT: Duration = Duration::from_secs(5);
+    const PRIVATE_IMPORTS: usize = ostd::kernelet::abi::buffer::SHARED_NET_IMPORT_LIMIT;
+    const PREPARED_CREDITS: usize = 2; // ordinary egress and the ingress reply
 
     #[ktest]
     fn shared_import_backpressure_retries_without_a_nic_notification() {
@@ -1693,13 +2190,14 @@ mod mapped_tcp_admission_tests {
             .unwrap();
         // Real import credits from a different private link exhaust the same
         // Image participant quota used by the NIC.
-        let held: Vec<_> = (0..64)
+        let held: Vec<_> = (0..PRIVATE_IMPORTS)
             .map(|_| other_link.reserve_send(PAGE_SIZE).unwrap())
             .collect();
         let mut backend = SharedFrames {
             endpoint: &endpoint,
             transport: shared.transport_for_test(),
             prepared: None,
+            reply: None,
             import_blocked: false,
         };
         assert!(!backend.prepare_transmit());
@@ -1726,7 +2224,7 @@ mod mapped_tcp_admission_tests {
         for _ in 0..64 {
             drop(backend.transmit().unwrap());
         }
-        let held: Vec<_> = (0..63)
+        let held: Vec<_> = (0..PRIVATE_IMPORTS - PREPARED_CREDITS)
             .map(|_| other_link.reserve_send(PAGE_SIZE).unwrap())
             .collect();
         assert!(other_link.reserve_send(PAGE_SIZE).is_err());
@@ -1735,6 +2233,47 @@ mod mapped_tcp_admission_tests {
         shared.cancel();
         drop(shared);
         other_link.close();
+        endpoint.revoke();
+        drop(endpoint);
+        fixture.finish();
+    }
+
+    #[ktest]
+    fn shared_ingress_reply_survives_ordinary_transmit_exhaustion() {
+        let fixture = Fixture::new();
+        let endpoint = NetEndpoint::new(fixture.uid, fixture.port.into());
+        let shared = crate::endovisor::shared_net::SharedNet::new(
+            &fixture.admission,
+            fixture.model.kernelet.clone(),
+            endpoint.clone(),
+            [2, 0x71, 4, 0, 0, 4],
+            33,
+        )
+        .unwrap();
+        let mut backend = SharedFrames {
+            endpoint: &endpoint,
+            transport: shared.transport_for_test(),
+            prepared: None,
+            reply: None,
+            import_blocked: false,
+        };
+        for _ in 1..ostd::kernelet::abi::buffer::SHARED_NET_POOL_SIZE {
+            backend
+                .transmit()
+                .unwrap()
+                .consume(14, |bytes| bytes.fill(0));
+        }
+        assert!(backend.transmit().is_none());
+        assert!(!backend.transport.has_free_buffer());
+        for _ in 0..64 {
+            // ACK-only ingress can leave this paired token unused without
+            // losing its independent backing or import reservation.
+            drop(backend.receive_transmit().unwrap());
+        }
+        assert!(backend.reply.is_some());
+        drop(backend);
+        shared.cancel();
+        drop(shared);
         endpoint.revoke();
         drop(endpoint);
         fixture.finish();
@@ -1806,11 +2345,12 @@ mod mapped_tcp_admission_tests {
             endpoint: &endpoint,
             transport,
             prepared: None,
+            reply: None,
             import_blocked: false,
         };
         assert!(backend.prepare_transmit());
-        // The unused paired transmit token owns the final import slot.
-        let held: Vec<_> = (0..63)
+        // Ordinary egress and the ingress reply retain independent credits.
+        let held: Vec<_> = (0..PRIVATE_IMPORTS - PREPARED_CREDITS)
             .map(|_| other_link.reserve_send(PAGE_SIZE).unwrap())
             .collect();
         for _ in 0..TX_POOL_SIZE {
@@ -1839,11 +2379,11 @@ mod mapped_tcp_admission_tests {
                 .is_empty()
         );
         assert_eq!(poller.wait().unwrap_err().error(), Errno::ETIME);
+        assert!(matches!(
+            backend.take_work(&fixture.model),
+            Some(Work::Progress)
+        ));
         for _ in 0..TX_POOL_SIZE {
-            assert!(matches!(
-                backend.take_work(&fixture.model),
-                Some(Work::Progress)
-            ));
             let delivery =
                 image.test_shared_buffer_service(buffer::RECEIVE, 0, [nic_connection, 0, 0]);
             assert_eq!(delivery.status, 0);
@@ -1863,6 +2403,484 @@ mod mapped_tcp_admission_tests {
         other_link.close();
         endpoint.revoke();
         drop(endpoint);
+        fixture.finish();
+    }
+
+    fn udp_ingress_frame(
+        mac: [u8; 6],
+        source_port: u16,
+        destination: SocketAddrV4,
+        payload: &[u8],
+    ) -> Frame {
+        use smoltcp::{
+            phy::ChecksumCapabilities,
+            wire::{Ipv4Repr, UdpRepr},
+        };
+
+        let mut frame = Frame::empty();
+        frame.len = 14 + 20 + 8 + payload.len();
+        let mut ethernet = EthernetFrame::new_unchecked(&mut frame.bytes[..frame.len]);
+        ethernet.set_src_addr(EthernetAddress(mac));
+        ethernet.set_dst_addr(EthernetAddress(GATEWAY_MAC));
+        ethernet.set_ethertype(EthernetProtocol::Ipv4);
+        let mut ipv4 = Ipv4Packet::new_unchecked(ethernet.payload_mut());
+        let checksums = ChecksumCapabilities::default();
+        Ipv4Repr {
+            src_addr: GUEST,
+            dst_addr: *destination.ip(),
+            next_header: IpProtocol::Udp,
+            payload_len: 8 + payload.len(),
+            hop_limit: 64,
+        }
+        .emit(&mut ipv4, &checksums);
+        UdpRepr {
+            src_port: source_port,
+            dst_port: destination.port(),
+        }
+        .emit(
+            &mut UdpPacket::new_unchecked(ipv4.payload_mut()),
+            &IpAddress::Ipv4(GUEST),
+            &IpAddress::Ipv4(*destination.ip()),
+            payload.len(),
+            |bytes| bytes.copy_from_slice(payload),
+            &checksums,
+        );
+        frame
+    }
+
+    fn tcp_syn_frame(mac: [u8; 6], destination: SocketAddrV4) -> Frame {
+        use smoltcp::{
+            phy::ChecksumCapabilities,
+            wire::{Ipv4Repr, TcpSeqNumber},
+        };
+
+        let mut frame = Frame::empty();
+        frame.len = 14 + 20 + 20;
+        let mut ethernet = EthernetFrame::new_unchecked(&mut frame.bytes[..frame.len]);
+        ethernet.set_src_addr(EthernetAddress(mac));
+        ethernet.set_dst_addr(EthernetAddress(GATEWAY_MAC));
+        ethernet.set_ethertype(EthernetProtocol::Ipv4);
+        let mut ipv4 = Ipv4Packet::new_unchecked(ethernet.payload_mut());
+        Ipv4Repr {
+            src_addr: GUEST,
+            dst_addr: *destination.ip(),
+            next_header: IpProtocol::Tcp,
+            payload_len: 20,
+            hop_limit: 64,
+        }
+        .emit(&mut ipv4, &ChecksumCapabilities::default());
+        let mut tcp = TcpPacket::new_unchecked(ipv4.payload_mut());
+        tcp.set_src_port(45002);
+        tcp.set_dst_port(destination.port());
+        tcp.set_seq_number(TcpSeqNumber(1));
+        tcp.set_header_len(20);
+        tcp.set_syn(true);
+        tcp.set_window_len(4096);
+        tcp.fill_checksum(&IpAddress::Ipv4(GUEST), &IpAddress::Ipv4(*destination.ip()));
+        frame
+    }
+
+    #[ktest]
+    fn host_first_tcp_close_retains_time_wait_and_replies_to_retransmitted_fin() {
+        use crate::net::socket::util::SockShutdownCmd;
+        use smoltcp::phy::Loopback;
+
+        let fixture = Fixture::new();
+        let native_client = fixture.connect_client();
+        let (stream, charge) =
+            accept_mapped_tcp(&fixture.model, fixture.listener(), fixture.context())
+                .unwrap()
+                .expect("real native connection must be pending");
+        let mut device = Loopback::new(Medium::Ip);
+        let mut interface = Interface::new(
+            InterfaceConfig::new(HardwareAddress::Ip),
+            &mut device,
+            NetworkInstant::from_millis(0),
+        );
+        interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::Ipv4(GATEWAY), 24))
+                .unwrap();
+            addresses
+                .push(IpCidr::new(IpAddress::Ipv4(GUEST), 24))
+                .unwrap();
+        });
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut server = tcp_socket();
+        server.listen((GATEWAY, 18080)).unwrap();
+        let server = sockets.add(server);
+        let mut peer = tcp_socket();
+        peer.connect(interface.context(), (GATEWAY, 18080), (GUEST, 45000))
+            .unwrap();
+        let peer = sockets.add(peer);
+        for tick in 0..100 {
+            interface.poll(NetworkInstant::from_millis(tick), &mut device, &mut sockets);
+            if sockets.get::<tcp::Socket>(server).state() == tcp::State::Established
+                && sockets.get::<tcp::Socket>(peer).state() == tcp::State::Established
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            sockets.get::<tcp::Socket>(server).state(),
+            tcp::State::Established
+        );
+        assert_eq!(
+            sockets.get::<tcp::Socket>(peer).state(),
+            tcp::State::Established
+        );
+        let mut flow = TcpFlow::new(server, stream, charge);
+        native_client.shutdown(SockShutdownCmd::SHUT_WR).unwrap();
+        assert!(poll_until(|| {
+            flow.forward(&fixture.model, sockets.get_mut::<tcp::Socket>(server));
+            flow.host_eof
+        }));
+        for tick in 100..300 {
+            interface.poll(NetworkInstant::from_millis(tick), &mut device, &mut sockets);
+            if sockets.get::<tcp::Socket>(server).state() == tcp::State::FinWait2
+                && sockets.get::<tcp::Socket>(peer).state() == tcp::State::CloseWait
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            sockets.get::<tcp::Socket>(server).state(),
+            tcp::State::FinWait2
+        );
+        assert_eq!(
+            sockets.get::<tcp::Socket>(peer).state(),
+            tcp::State::CloseWait
+        );
+        sockets.get_mut::<tcp::Socket>(peer).close();
+        interface.poll_egress(NetworkInstant::from_millis(1000), &mut device, &mut sockets);
+        let fin = device
+            .queue
+            .pop_front()
+            .expect("peer must emit its real FIN");
+        let ip = Ipv4Packet::new_checked(fin.as_slice()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.fin());
+        assert_eq!(tcp.src_port(), 45000);
+        let expected_ack = tcp.seq_number() + 1;
+        device.queue.push_back(fin.clone());
+        interface.poll_ingress_single(NetworkInstant::from_millis(1001), &mut device, &mut sockets);
+        interface.poll_egress(NetworkInstant::from_millis(1001), &mut device, &mut sockets);
+        assert_eq!(
+            sockets.get::<tcp::Socket>(server).state(),
+            tcp::State::TimeWait
+        );
+        let final_ack = device
+            .queue
+            .pop_front()
+            .expect("closing frontend must emit final ACK");
+        let ip = Ipv4Packet::new_checked(final_ack.as_slice()).unwrap();
+        let ack = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(ack.ack() && !ack.rst());
+        assert_eq!(ack.ack_number(), expected_ack);
+        // Drop the final ACK: the native socket handoff must not remove the
+        // frontend while the real peer remains in LAST_ACK.
+        assert!(device.queue.is_empty());
+        flow.forward(&fixture.model, sockets.get_mut::<tcp::Socket>(server));
+        assert!(flow.host.is_none());
+        assert!(flow.alive, "native handoff must retain the TIME_WAIT tuple");
+        flow.forward(&fixture.model, sockets.get_mut::<tcp::Socket>(server));
+        assert!(flow.alive, "the host-less flow must still retain TIME_WAIT");
+        device.queue.push_back(fin);
+        interface.poll_ingress_single(NetworkInstant::from_millis(2001), &mut device, &mut sockets);
+        let reply = device
+            .queue
+            .pop_front()
+            .expect("retransmitted FIN must be acknowledged");
+        let ip = Ipv4Packet::new_checked(reply.as_slice()).unwrap();
+        let ack = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(ack.ack() && !ack.rst());
+        assert_eq!(ack.ack_number(), expected_ack);
+        assert_eq!(
+            sockets.get::<tcp::Socket>(server).state(),
+            tcp::State::TimeWait
+        );
+        interface.poll_egress(
+            NetworkInstant::from_millis(12002),
+            &mut device,
+            &mut sockets,
+        );
+        assert_eq!(
+            sockets.get::<tcp::Socket>(server).state(),
+            tcp::State::Closed
+        );
+        flow.forward(&fixture.model, sockets.get_mut::<tcp::Socket>(server));
+        assert!(!flow.alive, "real TIME_WAIT expiry must allow retirement");
+        drop(flow);
+        drop(native_client);
+        fixture.finish();
+    }
+
+    #[ktest]
+    fn pending_udp_frontend_survives_real_transmit_backpressure() {
+        let fixture = Fixture::new();
+        let before = fixture.quota_snapshot();
+        let mut device = FrameDevice::new(CopyFrames(&fixture.model.endpoint));
+        let mut interface = Interface::new(
+            InterfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(GATEWAY_MAC))),
+            &mut device,
+            NetworkInstant::from_millis(0),
+        );
+        interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::Ipv4(GATEWAY), 24))
+                .unwrap();
+        });
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut tcp = Vec::new();
+        let mut frontends = BTreeMap::new();
+        let flows = BTreeMap::new();
+        let payload = b"retained first datagram";
+        let destination = SocketAddrV4::new(GATEWAY, 18080);
+        let frame = udp_ingress_frame(fixture.model.mac, 45000, destination, payload);
+        device.prepared_udp = frame
+            .with_bytes(|bytes| {
+                prepare_incoming(
+                    bytes,
+                    &NetConfigArgs::default(),
+                    &fixture.model,
+                    &mut sockets,
+                    &mut tcp,
+                    &mut frontends,
+                    0,
+                    1,
+                    &mut false,
+                )
+            })
+            .unwrap();
+        let handle = device
+            .prepared_udp
+            .expect("real datagram must prepare a frontend");
+        device.received = Some(frame);
+        for _ in 0..super::super::QUEUE_SIZE {
+            assert!(fixture.model.endpoint.push_input(Frame::empty()));
+        }
+        assert!(!fixture.model.endpoint.push_input(Frame::empty()));
+        assert!(!device.backend.can_transmit());
+        assert_eq!(
+            interface.poll_ingress_single(
+                NetworkInstant::from_millis(1),
+                &mut device,
+                &mut sockets
+            ),
+            PollIngressSingleResult::None
+        );
+        assert!(device.received.is_some());
+        retain_udp_frontends(&mut frontends, &flows, &mut sockets, device.prepared_udp);
+        assert_eq!(frontends.get(&destination).unwrap().handle, handle);
+        while fixture.model.endpoint.pop_input().is_some() {}
+        assert_ne!(
+            interface.poll_ingress_single(
+                NetworkInstant::from_millis(2),
+                &mut device,
+                &mut sockets
+            ),
+            PollIngressSingleResult::None
+        );
+        assert!(device.received.is_none());
+        assert_eq!(device.prepared_udp, None);
+        let (received, metadata) = sockets.get_mut::<udp::Socket>(handle).recv().unwrap();
+        assert_eq!(received, payload);
+        assert_eq!(
+            metadata.endpoint,
+            IpEndpoint::new(IpAddress::Ipv4(GUEST), 45000)
+        );
+        assert!(
+            !fixture.model.endpoint.input_available(),
+            "valid UDP must not generate an ICMP rejection"
+        );
+        retain_udp_frontends(&mut frontends, &flows, &mut sockets, device.prepared_udp);
+        assert!(frontends.is_empty());
+        drop(device);
+        assert_eq!(
+            fixture.quota_snapshot().endpoint_bytes,
+            before.endpoint_bytes
+        );
+        fixture.finish();
+    }
+
+    #[ktest]
+    fn full_mapped_udp_capacity_still_registers_existing_peer_wakeup() {
+        let fixture = Fixture::new();
+        let listener =
+            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, fixture.port)).unwrap();
+        let peer =
+            UdpSocket::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, fixture.port)).unwrap();
+        let listeners = vec![(listener, 18080)];
+        peer.send(b"first").unwrap();
+        let mut first_peer = None;
+        let mut bytes = [0; 32];
+        assert!(poll_until(|| match listeners[0].0.recv_from(&mut bytes) {
+            Ok((length, source)) => {
+                assert_eq!(&bytes[..length], b"first");
+                first_peer = Some(source);
+                true
+            }
+            Err(error) if error.error() == Errno::EAGAIN => false,
+            Err(error) => panic!("native UDP receive failed: {error:?}"),
+        }));
+        let mut socket = udp_socket();
+        socket.bind((GATEWAY, 40000)).unwrap();
+        let mut sockets = SocketSet::new(Vec::new());
+        let mapped = vec![UdpPortFlow {
+            listener: 0,
+            peer: first_peer.unwrap(),
+            handle: sockets.add(socket),
+            last_active: now(),
+            _charge: FlowCharge::new(&fixture.model, fixture.context()).unwrap(),
+        }];
+        let count = live_flow_count(&[], &BTreeMap::new(), &mapped);
+        assert_eq!(count, 1);
+        let timeout = Duration::from_millis(100);
+        let mut poller = Poller::new(Some(&timeout));
+        assert!(!poll_listeners(&[], &listeners, &[], count, 1, &mut poller));
+        peer.send(b"second").unwrap();
+        poll_loopback_for_ktest();
+        assert!(
+            poller.wait().is_ok(),
+            "a full table must still wake for the existing UDP peer"
+        );
+        let (length, source) = listeners[0].0.recv_from(&mut bytes).unwrap();
+        assert_eq!(&bytes[..length], b"second");
+        assert_eq!(source, mapped[0].peer);
+        let mut idle = Poller::new(Some(&timeout));
+        assert!(!poll_listeners(&[], &listeners, &[], count, 1, &mut idle));
+        drop((mapped, peer, listeners));
+        fixture.finish();
+    }
+
+    #[ktest]
+    fn full_flow_table_ignores_expired_tcp_admission_retry() {
+        let mut fixture = Fixture::new();
+        let client = fixture.connect_client();
+        let listener =
+            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, fixture.port)).unwrap();
+        let listeners = vec![(listener, 18080)];
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut socket = udp_socket();
+        socket.bind((GATEWAY, 40000)).unwrap();
+        let mapped = vec![UdpPortFlow {
+            listener: 0,
+            peer: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45000),
+            handle: sockets.add(socket),
+            last_active: now(),
+            _charge: FlowCharge::new(&fixture.model, fixture.context()).unwrap(),
+        }];
+        let before = fixture.quota_snapshot();
+        let filler = fixture.fill_quota(before);
+        let mut retry = None;
+        let start = Duration::from_secs(1);
+        let result = accept_mapped_tcp_with_backoff(
+            &fixture.model,
+            fixture.listener(),
+            &mut retry,
+            start,
+            fixture.context(),
+        );
+        assert!(matches!(result, Err(error) if error.error() == Errno::ENOSPC));
+        assert_eq!(retry, Some(start + ACCEPT_RETRY_DELAY));
+        let tcp_listeners = vec![(fixture.listener.take().unwrap(), 18080)];
+        let current = start + ACCEPT_RETRY_DELAY * 2;
+        let count = live_flow_count(&[], &BTreeMap::new(), &mapped);
+        assert_eq!(count, 1);
+        assert_eq!(accept_retry_delay(&[retry], current, count, 1), None);
+        // The real pending TCP listener is masked at full capacity; the real
+        // Poller must block rather than repeatedly observe the expired retry.
+        let wait = Duration::from_millis(2);
+        let mut poller = Poller::new(Some(&wait));
+        assert!(!poll_listeners(
+            &tcp_listeners,
+            &listeners,
+            &[retry],
+            count,
+            1,
+            &mut poller
+        ));
+        assert_eq!(poller.wait().unwrap_err().error(), Errno::ETIME);
+        drop((filler, mapped, listeners, sockets));
+        assert_eq!(
+            accept_retry_delay(&[retry], current, 0, 1),
+            Some(Duration::ZERO)
+        );
+        let (stream, charge) = accept_mapped_tcp_with_backoff(
+            &fixture.model,
+            &tcp_listeners[0].0,
+            &mut retry,
+            current,
+            tcp_listeners[0]
+                .0
+                .diagnostic_context("test_retry_after_capacity", 18080),
+        )
+        .unwrap()
+        .expect("free capacity must resume the pending native accept");
+        assert_eq!(retry, None);
+        drop((stream, charge, client, tcp_listeners));
+        assert!(poll_until(
+            || fixture.host_bytes() == fixture.baseline_host_bytes
+        ));
+        fixture.finish();
+    }
+
+    #[ktest]
+    fn shared_udp_frontend_does_not_undercount_tcp_admission() {
+        let fixture = Fixture::new();
+        let destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, fixture.port);
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut frontend = udp_socket();
+        frontend.bind(destination).unwrap();
+        let handle = sockets.add(frontend);
+        let mut frontends = BTreeMap::new();
+        frontends.insert(
+            destination,
+            UdpFrontend {
+                handle,
+                _charge: FlowCharge::new(&fixture.model, fixture.context()).unwrap(),
+            },
+        );
+        let mut flows = BTreeMap::new();
+        for port in [45000, 45001] {
+            flows.insert(
+                (SocketAddrV4::new(GUEST, port), destination),
+                UdpFlow {
+                    host: UdpSocket::connect(destination).unwrap(),
+                    last_active: now(),
+                    handle,
+                    _charge: FlowCharge::new(&fixture.model, fixture.context()).unwrap(),
+                },
+            );
+        }
+        let mut tcp = Vec::new();
+        let count = live_flow_count(&tcp, &flows, &[]);
+        assert_eq!(count, 2);
+        assert_eq!(sockets.iter().count(), 1);
+        let charged = fixture.host_bytes();
+        let frame = tcp_syn_frame(fixture.model.mac, destination);
+        assert_eq!(
+            frame
+                .with_bytes(|bytes| prepare_incoming(
+                    bytes,
+                    &NetConfigArgs::default(),
+                    &fixture.model,
+                    &mut sockets,
+                    &mut tcp,
+                    &mut frontends,
+                    count,
+                    2,
+                    &mut false
+                ))
+                .unwrap(),
+            None
+        );
+        assert!(
+            tcp.is_empty(),
+            "a shared UDP frontend must not hide its admitted flows"
+        );
+        assert_eq!(fixture.host_bytes(), charged);
+        drop((flows, frontends, sockets));
         fixture.finish();
     }
 
@@ -2098,7 +3116,7 @@ mod mapped_tcp_admission_tests {
                         .model
                         .endpoint
                         .reserve_backend_bytes(
-                            super::super::sockets::TCP_LISTENER_RESERVATION_BYTES,
+                            super::super::sockets::tcp_listener_reservation_bytes(),
                         )
                         .unwrap(),
                 )));
@@ -2229,11 +3247,11 @@ mod mapped_tcp_admission_tests {
         }
     }
 
-    fn poll_until(mut predicate: impl FnMut() -> bool) -> bool {
+    fn poll_until(mut predicate_fn: impl FnMut() -> bool) -> bool {
         let deadline = now() + TEST_WAIT;
         loop {
             poll_loopback_for_ktest();
-            if predicate() {
+            if predicate_fn() {
                 return true;
             }
             if now() >= deadline {

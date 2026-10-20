@@ -1,0 +1,78 @@
+diff --git a/home/plucky/Kernelets-Exp-Framework/.cache/rq12/smoltcp-egress-fairness-model-r1/upstream/src/iface/interface/mod.rs b/home/plucky/Kernelets-Exp-Framework/.cache/rq12/smoltcp-egress-fairness-model-r1/patched/src/iface/interface/mod.rs
+index a49fc2b..a7acdee 100644
+--- a/home/plucky/Kernelets-Exp-Framework/.cache/rq12/smoltcp-egress-fairness-model-r1/upstream/src/iface/interface/mod.rs
++++ b/home/plucky/Kernelets-Exp-Framework/.cache/rq12/smoltcp-egress-fairness-model-r1/patched/src/iface/interface/mod.rs
+@@ -109,6 +109,8 @@ pub enum PollIngressSingleResult {
+ /// a dependency on heap allocation, it instead owns a `BorrowMut<[T]>`, which can be
+ /// a `&mut [T]`, or `Vec<T>` if a heap is available.
+ pub struct Interface {
++    /// First storage slot to visit when device transmit credit becomes available.
++    egress_cursor: usize,
+     pub inner: InterfaceInner,
+     fragments: FragmentsBuffer,
+     fragmenter: Fragmenter,
+@@ -231,6 +233,7 @@ impl Interface {
+         }
+ 
+         Interface {
++            egress_cursor: 0,
+             fragments: FragmentsBuffer {
+                 #[cfg(feature = "proto-sixlowpan")]
+                 decompress_buf: [0u8; sixlowpan::MAX_DECOMPRESSED_LEN],
+@@ -649,7 +652,7 @@ impl Interface {
+         }
+ 
+         let mut result = PollResult::None;
+-        for item in sockets.items_mut() {
++        for (index, item) in sockets.items_mut_from(self.egress_cursor) {
+             if !item
+                 .meta
+                 .egress_permitted(self.inner.now, |ip_addr| self.inner.has_neighbor(&ip_addr))
+@@ -737,7 +740,11 @@ impl Interface {
+             };
+ 
+             match result {
+-                Err(EgressError::Exhausted) => break, // Device buffer full.
++                Err(EgressError::Exhausted) => {
++                    // Retry this socket first after the device replenishes its credit.
++                    self.egress_cursor = index;
++                    break;
++                }
+                 Err(EgressError::Dispatch) => {
+                     // `NeighborCache` already takes care of rate limiting the neighbor discovery
+                     // requests from the socket. However, without an additional rate limiting
+@@ -750,6 +757,7 @@ impl Interface {
+                 }
+                 Ok(()) => {}
+             }
++            self.egress_cursor = index + 1;
+         }
+         result
+     }
+diff --git a/home/plucky/Kernelets-Exp-Framework/.cache/rq12/smoltcp-egress-fairness-model-r1/upstream/src/iface/socket_set.rs b/home/plucky/Kernelets-Exp-Framework/.cache/rq12/smoltcp-egress-fairness-model-r1/patched/src/iface/socket_set.rs
+index ddaf1a2..87d8621 100644
+--- a/home/plucky/Kernelets-Exp-Framework/.cache/rq12/smoltcp-egress-fairness-model-r1/upstream/src/iface/socket_set.rs
++++ b/home/plucky/Kernelets-Exp-Framework/.cache/rq12/smoltcp-egress-fairness-model-r1/patched/src/iface/socket_set.rs
+@@ -148,4 +148,22 @@ impl<'a> SocketSet<'a> {
+     pub fn items_mut(&mut self) -> impl Iterator<Item = &mut Item<'a>> + '_ {
+         self.sockets.iter_mut().filter_map(|x| x.inner.as_mut())
+     }
++
++    /// Visit occupied storage slots once, starting at the given slot and wrapping.
++    pub(crate) fn items_mut_from(
++        &mut self,
++        start: usize,
++    ) -> impl Iterator<Item = (usize, &mut Item<'a>)> + '_ {
++        let start = if self.sockets.is_empty() {
++            0
++        } else {
++            start % self.sockets.len()
++        };
++        let (head, tail) = self.sockets.split_at_mut(start);
++        tail.iter_mut()
++            .enumerate()
++            .map(move |(index, slot)| (start + index, slot))
++            .chain(head.iter_mut().enumerate())
++            .filter_map(|(index, slot)| slot.inner.as_mut().map(|item| (index, item)))
++    }
+ }

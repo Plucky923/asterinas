@@ -1,0 +1,10 @@
+[package]
+name = "kbench-smoltcp-egress-credit-model"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+smoltcp = { path = "../../../vendor/smoltcp", default-features = false, features = ["alloc", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp", "socket-tcp"] }

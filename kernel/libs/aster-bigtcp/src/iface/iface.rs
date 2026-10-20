@@ -25,7 +25,7 @@ pub trait Iface<E>: internal::IfaceInternal<E> + Send + Sync {
     /// Transmits or receives packets queued in the iface, and updates socket status accordingly.
     fn poll(&self);
 
-    /// Returns the maximum transmission unit.
+    /// Returns the IP maximum transmission unit, excluding link-layer headers.
     fn mtu(&self) -> usize;
 }
 

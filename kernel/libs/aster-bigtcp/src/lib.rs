@@ -37,6 +37,8 @@ pub mod packet;
 pub mod socket;
 pub mod socket_table;
 pub mod time;
+#[cfg(kernelet_nat_failure_diag)]
+mod tx_allocation_diag;
 pub mod wire;
 
 extern crate alloc;

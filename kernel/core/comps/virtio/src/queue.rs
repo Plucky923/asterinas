@@ -57,6 +57,8 @@ pub(crate) struct VirtQueue {
     last_used_idx: u16,
     /// Whether the callback of this queue is enabled.
     is_callback_enabled: bool,
+    #[cfg(ktest)]
+    complete_before_callback_for_test: bool,
 }
 
 /// An error returned by [`VirtQueue::new`].
@@ -233,6 +235,8 @@ impl VirtQueue {
             avail_idx: 0,
             last_used_idx: 0,
             is_callback_enabled: true,
+            #[cfg(ktest)]
+            complete_before_callback_for_test: false,
         })
     }
 
@@ -532,6 +536,22 @@ impl VirtQueue {
             return;
         }
 
+        #[cfg(ktest)]
+        if core::mem::take(&mut self.complete_before_callback_for_test) {
+            // A controlled device completes the sole input descriptor while
+            // callbacks are still disabled. No interrupt accompanies this write.
+            assert_eq!(self.descs.len(), 1);
+            assert_eq!(self.num_used, 1);
+            let mut element = self.used.borrow_vm();
+            element.byte_add(offset_of!(UsedRing, ring));
+            let element = element.cast::<UsedElem>();
+            field_ptr!(&element, UsedElem, id).write_once(&0).unwrap();
+            field_ptr!(&element, UsedElem, len).write_once(&0).unwrap();
+            field_ptr!(&self.used, UsedRing, idx)
+                .write_once(&self.last_used_idx.wrapping_add(1))
+                .unwrap();
+        }
+
         let flags_ptr = field_ptr!(&self.avail, AvailRing, flags);
         let mut flags: AvailFlags = flags_ptr.read_once().unwrap();
         debug_assert!(flags.contains(AvailFlags::VIRTQ_AVAIL_F_NO_INTERRUPT));
@@ -539,6 +559,17 @@ impl VirtQueue {
         flags_ptr.write_once(&flags).unwrap();
 
         self.is_callback_enabled = true;
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn complete_before_callback_for_test(&mut self) {
+        assert_eq!(self.descs.len(), 1);
+        self.complete_before_callback_for_test = true;
+        // The controlled device polls the available ring without a doorbell.
+        // Its completion above is the only device action in this test.
+        field_ptr!(&self.used, UsedRing, flags)
+            .write_once(&1)
+            .unwrap();
     }
 }
 

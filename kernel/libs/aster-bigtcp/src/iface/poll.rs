@@ -360,6 +360,13 @@ impl<E: Ext> PollContext<'_, E> {
         let mut builder = match phy.alloc_tx_buffer(quote_len) {
             Ok(buffer) => buffer.to_builder(),
             Err(err) => {
+                #[cfg(kernelet_nat_failure_diag)]
+                crate::tx_allocation_diag::record(
+                    crate::tx_allocation_diag::AllocationContext::IcmpUnreachable,
+                    quote_len,
+                    err,
+                );
+                #[cfg(not(kernelet_nat_failure_diag))]
                 ostd::error!("failed to allocate a network packet: {:?}", err);
                 return None;
             }
@@ -397,7 +404,12 @@ impl<E: Ext> PollContext<'_, E> {
     ) -> Option<TxPacketWithDst> {
         let checksum_caps = self.iface.context().checksum_caps();
 
-        let packet = Self::copy_payload(phy, tcp_repr.payload)?;
+        let packet = Self::copy_payload(
+            phy,
+            tcp_repr.payload,
+            #[cfg(kernelet_nat_failure_diag)]
+            crate::tx_allocation_diag::AllocationContext::tcp(ip_repr, tcp_repr),
+        )?;
         let packet = tcp::emit(packet, ip_repr, tcp_repr, checksum_caps.tcp.tx());
         let packet = ip::emit(packet, ip_repr, checksum_caps.ipv4.tx());
 
@@ -416,7 +428,12 @@ impl<E: Ext> PollContext<'_, E> {
     ) -> Option<TxPacketWithDst> {
         let checksum_caps = self.iface.context().checksum_caps();
 
-        let packet = Self::copy_payload(phy, payload)?;
+        let packet = Self::copy_payload(
+            phy,
+            payload,
+            #[cfg(kernelet_nat_failure_diag)]
+            crate::tx_allocation_diag::AllocationContext::Udp,
+        )?;
         let packet = udp::emit(packet, ip_repr, udp_repr, checksum_caps.udp.tx());
         let packet = ip::emit(packet, ip_repr, checksum_caps.ipv4.tx());
 
@@ -429,10 +446,17 @@ impl<E: Ext> PollContext<'_, E> {
         Some(TxPacketWithDst { packet, dst_addr })
     }
 
-    fn copy_payload(phy: &dyn PollPhy, payload: &[u8]) -> Option<TxPacket<ApplicationLayer>> {
+    fn copy_payload(
+        phy: &dyn PollPhy,
+        payload: &[u8],
+        #[cfg(kernelet_nat_failure_diag)] context: crate::tx_allocation_diag::AllocationContext,
+    ) -> Option<TxPacket<ApplicationLayer>> {
         let mut builder = match phy.alloc_tx_buffer(payload.len()) {
             Ok(buffer) => buffer.to_builder(),
             Err(err) => {
+                #[cfg(kernelet_nat_failure_diag)]
+                crate::tx_allocation_diag::record(context, payload.len(), err);
+                #[cfg(not(kernelet_nat_failure_diag))]
                 ostd::error!("failed to allocate a network packet: {:?}", err);
                 return None;
             }

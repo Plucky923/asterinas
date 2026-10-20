@@ -120,6 +120,8 @@ default-members = [
 # Their crate-level `Cargo.toml` files are not affected
 # by the shared in-kernel workspace configuration.
 exclude = [
+    "vendor/smoltcp",
+    "tools/tests/smoltcp-egress-credit",
     "kernelet",
     "kernel/libs/comp-sys/cargo-component",
     "kernel/libs/comp-sys/component",
@@ -261,7 +263,7 @@ lru = "0.16.3"
 owo-colors = "4.2.2"
 paste = "1.0.15"
 postcard = "1.0.6"
-smoltcp = { git = "https://github.com/asterinas/smoltcp", tag = "r_2026-08-11_1b7629c", default-features = false, features = [
+smoltcp = { path = "vendor/smoltcp", default-features = false, features = [
     "alloc",
     "log",
     "medium-ethernet",

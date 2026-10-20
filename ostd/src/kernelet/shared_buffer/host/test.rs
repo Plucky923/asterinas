@@ -171,7 +171,7 @@ fn net_exchange_rejections_preserve_owners_and_pending_deliveries() {
         scratch
             .exchange(&image, connection, &[first, exhausted])
             .status,
-        -abi::LIMIT
+        -abi::STATE
     );
     assert_eq!(image.call(RECEIVE, 0, [connection, 0, 0]).value, pending);
     let host = image
@@ -182,7 +182,7 @@ fn net_exchange_rejections_preserve_owners_and_pending_deliveries() {
         .unwrap()
         .upgrade()
         .unwrap();
-    assert_eq!(host.imports.count.load(Ordering::Acquire), 0);
+    assert_eq!(host.net_imports.count.load(Ordering::Acquire), 0);
     let generic = Participant::connect(&image.0, &other.0).unwrap();
     assert_eq!(
         scratch.exchange(&image, generic, &[first]).status,
@@ -239,7 +239,7 @@ fn net_exchange_saturated_data_and_empty_returns_keep_making_progress() {
             Arc::new(|| {}),
         )
         .unwrap();
-    for _ in 0..SHARED_NET_BATCH_SIZE {
+    for _ in 0..SHARED_NET_POOL_SIZE {
         let token = image.allocate(PAGE_SIZE);
         image.call(REDEEM, token, [0; 3]);
         assert_eq!(
@@ -254,35 +254,33 @@ fn net_exchange_saturated_data_and_empty_returns_keep_making_progress() {
             .handoff(local.reserve_send(PAGE_SIZE).unwrap(), 32)
             .unwrap_or_else(|_| panic!("Host handoff failed"));
     }
-    assert_eq!(
-        scratch.exchange(&image, connection, &[]).value,
-        SHARED_NET_BATCH_SIZE as u64
-    );
-    let mut returns = [0; SHARED_NET_BATCH_SIZE];
-    for (index, token) in returns.iter_mut().enumerate() {
-        *token = scratch.descriptor(index).token;
+    let mut returns = Vec::new();
+    for _ in 0..SHARED_NET_POOL_SIZE / SHARED_NET_BATCH_SIZE {
+        assert_eq!(
+            scratch.exchange(&image, connection, &[]).value,
+            SHARED_NET_BATCH_SIZE as u64
+        );
+        returns.extend((0..SHARED_NET_BATCH_SIZE).map(|index| scratch.descriptor(index).token));
     }
-    let before = host_notified.load(Ordering::Relaxed);
-    assert_eq!(scratch.exchange(&image, connection, &returns).value, 0);
-    assert_eq!(host_notified.load(Ordering::Relaxed), before + 1);
+    for chunk in returns.chunks(SHARED_NET_BATCH_SIZE) {
+        let before = host_notified.load(Ordering::Relaxed);
+        assert_eq!(scratch.exchange(&image, connection, chunk).value, 0);
+        assert_eq!(host_notified.load(Ordering::Relaxed), before + 1);
+        assert_eq!(
+            scratch.exchange(&image, connection, &chunk[..1]).status,
+            -abi::INVALID
+        );
+    }
     assert_eq!(
-        scratch.exchange(&image, connection, &returns[..1]).status,
-        -abi::INVALID
+        host.net_imports.count.load(Ordering::Acquire),
+        PRIVATE_NET_IMPORTS
     );
-    assert_eq!(host.imports.count.load(Ordering::Acquire), MAX_BUFFERS);
     assert_eq!(
         host.data_imports.count.load(Ordering::Acquire),
-        MAX_BUFFERS / 2
+        SHARED_NET_POOL_SIZE
     );
-    let blocked = image.allocate(PAGE_SIZE);
-    image.call(REDEEM, blocked, [0; 3]);
-    assert_eq!(
-        scratch.exchange(&image, connection, &[blocked]).status,
-        -abi::LIMIT
-    );
-    assert_eq!(image.call(RELEASE, blocked, [0; 3]).status, 0);
     for _ in 0..3 {
-        let grants: Vec<_> = (0..MAX_BUFFERS)
+        let grants: Vec<_> = (0..PRIVATE_NET_IMPORTS)
             .map(|_| local.receive().unwrap().unwrap())
             .collect();
         for grant in grants {
@@ -291,13 +289,19 @@ fn net_exchange_saturated_data_and_empty_returns_keep_making_progress() {
                 .handoff(local.reserve_send(PAGE_SIZE).unwrap(), payload)
                 .unwrap_or_else(|_| panic!("Host handoff failed"));
         }
-        assert_eq!(image.0.imports.count.load(Ordering::Acquire), MAX_BUFFERS);
-        let mut data = Vec::with_capacity(SHARED_NET_BATCH_SIZE);
-        let mut empty = Vec::with_capacity(SHARED_NET_BATCH_SIZE);
-        for batch in 0..2 {
+        assert_eq!(
+            image.0.net_imports.count.load(Ordering::Acquire),
+            PRIVATE_NET_IMPORTS
+        );
+        let mut data = Vec::new();
+        let mut empty = Vec::new();
+        for batch in 0..PRIVATE_NET_IMPORTS / SHARED_NET_BATCH_SIZE {
             let reply = scratch.exchange(&image, connection, &[]);
             assert_eq!(reply.value, SHARED_NET_BATCH_SIZE as u64);
-            assert_eq!(reply.status, i64::from(batch == 0));
+            assert_eq!(
+                reply.status,
+                i64::from(batch + 1 < PRIVATE_NET_IMPORTS / SHARED_NET_BATCH_SIZE)
+            );
             for index in 0..SHARED_NET_BATCH_SIZE {
                 let descriptor = scratch.descriptor(index);
                 let (_, payload, writable) = mapping_fields(descriptor.mapping);
@@ -309,9 +313,11 @@ fn net_exchange_saturated_data_and_empty_returns_keep_making_progress() {
                 }
             }
         }
-        assert_eq!(data.len(), SHARED_NET_BATCH_SIZE);
-        assert_eq!(empty.len(), SHARED_NET_BATCH_SIZE);
-        assert_eq!(scratch.exchange(&image, connection, &data).value, 0);
+        assert_eq!(data.len(), SHARED_NET_POOL_SIZE);
+        assert_eq!(empty.len(), SHARED_NET_POOL_SIZE);
+        for chunk in data.chunks(SHARED_NET_BATCH_SIZE) {
+            scratch.exchange(&image, connection, chunk);
+        }
         for token in empty {
             assert_eq!(
                 image
@@ -320,7 +326,10 @@ fn net_exchange_saturated_data_and_empty_returns_keep_making_progress() {
                 0
             );
         }
-        assert_eq!(host.imports.count.load(Ordering::Acquire), MAX_BUFFERS);
+        assert_eq!(
+            host.net_imports.count.load(Ordering::Acquire),
+            PRIVATE_NET_IMPORTS
+        );
     }
 }
 
@@ -385,8 +394,10 @@ fn issued_nic_delivery_stays_private_after_host_notifier_retirement() {
 }
 
 #[ktest]
-fn host_data_imports_preserve_thirty_two_empty_return_slots() {
+fn host_data_imports_preserve_sixty_four_empty_return_slots() {
     let image = Owner::new();
+    let extra = Owner::new();
+    let link = Participant::connect(&extra.0, &image.0).unwrap();
     let local = HostLocalEndpoint::bind(image.0.account.clone(), &image.0).unwrap();
     let connection = local.connection();
     let host = image
@@ -397,7 +408,7 @@ fn host_data_imports_preserve_thirty_two_empty_return_slots() {
         .unwrap()
         .upgrade()
         .unwrap();
-    for _ in 0..MAX_BUFFERS / 2 {
+    for _ in 0..SHARED_NET_POOL_SIZE {
         let token = image.allocate(PAGE_SIZE);
         assert!(image.call(REDEEM, token, [0; 3]).status >= 0);
         assert_eq!(
@@ -407,39 +418,36 @@ fn host_data_imports_preserve_thirty_two_empty_return_slots() {
             0
         );
     }
-    // A caller can offer more packets than the driver's fixed pool. Rejection
-    // preserves the active grant and leaves room for empty-buffer returns.
-    let token = image.allocate(PAGE_SIZE);
-    assert!(image.call(REDEEM, token, [0; 3]).status >= 0);
-    assert_eq!(
-        image
-            .call(HANDOFF, token, [connection, READ_WRITE, 1])
-            .status,
-        -abi::LIMIT
-    );
-    assert_eq!(host.imports.count.load(Ordering::Acquire), MAX_BUFFERS / 2);
-    assert_eq!(
-        host.data_imports.count.load(Ordering::Acquire),
-        MAX_BUFFERS / 2
-    );
-    assert_eq!(
-        image
-            .call(HANDOFF, token, [connection, READ_WRITE, 0])
-            .status,
-        0
-    );
-    for _ in 1..MAX_BUFFERS / 2 {
-        let token = image.allocate(PAGE_SIZE);
-        assert!(image.call(REDEEM, token, [0; 3]).status >= 0);
+    for index in 0..SHARED_NET_POOL_SIZE {
+        let token = extra.allocate(PAGE_SIZE);
+        extra.call(REDEEM, token, [0; 3]);
+        assert_eq!(extra.call(HANDOFF, token, [link, READ_WRITE, 1]).status, 0);
+        let received = image.call(RECEIVE, 0, [link, 0, 0]).value;
+        image.call(REDEEM, received, [0; 3]);
+        if index == 0 {
+            assert_eq!(
+                image
+                    .call(HANDOFF, received, [connection, READ_WRITE, 1])
+                    .status,
+                -abi::LIMIT
+            );
+            assert_eq!(
+                host.data_imports.count.load(Ordering::Acquire),
+                SHARED_NET_POOL_SIZE
+            );
+        }
         assert_eq!(
             image
-                .call(HANDOFF, token, [connection, READ_WRITE, 0])
+                .call(HANDOFF, received, [connection, READ_WRITE, 0])
                 .status,
             0
         );
     }
-    assert_eq!(host.imports.count.load(Ordering::Acquire), MAX_BUFFERS);
-    let grants: Vec<_> = (0..MAX_BUFFERS)
+    assert_eq!(
+        host.net_imports.count.load(Ordering::Acquire),
+        PRIVATE_NET_IMPORTS
+    );
+    let grants: Vec<_> = (0..PRIVATE_NET_IMPORTS)
         .map(|_| local.receive().unwrap().unwrap())
         .collect();
     assert_eq!(
@@ -447,16 +455,13 @@ fn host_data_imports_preserve_thirty_two_empty_return_slots() {
             .iter()
             .filter(|grant| grant.payload_len() == 0)
             .count(),
-        MAX_BUFFERS / 2
-    );
-    assert_eq!(
-        host.data_imports.count.load(Ordering::Acquire),
-        MAX_BUFFERS / 2
+        SHARED_NET_POOL_SIZE
     );
     drop(grants);
-    assert_eq!(host.imports.count.load(Ordering::Acquire), 0);
+    assert_eq!(host.net_imports.count.load(Ordering::Acquire), 0);
     assert_eq!(host.data_imports.count.load(Ordering::Acquire), 0);
     assert_eq!(image.bytes(), 0);
+    assert_eq!(extra.bytes(), 0);
 }
 
 #[ktest]
@@ -491,7 +496,10 @@ fn large_host_data_imports_preserve_empty_return_byte_capacity() {
             .status,
         -abi::LIMIT
     );
-    assert_eq!(host.imports.bytes.load(Ordering::Acquire), MAX_BYTES / 2);
+    assert_eq!(
+        host.net_imports.bytes.load(Ordering::Acquire),
+        MAX_BYTES / 2
+    );
     assert_eq!(
         host.data_imports.bytes.load(Ordering::Acquire),
         MAX_BYTES / 2
@@ -509,7 +517,7 @@ fn large_host_data_imports_preserve_empty_return_byte_capacity() {
     for _ in 0..data_count + MAX_BUFFERS / 2 {
         drop(local.receive().unwrap().unwrap());
     }
-    assert_eq!(host.imports.bytes.load(Ordering::Acquire), 0);
+    assert_eq!(host.net_imports.bytes.load(Ordering::Acquire), 0);
     assert_eq!(host.data_imports.bytes.load(Ordering::Acquire), 0);
     assert_eq!(image.call(RELEASE, extra, [0; 3]).status, 0);
     assert_eq!(image.bytes(), 0);
@@ -582,27 +590,30 @@ fn host_local_grants_reuse_exclusive_storage_and_notify_after_unlock() {
 fn host_transmit_credit_is_reserved_before_production_and_refunded_on_drop() {
     let image = Owner::new();
     let local = HostLocalEndpoint::bind(image.0.account.clone(), &image.0).unwrap();
-    let credits: Vec<_> = (0..MAX_BUFFERS)
+    let credits: Vec<_> = (0..PRIVATE_NET_IMPORTS)
         .map(|_| local.reserve_send(PAGE_SIZE).unwrap())
         .collect();
     assert!(matches!(
         local.reserve_send(PAGE_SIZE),
         Err(Error::NotEnoughResources)
     ));
-    assert_eq!(image.0.imports.count.load(Ordering::Acquire), MAX_BUFFERS);
+    assert_eq!(
+        image.0.net_imports.count.load(Ordering::Acquire),
+        PRIVATE_NET_IMPORTS
+    );
     drop(credits);
-    assert_eq!(image.0.imports.count.load(Ordering::Acquire), 0);
-    assert_eq!(image.0.imports.bytes.load(Ordering::Acquire), 0);
+    assert_eq!(image.0.net_imports.count.load(Ordering::Acquire), 0);
+    assert_eq!(image.0.net_imports.bytes.load(Ordering::Acquire), 0);
     let grant = local.allocate(PAGE_SIZE, Box::new(())).unwrap();
     let credit = local.reserve_send(PAGE_SIZE).unwrap();
     image.0.mark_dying();
     let (grant, credit, error) = grant.handoff(credit, 1).err().unwrap();
     assert_eq!(error, Error::AccessDenied);
-    assert_eq!(image.0.imports.count.load(Ordering::Acquire), 1);
+    assert_eq!(image.0.net_imports.count.load(Ordering::Acquire), 1);
     drop(credit);
     drop(grant);
     assert_eq!(image.bytes(), 0);
-    assert_eq!(image.0.imports.count.load(Ordering::Acquire), 0);
+    assert_eq!(image.0.net_imports.count.load(Ordering::Acquire), 0);
 }
 
 #[ktest]
@@ -749,6 +760,24 @@ fn concurrent_receive_observations_cannot_consume_another_delivery() {
 }
 
 impl Owner {
+    fn transmit_batch(
+        &self,
+        scratch: &NetScratch,
+        connection: u64,
+        frames: &[NetTransmitDescriptor],
+    ) -> MmioResult {
+        scratch
+            .capability()
+            .write(scratch.base, ostd_pod::IntoBytes::as_bytes(frames))
+            .unwrap();
+        dispatch_net_transmit(
+            &self.0,
+            &scratch.capability(),
+            0,
+            [connection, scratch.base, frames.len() as u64],
+        )
+    }
+
     fn new() -> Self {
         Self(Participant::new(Account::new(
             Arc::new(WaitQueue::new()),
@@ -781,10 +810,351 @@ impl Owner {
     }
 }
 
+#[ktest]
+fn private_nic_transmit_batch_preserves_bytes_and_notifies_once() {
+    let image = Owner::new();
+    let local = HostLocalEndpoint::bind(image.0.account.clone(), &image.0).unwrap();
+    let scratch = NetScratch::new();
+    let notified = Arc::new(AtomicUsize::new(0));
+    let count = notified.clone();
+    local
+        .set_notifiers(
+            Arc::new(move || {
+                assert!(POOL.try_lock().is_some());
+                count.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+    let mut frames = [NetTransmitDescriptor::default(); SHARED_NET_BATCH_SIZE];
+    for (index, frame) in frames.iter_mut().enumerate() {
+        let token = image.allocate(PAGE_SIZE);
+        let mapping = image.call(REDEEM, token, [0; 3]);
+        assert!(mapping.status >= 0);
+        let record = POOL.lock();
+        record
+            .get(&(token as u32))
+            .unwrap()
+            .allocation
+            .dma
+            .writer()
+            .unwrap()
+            .write_val(&(index as u64))
+            .unwrap();
+        *frame = NetTransmitDescriptor { token, payload: 8 };
+    }
+    let reply = image.transmit_batch(&scratch, local.connection(), &frames);
+    assert_eq!(
+        (reply.status, reply.value),
+        (0, SHARED_NET_BATCH_SIZE as u64)
+    );
+    assert_eq!(notified.load(Ordering::Relaxed), 1);
+    let mut received = core::array::from_fn(|_| None);
+    assert_eq!(
+        local.receive_batch(&mut received).unwrap(),
+        SHARED_NET_BATCH_SIZE
+    );
+    for (index, grant) in received.into_iter().enumerate() {
+        let grant = grant.unwrap();
+        assert_eq!(grant.payload_len(), 8);
+        grant
+            .with_bytes(0..8, |bytes| {
+                assert_eq!(bytes, (index as u64).to_ne_bytes())
+            })
+            .unwrap();
+    }
+    assert_eq!(image.bytes(), 0);
+}
+
+#[ktest]
+fn private_nic_transmit_batch_rejection_preserves_every_owner() {
+    let image = Owner::new();
+    let local = HostLocalEndpoint::bind(image.0.account.clone(), &image.0).unwrap();
+    let scratch = NetScratch::new();
+    let first = image.allocate(PAGE_SIZE);
+    let second = image.allocate(PAGE_SIZE);
+    image.call(REDEEM, first, [0; 3]);
+    image.call(REDEEM, second, [0; 3]);
+    for bad in [first, second ^ (1 << 32)] {
+        let frames = [
+            NetTransmitDescriptor {
+                token: first,
+                payload: 8,
+            },
+            NetTransmitDescriptor {
+                token: bad,
+                payload: 8,
+            },
+        ];
+        assert!(
+            image
+                .transmit_batch(&scratch, local.connection(), &frames)
+                .status
+                < 0
+        );
+        assert!(local.receive().unwrap().is_none());
+        let mut pool = POOL.lock();
+        for token in [first, second] {
+            assert!(matches!(
+                owned(&mut pool, &image.0, token).unwrap().state,
+                State::Active
+            ));
+        }
+    }
+    // A full real data-import quota rejects a whole batch without consuming a
+    // prefix; releasing the credits permits the same original tokens to retry.
+    let host = image
+        .0
+        .peers
+        .lock()
+        .get(&local.connection())
+        .unwrap()
+        .upgrade()
+        .unwrap();
+    let held: Vec<_> = (0..SHARED_NET_POOL_SIZE)
+        .map(|_| {
+            Reservation::with_limits(
+                &host.data_imports,
+                PAGE_SIZE,
+                SHARED_NET_POOL_SIZE,
+                MAX_BYTES / 2,
+            )
+            .unwrap()
+        })
+        .collect();
+    let frames = [
+        NetTransmitDescriptor {
+            token: first,
+            payload: 8,
+        },
+        NetTransmitDescriptor {
+            token: second,
+            payload: 8,
+        },
+    ];
+    assert_eq!(
+        image
+            .transmit_batch(&scratch, local.connection(), &frames)
+            .status,
+        -abi::LIMIT
+    );
+    assert_eq!(host.net_imports.count.load(Ordering::Acquire), 0);
+    drop(held);
+    assert_eq!(
+        image
+            .transmit_batch(&scratch, local.connection(), &frames)
+            .value,
+        2
+    );
+    drop(local.receive().unwrap().unwrap());
+    drop(local.receive().unwrap().unwrap());
+    assert_eq!(image.bytes(), 0);
+}
+
+#[ktest]
+fn host_private_batch_keeps_failed_deliveries_and_notifies_after_unlock() {
+    let image = Owner::new();
+    let local = HostLocalEndpoint::bind(image.0.account.clone(), &image.0).unwrap();
+    let notified = Arc::new(AtomicUsize::new(0));
+    let count = notified.clone();
+    local
+        .set_notifiers(
+            Arc::new(|| {}),
+            Arc::new(move || {
+                assert!(POOL.try_lock().is_some());
+                count.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+        .unwrap();
+    let mut batch = core::array::from_fn(|_| None);
+    for slot in &mut batch {
+        *slot = Some((
+            local.allocate(PAGE_SIZE, Box::new(())).unwrap(),
+            local.reserve_send(PAGE_SIZE).unwrap(),
+            8,
+        ));
+    }
+    batch[SHARED_NET_BATCH_SIZE - 1].as_mut().unwrap().2 = PAGE_SIZE + 1;
+    assert_eq!(local.handoff_batch(&mut batch), Err(Error::InvalidArgs));
+    assert!(batch.iter().all(Option::is_some));
+    assert_eq!(notified.load(Ordering::Relaxed), 0);
+    batch[SHARED_NET_BATCH_SIZE - 1].as_mut().unwrap().2 = 8;
+    assert_eq!(
+        local.handoff_batch(&mut batch).unwrap(),
+        SHARED_NET_BATCH_SIZE
+    );
+    assert!(batch.iter().all(Option::is_none));
+    assert_eq!(notified.load(Ordering::Relaxed), 1);
+    for _ in 0..SHARED_NET_BATCH_SIZE {
+        let token = image.call(RECEIVE, 0, [local.connection(), 0, 0]).value;
+        assert_eq!(image.call(DISCARD, token, [0; 3]).status, 0);
+    }
+    assert_eq!(image.bytes(), 0);
+}
+
+#[ktest]
+fn private_nic_batch_generation_exhaustion_is_terminal_and_keeps_owners() {
+    let image = Owner::new();
+    let local = HostLocalEndpoint::bind(image.0.account.clone(), &image.0).unwrap();
+    let scratch = NetScratch::new();
+    let first = image.allocate(PAGE_SIZE);
+    let second = image.allocate(PAGE_SIZE);
+    image.call(REDEEM, first, [0; 3]);
+    image.call(REDEEM, second, [0; 3]);
+    let exhausted = (u32::MAX as u64) << 32 | second as u32 as u64;
+    POOL.lock().get_mut(&(second as u32)).unwrap().token = exhausted;
+    let frames = [
+        NetTransmitDescriptor {
+            token: first,
+            payload: 8,
+        },
+        NetTransmitDescriptor {
+            token: exhausted,
+            payload: 8,
+        },
+    ];
+    assert_eq!(
+        image
+            .transmit_batch(&scratch, local.connection(), &frames)
+            .status,
+        -abi::STATE
+    );
+    assert!(local.receive().unwrap().is_none());
+    assert_eq!(image.call(RELEASE, first, [0; 3]).status, 0);
+    assert_eq!(image.call(RELEASE, exhausted, [0; 3]).status, 0);
+    assert_eq!(image.bytes(), 0);
+}
+
+#[ktest]
+fn private_credit_observation_does_not_acquire_the_grant_pool() {
+    let image = Owner::new();
+    let local = HostLocalEndpoint::bind(image.0.account.clone(), &image.0).unwrap();
+    let pool = POOL.lock();
+    assert!(local.can_send(PAGE_SIZE));
+    let credit = local.reserve_send(PAGE_SIZE).unwrap();
+    drop(credit);
+    drop(pool);
+    assert_eq!(image.0.net_imports.count.load(Ordering::Acquire), 0);
+}
+
 impl Drop for Owner {
     fn drop(&mut self) {
         self.0.close();
     }
+}
+
+#[ktest]
+fn private_nic_pool_keeps_general_block_and_datagram_allocations_available() {
+    let image = Owner::new();
+    let peer = Owner::new();
+    let local = HostLocalEndpoint::bind(image.0.account.clone(), &image.0).unwrap();
+    let mut nic = Vec::new();
+    for _ in 0..SHARED_NET_POOL_SIZE {
+        let reply = image.call(
+            SHARED_NET_ALLOCATE,
+            0,
+            [PAGE_SIZE as u64, local.connection(), 0],
+        );
+        assert_eq!(reply.status, 0);
+        nic.push(reply.value);
+    }
+    assert_eq!(
+        image
+            .call(
+                SHARED_NET_ALLOCATE,
+                0,
+                [PAGE_SIZE as u64, local.connection(), 0]
+            )
+            .status,
+        -abi::LIMIT
+    );
+    assert!(
+        image
+            .call(
+                SHARED_NET_ALLOCATE,
+                0,
+                [(PAGE_SIZE * 2) as u64, local.connection(), 0]
+            )
+            .status
+            < 0
+    );
+    let connection = Participant::connect(&image.0, &peer.0).unwrap();
+    assert!(
+        image
+            .call(SHARED_NET_ALLOCATE, 0, [PAGE_SIZE as u64, connection, 0])
+            .status
+            < 0
+    );
+    for _ in 0..SHARED_NET_POOL_SIZE {
+        local
+            .allocate_net(Box::new(()))
+            .unwrap()
+            .handoff(local.reserve_send(PAGE_SIZE).unwrap(), 8)
+            .unwrap_or_else(|_| panic!("private pool delivery failed"));
+    }
+    assert_eq!(
+        image.0.net_imports.count.load(Ordering::Acquire),
+        SHARED_NET_POOL_SIZE
+    );
+    // Recycled NIC ownership must not reduce ordinary incoming datagram slots.
+    let inbound = peer.allocate(PAGE_SIZE);
+    peer.call(REDEEM, inbound, [0; 3]);
+    assert_eq!(
+        peer.call(HANDOFF, inbound, [connection, READ_WRITE, 1])
+            .status,
+        0
+    );
+    let inbound = image.call(RECEIVE, 0, [connection, 0, 0]).value;
+    assert_ne!(inbound, 0);
+    assert_eq!(image.call(DISCARD, inbound, [0; 3]).status, 0);
+    assert_eq!(image.0.imports.count.load(Ordering::Acquire), 0);
+    let mut general: Vec<_> = (0..MAX_BUFFERS)
+        .map(|_| image.allocate(PAGE_SIZE))
+        .collect();
+    assert_eq!(
+        image.call(ALLOCATE, 0, [PAGE_SIZE as u64, 0, 0]).status,
+        -abi::LIMIT
+    );
+    let block = general.pop().unwrap();
+    image.call(REDEEM, block, [0; 3]);
+    // Uses the actual backend ownership protocol with Owner's synthetic
+    // completion adapter. Real block content is checked by the runtime suite.
+    let submitted = image.call(SUBMIT, block, [0, 0, 512]);
+    assert_eq!(submitted.status, 0);
+    let returned = image.call(POLL, submitted.value, [0; 3]);
+    assert_eq!(returned.status, 0);
+    assert_ne!(returned.value, 0);
+    assert_eq!(image.call(DISCARD, returned.value, [0; 3]).status, 0);
+    let datagram = general.pop().unwrap();
+    image.call(REDEEM, datagram, [0; 3]);
+    assert_eq!(
+        image
+            .call(HANDOFF, datagram, [connection, READ_WRITE, 1])
+            .status,
+        0
+    );
+    let received = peer.call(RECEIVE, 0, [connection, 0, 0]).value;
+    assert_ne!(received, 0);
+    assert_eq!(peer.call(DISCARD, received, [0; 3]).status, 0);
+    for _ in 0..SHARED_NET_POOL_SIZE {
+        let token = image.call(RECEIVE, 0, [local.connection(), 0, 0]).value;
+        assert_eq!(image.call(DISCARD, token, [0; 3]).status, 0);
+    }
+    for token in general.into_iter().chain(nic) {
+        assert_eq!(image.call(DISCARD, token, [0; 3]).status, 0);
+    }
+    assert_eq!(image.bytes(), 0);
+    local.close();
+    assert!(
+        image
+            .call(
+                SHARED_NET_ALLOCATE,
+                0,
+                [PAGE_SIZE as u64, local.connection(), 0]
+            )
+            .status
+            < 0
+    );
 }
 
 #[ktest]

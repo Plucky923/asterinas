@@ -85,8 +85,7 @@ impl<D: WithDevice + 'static, E: Ext> Iface<E> for EtherIface<D, E> {
     }
 
     fn mtu(&self) -> usize {
-        self.driver
-            .with(|device| device.capabilities().max_transmission_unit)
+        self.driver.with(|device| device.capabilities().ip_mtu())
     }
 }
 
@@ -114,6 +113,13 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
                 match self.alloc_tx_buffer(0) {
                     Ok(buffer) => Self::emit_arp(&reply, buffer).map(PhyProcessResult::Tx),
                     Err(err) => {
+                        #[cfg(kernelet_nat_failure_diag)]
+                        crate::tx_allocation_diag::record(
+                            crate::tx_allocation_diag::AllocationContext::Arp,
+                            0,
+                            err,
+                        );
+                        #[cfg(not(kernelet_nat_failure_diag))]
                         ostd::error!("failed to allocate a network packet: {:?}", err);
                         None
                     }

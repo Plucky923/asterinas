@@ -3,7 +3,119 @@
 //! Bounded private-NIC exchanges using one checked, pinned Image DMA scratch.
 
 use super::*;
-use crate::{kernelet::guest_memory::GuestMemory, mm::paddr_to_vaddr};
+use crate::{kernelet::guest_memory::GuestMemory, mm};
+
+pub(crate) fn dispatch_net_transmit(
+    holder: &Arc<Participant>,
+    memory: &GuestMemory,
+    token: u64,
+    args: [u64; 3],
+) -> MmioResult {
+    let result = (|| {
+        if token != 0 || args[2] == 0 || args[2] > SHARED_NET_BATCH_SIZE as u64 {
+            return Err(Error::InvalidArgs);
+        }
+        let count = args[2] as usize;
+        let bytes = count * size_of::<NetTransmitDescriptor>();
+        let _pin = memory.pin_registered_dma(args[1], bytes)?;
+        let address = mm::paddr_to_vaddr(args[1] as usize);
+        // SAFETY: The registered DMA pin covers the entire metadata input.
+        // Copy each descriptor once; no Image-controlled reference is formed.
+        let mut reader = unsafe { VmReader::from_kernel_space(address as *const u8, bytes) };
+        let mut descriptors = [NetTransmitDescriptor::default(); SHARED_NET_BATCH_SIZE];
+        for descriptor in &mut descriptors[..count] {
+            *descriptor = reader.read_val()?;
+        }
+        transmit(holder, args[0], &descriptors[..count])
+    })();
+    result.unwrap_or_else(net_error_response)
+}
+
+fn net_error_response(error: Error) -> MmioResult {
+    if error == Error::Overflow {
+        response(-abi::STATE, 0)
+    } else {
+        error_response(error)
+    }
+}
+
+fn transmit(
+    holder: &Arc<Participant>,
+    connection: u64,
+    frames: &[NetTransmitDescriptor],
+) -> Result<MmioResult> {
+    if frames.is_empty() || frames.len() > SHARED_NET_BATCH_SIZE {
+        return Err(Error::InvalidArgs);
+    }
+    // Descriptors are a trusted local snapshot. Pure duplicate detection does
+    // not need the registry; ownership and state still require its transaction.
+    for (index, frame) in frames.iter().enumerate() {
+        if frames[..index]
+            .iter()
+            .any(|previous| previous.token == frame.token)
+        {
+            return Err(Error::InvalidArgs);
+        }
+    }
+    let mut pool = POOL.lock();
+    if !holder.live.load(Ordering::Acquire) {
+        return Err(Error::AccessDenied);
+    }
+    let peer = holder
+        .peers
+        .lock()
+        .get(&connection)
+        .filter(|peer| peer.host_local)
+        .and_then(Peer::upgrade)
+        .ok_or(Error::AccessDenied)?;
+    if !peer.live.load(Ordering::Acquire) {
+        return Err(Error::AccessDenied);
+    }
+    let mut credits: [Option<Reservation>; SHARED_NET_BATCH_SIZE] = core::array::from_fn(|_| None);
+    let mut data: [Option<Reservation>; SHARED_NET_BATCH_SIZE] = core::array::from_fn(|_| None);
+    let mut next = [0; SHARED_NET_BATCH_SIZE];
+    for (index, frame) in frames.iter().enumerate() {
+        let record = owned(&mut pool, holder, frame.token)?;
+        if !matches!(record.state, State::Active)
+            || !record.writable
+            || frame.payload == 0
+            || frame.payload > record.allocation.dma.size() as u64
+        {
+            return Err(Error::InvalidArgs);
+        }
+        next[index] = advance(frame.token)?;
+        data[index] = Some(Reservation::private_data(
+            &peer.data_imports,
+            record.allocation.dma.size(),
+        )?);
+        credits[index] = Some(Reservation::private_net(
+            &peer.net_imports,
+            record.allocation.dma.size(),
+        )?);
+    }
+    let notify = peer.notifiers.lock().get(&connection).cloned();
+    let mut inbox = peer.inbox.lock();
+    for (index, frame) in frames.iter().enumerate() {
+        inbox.push((connection, next[index]));
+        pool.get_mut(&(frame.token as u32))
+            .unwrap()
+            .publish(Delivery {
+                holder: peer.clone(),
+                token: next[index],
+                connection,
+                access: GrantAccess::ReadWrite,
+                payload: frame.payload as usize,
+                credit: credits[index].take().unwrap(),
+                local_data_credit: data[index].take(),
+            });
+    }
+    drop(inbox);
+    drop(pool);
+    if let Some(notify) = notify {
+        notify();
+    }
+    Ok(response(0, frames.len() as u64))
+}
 
 pub(crate) fn dispatch_net_exchange(
     holder: &Arc<Participant>,
@@ -18,7 +130,7 @@ pub(crate) fn dispatch_net_exchange(
         // Pin the entire input/output before any grant transition. Using the
         // registered DMA mapping also excludes typed Image objects and stacks.
         let _pin = memory.pin_registered_dma(args[1], NET_EXCHANGE_BYTES)?;
-        let address = paddr_to_vaddr(args[1] as usize);
+        let address = mm::paddr_to_vaddr(args[1] as usize);
         // SAFETY: The pin retains this participant's registered, initialized
         // untyped DMA range. VM I/O copies metadata without forming references
         // to Image-owned bytes. No accessor escapes this synchronous service.
@@ -38,7 +150,7 @@ pub(crate) fn dispatch_net_exchange(
         };
         exchange(holder, args[0], &returns[..args[2] as usize], &mut writer)
     })();
-    result.unwrap_or_else(error_response)
+    result.unwrap_or_else(net_error_response)
 }
 
 fn exchange(
@@ -51,6 +163,13 @@ fn exchange(
         || writer.avail() < NET_EXCHANGE_BYTES - NET_RETURN_BYTES
     {
         return Err(Error::InvalidArgs);
+    }
+    // Returns were copied before entering this function; only the token list
+    // is inspected here. Authentication and all transitions remain below.
+    for (index, &token) in returns.iter().enumerate() {
+        if returns[..index].contains(&token) {
+            return Err(Error::InvalidArgs);
+        }
     }
     let mut pool = POOL.lock();
     if !holder.live.load(Ordering::Acquire) {
@@ -76,16 +195,13 @@ fn exchange(
     let mut credits: [Option<Reservation>; SHARED_NET_BATCH_SIZE] = core::array::from_fn(|_| None);
     let mut next_tokens = [0; SHARED_NET_BATCH_SIZE];
     for (index, &token) in returns.iter().enumerate() {
-        if returns[..index].contains(&token) {
-            return Err(Error::InvalidArgs);
-        }
         let record = owned(&mut pool, holder, token)?;
         if !matches!(record.state, State::Active) || !record.writable {
             return Err(Error::InvalidArgs);
         }
         next_tokens[index] = advance(token)?;
-        credits[index] = Some(Reservation::new(
-            &peer.as_ref().unwrap().imports,
+        credits[index] = Some(Reservation::private_net(
+            &peer.as_ref().unwrap().net_imports,
             record.allocation.dma.size(),
         )?);
     }

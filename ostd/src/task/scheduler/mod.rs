@@ -462,7 +462,6 @@ pub(crate) fn might_preempt() {
     if !cpu_local::should_preempt() {
         return;
     }
-    #[cfg(feature = "kernelet")]
     if super::scheduling_in_progress() {
         return;
     }
@@ -681,20 +680,13 @@ where
     // IRQs may run after the runqueue decision and before the context switch.
     // Keep their preemption checks from replacing this Task's unfinished
     // decision. The next Task has its own mark and can still be preempted.
-    #[cfg(feature = "kernelet")]
     let scheduling_guard = super::SchedulingGuard::new();
 
-    reschedule_with_guard(
-        f,
-        #[cfg(feature = "kernelet")]
-        scheduling_guard,
-    );
+    reschedule_with_guard(f, scheduling_guard);
 }
 
-fn reschedule_with_guard<F>(
-    mut f: F,
-    #[cfg(feature = "kernelet")] _scheduling_guard: super::SchedulingGuard,
-) where
+fn reschedule_with_guard<F>(mut f: F, _scheduling_guard: super::SchedulingGuard)
+where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
     // Even if the decision below is `DoNothing`, we should clear this flag. Meanwhile, to avoid
@@ -746,7 +738,54 @@ mod test {
 
     use super::*;
 
-    #[cfg(feature = "kernelet")]
+    #[ktest]
+    fn previous_task_destructor_can_yield() {
+        assert_eq!(
+            crate::cpu::num_cpus(),
+            1,
+            "destructor regression requires one CPU"
+        );
+        assert!(
+            cfg!(debug_assertions),
+            "destructor regression requires debug assertions"
+        );
+
+        struct YieldOnDrop(Arc<core::sync::atomic::AtomicUsize>);
+        impl Drop for YieldOnDrop {
+            fn drop(&mut self) {
+                crate::early_println!(
+                    "[task-exit-drop-regression] destructor: IRQ={}, transition={}",
+                    crate::arch::irq::is_local_enabled(),
+                    super::super::scheduling_in_progress()
+                );
+                assert!(crate::arch::irq::is_local_enabled());
+                // This is a valid Task local-data destructor. Its yield may
+                // schedule again after the preceding switch is complete.
+                Task::yield_now();
+                self.0.fetch_add(1, core::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let completed = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        for expected in 1..=16 {
+            let worker = crate::task::TaskOptions::new(|| {})
+                .local_data(YieldOnDrop(completed.clone()))
+                .spawn()
+                .unwrap();
+            drop(worker);
+            for _ in 0..32 {
+                Task::yield_now();
+                if completed.load(core::sync::atomic::Ordering::Acquire) == expected {
+                    break;
+                }
+            }
+            assert_eq!(
+                completed.load(core::sync::atomic::Ordering::Acquire),
+                expected
+            );
+        }
+    }
+
     #[ktest]
     fn preemption_waits_for_scheduler_decision() {
         assert!(!super::super::scheduling_in_progress());

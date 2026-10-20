@@ -22,8 +22,10 @@ use crate::prelude::*;
 #[cfg(ktest)]
 mod test;
 
-const BUFFERS: usize = 32;
-const RETURNS: usize = 64;
+const BUFFERS: usize = buffer::SHARED_NET_POOL_SIZE;
+const RETURNS: usize = BUFFERS;
+const BATCH: usize = buffer::SHARED_NET_BATCH_SIZE;
+type Delivery = (HostLocalGrant, HostSendCredit, usize);
 const CAPACITY: usize = ostd::mm::PAGE_SIZE;
 
 /// Actual Ethernet transfers at the Host/Image boundary. Copies inside TCP or
@@ -81,7 +83,8 @@ impl SharedNet {
         let bytes = size_of::<Self>()
             + HostLocalEndpoint::reservation_bytes()
             + size_of::<SharedNetTransport>()
-            + (BUFFERS + RETURNS) * size_of::<HostLocalGrant>();
+            + (BUFFERS + RETURNS + BATCH) * size_of::<HostLocalGrant>()
+            + BUFFERS * size_of::<Delivery>();
         let reservation = admission
             .reserve_endpoint_bytes(bytes)
             .map_err(|_| ostd::Error::NotEnoughResources)?;
@@ -92,7 +95,7 @@ impl SharedNet {
             let charge = admission
                 .reserve_shared_buffer(CAPACITY * 2)
                 .map_err(|_| ostd::Error::NotEnoughResources)?;
-            free.push(local.allocate(CAPACITY, Box::new(charge))?);
+            free.push(local.allocate_net(Box::new(charge))?);
         }
         let transport = Arc::new(SharedNetTransport {
             local,
@@ -103,6 +106,8 @@ impl SharedNet {
             return_import_blocked: AtomicBool::new(false),
             free: Mutex::new(free),
             returned: Mutex::new(VecDeque::with_capacity(RETURNS)),
+            received: Mutex::new(VecDeque::with_capacity(BATCH)),
+            transmit: Mutex::new(VecDeque::with_capacity(BUFFERS)),
             counters: Counters::default(),
         });
         transport
@@ -147,8 +152,12 @@ impl SharedNet {
         // Active Frame wrappers retain their allocation until their final read ends.
         let free = core::mem::take(&mut *self.transport.free.lock());
         let returned = core::mem::take(&mut *self.transport.returned.lock());
+        let received = core::mem::take(&mut *self.transport.received.lock());
+        let transmit = core::mem::take(&mut *self.transport.transmit.lock());
         drop(free);
         drop(returned);
+        drop(received);
+        drop(transmit);
     }
 
     pub(super) fn info(&self, query: u32) -> MmioResult {
@@ -211,6 +220,8 @@ pub(super) struct SharedNetTransport {
     return_import_blocked: AtomicBool,
     free: Mutex<Vec<HostLocalGrant>>,
     returned: Mutex<VecDeque<HostLocalGrant>>,
+    received: Mutex<VecDeque<HostLocalGrant>>,
+    transmit: Mutex<VecDeque<Delivery>>,
     counters: Counters,
 }
 
@@ -232,7 +243,8 @@ impl SharedNetTransport {
     }
 
     /// Reserves both initialized storage and receiver import credit before the
-    /// infallible smoltcp callback is offered. No allocation occurs per packet.
+    /// infallible smoltcp callback is offered.
+    /// No allocation occurs per packet.
     pub(super) fn allocate_frame(self: &Arc<Self>) -> Option<SharedTxFrame> {
         if self.cancelled.load(Ordering::Acquire) {
             return None;
@@ -263,12 +275,118 @@ impl SharedNetTransport {
         !self.free.lock().is_empty()
     }
 
+    #[cfg(kernelet_nat_failure_diag_host)]
+    pub(super) fn diagnostic_buffer_counts(&self) -> (usize, usize) {
+        let free = self.free.lock().len();
+        let returned = self.returned.lock().len();
+        (free, returned)
+    }
+
     pub(super) fn take_return_retry(&self) -> bool {
         // The common idle path only reads the flag. Query the queue only
         // after an actual import failure, and consume that attempt's retry.
         self.return_import_blocked.load(Ordering::Relaxed)
             && self.return_import_blocked.swap(false, Ordering::Relaxed)
             && !self.returned.lock().is_empty()
+    }
+
+    fn queue_transmit(
+        &self,
+        grant: HostLocalGrant,
+        credit: HostSendCredit,
+        payload: usize,
+    ) -> bool {
+        let mut queue = self.transmit.lock();
+        if self.cancelled.load(Ordering::Acquire) || queue.len() == BUFFERS {
+            return false;
+        }
+        queue.push_back((grant, credit, payload));
+        let full = queue.len() >= BATCH;
+        drop(queue);
+        if full {
+            self.flush_transmit();
+        }
+        true
+    }
+
+    fn publication_failed(&self, error: ostd::Error) {
+        // Reserved credits make publication infallible while the owners are
+        // live and their generations can advance. These errors are terminal.
+        warn!("shared Ethernet admitted batch failed: {:?}", error);
+        self.cancelled.store(true, Ordering::Release);
+        self.local.close();
+        self.notify_image();
+        self.wake();
+    }
+
+    /// Publishes bounded batches at the worker poll boundary, including a short
+    /// final batch. Never park while a locally accepted packet is unpublished.
+    pub(super) fn flush_transmit(&self) -> bool {
+        let mut batch: [Option<Delivery>; BATCH] = core::array::from_fn(|_| None);
+        {
+            let mut queue = self.transmit.lock();
+            for slot in &mut batch {
+                *slot = queue.pop_front();
+            }
+        }
+        let bytes = batch
+            .iter()
+            .flatten()
+            .map(|(_, _, payload)| payload - SharedNetHeader::SIZE)
+            .sum::<usize>();
+        match self.local.handoff_batch(&mut batch) {
+            Ok(0) => false,
+            Ok(count) => {
+                self.counters
+                    .rx_packets
+                    .fetch_add(count as u64, Ordering::Relaxed);
+                self.counters
+                    .rx_bytes
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                true
+            }
+            Err(error) => {
+                self.publication_failed(error);
+                false
+            }
+        }
+    }
+
+    fn flush_returns(&self) -> bool {
+        let mut pending: [Option<HostLocalGrant>; BATCH] = core::array::from_fn(|_| None);
+        {
+            let mut returned = self.returned.lock();
+            for slot in &mut pending {
+                *slot = returned.pop_front();
+            }
+        }
+        // Quota reservations and grant publication happen outside the queue
+        // lock. Only the failure path needs to enqueue unprocessed owners again.
+        let mut pending = pending.into_iter().flatten();
+        let mut batch: [Option<Delivery>; BATCH] = core::array::from_fn(|_| None);
+        for slot in &mut batch {
+            let Some(grant) = pending.next() else {
+                break;
+            };
+            match self.local.reserve_send(grant.capacity()) {
+                Ok(credit) => *slot = Some((grant, credit, 0)),
+                Err(_) => {
+                    self.return_import_blocked.store(true, Ordering::Relaxed);
+                    self.return_to_image(grant);
+                    for grant in pending.by_ref() {
+                        self.return_to_image(grant);
+                    }
+                    break;
+                }
+            }
+        }
+        match self.local.handoff_batch(&mut batch) {
+            Ok(count) => count != 0,
+            Err(error) => {
+                self.publication_failed(error);
+                false
+            }
+        }
     }
 
     fn return_to_image(&self, grant: HostLocalGrant) {
@@ -293,42 +411,45 @@ impl SharedNetTransport {
         }
     }
 
-    /// One bounded worker step, driven by the existing endpoint poll generation.
+    /// Performs one bounded worker step driven by the endpoint poll generation.
     pub(super) fn take_work(self: &Arc<Self>) -> Option<Work> {
         let endpoint = self.endpoint.upgrade()?;
         if self.cancelled.load(Ordering::Acquire) || endpoint.is_revoked() {
             return Some(Work::Cancel);
         }
-        // Return consumed Image TX buffers before importing more frames.
-        let returned = self.returned.lock().pop_front();
-        if let Some(grant) = returned {
-            match self.local.reserve_send(grant.capacity()) {
-                Ok(credit) => match grant.handoff(credit, 0) {
-                    Ok(()) => return Some(Work::Progress),
-                    Err((grant, _, _)) => self.return_to_image(grant),
-                },
-                Err(_) => {
-                    self.return_import_blocked.store(true, Ordering::Relaxed);
-                    let mut returned = self.returned.lock();
-                    if !self.cancelled.load(Ordering::Acquire) && returned.len() < RETURNS {
-                        returned.push_front(grant);
-                    }
+        if self.flush_returns() {
+            return Some(Work::Progress);
+        }
+        if self.received.lock().is_empty() {
+            let mut batch = core::array::from_fn(|_| None);
+            let count = self.local.receive_batch(&mut batch).ok()?;
+            if count == 0 {
+                return None;
+            }
+            let mut received = self.received.lock();
+            if self.cancelled.load(Ordering::Acquire) {
+                return Some(Work::Cancel);
+            }
+            for grant in batch.into_iter().flatten() {
+                if grant.payload_len() != 0 {
+                    received.push_back(grant);
+                    continue;
                 }
+                if grant.is_writable() && grant.capacity() == CAPACITY {
+                    self.counters.reuses.fetch_add(1, Ordering::Relaxed);
+                    self.recycle_host_buffer(grant);
+                }
+            }
+            if received.is_empty() {
+                return Some(Work::Progress);
             }
         }
         if !endpoint.shared_output_has_space() {
             return None;
         }
-        let Ok(Some(grant)) = self.local.receive() else {
+        let Some(grant) = self.received.lock().pop_front() else {
             return None;
         };
-        if grant.payload_len() == 0 {
-            if grant.is_writable() && grant.capacity() == CAPACITY {
-                self.counters.reuses.fetch_add(1, Ordering::Relaxed);
-                self.recycle_host_buffer(grant);
-            }
-            return Some(Work::Progress);
-        }
         let header = grant
             .with_bytes(0..SharedNetHeader::SIZE, |bytes| {
                 SharedNetHeader::decode(bytes.try_into().unwrap())
@@ -455,23 +576,8 @@ impl SharedTxFrame {
         }
         let grant = self.grant.take().unwrap();
         let credit = self.credit.take().unwrap();
-        match grant.handoff(credit, self.offset + len) {
-            Ok(()) => {
-                self.transport
-                    .counters
-                    .rx_packets
-                    .fetch_add(1, Ordering::Relaxed);
-                self.transport
-                    .counters
-                    .rx_bytes
-                    .fetch_add(len as u64, Ordering::Relaxed);
-                true
-            }
-            Err((grant, _, _)) => {
-                self.grant = Some(grant);
-                false
-            }
-        }
+        self.transport
+            .queue_transmit(grant, credit, self.offset + len)
     }
 }
 

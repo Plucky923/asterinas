@@ -289,6 +289,11 @@ pub(super) unsafe fn after_switching_to() {
         handler();
     }
 
+    // The resumed context and previous Task ownership are now settled. Clear
+    // its transition mark before IRQ handlers or local-data destructors can
+    // schedule again. The guard still handles paths that never switch Tasks.
+    super::finish_scheduling();
+
     // See `switch_to_task`, where we forgot an IRQ guard.
     crate::arch::irq::enable_local();
 

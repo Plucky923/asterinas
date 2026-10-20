@@ -66,8 +66,24 @@ pub const SHARED_NET_KICK: u32 = 14;
 /// Rejection preserves every grant. The fixed scratch contains return tokens
 /// followed by mapping descriptors, each bounded by `SHARED_NET_BATCH_SIZE`.
 pub const SHARED_NET_EXCHANGE: u32 = 15;
+/// Atomically publishes at most one private NIC transmit batch. The scratch
+/// contains NetTransmitDescriptor entries. Rejection preserves all owners.
+pub const SHARED_NET_TRANSMIT: u32 = 16;
+/// Allocates one initialized private NIC page under its separate pool quota.
+/// token=0, arg0=PAGE_SIZE, arg1=live private connection, arg2=0.
+pub const SHARED_NET_ALLOCATE: u32 = 17;
 /// Maximum empty returns and received grants in one Ethernet exchange.
 pub const SHARED_NET_BATCH_SIZE: usize = 32;
+/// Private NIC data window per direction, separate from its empty-return slots.
+pub const SHARED_NET_POOL_SIZE: usize = 64;
+pub const SHARED_NET_IMPORT_LIMIT: usize = 2 * SHARED_NET_POOL_SIZE;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod)]
+pub(crate) struct NetTransmitDescriptor {
+    pub token: u64,
+    pub payload: u64,
+}
 
 /// Host-written active grant metadata; image callers receive owning wrappers.
 #[repr(C)]

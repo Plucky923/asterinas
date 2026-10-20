@@ -155,7 +155,11 @@ fn buffer_from_mapping(token: u64, address: u64, mapping: i64) -> Result<Buffer,
 impl ReadWriteBuffer {
     /// Allocates zeroed storage. Capacity is rounded up to a page.
     pub fn allocate(capacity: usize) -> Result<Self, i64> {
-        let reply = call(ALLOCATE, 0, [capacity as u64, 0, 0]);
+        Self::allocate_with(ALLOCATE, capacity, 0)
+    }
+
+    fn allocate_with(operation: u32, capacity: usize, connection: u64) -> Result<Self, i64> {
+        let reply = call(operation, 0, [capacity as u64, connection, 0]);
         if reply.status < 0 {
             return Err(reply.status);
         }

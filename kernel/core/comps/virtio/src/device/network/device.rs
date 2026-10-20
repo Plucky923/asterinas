@@ -229,7 +229,13 @@ impl NetworkDevice {
         // to free the send buffers as quickly as possible.
         if !self.can_send() {
             self.send_queue.enable_callback();
-        } else {
+            // A completion may arrive after the previous reap while callbacks
+            // are disabled. The used-ring read barrier publishes the callback
+            // state before checking again: this reap observes earlier work,
+            // while a later completion can generate an interrupt.
+            self.free_processed_tx_buffers();
+        }
+        if self.can_send() {
             self.send_queue.disable_callback();
         }
 
@@ -368,3 +374,7 @@ const QUEUE_RECV: u16 = 0;
 const QUEUE_SEND: u16 = 1;
 
 const QUEUE_SIZE: u16 = 64;
+
+#[cfg(ktest)]
+#[path = "tx_completion_test.rs"]
+mod tx_completion_test;

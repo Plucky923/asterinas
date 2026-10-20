@@ -31,6 +31,7 @@ const MAX_USERS: usize = 64;
 const MAX_INSTANCES: usize = 64;
 const MAX_LIVE_PER_USER: u16 = 8;
 const MAX_VCPUS_PER_USER: u16 = 32;
+#[cfg(ktest)]
 const MAX_ENDPOINT_BYTES_PER_USER: usize = 16 * 1024 * 1024;
 
 static LEDGER: SpinLock<Ledger, LocalIrqDisabled> = SpinLock::new(Ledger::new());
@@ -409,6 +410,7 @@ struct NativeRefund {
 struct UserCategories {
     row_epoch: Option<u64>,
     balances: [CategoryBalance; QUOTA_CLASSES],
+    endpoint_high_water: usize,
     last_native_refund: Option<NativeRefund>,
     counter_overflow: bool,
     accounting_error: bool,
@@ -419,6 +421,7 @@ impl UserCategories {
     const EMPTY: Self = Self {
         row_epoch: None,
         balances: [CategoryBalance::EMPTY; QUOTA_CLASSES],
+        endpoint_high_water: 0,
         last_native_refund: None,
         counter_overflow: false,
         accounting_error: false,
@@ -451,6 +454,14 @@ impl UserCategories {
         balance.high_water = balance.high_water.max(current);
         Self::increment(&mut balance.reserve_count, &mut self.counter_overflow);
         self.balances[class as usize] = balance;
+        match self
+            .balances
+            .iter()
+            .try_fold(0usize, |sum, balance| sum.checked_add(balance.current))
+        {
+            Some(current) => self.endpoint_high_water = self.endpoint_high_water.max(current),
+            None => self.accounting_error = true,
+        }
     }
 
     fn refund(&mut self, class: QuotaClass, bytes: usize, owner: CategoryOwner) {
@@ -515,6 +526,64 @@ impl UserCategories {
                 .balances
                 .iter()
                 .all(|b| b.independent_current <= b.current)
+    }
+}
+
+#[cfg(kernelet_nat_failure_diag_host)]
+struct EndpointUsageSnapshot {
+    owner: Uid,
+    row_epoch: Option<u64>,
+    endpoint_bytes: usize,
+    independent_endpoint_bytes: usize,
+    high_water: usize,
+    limit: usize,
+    totals_match: bool,
+    accounting_error: bool,
+    counter_overflow: bool,
+}
+
+/// Emits one coherent UID peak after releasing the existing ledger guard.
+#[cfg(kernelet_nat_failure_diag_host)]
+pub(super) fn emit_endpoint_usage(owner: Uid, cid: u32) {
+    let snapshot = {
+        let ledger = LEDGER.lock();
+        ledger
+            .users
+            .iter()
+            .find(|user| user.owner == Some(owner))
+            .map(|user| EndpointUsageSnapshot {
+                owner,
+                row_epoch: user.categories.row_epoch,
+                endpoint_bytes: user.endpoint_bytes,
+                independent_endpoint_bytes: user.independent_endpoint_bytes,
+                high_water: user.categories.endpoint_high_water,
+                limit: limits::max_endpoint_bytes_per_user(),
+                totals_match: user
+                    .categories
+                    .totals_match(user.endpoint_bytes, user.independent_endpoint_bytes),
+                accounting_error: user.categories.accounting_error,
+                counter_overflow: user.categories.counter_overflow,
+            })
+    };
+    if let Some(snapshot) = snapshot {
+        error!(
+            "kernelet NAT quota_usage version=1 scope=uid cid={} uid={:?} row_epoch={:?} current={} independent={} high_water={} limit={} totals_match={} accounting_error={} counter_overflow={}",
+            cid,
+            snapshot.owner,
+            snapshot.row_epoch,
+            snapshot.endpoint_bytes,
+            snapshot.independent_endpoint_bytes,
+            snapshot.high_water,
+            snapshot.limit,
+            snapshot.totals_match,
+            snapshot.accounting_error,
+            snapshot.counter_overflow,
+        );
+    } else {
+        error!(
+            "kernelet NAT quota_usage version=1 scope=uid cid={} uid={:?} snapshot=missing",
+            cid, owner,
+        );
     }
 }
 
@@ -927,7 +996,7 @@ impl Ledger {
         if new_live > MAX_LIVE_PER_USER
             || new_grains > limits::max_grains_per_user()
             || new_vcpus > MAX_VCPUS_PER_USER
-            || new_endpoint_bytes > MAX_ENDPOINT_BYTES_PER_USER
+            || new_endpoint_bytes > limits::max_endpoint_bytes_per_user()
         {
             return_errno_with_message!(Errno::ENOSPC, "kernelet user quota exhausted");
         }
@@ -1058,7 +1127,7 @@ impl Ledger {
         let Some(total) = user.endpoint_bytes.checked_add(bytes) else {
             return_errno_with_message!(Errno::ENOSPC, "kernelet endpoint limit reached");
         };
-        if total > MAX_ENDPOINT_BYTES_PER_USER {
+        if total > limits::max_endpoint_bytes_per_user() {
             return_errno_with_message!(Errno::ENOSPC, "kernelet endpoint limit reached");
         }
         user.endpoint_bytes = total;
@@ -1094,7 +1163,7 @@ impl Ledger {
                 requested_bytes: bytes,
                 endpoint_bytes: None,
                 prestart_bytes: None,
-                limit: MAX_ENDPOINT_BYTES_PER_USER,
+                limit: limits::max_endpoint_bytes_per_user(),
                 reason: NatQuotaReason::UserTableFull,
             }
         };
@@ -1157,7 +1226,7 @@ impl Ledger {
             }
             return_errno_with_message!(Errno::ENOSPC, "kernelet endpoint limit reached");
         };
-        if total > MAX_ENDPOINT_BYTES_PER_USER {
+        if total > limits::max_endpoint_bytes_per_user() {
             #[cfg(kernelet_nat_failure_diag_host)]
             {
                 snapshot.reason = NatQuotaReason::EndpointLimit;
@@ -1313,6 +1382,22 @@ mod tests {
     use ostd::prelude::*;
 
     use super::*;
+
+    #[cfg(kernelet_nat_failure_diag_host)]
+    #[ktest]
+    fn endpoint_peak_tracks_simultaneous_charges_across_categories() {
+        let mut categories = UserCategories::EMPTY;
+        categories.reserve(QuotaClass::NatFlow, 100, CategoryOwner::Independent);
+        categories.refund(QuotaClass::NatFlow, 100, CategoryOwner::Independent);
+        categories.reserve(QuotaClass::NatBackend, 120, CategoryOwner::Independent);
+        assert_eq!(categories.endpoint_high_water, 120);
+        categories.reserve(QuotaClass::NatFlow, 50, CategoryOwner::Independent);
+        assert_eq!(categories.endpoint_high_water, 170);
+        categories.reclassify(QuotaClass::NatBackend, QuotaClass::NatNativeTcp, 20);
+        assert_eq!(categories.endpoint_high_water, 170);
+        assert!(categories.totals_match(170, 170));
+        assert!(!categories.accounting_error);
+    }
 
     #[ktest]
     fn shared_storage_charge_survives_sender_destruction() {

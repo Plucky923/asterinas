@@ -25,6 +25,7 @@ pub struct SharedNetTransport {
 impl SharedNetTransport {
     /// Maximum empty returns and received grants in one exchange.
     pub const BATCH_SIZE: usize = buffer::SHARED_NET_BATCH_SIZE;
+    pub const POOL_SIZE: usize = buffer::SHARED_NET_POOL_SIZE;
 
     /// Discovers a NIC. A zero connection marks the end of the device list.
     pub fn open(index: u32) -> Result<Option<Self>, i64> {
@@ -67,10 +68,68 @@ impl SharedNetTransport {
         self.info
     }
 
+    /// Allocates one page from the selected NIC's independent bounded pool.
+    pub fn allocate_buffer(&self) -> Result<ReadWriteBuffer, i64> {
+        ReadWriteBuffer::allocate_with(buffer::SHARED_NET_ALLOCATE, PAGE_SIZE, self.info.connection)
+    }
+
     /// Reports queued deliveries observed after the last successful exchange.
     /// Later handoffs are reported through the device's interrupt notification.
     pub fn has_pending(&self) -> bool {
         self.pending
+    }
+
+    /// Publishes one owning transmit batch. Rejection leaves every slot intact;
+    /// successful publication disarms wrappers before their local destruction.
+    pub fn transmit(
+        &mut self,
+        frames: &mut [Option<(ReadWriteBuffer, usize)>; Self::BATCH_SIZE],
+    ) -> Result<usize, i64> {
+        let mut descriptors = [buffer::NetTransmitDescriptor::default(); Self::BATCH_SIZE];
+        let mut count = 0;
+        for (frame, payload) in frames.iter().flatten() {
+            if *payload == 0 || *payload > frame.capacity() {
+                return Err(-INVALID);
+            }
+            descriptors[count] = buffer::NetTransmitDescriptor {
+                token: frame.0.token,
+                payload: *payload as u64,
+            };
+            count += 1;
+        }
+        if count == 0 {
+            return Ok(0);
+        }
+        const {
+            assert!(size_of::<[buffer::NetTransmitDescriptor; Self::BATCH_SIZE]>() <= PAGE_SIZE);
+        }
+        let bytes = ostd_pod::IntoBytes::as_bytes(&descriptors[..count]);
+        self.scratch
+            .writer()
+            .write(&mut crate::mm::VmReader::from(bytes));
+        let reply = super::call(
+            buffer::SHARED_NET_TRANSMIT,
+            0,
+            [
+                self.info.connection,
+                self.scratch.paddr() as u64,
+                count as u64,
+            ],
+        );
+        if reply.status < 0 {
+            return Err(reply.status);
+        }
+        // The trusted Host accepted all descriptors. Disarm first even if its
+        // reply count is malformed, so no accepted token is released twice.
+        for slot in frames {
+            if let Some((mut frame, _)) = slot.take() {
+                frame.0.token = 0;
+            }
+        }
+        if reply.value != count as u64 {
+            return Err(-INVALID);
+        }
+        Ok(count)
     }
 
     /// Returns empty buffers and receives active grants in one bounded call.

@@ -1,0 +1,757 @@
+{
+  "protocol": "actual-smoltcp-fairness-model-source-v1",
+  "status": "prepared",
+  "original": "/root/.cargo/git/checkouts/smoltcp-da84dc96af6ffcd7/56ab837",
+  "commit": "56ab83798451a91dad5faa3314e5dc592c675d94",
+  "clean_source_actual_returncode": 0,
+  "archive": {
+    "path": "/home/plucky/Kernelets-Exp-Framework/.cache/rq12/smoltcp-egress-fairness-model-r1/upstream-source.tar",
+    "sha256": "3f53beb629c9036a0c26e1cfd32c2325875e53a285c8e14d67454751d9d6c75c",
+    "bytes": 2058240
+  },
+  "copy_argv": [
+    "docker",
+    "exec",
+    "codex-kbench-resource-fixes-20261018",
+    "taskset",
+    "-c",
+    "24",
+    "tar",
+    "--exclude=.git",
+    "--exclude=target",
+    "-cf",
+    "-",
+    "-C",
+    "/root/.cargo/git/checkouts/smoltcp-da84dc96af6ffcd7/56ab837",
+    "."
+  ],
+  "copy_actual_wait_returncode": 0,
+  "files": {
+    ".cargo-ok": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "mode": 420
+    },
+    ".github/codecov.yml": {
+      "sha256": "a3f9dbd81eea794acde6bd9a2d684f56add1f2f69ddfc906362667935482706e",
+      "bytes": 167,
+      "mode": 420
+    },
+    ".github/workflows/coverage.yml": {
+      "sha256": "315ad79e9932dc2be3a45e794c147f6e391deb269026b5c7633d6006d84261f2",
+      "bytes": 524,
+      "mode": 420
+    },
+    ".github/workflows/fuzz.yml": {
+      "sha256": "80b294212ab5faa7373c9f8ac96bdd6182f2e5bde2fc5c84783f38610a7d8951",
+      "bytes": 342,
+      "mode": 420
+    },
+    ".github/workflows/matrix-bot.yml": {
+      "sha256": "eea9593d8e93942211ce2379af4fea576bc7d61a8aa6f58e683982b8099267d7",
+      "bytes": 1692,
+      "mode": 420
+    },
+    ".github/workflows/rustfmt.yaml": {
+      "sha256": "618f58a0efeb91bfed5854c368cbc2097e0bfdf7721c619d436d68a21fc4d496",
+      "bytes": 199,
+      "mode": 420
+    },
+    ".github/workflows/test.yml": {
+      "sha256": "7ab3304219c22138797d3ecd7fd5f15c0257d5c315b7d7bad9f0fc92e640ae9d",
+      "bytes": 1160,
+      "mode": 420
+    },
+    ".gitignore": {
+      "sha256": "d98b2df0920373dedde9a5acbe1eb7e4888c5807080d3fc21eecd6997b916c6b",
+      "bytes": 26,
+      "mode": 420
+    },
+    "CHANGELOG.md": {
+      "sha256": "870f719dff2cbfe45a04a126746b5b2e95e18ccd1cb46ac0e3e05b95845529dc",
+      "bytes": 24795,
+      "mode": 420
+    },
+    "Cargo.toml": {
+      "sha256": "03f2ce2e650720fda425ff32722d9f02b1aae33752a810b3a52226da2a1e1738",
+      "bytes": 11260,
+      "mode": 420
+    },
+    "LICENSE-0BSD.txt": {
+      "sha256": "beb2cad88fab8447f7975564e21f9506e733e14c344836f146fa02e811216694",
+      "bytes": 644,
+      "mode": 420
+    },
+    "README.md": {
+      "sha256": "3d3a24e1539fc76aa584584195b231df198750225a78528b15c814bdab531c39",
+      "bytes": 21624,
+      "mode": 420
+    },
+    "benches/bench.rs": {
+      "sha256": "17c94bb960e26a3173e78659ebe5154d4c1241a666d787cae9740590d18cd670",
+      "bytes": 3868,
+      "mode": 420
+    },
+    "build.rs": {
+      "sha256": "aa902be753a22e13d6075b6b2813da5ad47faaae158cb4a4f35c428d03b5ab59",
+      "bytes": 3248,
+      "mode": 420
+    },
+    "ci.sh": {
+      "sha256": "0e5cad96154a1776a2251113c27c5399b20c9b56e308c4ce45cb5bb10ec41dea",
+      "bytes": 4282,
+      "mode": 493
+    },
+    "examples/benchmark.rs": {
+      "sha256": "e9ae00fb463d6b7fd71e2bdaf694ec17d840989918e35908845b9307563910a1",
+      "bytes": 5023,
+      "mode": 420
+    },
+    "examples/client.rs": {
+      "sha256": "184ea765369efc6313b2844df7a87575889ed5c635545a7f0f29154950237283",
+      "bytes": 4153,
+      "mode": 420
+    },
+    "examples/dhcp_client.rs": {
+      "sha256": "78c4bdc45bc14dcf088298f50ec4a467549b7d98ddc8d0ed87bd1b9c969b4dde",
+      "bytes": 3348,
+      "mode": 420
+    },
+    "examples/dns.rs": {
+      "sha256": "f0d4786622cfeb30dab4f097803e0600d3d77853251b617335066880d7570847",
+      "bytes": 3035,
+      "mode": 420
+    },
+    "examples/httpclient.rs": {
+      "sha256": "6ee513a273393a3f23043db3911a8146a7cb9eee1d5365d34aeb887b09d3e689",
+      "bytes": 4393,
+      "mode": 420
+    },
+    "examples/loopback.rs": {
+      "sha256": "7d8ba270c119ab8b88cf62a2ef02d761459f3849a453997e5108ab129c1ba7a6",
+      "bytes": 5862,
+      "mode": 420
+    },
+    "examples/loopback_benchmark.rs": {
+      "sha256": "33e7f22e0f8a81269e93eaa9169b24f58189d88ff4aa12c2f39a3aba1e460e49",
+      "bytes": 3305,
+      "mode": 420
+    },
+    "examples/multicast.rs": {
+      "sha256": "2552d2e6f0c974115d737d44b243a94bfd573ca5ffb44ed919fb0eb15bfe1214",
+      "bytes": 4442,
+      "mode": 420
+    },
+    "examples/multicast6.rs": {
+      "sha256": "0eccad9be12fece3e2e919e185a9fca025beeca39af259c4a1218a6ccd49cd0a",
+      "bytes": 3043,
+      "mode": 420
+    },
+    "examples/ping.rs": {
+      "sha256": "2a9bf6c8398feb2a4b43788aae4a9453b50283dc20da908b31c100a0b8f06205",
+      "bytes": 9320,
+      "mode": 420
+    },
+    "examples/server.rs": {
+      "sha256": "351b74b3e200cb4d6b618dc88e88268ecc2a84f4141b288365f6c3853406d016",
+      "bytes": 7363,
+      "mode": 420
+    },
+    "examples/sixlowpan.rs": {
+      "sha256": "23fac92872faf9f4a70e7a884d9b53bdb8fa37e74b4ebb1ee256bd903630e230",
+      "bytes": 5938,
+      "mode": 420
+    },
+    "examples/sixlowpan_benchmark.rs": {
+      "sha256": "7ad3d7b5ef996454202f42df6c94ab4cae090ed7e922045f5c64ce2b077db140",
+      "bytes": 7166,
+      "mode": 420
+    },
+    "examples/tcpdump.rs": {
+      "sha256": "a6cf35290a796865ec1793b9b4e020300dfdcbee127f03c49aec43e6183dcc3d",
+      "bytes": 682,
+      "mode": 420
+    },
+    "examples/utils.rs": {
+      "sha256": "f8c8d59743c45620626adea8005c2090118b2fe14f950e8f07703883c67b7d31",
+      "bytes": 6513,
+      "mode": 420
+    },
+    "fuzz/.gitignore": {
+      "sha256": "d21db343d9990904d5258870238e13118ac82593d4ea54a88b3e97c10bf4af29",
+      "bytes": 24,
+      "mode": 420
+    },
+    "fuzz/Cargo.toml": {
+      "sha256": "c565405724d4bffe95865589c21ae7ef65a95f306143ebfba04400a490f2b41e",
+      "bytes": 855,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/arp.bin": {
+      "sha256": "985d8cc19172b3000cf29b6129b479b07acb2f9a7457e313f3698634f3cc66d8",
+      "bytes": 60,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/icmpv4_reply.bin": {
+      "sha256": "b956f8fce7e2c1a5fea319398ad8674f24a831702bebec65127d457fd76940cb",
+      "bytes": 98,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/icmpv4_request.bin": {
+      "sha256": "7832dc9f410ea19f5ab704a6c3fdf302d2e5929d1a3bf366835eaccc71ee3a13",
+      "bytes": 98,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/icmpv4_unreachable.bin": {
+      "sha256": "d099422c7be040a46d503b0abf81c399300e5f344ddcce877bc8fe0d85980e89",
+      "bytes": 590,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/icmpv6_nbr_solicitation.bin": {
+      "sha256": "3fd72303807c089371e0eb5c45722263f75800f8eb77d5001623c03668a0c4c6",
+      "bytes": 86,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/tcpv4_data.bin": {
+      "sha256": "738b01851322915de4cc98379092aa31d42e56593bac9bf38c8a43ecf1600158",
+      "bytes": 166,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/tcpv4_fin.bin": {
+      "sha256": "c1c0f8b19f919fc0a059dc69ac94d89fb4ac8ada19e6c85c2f7c28795ea6f1f4",
+      "bytes": 54,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/tcpv4_rst.bin": {
+      "sha256": "fc2efb339a24d9cac87df1e867e47542409a0f96bdbb8bc04cee22867d672246",
+      "bytes": 54,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/tcpv4_syn.bin": {
+      "sha256": "6b3f6a493b45b9b7243668253baf6ca96692b166bf36df572111fbf7edf51f99",
+      "bytes": 74,
+      "mode": 420
+    },
+    "fuzz/corpus/packet_parser/udpv4.bin": {
+      "sha256": "b5c99f5f04c7a6774e371de28a90b477259b3e3c4fe999f0f148b90201fb5ca7",
+      "bytes": 122,
+      "mode": 420
+    },
+    "fuzz/fuzz_targets/dhcp_header.rs": {
+      "sha256": "e947f9986528d2eae216fe1e4b54206b22f6306ae28ac5eea82c30c289042a43",
+      "bytes": 620,
+      "mode": 420
+    },
+    "fuzz/fuzz_targets/ieee802154_header.rs": {
+      "sha256": "59de3a32473cf32cfebc116c53dfbe1995148f1162f406697be409f24bd19722",
+      "bytes": 848,
+      "mode": 420
+    },
+    "fuzz/fuzz_targets/packet_parser.rs": {
+      "sha256": "24ae0ffcee43014e4ee4dcd5619363edebb481e4b99c70057c45421dd154f5ee",
+      "bytes": 204,
+      "mode": 420
+    },
+    "fuzz/fuzz_targets/sixlowpan_packet.rs": {
+      "sha256": "8bc65372bbe7aa5a0e2b13f7ca3b9ec91c8f539a3396c5464cd6c21d10b1f63a",
+      "bytes": 13591,
+      "mode": 420
+    },
+    "fuzz/fuzz_targets/tcp_headers.rs": {
+      "sha256": "f58933e1c7086717bdfe72669cbdc4c10e9eaf44b1255c2433d43de1d5a05029",
+      "bytes": 7337,
+      "mode": 420
+    },
+    "fuzz/utils.rs": {
+      "sha256": "1b2f8b9836f7259e319c91ca2e2d4b29e4fe74d1ba6f0b6d24b08dcf59ff8824",
+      "bytes": 4507,
+      "mode": 420
+    },
+    "gen_config.py": {
+      "sha256": "b833449d43fc409d85bb82aa51b384736d30b3a286a9d4dc4225fbf842981c55",
+      "bytes": 2960,
+      "mode": 420
+    },
+    "src/iface/fragmentation.rs": {
+      "sha256": "68d177dc19fd3e99eb3e563b6b6e2d6d6af700b3a9e7049dc8b200f3ab474d4e",
+      "bytes": 14991,
+      "mode": 420
+    },
+    "src/iface/interface/ethernet.rs": {
+      "sha256": "997432f39266a183865d069bddf02f384b3d3eccedcb31e568023e26a77fcfe1",
+      "bytes": 2359,
+      "mode": 420
+    },
+    "src/iface/interface/ieee802154.rs": {
+      "sha256": "1dbe7640c56fccd52b4cac1938e6f43c65850058dee259120b030afd4b0bff4d",
+      "bytes": 3517,
+      "mode": 420
+    },
+    "src/iface/interface/ipv4.rs": {
+      "sha256": "ba9988a6d230baa0f3d31acde35ddbcfccb6f755c3e3d5eedaad2eb0fcf8cce6",
+      "bytes": 18412,
+      "mode": 420
+    },
+    "src/iface/interface/ipv6.rs": {
+      "sha256": "a5ea422498fc1c9dd7221163c42327367a05ae02e1070d756208eb8d54651aa7",
+      "bytes": 21308,
+      "mode": 420
+    },
+    "src/iface/interface/mod.rs": {
+      "sha256": "0c92c9a95cebe33064f69a2586097c9d91519ccd1eaf65c9c4acc3b7a4fd0fc5",
+      "bytes": 50043,
+      "mode": 420
+    },
+    "src/iface/interface/multicast.rs": {
+      "sha256": "771dba82c35b08c50f9f328c55218159ac354fd955d40ad7d88bcf5e2a1fa88c",
+      "bytes": 16453,
+      "mode": 420
+    },
+    "src/iface/interface/sixlowpan.rs": {
+      "sha256": "24b74803582fb9e935b6846142e17cedcbcf407d41ea0be2fbecba8f3f2a18e2",
+      "bytes": 39825,
+      "mode": 420
+    },
+    "src/iface/interface/tcp.rs": {
+      "sha256": "e52e712b2a1f8efd324bddaa82ee0175a23f2494e59ed6baae3c29bd87e6b50e",
+      "bytes": 1540,
+      "mode": 420
+    },
+    "src/iface/interface/tests/ipv4.rs": {
+      "sha256": "c2007664020d72a693928014e608de499f70911984d0df8da92f1b1750545c54",
+      "bytes": 35701,
+      "mode": 420
+    },
+    "src/iface/interface/tests/ipv6.rs": {
+      "sha256": "9e5ffa0136417b3bd38b7309b7743d36b742025626876d24483c655b7aeb13ba",
+      "bytes": 46544,
+      "mode": 420
+    },
+    "src/iface/interface/tests/mod.rs": {
+      "sha256": "0e1615d635898429cdca3399d63e59a638c04acc7fed3f15990b1303ad1139cc",
+      "bytes": 7258,
+      "mode": 420
+    },
+    "src/iface/interface/tests/sixlowpan.rs": {
+      "sha256": "321be10f399a0bf48c75bbde95f8bb42be3c7c0b46fa60eff9fa7f27be385a4d",
+      "bytes": 16818,
+      "mode": 420
+    },
+    "src/iface/interface/udp.rs": {
+      "sha256": "32553d52d249c451be0b06af0bac32f883ae194da17f208a7235e54f8528fc0c",
+      "bytes": 2932,
+      "mode": 420
+    },
+    "src/iface/mod.rs": {
+      "sha256": "1f9bc291437cd959feda4ead3c2273187d74bd94b582fb520f4442e2fb0f015c",
+      "bytes": 744,
+      "mode": 420
+    },
+    "src/iface/neighbor.rs": {
+      "sha256": "323738143be810effa7641e5ab74745a40477e27583c6d0ae26552d9120f8531",
+      "bytes": 10490,
+      "mode": 420
+    },
+    "src/iface/packet.rs": {
+      "sha256": "1c76d6959eb9c46efd9152fe690e45d8a1cf1e8fa8d1dbe6e4af78ce8d94708e",
+      "bytes": 9710,
+      "mode": 420
+    },
+    "src/iface/route.rs": {
+      "sha256": "a9e481f408847dfafc8697b0528cddac3bd874f1e10e4d3f3691b4a78f8246b8",
+      "bytes": 9791,
+      "mode": 420
+    },
+    "src/iface/rpl/consts.rs": {
+      "sha256": "2ea0bbfac3585383b5f94f72e67f348a622a0183bb6083fec8b5a9ea258754e7",
+      "bytes": 299,
+      "mode": 420
+    },
+    "src/iface/rpl/lollipop.rs": {
+      "sha256": "5f4541a9dbfcfdccb4c69d4e19565700673798936336067fe1b57837cf2c50ad",
+      "bytes": 6211,
+      "mode": 420
+    },
+    "src/iface/rpl/mod.rs": {
+      "sha256": "fa8ecf836d9b044b2c84ea94a8a4073f1ade52dcd198991c9a7a3786bb8369de",
+      "bytes": 105,
+      "mode": 420
+    },
+    "src/iface/rpl/of0.rs": {
+      "sha256": "61a4ef52f44ea904faed8a21d05014301b98db44441461af40c60f929de0d36a",
+      "bytes": 3261,
+      "mode": 420
+    },
+    "src/iface/rpl/parents.rs": {
+      "sha256": "349a54c1ce842989d3b42ea3a5abd3c6a8f9883b7d2ba1f5d52f7d1e7f0c507d",
+      "bytes": 5033,
+      "mode": 420
+    },
+    "src/iface/rpl/rank.rs": {
+      "sha256": "93ab780238dc1cc198d0507befd4a285ff553ab1e5a7d1a31f019bd4cd4e6214",
+      "bytes": 3432,
+      "mode": 420
+    },
+    "src/iface/rpl/relations.rs": {
+      "sha256": "2670e36791e00d3b069362adb68df91cd6cddac956093c60271493c6cb486fe1",
+      "bytes": 4633,
+      "mode": 420
+    },
+    "src/iface/rpl/trickle.rs": {
+      "sha256": "7cc8c60f45ef564de9f664e64fa653da8d0d37ad55fe5ffe377b6b5b3999efcc",
+      "bytes": 9332,
+      "mode": 420
+    },
+    "src/iface/socket_meta.rs": {
+      "sha256": "97f716f3bd09f4a6d5301310287dcd7c5a21139c354d1ac58c0274faeb1481d4",
+      "bytes": 3306,
+      "mode": 420
+    },
+    "src/iface/socket_set.rs": {
+      "sha256": "17b3cb1e6afc25aabd56e6d041987e64dc914bd0c69d8a604445f579e8da468f",
+      "bytes": 5152,
+      "mode": 420
+    },
+    "src/lib.rs": {
+      "sha256": "291f76e59bddd489a14905e47543607a972d3a857550a26e8d326947f9e36ffd",
+      "bytes": 7019,
+      "mode": 420
+    },
+    "src/macros.rs": {
+      "sha256": "e7e1073680519e156f2d43747e8ba5fefceeb240dece0f179f686a9158bbd2c9",
+      "bytes": 5271,
+      "mode": 420
+    },
+    "src/parsers.rs": {
+      "sha256": "c6887c59c90a16e3c6e52cad3a9398241e73d203988350513319abecd4a32762",
+      "bytes": 19502,
+      "mode": 420
+    },
+    "src/phy/fault_injector.rs": {
+      "sha256": "53038bb413a820313f85f641cebfcfda16f51ac691b5cc81b96b322ad1f24087",
+      "bytes": 9417,
+      "mode": 420
+    },
+    "src/phy/fuzz_injector.rs": {
+      "sha256": "862496732bc66c9e8fe7f81b40199cd0bd6250044131e74934e016f79785ad0d",
+      "bytes": 3565,
+      "mode": 420
+    },
+    "src/phy/loopback.rs": {
+      "sha256": "88fea7d30f59726a14d1c6d271be531b15e98eb7292c8feef66ac95b303cb423",
+      "bytes": 2067,
+      "mode": 420
+    },
+    "src/phy/mod.rs": {
+      "sha256": "8de9ee9e879da62ca1443d2c5b52636a004a5e56e684132f0ec432aca6e85cd3",
+      "bytes": 13340,
+      "mode": 420
+    },
+    "src/phy/pcap_writer.rs": {
+      "sha256": "7952591b3e49b4e9cfff8dc4fc01b921caa9888b6ef74d9e88cdbae6abdbdfef",
+      "bytes": 7969,
+      "mode": 420
+    },
+    "src/phy/raw_socket.rs": {
+      "sha256": "1fe6d9252b503c9e6e40941950ec2829ca04e86d11b4ddee19d48e8b249b3b70",
+      "bytes": 3927,
+      "mode": 420
+    },
+    "src/phy/sys/bpf.rs": {
+      "sha256": "e33d3237c095383edc5a38644f71b93fe78065af271a8cfab42314e2369a26a0",
+      "bytes": 6164,
+      "mode": 420
+    },
+    "src/phy/sys/linux.rs": {
+      "sha256": "95c2ce63d4e64232c4484e034b098d491da94617d36219f7f3f812c26562d12f",
+      "bytes": 857,
+      "mode": 420
+    },
+    "src/phy/sys/mod.rs": {
+      "sha256": "8d4ac3b5596c90bff232540f1a4ab02b750ce521955ca8431a577f699f214fa1",
+      "bytes": 3590,
+      "mode": 420
+    },
+    "src/phy/sys/raw_socket.rs": {
+      "sha256": "136c668b7a07b8a668655a7d7a7b6e4c6bdf70522f6c55fc47cd30d92cf3d8fa",
+      "bytes": 3102,
+      "mode": 420
+    },
+    "src/phy/sys/tuntap_interface.rs": {
+      "sha256": "9a619a2b91d1f40b83cecc74499afda0491dbb21332ebd5179a99f89b07de5f3",
+      "bytes": 3758,
+      "mode": 420
+    },
+    "src/phy/tracer.rs": {
+      "sha256": "efe47e5c8a17d0d7cdd32101adbaca301ced6db5046e10c6b83fe9995689bd55",
+      "bytes": 5325,
+      "mode": 420
+    },
+    "src/phy/tuntap_interface.rs": {
+      "sha256": "f948927deb0a42d81d99a3fee73f9d62cfc368a8730d4d0d9c493d503b580004",
+      "bytes": 3678,
+      "mode": 420
+    },
+    "src/rand.rs": {
+      "sha256": "5218a584f82c4ae4639e8452da2fe0d797626e2d21a2fcbe2c368c4b79e7a48f",
+      "bytes": 884,
+      "mode": 420
+    },
+    "src/socket/dhcpv4.rs": {
+      "sha256": "a0c2da619b8e8dbe9d03306590d1e648345ddb3179f6990720eb608baa480e45",
+      "bytes": 50692,
+      "mode": 420
+    },
+    "src/socket/dns.rs": {
+      "sha256": "8d0981d72ae1911e38bb4c3cff573c95c0d58c34f67749cc6e571acbb6a13534",
+      "bytes": 23641,
+      "mode": 420
+    },
+    "src/socket/icmp.rs": {
+      "sha256": "56f0d062047eeb695159a625f28295de657aeaaae6c743e30a1ee1cc51d2f7db",
+      "bytes": 42021,
+      "mode": 420
+    },
+    "src/socket/mod.rs": {
+      "sha256": "4e1ad86decac2103a83676d3a82f5e14f378515823af5e3e4bf8859a32ae8985",
+      "bytes": 4545,
+      "mode": 420
+    },
+    "src/socket/raw.rs": {
+      "sha256": "74e95c40ba9f5f07d460ffc8f7547cc862493d17b1878af9fb33cee72e067478",
+      "bytes": 31071,
+      "mode": 420
+    },
+    "src/socket/tcp/congestion/cubic.rs": {
+      "sha256": "b0592438058b0f228ef9336c69ec4c70ea14e0f6ceb532b976a3b35b7240cb3c",
+      "bytes": 8006,
+      "mode": 420
+    },
+    "src/socket/tcp/congestion/no_control.rs": {
+      "sha256": "4644be1fdbfd2ea0367c75b51bf37ef162a806b35ca45f45c9758275ac31803c",
+      "bytes": 209,
+      "mode": 420
+    },
+    "src/socket/tcp/congestion/reno.rs": {
+      "sha256": "8f873494f98f4d510598805de3b71f1773f44e39f63059f95a0b43003f482e5b",
+      "bytes": 3041,
+      "mode": 420
+    },
+    "src/socket/tcp/congestion.rs": {
+      "sha256": "f8d3200c1ab87108b54028abb5eb71d0827b2c60e69b04fd10e1ab3043135e17",
+      "bytes": 2891,
+      "mode": 420
+    },
+    "src/socket/tcp.rs": {
+      "sha256": "b1fd15203670b8544373e4d86449490034470c836b40236c3cb05b78e88da43f",
+      "bytes": 267037,
+      "mode": 420
+    },
+    "src/socket/udp.rs": {
+      "sha256": "2a3c34acb99637d686fa232410b769372cc78a79f042dddf64109c58f4b09abb",
+      "bytes": 35148,
+      "mode": 420
+    },
+    "src/socket/waker.rs": {
+      "sha256": "dc0492d9f9429f0b02355bdd3f1746e506f8dacdfa845bfdabdd9bc76a7c6bf5",
+      "bytes": 1097,
+      "mode": 420
+    },
+    "src/storage/assembler.rs": {
+      "sha256": "0149f2c40a2223d09bfb91f3a32e4ceb0305a396c7c0a08d3b18b4c35de2a4d2",
+      "bytes": 22341,
+      "mode": 420
+    },
+    "src/storage/mod.rs": {
+      "sha256": "6a843b592a63498dd437a6d1d08a404a65acd2fb9373dc736a4e8324ec3cc417",
+      "bytes": 953,
+      "mode": 420
+    },
+    "src/storage/packet_buffer.rs": {
+      "sha256": "52dec6d5db239a196990dca87affecf993f71b80830518a23ff4c1534c5d2361",
+      "bytes": 13812,
+      "mode": 420
+    },
+    "src/storage/ring_buffer.rs": {
+      "sha256": "9f767734c6255a33b0af376b19a34cca1976d5e4142c03e50e517b67cf348ac4",
+      "bytes": 26396,
+      "mode": 420
+    },
+    "src/storage/slice_like.rs": {
+      "sha256": "44ec4c795e9c560301a6c4435c73a0dc1f7741412df8939a2f19fdacb45b9e08",
+      "bytes": 875,
+      "mode": 420
+    },
+    "src/tests.rs": {
+      "sha256": "14282a20380164245170bd03ed421242118b16791f8f44c5e10b382892f23261",
+      "bytes": 4087,
+      "mode": 420
+    },
+    "src/time.rs": {
+      "sha256": "961adccec81d7b15cc5216ea675e16630a7021418fd076ecc0481e76031da5a4",
+      "bytes": 12928,
+      "mode": 420
+    },
+    "src/wire/arp.rs": {
+      "sha256": "002fe8fae6c0789353662800cfc7a1238496e5a76fc098a036c4be45db89536d",
+      "bytes": 15393,
+      "mode": 420
+    },
+    "src/wire/dhcpv4.rs": {
+      "sha256": "a2436a2469e87d50d6c669547139109ac86f28cce197a08b074af0a09f1cd3ea",
+      "bytes": 51418,
+      "mode": 420
+    },
+    "src/wire/dns.rs": {
+      "sha256": "1a504657d67ab520466b1f1b8fc64c6b0722cc3e816d01a27d4d83c2d3f1536c",
+      "bytes": 26886,
+      "mode": 420
+    },
+    "src/wire/ethernet.rs": {
+      "sha256": "a84b66152474c996357781357c2c5d91ddd9733057ade53343c39a2f9f267f03",
+      "bytes": 12995,
+      "mode": 420
+    },
+    "src/wire/icmp.rs": {
+      "sha256": "788bf58fd931614b4294f67d1926702fb02870c77e2899290c6d9c0539f388dd",
+      "bytes": 656,
+      "mode": 420
+    },
+    "src/wire/icmpv4.rs": {
+      "sha256": "362477bde5e8c9f688a8ce4b79dd6804ba5f75513e7b73778f8497ba80d407a1",
+      "bytes": 23541,
+      "mode": 420
+    },
+    "src/wire/icmpv6.rs": {
+      "sha256": "b09c2bd68947fa6b4d935a741705c6dd8813fd91fa50378e9ab4f17e8f2e2502",
+      "bytes": 38438,
+      "mode": 420
+    },
+    "src/wire/ieee802154.rs": {
+      "sha256": "8252727f236f71a80644245f7b315e5e112468571732e295fda7c2bfbfecbc1e",
+      "bytes": 39157,
+      "mode": 420
+    },
+    "src/wire/igmp.rs": {
+      "sha256": "399a614199bdbcd2b0cdcaf946588e513ff7e5aa391a4a3b147e3ddc2a237d01",
+      "bytes": 13882,
+      "mode": 420
+    },
+    "src/wire/ip.rs": {
+      "sha256": "7449e9ab2de167216b6d49d319d802776c0053c65a636e3decd06d6254bc33de",
+      "bytes": 29888,
+      "mode": 420
+    },
+    "src/wire/ipsec_ah.rs": {
+      "sha256": "7b399a426181bebe4151da6ea43d232cc265fdccecaa9479724a008cad83989f",
+      "bytes": 9990,
+      "mode": 420
+    },
+    "src/wire/ipsec_esp.rs": {
+      "sha256": "78b9be7fb0a13adec7e03c7ef816c51f86059727249f8e4f77de1123c0effef9",
+      "bytes": 5930,
+      "mode": 420
+    },
+    "src/wire/ipv4.rs": {
+      "sha256": "1d79c10a77c5b362ec702154c3a210b5aa5a4320c443cd6495d83b5a710b43c9",
+      "bytes": 36477,
+      "mode": 420
+    },
+    "src/wire/ipv6.rs": {
+      "sha256": "9c47f249878999085569110778f5f8583a05cbc041e3a496a4fc185d874d1024",
+      "bytes": 37571,
+      "mode": 420
+    },
+    "src/wire/ipv6ext_header.rs": {
+      "sha256": "32b22ef656e5dc50a6e48cc679a3122faab760522607fcbfe77857972816d34e",
+      "bytes": 9189,
+      "mode": 420
+    },
+    "src/wire/ipv6fragment.rs": {
+      "sha256": "e38a8eabf83619de5c22212bba5603024dddbf7a81e251af581da7a7e8189c9b",
+      "bytes": 8724,
+      "mode": 420
+    },
+    "src/wire/ipv6hbh.rs": {
+      "sha256": "74e20d7fa21e9824cedc04b63c9bad1e7d97a356bf30cd7c774b48409e32dd7f",
+      "bytes": 5930,
+      "mode": 420
+    },
+    "src/wire/ipv6option.rs": {
+      "sha256": "4a7f5aec41bec345f118257f43a464dd59495ee8b76e9f11336eacba4dd6a3b2",
+      "bytes": 24321,
+      "mode": 420
+    },
+    "src/wire/ipv6routing.rs": {
+      "sha256": "b0fea6a78ded7ac7a896d87a9f016a16c983fda8513efa159904f5ff5b522df3",
+      "bytes": 20962,
+      "mode": 420
+    },
+    "src/wire/mld.rs": {
+      "sha256": "1ff719b2cf754edccc86646dfb095f401afcc916bfab2745b5c35178ed414219",
+      "bytes": 21744,
+      "mode": 420
+    },
+    "src/wire/mod.rs": {
+      "sha256": "3b647f3f43fd173519bb28205684bd4aa2c2a2285fb175fa81e1eb44f6ebd52e",
+      "bytes": 18704,
+      "mode": 420
+    },
+    "src/wire/ndisc.rs": {
+      "sha256": "6bf73eb7dd76dcccf8eb27e8cea7b7a3c750bb61fb1614f6d8b0427e2d81b89f",
+      "bytes": 19908,
+      "mode": 420
+    },
+    "src/wire/ndiscoption.rs": {
+      "sha256": "30c34d4d3f77e162250e1c7c38341ea1e0facbe1bcd0e6ff0d1d99f8f37550e0",
+      "bytes": 27301,
+      "mode": 420
+    },
+    "src/wire/pretty_print.rs": {
+      "sha256": "3bc2299749a29c8218351251267c80cdc15cfb953171f80c41d57097489226d3",
+      "bytes": 3639,
+      "mode": 420
+    },
+    "src/wire/rpl.rs": {
+      "sha256": "f1469dc2695e2b2a5f72fbd4ba9bf9dc62ad71615f8aeccb0e29537517c5c62e",
+      "bytes": 100012,
+      "mode": 420
+    },
+    "src/wire/sixlowpan/frag.rs": {
+      "sha256": "8d067e5650aa0e1aebf5270f55e2ac8e123a5bb7bf87cc48ade8668b5a7e0cfa",
+      "bytes": 9451,
+      "mode": 420
+    },
+    "src/wire/sixlowpan/iphc.rs": {
+      "sha256": "f0b2842c174ca9643dcc6d97e90b6a359041cfb49945b43f6947db5e90c35488",
+      "bytes": 31537,
+      "mode": 420
+    },
+    "src/wire/sixlowpan/mod.rs": {
+      "sha256": "2ae4df70e7b9ed4a05fa1cfd1899f0b66f6b91e2939c0d0f41fb3ba5b6f68419",
+      "bytes": 15134,
+      "mode": 420
+    },
+    "src/wire/sixlowpan/nhc.rs": {
+      "sha256": "c319191ae02f94aac944fa56c16f22585a324fddf2451490314077cd430e4468",
+      "bytes": 28387,
+      "mode": 420
+    },
+    "src/wire/tcp.rs": {
+      "sha256": "27ef0e6e1b913ce8ac27144234aa72610def7c57e1352e448c7c0704cce21e74",
+      "bytes": 47372,
+      "mode": 420
+    },
+    "src/wire/udp.rs": {
+      "sha256": "9c19f093e35cbc1444ec45f8c5c6b47b25081b6149cd53f8cdfa3d71a7fe3fe7",
+      "bytes": 15050,
+      "mode": 420
+    },
+    "utils/packet2pcap.rs": {
+      "sha256": "dd64131dbd16785f81883a6893a6aea9358ddde0711aeaa61c22b57c1de2da42",
+      "bytes": 1895,
+      "mode": 420
+    }
+  },
+  "scope": "Private copy of the exact clean deployed dependency. Model device credit is controlled; no actual Image performance or repair claim."
+}

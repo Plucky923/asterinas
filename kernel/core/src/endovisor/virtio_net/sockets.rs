@@ -2,9 +2,11 @@
 
 //! Nonblocking native sockets used by the network backend, without file descriptors.
 
-use core::net::SocketAddrV4;
+use core::{net::SocketAddrV4, str::FromStr};
 
 use aster_bigtcp::socket::{TCP_RECV_BUF_LEN, TCP_SEND_BUF_LEN};
+use aster_cmdline::parse::ParamError;
+use spin::Once;
 
 #[cfg(kernelet_nat_failure_diag_host)]
 use super::{
@@ -25,12 +27,55 @@ use crate::{
     process::signal::{PollHandle, Pollable},
 };
 
-const TCP_LISTENER_BACKLOG: usize = 8;
+const DEFAULT_TCP_LISTENER_BACKLOG: usize = 8;
 const TCP_LISTENER_METADATA_BYTES: usize = 128 * 1024;
+
+/// One immutable queue capacity and its complete native-buffer reservation.
+#[derive(Clone, Copy)]
+struct TcpListenerCapacity {
+    backlog: usize,
+    reservation_bytes: usize,
+}
+
+const DEFAULT_TCP_LISTENER_CAPACITY: TcpListenerCapacity = TcpListenerCapacity {
+    backlog: DEFAULT_TCP_LISTENER_BACKLOG,
+    reservation_bytes: (DEFAULT_TCP_LISTENER_BACKLOG + 1) * (TCP_RECV_BUF_LEN + TCP_SEND_BUF_LEN)
+        + TCP_LISTENER_METADATA_BYTES,
+};
+static TCP_LISTENER_CAPACITY: Once<TcpListenerCapacity> = Once::new();
+aster_cmdline::define_kv_param!("kernelet_tcp_backlog", TCP_LISTENER_CAPACITY);
+
+impl FromStr for TcpListenerCapacity {
+    type Err = ParamError;
+
+    fn from_str(value: &str) -> core::result::Result<Self, Self::Err> {
+        let backlog: usize = value.parse().map_err(|_| ParamError::InvalidValue)?;
+        if backlog == 0 {
+            return Err(ParamError::InvalidValue);
+        }
+        let reservation_bytes = backlog
+            .checked_add(1)
+            .and_then(|sockets| sockets.checked_mul(TCP_RECV_BUF_LEN + TCP_SEND_BUF_LEN))
+            .and_then(|buffers| buffers.checked_add(TCP_LISTENER_METADATA_BYTES))
+            .ok_or(ParamError::InvalidValue)?;
+        Ok(Self {
+            backlog,
+            reservation_bytes,
+        })
+    }
+}
+
+fn tcp_listener_capacity() -> TcpListenerCapacity {
+    TCP_LISTENER_CAPACITY
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_TCP_LISTENER_CAPACITY)
+}
+
 // Reserve the listener socket and the entire pending queue before binding.
-pub(super) const TCP_LISTENER_RESERVATION_BYTES: usize = (TCP_LISTENER_BACKLOG + 1)
-    * (TCP_RECV_BUF_LEN + TCP_SEND_BUF_LEN)
-    + TCP_LISTENER_METADATA_BYTES;
+pub(super) fn tcp_listener_reservation_bytes() -> usize {
+    tcp_listener_capacity().reservation_bytes
+}
 
 fn address(value: SocketAddrV4) -> SocketAddr {
     SocketAddr::IPv4(*value.ip(), value.port())
@@ -237,7 +282,7 @@ impl TcpListener {
         socket.bind(address(local))?;
         // Retain a bounded connection burst until the backend can accept it.
         // The endpoint reserves buffers for this entire pending queue.
-        socket.listen(TCP_LISTENER_BACKLOG)?;
+        socket.listen(tcp_listener_capacity().backlog)?;
         Ok(Self(
             socket,
             #[cfg(kernelet_nat_failure_diag_host)]
@@ -309,6 +354,40 @@ impl TcpListener {
 
     pub(super) fn poll(&self, handle: Option<&mut PollHandle>) -> IoEvents {
         self.0.poll(IoEvents::IN, handle)
+    }
+}
+
+#[cfg(ktest)]
+mod capacity_tests {
+    use ostd::prelude::*;
+
+    use super::*;
+
+    #[ktest]
+    fn default_listener_preserves_existing_buffer_reservation() {
+        assert_eq!(DEFAULT_TCP_LISTENER_CAPACITY.backlog, 8);
+        assert_eq!(DEFAULT_TCP_LISTENER_CAPACITY.reservation_bytes, 2_490_368);
+    }
+
+    #[ktest]
+    fn operator_capacity_reserves_the_entire_128_connection_queue() {
+        let capacity: TcpListenerCapacity = "128".parse().ok().unwrap();
+        assert_eq!(capacity.backlog, 128);
+        assert_eq!(capacity.reservation_bytes, 33_947_648);
+    }
+
+    #[ktest]
+    fn listener_capacity_rejects_zero_invalid_values_and_reservation_overflow() {
+        for value in [
+            "0",
+            "-1",
+            "128x",
+            "",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            assert!(value.parse::<TcpListenerCapacity>().is_err());
+        }
     }
 }
 

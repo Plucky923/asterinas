@@ -244,9 +244,15 @@ impl<E: Ext> IfaceCommon<E> {
 impl<E: Ext> IfaceCommon<E> {
     pub(super) fn poll<D: WithDevice>(&self, driver: &D, phy: &dyn PollPhy) {
         driver.with(|device| self.do_poll_and_notify(device, phy));
+        // `with` has returned: device, interface and socket guards are gone.
+        #[cfg(kernelet_nat_failure_diag)]
+        crate::tx_allocation_diag::flush();
     }
 
     fn do_poll_and_notify(&self, device: &mut dyn AnyNetworkDevice, phy: &dyn PollPhy) {
+        // Polling can run before the TX softirq. Reclaim completed descriptors
+        // before ingress replies or egress consult the cached send capacity.
+        device.free_processed_tx_buffers();
         let next_poll = self.do_poll(device, phy);
         device.notify_poll_end();
         self.sched_poll.schedule_next_poll(next_poll);
@@ -312,6 +318,11 @@ impl<E: Ext> BoundPort<E> {
     /// Returns the bound endpoint.
     pub fn endpoint(&self) -> IpEndpoint {
         IpEndpoint::new(self.addr, self.port)
+    }
+
+    /// Returns whether the port can be reused.
+    pub fn can_reuse(&self) -> bool {
+        self.can_reuse.load(Ordering::Relaxed)
     }
 
     /// Sets whether the port can be reused.

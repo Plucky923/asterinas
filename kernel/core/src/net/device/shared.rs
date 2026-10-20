@@ -2,7 +2,10 @@
 
 //! Ethernet packets over exclusively owned shared allocations.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::{
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Duration,
+};
 
 use aster_bigtcp::{
     device::{AnyNetworkDevice, Checksum, DeviceCapabilities, EthernetAddress, Medium, NetError},
@@ -13,17 +16,19 @@ use ostd::{
     irq::IrqLine,
     kernelet::{
         abi::LIMIT,
-        shared_buffer::{
-            Buffer, GrantAccess, ReadWriteBuffer, SharedNetHeader, SharedNetTransport,
-        },
+        shared_buffer::{Buffer, ReadWriteBuffer, SharedNetHeader, SharedNetTransport},
     },
 };
 
-use crate::prelude::*;
+use crate::{
+    prelude::*,
+    time::{Timer, clocks::MonotonicClock, timer::Timeout},
+};
 
 pub(crate) const DEVICE_NAME: &str = "shared_net";
-const POOL_SIZE: usize = 32;
+const POOL_SIZE: usize = SharedNetTransport::POOL_SIZE;
 const BATCH_SIZE: usize = SharedNetTransport::BATCH_SIZE;
+const TRANSMIT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 // Drop callbacks only enqueue local wrappers. Host transitions happen after
 // packet readers end, outside these locks, at the end of interface polling.
@@ -108,6 +113,10 @@ pub(crate) struct SharedNetworkDevice {
     ready: VecDeque<RxPacket<LinkLayer>>,
     returns: [Option<ReadWriteBuffer>; BATCH_SIZE],
     received: [Option<Buffer>; BATCH_SIZE],
+    transmit: [Option<(ReadWriteBuffer, usize)>; BATCH_SIZE],
+    transmit_count: usize,
+    transmit_retry: Arc<Timer>,
+    retry_armed: bool,
     alive: bool,
     _irq: IrqLine,
 }
@@ -131,7 +140,7 @@ impl SharedNetworkDevice {
         let mut irq = IrqLine::alloc_specific(info.irq).map_err(|_| -22_i64)?;
         let mut buffers = Vec::with_capacity(POOL_SIZE);
         for _ in 0..POOL_SIZE {
-            buffers.push(ReadWriteBuffer::allocate(PAGE_SIZE)?);
+            buffers.push(transport.allocate_buffer()?);
         }
         *TX_FREE.lock() = buffers;
         RX_RETURN.lock().reserve(POOL_SIZE);
@@ -158,6 +167,13 @@ impl SharedNetworkDevice {
             ready: VecDeque::with_capacity(POOL_SIZE),
             returns: core::array::from_fn(|_| None),
             received: core::array::from_fn(|_| None),
+            transmit: core::array::from_fn(|_| None),
+            transmit_count: 0,
+            transmit_retry: MonotonicClock::timer_manager().create_timer(|_| {
+                IRQ_PENDING.store(true, Ordering::Release);
+                aster_network::raise_send_softirq();
+            }),
+            retry_armed: false,
             alive: true,
             _irq: irq,
         };
@@ -167,6 +183,45 @@ impl SharedNetworkDevice {
             info.mac, info.max_frame, info.irq
         );
         Ok(true)
+    }
+
+    fn flush_transmit(&mut self) {
+        if !self.alive || self.transmit_count == 0 {
+            return;
+        }
+        match self.transport.transmit(&mut self.transmit) {
+            Ok(count) => {
+                TX_PACKETS.fetch_add(count as u64, Ordering::Relaxed);
+                self.transmit_count = 0;
+                if self.retry_armed {
+                    self.transmit_retry.lock().cancel();
+                    self.retry_armed = false;
+                }
+            }
+            Err(error) if error == -LIMIT => {
+                // Keep the whole owning batch until peer progress permits it.
+                // Other private links can release import quota without a NIC
+                // IRQ. Arm a one-shot only after this actual failed publish.
+                let _ = self.transport.kick();
+                let mut timer = self.transmit_retry.lock();
+                if !self.retry_armed || timer.remain().is_zero() {
+                    timer.set_timeout(Timeout::After(TRANSMIT_RETRY_DELAY));
+                    self.retry_armed = true;
+                }
+            }
+            Err(error) => {
+                warn!("shared Ethernet transmit batch failed: {}", error);
+                self.alive = false;
+                if self.retry_armed {
+                    self.transmit_retry.lock().cancel();
+                    self.retry_armed = false;
+                }
+                for slot in &mut self.transmit {
+                    drop(slot.take());
+                }
+                self.transmit_count = 0;
+            }
+        }
     }
 
     fn collect(&mut self) {
@@ -283,7 +338,7 @@ impl AnyNetworkDevice for SharedNetworkDevice {
     }
 
     fn can_send(&self) -> bool {
-        self.alive && !TX_FREE.lock().is_empty()
+        self.alive && self.transmit_count < BATCH_SIZE && !TX_FREE.lock().is_empty()
     }
 
     fn receive(&mut self) -> core::result::Result<RxPacket<LinkLayer>, NetError> {
@@ -294,7 +349,10 @@ impl AnyNetworkDevice for SharedNetworkDevice {
     }
 
     fn send(&mut self, packet: TxPacket<LinkLayer>) -> core::result::Result<(), NetError> {
-        if !self.alive {
+        if self.transmit_count == BATCH_SIZE {
+            self.flush_transmit();
+        }
+        if !self.alive || self.transmit_count == BATCH_SIZE {
             return Err(NetError::NotReady);
         }
         let shared = packet
@@ -312,21 +370,12 @@ impl AnyNetworkDevice for SharedNetworkDevice {
         // Headroom outside the Ethernet frame must not disclose old packet bytes.
         buffer.writer().fill_zeros(range.start);
         buffer.writer().write_val(&header.encode()).unwrap();
-        match buffer.handoff(
-            self.transport.info().connection,
-            GrantAccess::ReadWrite,
-            range.end,
-        ) {
-            Ok(()) => {
-                TX_PACKETS.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err((buffer, _)) => {
-                recycle_tx(buffer);
-                REJECTED.fetch_add(1, Ordering::Relaxed);
-                Err(NetError::Busy)
-            }
+        self.transmit[self.transmit_count] = Some((buffer, range.end));
+        self.transmit_count += 1;
+        if self.transmit_count == BATCH_SIZE {
+            self.flush_transmit();
         }
+        Ok(())
     }
 
     fn alloc_tx_buffer(payload_len: usize) -> ostd::Result<FreshTxPacket> {
@@ -338,10 +387,13 @@ impl AnyNetworkDevice for SharedNetworkDevice {
 
     fn free_processed_tx_buffers(&mut self) {
         self.collect();
+        self.flush_transmit();
     }
 
     fn notify_poll_end(&mut self) {
+        self.flush_transmit();
         self.collect();
+        self.flush_transmit();
         if !self.ready.is_empty() {
             // The return exchange can receive another batch after the current
             // ingress poll has finished. Arrange a poll for these packets.

@@ -231,6 +231,38 @@ Example:
 kernelet_user_memory_mib=4096
 ```
 
+### `kernelet_tcp_backlog`
+
+Set the pending TCP connection capacity of each Kernelet Host port mapping.
+The default is `8`.
+Use a positive integer whose listener-buffer reservation fits in `usize`.
+The Host reserves buffers for the listener and every pending connection before binding.
+All mapped ports share the existing per-user endpoint budget.
+An insufficient budget rejects setup; it does not reduce the requested queue capacity.
+
+For a 128-connection burst, each mapping reserves 32.375 MiB with the current TCP buffers.
+Choose the endpoint budget for all mappings, active flows, and independently retained closing buffers.
+
+Example:
+```text
+kernelet_user_endpoint_mib=512 kernelet_tcp_backlog=128
+```
+
+### `kernelet_nat_max_flows`
+
+Set the logical NAT socket capacity of each Kernelet network device.
+The default is `256`.
+Both mapped inbound connections and outbound connections count toward this limit.
+Use a positive integer whose product with the per-flow byte reservation fits in `usize`.
+The parameter does not reserve memory or increase any byte quota.
+Every new flow must still obtain its existing Host and per-user endpoint byte reservations.
+Choose the capacity for both connection directions and overlapping connection lifetimes.
+
+Example:
+```text
+kernelet_user_endpoint_mib=512 kernelet_tcp_backlog=128 kernelet_nat_max_flows=512
+```
+
 ### `i8042.exist`
 
 Override ACPI's indication of whether a PS/2 (i8042) controller exists.

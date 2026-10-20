@@ -21,15 +21,13 @@ mod utils;
 
 #[cfg(feature = "kernelet-host")]
 use core::sync::atomic::AtomicUsize;
-#[cfg(any(feature = "kernelet-host", feature = "kernelet"))]
-use core::sync::atomic::Ordering;
 use core::{
     any::Any,
     borrow::Borrow,
     cell::{Cell, SyncUnsafeCell},
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
 };
 #[cfg(feature = "kernelet")]
 use core::{
@@ -180,7 +178,6 @@ pub struct Task {
     switched_to_cpu: AtomicBool,
 
     /// Defers preemption from a scheduler decision until its context switch.
-    #[cfg(feature = "kernelet")]
     scheduling_in_progress: AtomicBool,
 
     /// Defers virtual interrupt delivery while this Task finishes an upcall.
@@ -349,12 +346,10 @@ impl Task {
     }
 }
 
-#[cfg(feature = "kernelet")]
 crate::cpu_local_cell! {
     static BOOT_SCHEDULING_IN_PROGRESS: bool = false;
 }
 
-#[cfg(feature = "kernelet")]
 pub(crate) fn scheduling_in_progress() -> bool {
     Task::current().map_or_else(
         || BOOT_SCHEDULING_IN_PROGRESS.load(),
@@ -362,17 +357,23 @@ pub(crate) fn scheduling_in_progress() -> bool {
     )
 }
 
+/// Completes this Task's scheduling transition before callbacks can reschedule.
+pub(super) fn finish_scheduling() {
+    if let Some(task) = Task::current() {
+        task.scheduling_in_progress.store(false, Ordering::Relaxed);
+    } else {
+        BOOT_SCHEDULING_IN_PROGRESS.store(false);
+    }
+}
+
 /// Keeps IRQ preemption from reentering a Task's unfinished scheduler decision.
 ///
 /// The mark follows the Task across a context switch. It does not mask IRQs or
 /// add a preemption guard, so the scheduler can still switch to another Task.
-#[cfg(feature = "kernelet")]
 pub(crate) struct SchedulingGuard;
 
-#[cfg(feature = "kernelet")]
 impl !Send for SchedulingGuard {}
 
-#[cfg(feature = "kernelet")]
 impl SchedulingGuard {
     pub(crate) fn new() -> Self {
         debug_assert!(!scheduling_in_progress());
@@ -385,14 +386,9 @@ impl SchedulingGuard {
     }
 }
 
-#[cfg(feature = "kernelet")]
 impl Drop for SchedulingGuard {
     fn drop(&mut self) {
-        if let Some(task) = Task::current() {
-            task.scheduling_in_progress.store(false, Ordering::Relaxed);
-        } else {
-            BOOT_SCHEDULING_IN_PROGRESS.store(false);
-        }
+        finish_scheduling();
     }
 }
 
@@ -578,7 +574,6 @@ impl TaskOptions {
             ctx: SyncUnsafeCell::new(ctx),
             kstack,
             switched_to_cpu: AtomicBool::new(false),
-            #[cfg(feature = "kernelet")]
             scheduling_in_progress: AtomicBool::new(false),
             #[cfg(feature = "kernelet")]
             virq_deferral_depth: AtomicU32::new(0),

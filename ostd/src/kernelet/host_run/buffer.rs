@@ -73,6 +73,13 @@ extern "C" fn kernelet_host_buffer_impl(
             },
             value: 0,
         }
+    } else if operation == crate::kernelet::abi::buffer::SHARED_NET_TRANSMIT {
+        shared_buffer::dispatch_net_transmit(
+            &state.control.shared_buffers,
+            &state.guest_memory,
+            token,
+            [arg0, arg1, arg2],
+        )
     } else if operation == crate::kernelet::abi::buffer::SHARED_NET_EXCHANGE {
         shared_buffer::dispatch_net_exchange(
             &state.control.shared_buffers,

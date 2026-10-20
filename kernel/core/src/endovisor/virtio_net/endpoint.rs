@@ -20,7 +20,7 @@ use super::{
     super::{policy::UserEndpointReservation, shared_net::SharedFrame},
     ENDPOINT_SLOTS, Frame,
     nat::NatBackend,
-    sockets::TCP_LISTENER_RESERVATION_BYTES,
+    sockets::tcp_listener_reservation_bytes,
 };
 use crate::{
     dispatch_ioctl,
@@ -260,14 +260,16 @@ impl NetEndpoint {
         // guard follows the sockets into the worker, beyond endpoint revoke.
         let bytes = config.ports[..usize::from(config.num_ports)]
             .iter()
-            .map(|port| {
-                if port.protocol == NET_PROTOCOL_TCP {
-                    TCP_LISTENER_RESERVATION_BYTES
+            .try_fold(0usize, |total, port| {
+                let bytes = if port.protocol == NET_PROTOCOL_TCP {
+                    tcp_listener_reservation_bytes()
                 } else {
                     MAPPING_RESERVATION_BYTES
-                }
-            })
-            .sum::<usize>()
+                };
+                total.checked_add(bytes).ok_or_else(|| {
+                    Error::with_message(Errno::ENOSPC, "network listener reservation overflows")
+                })
+            })?
             .max(MAPPING_RESERVATION_BYTES);
         let reservation = Arc::new(crate::endovisor::NativeTcpBufferCharge::prestart(
             self.reserve_backend_bytes(bytes)?,
@@ -557,6 +559,7 @@ impl NetEndpoint {
             size_of::<QuotaCategorySnapshot>(),
             QUOTA_DIAGNOSTIC_LAYOUT,
         );
+        super::super::policy::emit_endpoint_usage(self.owner, self.diagnostic_cid);
     }
 
     pub(super) fn generation(&self) -> u64 {

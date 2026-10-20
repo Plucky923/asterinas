@@ -36,7 +36,9 @@ impl HostLocalEndpoint {
     /// Returns metadata admission for the participant, inbox, peer and two
     /// notifier entries. Payload allocations carry their own separate charge.
     pub const fn reservation_bytes() -> usize {
-        2 * PAGE_SIZE
+        // Include the larger private inboxes on both ends and their separate
+        // quota metadata; packet records retain their own independent charge.
+        4 * PAGE_SIZE
     }
 
     pub(crate) fn bind(account: Arc<Account>, image: &Arc<Participant>) -> Result<Self> {
@@ -107,6 +109,20 @@ impl HostLocalEndpoint {
         self.redeem_locked(&mut pool, token)
     }
 
+    /// Allocates one separately charged private NIC page without consuming
+    /// the participant's ordinary shared-buffer allocation quota.
+    pub fn allocate_net(&self, admission: Box<dyn Send + Sync>) -> Result<HostLocalGrant> {
+        let reply = execute(
+            &self.holder,
+            SHARED_NET_ALLOCATE,
+            0,
+            [PAGE_SIZE as u64, self.connection, 0],
+            |_| Ok(admission),
+            |_, _| unreachable!(),
+        )?;
+        self.redeem(reply.value)
+    }
+
     fn redeem_locked(
         &self,
         pool: &mut BTreeMap<u32, Record>,
@@ -151,9 +167,81 @@ impl HostLocalEndpoint {
             .transpose()
     }
 
-    /// Reserves bounded destination capacity before a producer fills storage.
-    pub fn reserve_send(&self, capacity: usize) -> Result<HostSendCredit> {
-        let _pool = POOL.lock();
+    /// Activates a checked prefix of private-link deliveries under one pool lock.
+    pub fn receive_batch(
+        &self,
+        received: &mut [Option<HostLocalGrant>; SHARED_NET_BATCH_SIZE],
+    ) -> Result<usize> {
+        if received.iter().any(Option::is_some) {
+            return Err(Error::InvalidArgs);
+        }
+        let mut pool = POOL.lock();
+        if !self.holder.live.load(Ordering::Acquire) {
+            return Err(Error::AccessDenied);
+        }
+        let mut inbox = self.holder.inbox.lock();
+        let mut tokens = [0; SHARED_NET_BATCH_SIZE];
+        let mut count = 0;
+        for &(_, token) in inbox
+            .iter()
+            .filter(|&&(link, _)| link == self.connection)
+            .take(SHARED_NET_BATCH_SIZE)
+        {
+            let record = owned(&mut pool, &self.holder, token)?;
+            if !matches!(record.state, State::Issued) || record.connection != Some(self.connection)
+            {
+                return Err(Error::InvalidArgs);
+            }
+            tokens[count] = token;
+            count += 1;
+        }
+        // Validate the complete prefix before changing any owner or inbox.
+        for (slot, &token) in received.iter_mut().zip(&tokens[..count]) {
+            let record = pool.get_mut(&(token as u32)).unwrap();
+            *slot = Some(HostLocalGrant {
+                holder: self.holder.clone(),
+                allocation: record.allocation.clone(),
+                token,
+                writable: record.writable,
+                payload: record.payload,
+            });
+            record.state = State::Active;
+        }
+        let mut remaining = count;
+        inbox.retain(|&(link, _)| {
+            if link == self.connection && remaining != 0 {
+                remaining -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        Ok(count)
+    }
+
+    /// Publishes one bounded private-link batch with a single peer notification.
+    /// Every delivery carries its own previously admitted import credit.
+    /// Rejection leaves all wrappers and credits in their original slots.
+    pub fn handoff_batch(
+        &self,
+        deliveries: &mut [Option<(HostLocalGrant, HostSendCredit, usize)>; SHARED_NET_BATCH_SIZE],
+    ) -> Result<usize> {
+        if deliveries.iter().all(Option::is_none) {
+            return Ok(0);
+        }
+        // The caller exclusively borrows all wrappers throughout this call.
+        // Duplicate detection needs no mutable registry or peer state.
+        for (index, delivery) in deliveries.iter().enumerate() {
+            if let Some((grant, _, _)) = delivery
+                && deliveries[..index]
+                    .iter()
+                    .flatten()
+                    .any(|(other, _, _)| other.token == grant.token)
+            {
+                return Err(Error::InvalidArgs);
+            }
+        }
+        let mut pool = POOL.lock();
         if !self.holder.live.load(Ordering::Acquire) {
             return Err(Error::AccessDenied);
         }
@@ -167,7 +255,74 @@ impl HostLocalEndpoint {
         if !peer.live.load(Ordering::Acquire) {
             return Err(Error::AccessDenied);
         }
-        let reservation = Reservation::new(&peer.imports, capacity)?;
+        let mut next = [0; SHARED_NET_BATCH_SIZE];
+        let mut count = 0;
+        for (index, delivery) in deliveries.iter().enumerate() {
+            let Some((grant, credit, payload)) = delivery else {
+                continue;
+            };
+            if *payload > grant.capacity()
+                || !grant.writable
+                || !Arc::ptr_eq(&grant.holder, &self.holder)
+                || !Arc::ptr_eq(&credit.sender, &self.holder)
+                || !Arc::ptr_eq(&credit.peer, &peer)
+                || credit.connection != self.connection
+                || credit.reservation.bytes < grant.capacity()
+            {
+                return Err(Error::InvalidArgs);
+            }
+            let record = owned(&mut pool, &self.holder, grant.token)?;
+            if !matches!(record.state, State::Active) || !record.writable {
+                return Err(Error::InvalidArgs);
+            }
+            next[index] = advance(grant.token)?;
+            count += 1;
+        }
+        let notify = peer.notifiers.lock().get(&self.connection).cloned();
+        let mut inbox = peer.inbox.lock();
+        for (index, slot) in deliveries.iter_mut().enumerate() {
+            let Some((mut grant, credit, payload)) = slot.take() else {
+                continue;
+            };
+            let record = pool.get_mut(&(grant.token as u32)).unwrap();
+            inbox.push((self.connection, next[index]));
+            record.publish(Delivery {
+                holder: peer.clone(),
+                token: next[index],
+                connection: self.connection,
+                access: GrantAccess::ReadWrite,
+                payload,
+                credit: credit.reservation,
+                local_data_credit: None,
+            });
+            grant.token = 0;
+        }
+        drop(inbox);
+        drop(pool);
+        if let Some(notify) = notify {
+            notify();
+        }
+        Ok(count)
+    }
+
+    /// Reserves bounded destination capacity before a producer fills storage.
+    pub fn reserve_send(&self, capacity: usize) -> Result<HostSendCredit> {
+        // A credit alone publishes no access. A close may race this bounded
+        // reservation; handoff rechecks both participants under POOL.
+        if !self.holder.live.load(Ordering::Acquire) {
+            return Err(Error::AccessDenied);
+        }
+        let peer = self
+            .holder
+            .peers
+            .lock()
+            .get(&self.connection)
+            .and_then(Peer::upgrade)
+            .ok_or(Error::AccessDenied)?;
+        if !peer.live.load(Ordering::Acquire) {
+            return Err(Error::AccessDenied);
+        }
+        let reservation = Reservation::private_net(&peer.net_imports, capacity)?;
         Ok(HostSendCredit {
             sender: self.holder.clone(),
             peer,
@@ -179,7 +334,6 @@ impl HostLocalEndpoint {
     /// Observes destination capacity for worker polling. This does not reserve
     /// it; producers must still obtain their owning credit before writing.
     pub fn can_send(&self, capacity: usize) -> bool {
-        let _pool = POOL.lock();
         if !self.holder.live.load(Ordering::Acquire) {
             return false;
         }
@@ -190,9 +344,9 @@ impl HostLocalEndpoint {
             .and_then(Peer::upgrade)
             .is_some_and(|peer| {
                 peer.live.load(Ordering::Acquire)
-                    && peer.imports.count.load(Ordering::Acquire) < MAX_BUFFERS
+                    && peer.net_imports.count.load(Ordering::Acquire) < PRIVATE_NET_IMPORTS
                     && peer
-                        .imports
+                        .net_imports
                         .bytes
                         .load(Ordering::Acquire)
                         .checked_add(capacity)

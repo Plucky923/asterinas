@@ -20,7 +20,7 @@ pub use host_local::{HostLocalEndpoint, HostLocalGrant, HostSendCredit};
 
 #[path = "host_shared_net.rs"]
 mod shared_net;
-pub(crate) use shared_net::dispatch_net_exchange;
+pub(crate) use shared_net::{dispatch_net_exchange, dispatch_net_transmit};
 
 use crate::{
     Error, Result,
@@ -39,6 +39,9 @@ use crate::{
 // participant has separate allocation and import quotas; sender charges do
 // not migrate with a grant. There are no unbounded completion queues.
 const MAX_BUFFERS: usize = 64;
+// Private NICs may hold a full data window and a full empty-return window.
+// Allocation and ordinary datagram import quotas retain their original bounds.
+const PRIVATE_NET_IMPORTS: usize = SHARED_NET_IMPORT_LIMIT;
 const MAX_BYTES: usize = 16 * MAX_CAPACITY;
 const MAX_CONNECTIONS: usize = 64;
 // Reserve metadata independently of useful payload. This covers the record,
@@ -71,6 +74,14 @@ struct Reservation {
 impl Reservation {
     fn new(quota: &Arc<Quota>, bytes: usize) -> Result<Self> {
         Self::with_limits(quota, bytes, MAX_BUFFERS, MAX_BYTES)
+    }
+
+    fn private_net(quota: &Arc<Quota>, bytes: usize) -> Result<Self> {
+        Self::with_limits(quota, bytes, PRIVATE_NET_IMPORTS, MAX_BYTES)
+    }
+
+    fn private_data(quota: &Arc<Quota>, bytes: usize) -> Result<Self> {
+        Self::with_limits(quota, bytes, SHARED_NET_POOL_SIZE, MAX_BYTES / 2)
     }
 
     fn with_limits(
@@ -116,8 +127,12 @@ struct Charge {
 }
 
 impl Charge {
-    fn new(owner: &Participant, bytes: usize, admission: Box<dyn Send + Sync>) -> Result<Self> {
-        let reservation = Reservation::new(&owner.allocations, bytes)?;
+    fn new(
+        owner: &Participant,
+        bytes: usize,
+        admission: Box<dyn Send + Sync>,
+        reservation: Reservation,
+    ) -> Result<Self> {
         let bytes = bytes.checked_add(RECORD_RESERVE).ok_or(Error::Overflow)?;
         owner
             .account
@@ -173,9 +188,11 @@ pub(crate) struct Participant {
     host_local: bool,
     account: Arc<Account>,
     allocations: Arc<Quota>,
+    net_allocations: Arc<Quota>,
     imports: Arc<Quota>,
-    // Private Host links retain half the import count and bytes for empty returns,
-    // even when callers send externally allocated packets beyond the NIC pool.
+    net_imports: Arc<Quota>,
+    // Private Host links retain a complete empty-return window independently
+    // of data imports, including externally allocated NIC packets.
     data_imports: Arc<Quota>,
     peers: SpinLock<BTreeMap<u64, Peer>, LocalIrqDisabled>,
     notifiers: SpinLock<BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>, LocalIrqDisabled>,
@@ -195,11 +212,13 @@ impl Participant {
             host_local,
             account,
             allocations: Arc::default(),
+            net_allocations: Arc::default(),
             imports: Arc::default(),
+            net_imports: Arc::default(),
             data_imports: Arc::default(),
             peers: SpinLock::new(BTreeMap::new()),
             notifiers: SpinLock::new(BTreeMap::new()),
-            inbox: SpinLock::new(Vec::with_capacity(MAX_BUFFERS)),
+            inbox: SpinLock::new(Vec::with_capacity(MAX_BUFFERS + PRIVATE_NET_IMPORTS)),
         })
     }
 
@@ -587,6 +606,16 @@ fn error_response(error: Error) -> MmioResult {
     )
 }
 
+fn private_link_live(holder: &Participant, connection: u64) -> bool {
+    holder
+        .peers
+        .lock()
+        .get(&connection)
+        .filter(|peer| holder.host_local || peer.host_local)
+        .and_then(Peer::upgrade)
+        .is_some_and(|peer| peer.live.load(Ordering::Acquire))
+}
+
 fn execute(
     holder: &Arc<Participant>,
     operation: u32,
@@ -598,13 +627,37 @@ fn execute(
     if !holder.live.load(Ordering::Acquire) {
         return Err(Error::AccessDenied);
     }
-    if operation == ALLOCATE {
+    if operation == ALLOCATE || operation == SHARED_NET_ALLOCATE {
+        let private_net = operation == SHARED_NET_ALLOCATE;
         let capacity = usize::try_from(args[0]).map_err(|_| Error::InvalidArgs)?;
         if capacity == 0 || capacity > MAX_CAPACITY {
             return Err(Error::InvalidArgs);
         }
+        if private_net
+            && (token != 0
+                || capacity != PAGE_SIZE
+                || args[2] != 0
+                || !private_link_live(holder, args[1]))
+        {
+            return Err(Error::AccessDenied);
+        }
         let bytes = capacity.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        let charge = Charge::new(holder, bytes, reserve_fn(bytes + RECORD_RESERVE)?)?;
+        let reservation = if private_net {
+            Reservation::with_limits(
+                &holder.net_allocations,
+                bytes,
+                SHARED_NET_POOL_SIZE,
+                SHARED_NET_POOL_SIZE * PAGE_SIZE,
+            )?
+        } else {
+            Reservation::new(&holder.allocations, bytes)?
+        };
+        let charge = Charge::new(
+            holder,
+            bytes,
+            reserve_fn(bytes + RECORD_RESERVE)?,
+            reservation,
+        )?;
         let dma = DmaStream::alloc(bytes / PAGE_SIZE, false)?;
         let allocation = Arc::new(Allocation {
             dma,
@@ -613,7 +666,9 @@ fn execute(
         let slot = u32::try_from(identity()?).map_err(|_| Error::Overflow)?;
         let token = (1u64 << 32) | slot as u64;
         let mut pool = POOL.lock();
-        if !holder.live.load(Ordering::Acquire) {
+        if !holder.live.load(Ordering::Acquire)
+            || (private_net && !private_link_live(holder, args[1]))
+        {
             drop(pool);
             return Err(Error::AccessDenied);
         }
@@ -719,16 +774,18 @@ fn execute(
                 return Err(Error::AccessDenied);
             }
             let data_credit = if peer.host_local && args[2] != 0 {
-                Some(Reservation::with_limits(
+                Some(Reservation::private_data(
                     &peer.data_imports,
                     record.allocation.dma.size(),
-                    MAX_BUFFERS / 2,
-                    MAX_BYTES / 2,
                 )?)
             } else {
                 None
             };
-            let credit = Reservation::new(&peer.imports, record.allocation.dma.size())?;
+            let credit = if peer.host_local {
+                Reservation::private_net(&peer.net_imports, record.allocation.dma.size())?
+            } else {
+                Reservation::new(&peer.imports, record.allocation.dma.size())?
+            };
             let next = advance(token)?;
             let notify = peer.notifiers.lock().get(&args[0]).cloned();
             peer.inbox.lock().push((args[0], next));

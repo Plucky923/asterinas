@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 
 use super::{
     BorrowedBlockStats, Buffer, MAX_REQUEST_BYTES, QUEUE_SIZE, REQUEST_READ, REQUEST_WRITE,
-    SECTOR_BYTES,
+    SECTOR_BYTES, TailCounters, TailSnapshot,
 };
 use crate::{
     endovisor::policy::{Admission, EndpointReservation},
@@ -46,6 +46,10 @@ struct Counters {
     requests: AtomicU64,
     bytes: AtomicU64,
     identity_checks: AtomicU64,
+    /// Transfers drained by the worker, including rejected submissions.
+    completions: AtomicU64,
+    /// Bounded tail buckets of the physical BIO service time.
+    wait_tail: TailCounters,
 }
 
 pub(super) struct BorrowedBackend {
@@ -90,7 +94,7 @@ impl BorrowedIo {
         transfer: PendingTransfer,
         publish_allowed_fn: impl FnOnce() -> bool,
     ) -> Result<u32, (Error, u32)> {
-        transfer.finish(publish_allowed_fn, &mut self.cache)
+        transfer.finish(publish_allowed_fn, &mut self.cache, &self.backend.counters)
     }
 }
 
@@ -120,13 +124,16 @@ impl BorrowedBackend {
         }))
     }
 
-    pub(super) fn stats(&self) -> BorrowedBlockStats {
+    pub(super) fn stats(&self, worker_tail: TailSnapshot) -> BorrowedBlockStats {
         BorrowedBlockStats {
             requests: self.counters.requests.load(Ordering::Relaxed),
             bytes: self.counters.bytes.load(Ordering::Relaxed),
             // There is no payload-copy operation or copying fallback here.
             copied_bytes: 0,
             identity_checks: self.counters.identity_checks.load(Ordering::Relaxed),
+            completions: self.counters.completions.load(Ordering::Relaxed),
+            wait_tail: self.counters.wait_tail.snapshot(),
+            worker_tail,
         }
     }
 
@@ -329,8 +336,19 @@ impl PendingTransfer {
         self,
         publish_allowed_fn: impl FnOnce() -> bool,
         cache: &mut Vec<GuestBioSegmentCache>,
+        counters: &Counters,
     ) -> Result<u32, (Error, u32)> {
+        // Device service time: the span of the physical BIOs, that is the Host
+        // backend plus DMA. Image wake-up happens after this window, so a
+        // mismatch against the worker span and the measured request latency
+        // separates the two tail sources. The clock pair is the only added
+        // fast-path cost; `record` writes no atomic below the floor.
+        let wait_start = crate::time::read_monotonic_time();
         let result = self.batch.wait_all();
+        counters
+            .wait_tail
+            .record(crate::time::read_monotonic_time().saturating_sub(wait_start));
+        counters.completions.fetch_add(1, Ordering::Relaxed);
         // Each BIO has finished device synchronization and dropped its segment
         // references. Release all leases before the Image can observe completion,
         // including failures and stale/reset requests. Only empty metadata is cached.
@@ -481,9 +499,10 @@ mod test {
                 attempts: AtomicUsize::new(0),
                 reject_attempt: None,
             };
+            let counters = Counters::default();
             let transfer = submit_single_segment(
                 &device,
-                &Counters::default(),
+                &counters,
                 borrowed_segment(memory, address, DeviceAccess::Write),
                 0,
                 PAGE_SIZE,
@@ -501,7 +520,8 @@ mod test {
                             assert!(!memory.is_pinned_for_test());
                             true
                         },
-                        &mut cache
+                        &mut cache,
+                        &counters
                     )
                     .unwrap(),
                 PAGE_SIZE as u32
@@ -519,9 +539,10 @@ mod test {
                 attempts: AtomicUsize::new(0),
                 reject_attempt: Some(0),
             };
+            let counters = Counters::default();
             let transfer = submit_single_segment(
                 &device,
-                &Counters::default(),
+                &counters,
                 borrowed_segment(memory, address, DeviceAccess::Write),
                 0,
                 PAGE_SIZE,
@@ -530,7 +551,11 @@ mod test {
             let mut cache = Vec::new();
             assert!(
                 transfer
-                    .finish(|| panic!("rejected BIO cannot publish"), &mut cache)
+                    .finish(
+                        || panic!("rejected BIO cannot publish"),
+                        &mut cache,
+                        &counters
+                    )
                     .is_err()
             );
             assert_eq!(cache.len(), 1);
@@ -566,7 +591,9 @@ mod test {
         assert_eq!(bio.sid_range().start.to_raw(), PAGE_SIZE as u64 / 512);
         bio.complete(BioStatus::Complete);
         assert_eq!(
-            transfer.finish(|| true, &mut Vec::new()).unwrap(),
+            transfer
+                .finish(|| true, &mut Vec::new(), &counters)
+                .unwrap(),
             PAGE_SIZE as u32
         );
     }
@@ -591,7 +618,11 @@ mod test {
         assert!(transfer.batch.is_empty());
         assert!(
             transfer
-                .finish(|| panic!("rejected BIO cannot publish"), &mut Vec::new())
+                .finish(
+                    || panic!("rejected BIO cannot publish"),
+                    &mut Vec::new(),
+                    &counters
+                )
                 .is_err()
         );
         assert!(device.pending.lock().is_empty());
@@ -607,9 +638,10 @@ mod test {
             attempts: AtomicUsize::new(0),
             reject_attempt: None,
         };
+        let counters = Arc::new(Counters::default());
         let transfer = submit_single_segment(
             &device,
-            &Counters::default(),
+            &counters,
             segments(1).pop().unwrap(),
             0,
             PAGE_SIZE,
@@ -623,7 +655,7 @@ mod test {
             let result = result.clone();
             TaskOptions::new(move || {
                 started.store(true, Ordering::Release);
-                *result.lock() = Some(transfer.finish(|| false, &mut Vec::new()));
+                *result.lock() = Some(transfer.finish(|| false, &mut Vec::new(), &counters));
             })
             .spawn()
             .unwrap()
@@ -688,7 +720,9 @@ mod test {
         );
         assert_eq!(counters.identity_checks.load(Ordering::Relaxed), 3);
         assert_eq!(
-            transfer.finish(|| true, &mut Vec::new()).unwrap(),
+            transfer
+                .finish(|| true, &mut Vec::new(), &counters)
+                .unwrap(),
             (3 * PAGE_SIZE) as u32
         );
     }
@@ -700,9 +734,10 @@ mod test {
             attempts: AtomicUsize::new(0),
             reject_attempt: Some(2),
         };
+        let counters = Arc::new(Counters::default());
         let transfer = submit_segments(
             &device,
-            &Counters::default(),
+            &counters,
             segments(3),
             0,
             3 * PAGE_SIZE,
@@ -721,7 +756,7 @@ mod test {
             let result = result.clone();
             TaskOptions::new(move || {
                 started.store(true, Ordering::Release);
-                *result.lock() = Some(transfer.finish(|| true, &mut Vec::new()));
+                *result.lock() = Some(transfer.finish(|| true, &mut Vec::new(), &counters));
             })
             .spawn()
             .unwrap()

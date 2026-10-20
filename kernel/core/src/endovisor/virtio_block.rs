@@ -9,7 +9,10 @@
 //! See <https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html>.
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
+use core::{
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence},
+    time::Duration,
+};
 
 use ostd::{
     kernelet::{
@@ -38,6 +41,70 @@ use backing::{BlockIo, IO_DEPTH, STAGING_BYTES};
 mod borrowed;
 use borrowed::{BorrowedBackend, BorrowedIo};
 
+/// A single wait below this floor is not tail and costs no atomic write.
+const TAIL_FLOOR_NS: u64 = 1_000_000;
+/// Buckets around the measured distributions: the normal p99 is 1.63 ms while
+/// the reported zero-copy write tail occupies 4-10 ms.
+const TAIL_4MS_NS: u64 = 4_000_000;
+const TAIL_8MS_NS: u64 = 8_000_000;
+
+/// Bounded tail buckets for one block observation point.
+///
+/// One observation costs a clock read pair and, only when the span reaches
+/// the 1 ms floor, three to five relaxed adds. Nothing is logged, allocated or
+/// kept per request, so the instrumentation adds O(1) work and 40 bytes per
+/// observation point however many requests the worker completes.
+#[derive(Default)]
+pub(super) struct TailCounters {
+    over_1ms: AtomicU64,
+    slow_ns: AtomicU64,
+    over_4ms: AtomicU64,
+    tail_ns: AtomicU64,
+    over_8ms: AtomicU64,
+}
+
+/// Point-in-time copy of `TailCounters` merged into `BorrowedBlockStats`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct TailSnapshot {
+    pub(super) over_1ms: u64,
+    pub(super) slow_ns: u64,
+    pub(super) over_4ms: u64,
+    pub(super) tail_ns: u64,
+    pub(super) over_8ms: u64,
+}
+
+impl TailCounters {
+    /// Accumulates one observation. Only a span at or above the floor writes.
+    #[inline]
+    fn record(&self, elapsed: Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        if ns < TAIL_FLOOR_NS {
+            return;
+        }
+        self.over_1ms.fetch_add(1, Ordering::Relaxed);
+        self.slow_ns.fetch_add(ns, Ordering::Relaxed);
+        if ns >= TAIL_4MS_NS {
+            self.over_4ms.fetch_add(1, Ordering::Relaxed);
+            // Sum of the 4 ms-and-above spans only, so `tail_ns / over_4ms` is
+            // the tail mean itself rather than one diluted by every completion.
+            self.tail_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+        if ns >= TAIL_8MS_NS {
+            self.over_8ms.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> TailSnapshot {
+        TailSnapshot {
+            over_1ms: self.over_1ms.load(Ordering::Relaxed),
+            slow_ns: self.slow_ns.load(Ordering::Relaxed),
+            over_4ms: self.over_4ms.load(Ordering::Relaxed),
+            tail_ns: self.tail_ns.load(Ordering::Relaxed),
+            over_8ms: self.over_8ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Counts physical BIO submissions on the explicit borrowing path.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct BorrowedBlockStats {
@@ -45,6 +112,12 @@ pub(super) struct BorrowedBlockStats {
     pub(super) bytes: u64,
     pub(super) copied_bytes: u64,
     pub(super) identity_checks: u64,
+    /// Transfers drained by the worker; the denominator of the tail ratios.
+    pub(super) completions: u64,
+    /// Physical BIO service time, sampled around `IoBatch::wait_all()`.
+    pub(super) wait_tail: TailSnapshot,
+    /// Worker span from BIO submission to completion publication.
+    pub(super) worker_tail: TailSnapshot,
 }
 
 enum RawBackend {
@@ -207,6 +280,7 @@ pub(super) struct VirtioBlock {
     memory: GuestMemory,
     backing: Arc<dyn FileLike>,
     borrowed: Option<Arc<BorrowedBackend>>,
+    borrowed_worker_tail: TailCounters,
     capacity_sectors: u64,
     read_only: bool,
     irq: u8,
@@ -330,7 +404,10 @@ impl VirtioBlock {
     }
 
     pub(super) fn borrowed_stats(&self) -> Option<BorrowedBlockStats> {
-        self.borrowed.as_ref().map(|backend| backend.stats())
+        let worker_tail = self.borrowed_worker_tail.snapshot();
+        self.borrowed
+            .as_ref()
+            .map(|backend| backend.stats(worker_tail))
     }
 
     fn new_with_backend(
@@ -359,6 +436,7 @@ impl VirtioBlock {
             admission,
             backing,
             borrowed,
+            borrowed_worker_tail: TailCounters::default(),
             capacity_sectors,
             read_only,
             irq,
@@ -749,6 +827,11 @@ impl VirtioBlock {
                             deferred = Some((request, command));
                             break;
                         }
+                        let submitted_at = if matches!(io, RawBackend::Borrowed(_)) {
+                            Some(crate::time::read_monotonic_time())
+                        } else {
+                            None
+                        };
                         match io.submit(
                             pending.len(),
                             &self.memory,
@@ -759,7 +842,7 @@ impl VirtioBlock {
                         ) {
                             Ok(transfer) => {
                                 staged_bytes += bytes;
-                                pending.push((request, transfer));
+                                pending.push((request, transfer, submitted_at));
                             }
                             // Drain this batch before retrying admission or device
                             // backpressure once with no earlier BIO in flight.
@@ -776,7 +859,7 @@ impl VirtioBlock {
             // stale generations skip read copyback and used publication. Reset stays
             // pending until all active references drain, so a concurrent reset
             // cannot enable reuse of buffers during a copy already in progress.
-            for (request, transfer) in pending.drain(..) {
+            for (request, transfer, submitted_at) in pending.drain(..) {
                 let result = io.finish(
                     transfer,
                     &self.memory,
@@ -791,6 +874,10 @@ impl VirtioBlock {
                     Err((_, len)) => (STATUS_IO_ERROR, len),
                 };
                 self.complete(request, result);
+                if let Some(submitted_at) = submitted_at {
+                    self.borrowed_worker_tail
+                        .record(crate::time::read_monotonic_time().saturating_sub(submitted_at));
+                }
             }
             if ostd::task::Task::need_yield() {
                 ostd::task::Task::yield_now();

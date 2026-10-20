@@ -161,6 +161,23 @@ pub struct IoPathStatsRaw {
     pub borrowed_block_bytes: u64,
     pub borrowed_block_identity_checks: u64,
     pub borrowed_block_copy_bytes: u64,
+    /// Borrowed transfers drained by the worker; tail-ratio denominator.
+    pub borrowed_block_completions: u64,
+    /// `wait_all()` spans at or above 1 ms: Host backend plus DMA service.
+    pub borrowed_block_wait_over_1ms: u64,
+    /// Sum of those spans in nanoseconds (`slow_ns / over_1ms` is their mean).
+    pub borrowed_block_wait_slow_ns: u64,
+    /// How many of the 1 ms spans reached 4 ms / 8 ms.
+    pub borrowed_block_wait_over_4ms: u64,
+    /// Sum of the 4 ms-and-above spans (`tail_ns / over_4ms` is the tail mean).
+    pub borrowed_block_wait_tail_ns: u64,
+    pub borrowed_block_wait_over_8ms: u64,
+    /// Worker spans from BIO submission to completion publication.
+    pub borrowed_block_worker_over_1ms: u64,
+    pub borrowed_block_worker_slow_ns: u64,
+    pub borrowed_block_worker_over_4ms: u64,
+    pub borrowed_block_worker_tail_ns: u64,
+    pub borrowed_block_worker_over_8ms: u64,
     pub shared_net_devices: u64,
     pub shared_net_tx_packets: u64,
     pub shared_net_tx_bytes: u64,

@@ -38,7 +38,7 @@ use super::{
 use super::{
     super::{
         policy::{NativeTcpBufferCharge, UserEndpointReservation},
-        shared_net::{SharedFrame, SharedNetTransport, SharedTxFrame},
+        shared_net::{REPLY_HEADROOM, SharedFrame, SharedNetTransport, SharedTxFrame},
     },
     Frame, MAX_FRAME_BYTES, NetEndpoint, NetWorker, Work,
     sockets::{TcpListener, TcpStream, UdpSocket},
@@ -1834,13 +1834,19 @@ impl FrameBackend for SharedFrames<'_> {
             return false;
         }
         if self.prepared.is_none() {
+            // Ordinary egress stops at the reply headroom. `receive_transmit`
+            // keeps allocating without it, so Image ingress always finds a
+            // token even when egress owns every other grant.
             if self.reply.is_none() {
-                self.reply = self.transport.allocate_frame();
+                self.reply = self.transport.allocate_frame_above(REPLY_HEADROOM);
             }
             if self.reply.is_some() {
-                self.prepared = self.transport.allocate_frame();
+                self.prepared = self.transport.allocate_frame_above(REPLY_HEADROOM);
             }
-            self.import_blocked = self.prepared.is_none() && self.transport.has_free_buffer();
+            // Only an import-quota failure deserves the retry timer; running
+            // out of headroom-admissible grants is resolved by returns/IRQs.
+            self.import_blocked = self.prepared.is_none()
+                && self.transport.has_free_buffer_above(REPLY_HEADROOM);
         }
         self.prepared.is_some()
     }

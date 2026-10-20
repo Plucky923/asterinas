@@ -376,6 +376,17 @@ impl SandboxFile {
                 raw.borrowed_block_bytes += stats.bytes;
                 raw.borrowed_block_identity_checks += stats.identity_checks;
                 raw.borrowed_block_copy_bytes += stats.copied_bytes;
+                raw.borrowed_block_completions += stats.completions;
+                raw.borrowed_block_wait_over_1ms += stats.wait_tail.over_1ms;
+                raw.borrowed_block_wait_slow_ns += stats.wait_tail.slow_ns;
+                raw.borrowed_block_wait_over_4ms += stats.wait_tail.over_4ms;
+                raw.borrowed_block_wait_tail_ns += stats.wait_tail.tail_ns;
+                raw.borrowed_block_wait_over_8ms += stats.wait_tail.over_8ms;
+                raw.borrowed_block_worker_over_1ms += stats.worker_tail.over_1ms;
+                raw.borrowed_block_worker_slow_ns += stats.worker_tail.slow_ns;
+                raw.borrowed_block_worker_over_4ms += stats.worker_tail.over_4ms;
+                raw.borrowed_block_worker_tail_ns += stats.worker_tail.tail_ns;
+                raw.borrowed_block_worker_over_8ms += stats.worker_tail.over_8ms;
             }
         }
         if let Some(net) = &devices.shared_net {

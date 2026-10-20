@@ -25,6 +25,14 @@ mod test;
 const BUFFERS: usize = buffer::SHARED_NET_POOL_SIZE;
 const RETURNS: usize = BUFFERS;
 const BATCH: usize = buffer::SHARED_NET_BATCH_SIZE;
+/// Grants that ordinary egress must leave free for ingress replies.
+///
+/// An Image frame is only handed to smoltcp together with a paired TxToken.
+/// If Host->Image egress drains the whole pool, `FrameDevice::receive` fails
+/// for every Image frame, the Image vehicle stalls, and the grants that
+/// egress is waiting for cannot be returned. Two grants cover the reply of
+/// the frame being processed plus the reply of the next pipelined frame.
+pub(super) const REPLY_HEADROOM: usize = 2;
 type Delivery = (HostLocalGrant, HostSendCredit, usize);
 const CAPACITY: usize = ostd::mm::PAGE_SIZE;
 
@@ -246,10 +254,24 @@ impl SharedNetTransport {
     /// infallible smoltcp callback is offered.
     /// No allocation occurs per packet.
     pub(super) fn allocate_frame(self: &Arc<Self>) -> Option<SharedTxFrame> {
+        self.allocate_frame_above(0)
+    }
+
+    /// Like [`Self::allocate_frame`], but leaves `reserve` grants untouched so
+    /// an ingress reply can still be admitted while ordinary egress is
+    /// saturated. The length check and the pop share one critical section, so
+    /// no concurrent producer can take the reserve between them.
+    pub(super) fn allocate_frame_above(self: &Arc<Self>, reserve: usize) -> Option<SharedTxFrame> {
         if self.cancelled.load(Ordering::Acquire) {
             return None;
         }
-        let grant = self.free.lock().pop()?;
+        let grant = {
+            let mut free = self.free.lock();
+            if free.len() <= reserve {
+                return None;
+            }
+            free.pop()?
+        };
         let credit = match self.local.reserve_send(CAPACITY) {
             Ok(credit) => credit,
             Err(_) => {
@@ -267,12 +289,17 @@ impl SharedNetTransport {
 
     pub(super) fn can_transmit(&self) -> bool {
         !self.cancelled.load(Ordering::Acquire)
-            && self.has_free_buffer()
+            && self.has_free_buffer_above(REPLY_HEADROOM)
             && self.local.can_send(CAPACITY)
     }
 
     pub(super) fn has_free_buffer(&self) -> bool {
-        !self.free.lock().is_empty()
+        self.has_free_buffer_above(0)
+    }
+
+    /// `true` when more than `reserve` grants are free.
+    pub(super) fn has_free_buffer_above(&self, reserve: usize) -> bool {
+        self.free.lock().len() > reserve
     }
 
     #[cfg(kernelet_nat_failure_diag_host)]

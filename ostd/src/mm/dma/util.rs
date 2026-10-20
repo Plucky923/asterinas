@@ -89,6 +89,20 @@ pub(super) fn cvm_need_private_protection() -> bool {
     }
 }
 
+/// Borrowed Image DMA uses the existing writeback mapping and physical address.
+/// Other environments require a device-specific mapping and retirement protocol.
+#[cfg(feature = "kernelet-host")]
+pub(crate) fn supports_borrowed_identity_dma() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        !has_dma_remapping() && !cvm_need_private_protection()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 pub(super) fn split_daddr(daddr: Option<Daddr>, offset: usize) -> (Option<Daddr>, Option<Daddr>) {
     match daddr {
         Some(daddr) => {

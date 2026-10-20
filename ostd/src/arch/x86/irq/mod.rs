@@ -41,6 +41,29 @@ pub(crate) const IRQ_NUM_MAX: u8 = 254;
 /// Reserved local-APIC spurious vector, never allocated to a real IRQ.
 pub(crate) const SPURIOUS_VECTOR: u8 = 255;
 
+/// Captures ISR before recovery performs any acknowledgment. More than one
+/// active vector cannot be attributed to the abandoned entry prefix.
+#[cfg(feature = "kernelet-host")]
+pub(crate) fn interrupted_delivery() -> Result<Option<u8>, ()> {
+    let guard = crate::irq::disable_local();
+    let isr = kernel::apic::get_or_init(&guard).in_service();
+    let mut vector = None;
+    for (index, word) in isr.into_iter().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        if vector.is_some() || word.count_ones() != 1 {
+            return Err(());
+        }
+        let number = index * 32 + word.trailing_zeros() as usize;
+        if number < IRQ_NUM_MIN as usize || number > IRQ_NUM_MAX as usize {
+            return Err(());
+        }
+        vector = Some(number as u8);
+    }
+    Ok(vector)
+}
+
 #[cfg(ktest)]
 #[crate::prelude::ktest]
 fn spurious_vector_is_not_an_allocatable_irq() {

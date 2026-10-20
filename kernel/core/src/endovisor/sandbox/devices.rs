@@ -16,13 +16,15 @@ use crate::{
     endovisor::{
         log_endpoint::LogEndpoint,
         placement::CpuReservation,
-        policy::{Admission, PrestartEndpointReservation},
+        policy::{Admission, UserEndpointReservation},
         scheduling::ExecutionThreads,
+        shared_net::SharedNet,
         virtio_block::VirtioBlock,
         virtio_console::{ConsoleEndpoint, VirtioConsole},
         virtio_net::{NetEndpoint, VirtioNet},
         virtio_rng::VirtioRng,
         virtio_vsock::VirtioVsock,
+        zero_copy_block::ZeroCopyBlock,
     },
     prelude::*,
     thread::kernel_thread::ThreadOptions,
@@ -100,6 +102,7 @@ pub(super) enum DeviceModel<'a> {
     Vsock(&'a Arc<VirtioVsock>),
     Rng(&'a Arc<VirtioRng>),
     Net(&'a Arc<VirtioNet>),
+    SharedNet(&'a Arc<SharedNet>),
 }
 impl DeviceModel<'_> {
     pub(super) fn start_worker(self, execution: &ExecutionThreads) {
@@ -109,6 +112,7 @@ impl DeviceModel<'_> {
             Self::Vsock(x) => x.start_worker(execution),
             Self::Rng(x) => x.start_worker(execution),
             Self::Net(x) => x.start_worker(execution),
+            Self::SharedNet(x) => x.start_worker(execution),
         }
     }
     fn cancel(self) {
@@ -118,6 +122,7 @@ impl DeviceModel<'_> {
             Self::Vsock(x) => x.cancel(),
             Self::Rng(x) => x.cancel(),
             Self::Net(x) => x.cancel(),
+            Self::SharedNet(x) => x.cancel(),
         }
     }
     fn read(self, offset: u32, width: u32) -> MmioResult {
@@ -127,6 +132,10 @@ impl DeviceModel<'_> {
             Self::Vsock(x) => x.read(offset, width),
             Self::Rng(x) => x.read(offset, width),
             Self::Net(x) => x.read(offset, width),
+            Self::SharedNet(_) => MmioResult {
+                status: -INVALID,
+                value: 0,
+            },
         }
     }
     fn write(self, offset: u32, width: u32, value: u64) -> i64 {
@@ -136,6 +145,7 @@ impl DeviceModel<'_> {
             Self::Vsock(x) => x.write(offset, width, value),
             Self::Rng(x) => x.write(offset, width, value),
             Self::Net(x) => x.write(offset, width, value),
+            Self::SharedNet(_) => -INVALID,
         }
     }
 }
@@ -163,6 +173,9 @@ impl SandboxDevices {
         if let Some(x) = &self.net {
             f(DeviceModel::Net(x));
         }
+        if let Some(x) = &self.shared_net {
+            f(DeviceModel::SharedNet(x));
+        }
         if let Some(x) = &self.rng {
             f(DeviceModel::Rng(x));
         }
@@ -175,7 +188,7 @@ pub(super) struct SandboxHooks {
     pub(super) console_endpoint: Option<Arc<ConsoleEndpoint>>,
     pub(super) net_endpoint: Option<Arc<NetEndpoint>>,
     pub(super) log_endpoint: Option<Arc<LogEndpoint>>,
-    pub(super) _endpoint_reservations: Vec<Arc<PrestartEndpointReservation>>,
+    pub(super) _endpoint_reservations: Vec<Arc<UserEndpointReservation>>,
     pub(super) admission: Arc<Admission>,
     pub(super) _placement: CpuReservation,
     pub(super) execution: ExecutionThreads,
@@ -183,9 +196,11 @@ pub(super) struct SandboxHooks {
 
 pub(super) struct SandboxDevices {
     pub(super) blocks: Vec<Arc<VirtioBlock>>,
+    pub(super) zero_copy_blocks: Vec<Arc<ZeroCopyBlock>>,
     pub(super) console: Option<Arc<VirtioConsole>>,
     pub(super) vsock: Option<Arc<VirtioVsock>>,
     pub(super) net: Option<Arc<VirtioNet>>,
+    pub(super) shared_net: Option<Arc<SharedNet>>,
     pub(super) rng: Option<Arc<VirtioRng>>,
 }
 
@@ -195,6 +210,9 @@ impl SandboxHooks {
             return;
         };
         devices.for_each(|device| device.cancel());
+        for device in &devices.zero_copy_blocks {
+            device.cancel();
+        }
     }
 
     pub(super) fn revoke_endpoints(&self) {
@@ -211,6 +229,63 @@ impl SandboxHooks {
 }
 
 impl KerneletHooks for SandboxHooks {
+    fn shared_net_info(&self, device: u32, query: u32) -> MmioResult {
+        match self
+            .devices
+            .get()
+            .and_then(|devices| devices.shared_net.as_ref())
+        {
+            Some(net) if device == 0 => net.info(query),
+            _ => MmioResult {
+                status: 0,
+                value: 0,
+            },
+        }
+    }
+
+    fn shared_net_kick(&self, device: u32) -> bool {
+        if device == 0
+            && let Some(net) = self
+                .devices
+                .get()
+                .and_then(|devices| devices.shared_net.as_ref())
+        {
+            net.kick();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn shared_block_info(
+        &self,
+        device: u32,
+    ) -> Option<ostd::kernelet::shared_buffer::ZeroCopyBlockInfo> {
+        self.devices
+            .get()?
+            .zero_copy_blocks
+            .get(device as usize)?
+            .info()
+    }
+    fn reserve_shared_buffer(&self, bytes: usize) -> ostd::Result<Box<dyn Send + Sync>> {
+        self.admission
+            .reserve_shared_buffer(bytes)
+            .map(|charge| Box::new(charge) as Box<dyn Send + Sync>)
+            .map_err(|_| ostd::Error::NotEnoughResources)
+    }
+    fn submit_buffer(
+        &self,
+        buffer: ostd::kernelet::shared_buffer::BackendBuffer,
+        request: ostd::kernelet::shared_buffer::IoRequest,
+    ) {
+        if let Some(devices) = self.devices.get()
+            && let Some(block) = devices.zero_copy_blocks.get(request.device as usize)
+        {
+            block.submit(buffer);
+        } else {
+            let _ = buffer.complete(-INVALID, 0);
+        }
+    }
     fn on_dying(&self, _: &Kernelet, _: &ostd::kernelet::control::ExitReason) {
         self.cancel();
         crate::endovisor::vsock_switch::on_dying(self.cid);

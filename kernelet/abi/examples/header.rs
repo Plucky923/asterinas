@@ -60,6 +60,29 @@ fn main() {
         },
         VsockArgs { port, flags },
         VsockPolicyArgs { peer_fd, allow },
+        SharedBufferConnectArgs {
+            peer_fd,
+            flags,
+            out_connection,
+            out_peer_connection,
+        },
+        IoPathStatsRaw {
+            borrowed_block_devices,
+            borrowed_block_requests,
+            borrowed_block_bytes,
+            borrowed_block_identity_checks,
+            borrowed_block_copy_bytes,
+            shared_net_devices,
+            shared_net_tx_packets,
+            shared_net_tx_bytes,
+            shared_net_rx_packets,
+            shared_net_rx_bytes,
+            shared_net_payload_copy_bytes,
+            shared_net_native_fallback_packets,
+            shared_net_native_fallback_bytes,
+            shared_net_allocations,
+            shared_net_reuses,
+        },
         BudgetArgs {
             nice,
             reserved0,
@@ -148,7 +171,9 @@ fn main() {
         VSOCK_CONNECT,
         VSOCK_LISTEN,
         VSOCK_SHUTDOWN,
-        VSOCK_POLICY
+        VSOCK_POLICY,
+        SHARED_BUFFER_CONNECT,
+        IO_PATH_STATS
     );
     for (name, size, fields) in layouts {
         writeln!(

@@ -13,7 +13,7 @@ use crate::{
         vfs::range_lock::{FileRange, OFFSET_MAX, RangeLockItem, RangeLockType},
     },
     prelude::*,
-    process::{Pid, pid_table},
+    process::{Pid, ResourceType, pid_table},
 };
 
 pub(super) fn sys_fcntl(
@@ -46,12 +46,23 @@ pub(super) fn sys_fcntl(
 }
 
 fn handle_dupfd(fd: FileDesc, arg: u64, flags: FdFlags, ctx: &Context) -> Result<SyscallReturn> {
+    let fd_limit = ctx
+        .process
+        .resource_limits()
+        .get_rlimit(ResourceType::RLIMIT_NOFILE)
+        .get_cur() as usize;
+    let file_table = ctx.thread_local.borrow_file_table();
+    let mut file_table_locked = file_table.unwrap().write();
+    // An invalid source takes precedence over an invalid minimum descriptor.
+    file_table_locked.get_file(fd)?;
     let ceil_fd = (arg as RawFileDesc)
         .try_into()
         .map_err(|_| Error::with_message(Errno::EINVAL, "invalid fd"))?;
+    if usize::from(ceil_fd) >= fd_limit {
+        return_errno!(Errno::EINVAL);
+    }
 
-    let file_table = ctx.thread_local.borrow_file_table();
-    let new_fd = file_table.unwrap().write().dup_ceil(fd, ceil_fd, flags)?;
+    let new_fd = file_table_locked.dup_ceil(fd, ceil_fd, flags, fd_limit)?;
     Ok(SyscallReturn::Return(new_fd.into()))
 }
 

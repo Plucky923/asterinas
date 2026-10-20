@@ -7,6 +7,7 @@ mod crossing_capture;
 mod holder;
 mod hooks;
 mod rootfs;
+mod shared_buffers;
 mod status;
 mod terminal;
 mod tlb_capture;
@@ -33,6 +34,7 @@ use crate::{config::Process, protocol};
 // admission budget of 512 grains, which includes both Guest and Host memory.
 const DEFAULT_MAX_GRAINS: u32 = 256;
 const DEFAULT_VCPUS: u16 = 2;
+const DEFAULT_MAX_TASKS: u32 = 256;
 const DEFAULT_ROOT: &str = "/run/kernelet";
 const DEFAULT_CACHE: &str = "/var/cache/kernelet";
 const DEFAULT_AGENT: &str = "/usr/libexec/kernelet-agent";
@@ -54,6 +56,9 @@ pub struct Cli {
     vcpus: u16,
     #[arg(long, default_value_t = DEFAULT_MAX_GRAINS)]
     max_grains: u32,
+    /// Maximum live internal Tasks, including application and background threads.
+    #[arg(long, default_value_t = DEFAULT_MAX_TASKS)]
+    max_tasks: u32,
     #[command(subcommand)]
     command: Operation,
 }
@@ -78,6 +83,10 @@ enum Operation {
         id: String,
     },
     Stats {
+        id: String,
+    },
+    /// Read Host/Image device-path counters without enabling test instrumentation.
+    IoPathStats {
         id: String,
     },
     /// Read the kernel instance state and exit reason without changing lifecycle.
@@ -108,6 +117,11 @@ enum Operation {
         peer_id: String,
         #[command(subcommand)]
         action: PairAction,
+    },
+    /// Authorize shared-buffer exchange between two running sandboxes.
+    SharedBufferConnect {
+        id: String,
+        peer_id: String,
     },
     Kill {
         id: String,
@@ -189,11 +203,13 @@ pub(crate) enum Control {
     Resize { id: u64, columns: u16, rows: u16 },
     State,
     Stats,
+    IoPathStats,
     InspectStatus,
     Rq1Tlb { action: TlbAction },
     Rq1Crossing { action: CrossingAction },
     VsockCid,
     VsockCapability,
+    SharedBufferCapability,
     Processes,
     ExitStatus { id: u64 },
     ForgetExited { id: u64 },
@@ -211,10 +227,12 @@ pub(crate) enum Reply {
     Ready,
     State(State),
     Stats(Stats),
+    IoPathStats(serde_json::Value),
     InspectStatus(InstanceStatus),
     Rq1TlbSnapshot(String),
     Rq1CrossingSnapshot(String),
     VsockIdentity(vsock::Identity),
+    SharedBufferIdentity { id: String },
     Processes(Vec<u32>),
     ExitStatus { code: Option<i32> },
     Reserved { id: u64 },
@@ -246,11 +264,13 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Operation::Start { id, .. }
         | Operation::State { id }
         | Operation::Stats { id }
+        | Operation::IoPathStats { id }
         | Operation::InspectStatus { id }
         | Operation::Rq1Tlb { id, .. }
         | Operation::Rq1Crossing { id, .. }
         | Operation::VsockCid { id, .. }
         | Operation::VsockPair { id, .. }
+        | Operation::SharedBufferConnect { id, .. }
         | Operation::Kill { id, .. }
         | Operation::Delete { id, .. }
         | Operation::Resize { id, .. }
@@ -297,6 +317,10 @@ pub fn run(cli: Cli) -> Result<i32> {
             let pair = vsock::set_pair(&cli.root, id, peer_id, *action)?;
             println!("{}", serde_json::to_string(&pair)?);
         }
+        Operation::SharedBufferConnect { peer_id, .. } => {
+            let pair = shared_buffers::connect(&cli.root, id, peer_id)?;
+            println!("{}", serde_json::to_string(&pair)?);
+        }
         Operation::Rq1Tlb { action, .. } => {
             let (reply, _) = request(&directory, &Control::Rq1Tlb { action: *action })?;
             match (action, reply) {
@@ -323,6 +347,13 @@ pub fn run(cli: Cli) -> Result<i32> {
                 bail!("invalid holder stats response");
             };
             println!("{}", serde_json::to_string(&stats)?);
+        }
+        Operation::IoPathStats { .. } => {
+            let (reply, _) = request(&directory, &Control::IoPathStats)?;
+            let Reply::IoPathStats(stats) = reply else {
+                bail!("invalid holder I/O path stats response");
+            };
+            println!("{stats}");
         }
         Operation::Start { attach, .. } => {
             let terminal = if *attach {
@@ -524,6 +555,21 @@ fn parse_signal(value: &str) -> Result<i32> {
         format!("SIG{value}")
     };
     Ok(name.parse::<nix::sys::signal::Signal>()? as i32)
+}
+
+/// Linux signal zero probes existence; real signal numbers are 1 through 64.
+pub(crate) fn validate_signal(signal: i32) -> Result<()> {
+    ensure!((0..=64).contains(&signal), "invalid signal number {signal}");
+    Ok(())
+}
+
+/// A launch observation outlives its caller's RPC deadline. Only a confirmed
+/// rejection permits reuse; transport failure leaves the operation uncertain.
+pub(crate) fn request_launch(directory: &Path, operation: &Control) -> Result<(Reply, UnixStream)> {
+    let mut stream = begin_request(directory, operation)?;
+    stream.set_read_timeout(None)?;
+    let reply = receive_reply(&mut stream)?;
+    Ok((reply, stream))
 }
 
 #[cfg(test)]
@@ -745,19 +791,4 @@ mod tests {
             assert_eq!(serde_json::to_value(action).unwrap(), expected);
         }
     }
-}
-
-/// Linux signal zero probes existence; real signal numbers are 1 through 64.
-pub(crate) fn validate_signal(signal: i32) -> Result<()> {
-    ensure!((0..=64).contains(&signal), "invalid signal number {signal}");
-    Ok(())
-}
-
-/// A launch observation outlives its caller's RPC deadline. Only a confirmed
-/// rejection permits reuse; transport failure leaves the operation uncertain.
-pub(crate) fn request_launch(directory: &Path, operation: &Control) -> Result<(Reply, UnixStream)> {
-    let mut stream = begin_request(directory, operation)?;
-    stream.set_read_timeout(None)?;
-    let reply = receive_reply(&mut stream)?;
-    Ok((reply, stream))
 }

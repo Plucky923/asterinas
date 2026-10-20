@@ -18,6 +18,7 @@ mod external_sources;
 mod host_audit;
 pub(crate) mod rustc_wrapper;
 mod snapshot;
+mod stack_budget;
 mod unsafe_allowlist;
 
 use std::{
@@ -29,6 +30,7 @@ use std::{
 
 pub(crate) use host_audit::audit_host_services;
 use sha2::{Digest, Sha256};
+pub(crate) use stack_budget::generate_host_budgets;
 
 use crate::{
     arch::Arch,

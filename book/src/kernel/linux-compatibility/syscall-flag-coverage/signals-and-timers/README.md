@@ -58,6 +58,11 @@ Unsupported predefined clock IDs:
 Unsupported notification methods:
 * `SIGEV_THREAD`
 
+Dynamic process and thread CPU clocks support profiling, virtual, and scheduling modes.
+A zero encoded PID or TID selects the calling process or thread.
+Scheduling mode uses the existing tick-based profiling accounting.
+File-descriptor clocks are unsupported.
+
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/timer_create.2.html).
 

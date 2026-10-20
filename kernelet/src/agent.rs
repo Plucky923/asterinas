@@ -1161,14 +1161,14 @@ mod tests {
         );
         let path =
             std::env::temp_dir().join(format!("kernelet-exit-fixture-{}.log", std::process::id()));
-        let capture = std::fs::OpenOptions::new()
+        let capture = fs::OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
         // Unlink immediately; the supervisor and fixture retain bounded ownership.
-        std::fs::remove_file(path).unwrap();
+        fs::remove_file(path).unwrap();
         let mut fixture = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",

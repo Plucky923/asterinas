@@ -52,7 +52,7 @@ pub fn receive(stream: &UnixStream) -> io::Result<Vec<OwnedFd>> {
         unsafe { libc::CMSG_SPACE((MAX_RIGHTS_DESCRIPTORS * size_of::<RawFd>()) as u32) as usize };
     // Linux CMSG alignment uses usize on both GNU and musl. Their cmsghdr
     // field layouts differ, so allocate aligned words rather than a literal.
-    const { assert!(mem::align_of::<usize>() >= mem::align_of::<libc::cmsghdr>()) };
+    const { assert!(align_of::<usize>() >= align_of::<libc::cmsghdr>()) };
     let mut control = vec![0usize; control_bytes.div_ceil(size_of::<usize>())];
     let mut buffer = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
@@ -63,12 +63,8 @@ pub fn receive(stream: &UnixStream) -> io::Result<Vec<OwnedFd>> {
     message.msg_iov = &mut buffer;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control_bytes.try_into().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "control buffer exceeds ABI limit",
-        )
-    })?;
+    // CMSG_SPACE returns u32, which fits both musl's u32 and GNU's usize.
+    message.msg_controllen = control_bytes as _;
     // SAFETY: The live iovec and aligned control buffer are writable for their
     // declared lengths. recvmsg cannot retain their pointers after returning.
     let bytes = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
@@ -188,8 +184,7 @@ mod tests {
         drop(file);
         let received = receive(&receiver).unwrap();
         assert_eq!(received.len(), 1);
-        let flags =
-            nix::fcntl::fcntl(received[0].as_raw_fd(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        let flags = fcntl(received[0].as_raw_fd(), FcntlArg::F_GETFD).unwrap();
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 

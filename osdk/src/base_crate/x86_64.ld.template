@@ -136,6 +136,11 @@ SECTIONS
         __sensitive_io_ports_end = .;
     } : rodata
 
+    # Fixed-size, read-only cells are filled after the final Host link.
+    .kernelet_service_budgets : AT(ADDR(.kernelet_service_budgets) - KERNEL_VMA) {
+        KEEP(*(.rodata.kernelet_service_budgets))
+    } : rodata
+
     .rodata                 : AT(ADDR(.rodata) - KERNEL_VMA) {
         *(.rodata .rodata.*)
     } : rodata
@@ -181,4 +186,7 @@ SECTIONS
     } : data
 
     __kernel_end = .;
+
+    # Analysis metadata is retained in the ELF, outside every load segment.
+    .stack_sizes 0 : { *(.stack_sizes) } :NONE
 }

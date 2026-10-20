@@ -100,6 +100,23 @@ The OCI CLI accepts
 Global `--root`, `--cache`, `--agent`, and `--mke2fs` options
 select installation paths.
 `create --bundle <directory> <id>` consumes a standard OCI bundle.
+`--max-tasks` selects the internal Task limit, defaulting to 256 and capped at
+4096.
+The `org.asterinas.kernelet.max-tasks` OCI annotation overrides this value
+for both CLI and shim creation.
+This counts kernel Tasks, including background
+threads; it is separate from the unsupported OCI PID controller.
+
+Large syscall workloads can use a 2048 MiB OCI memory limit and a 4096 Task
+limit.
+Boot the Host with `kernelet_user_memory_mib=4096` to authorize a 4096 MiB
+per-user total reservation.
+The default remains 1024 MiB.
+Values must be positive multiples of 2 MiB.
+This total includes Guest memory ceilings and Host execution
+and metadata storage; raising the Image ceiling alone does not raise it.
+Host physical allocation can still fail within the configured reservation.
+
 `start --attach <id>` attaches the container to the calling terminal:
 a `terminal=true` process runs interactively on the Guest PTY
 and the CLI restores the tty when the attach ends,
@@ -235,7 +252,7 @@ The DNS proxy reaches the Host's configured IPv4 resolver,
 including a resolver bound to the Host loopback address.
 These addresses belong to each sandbox's separate Ethernet link.
 
-The Guest uses the kernel's existing static VirtIO network configuration.
+The Guest uses the kernel's static Ethernet configuration with either device backend.
 The agent writes the DNS resolver file
 without changing the link, address, or route through rtnetlink.
 Custom Guest IPv4 addresses and gateways are not supported.
@@ -255,6 +272,148 @@ the runtime keeps no network descriptor and exchanges no packets.
 The existing per-user endpoint memory quota
 also applies to listeners and active forwarding flows.
 ICMP forwarding and IPv6 are not provided.
+
+## Device selection for ordinary applications
+
+The `org.asterinas.kernelet.io-devices` OCI annotation selects block and network
+backends before the sandbox starts.
+Its value is a JSON object encoded as a string:
+
+```json
+{
+  "annotations": {
+    "org.asterinas.kernelet.network": "nat",
+    "org.asterinas.kernelet.io-devices": "{\"block\":\"borrowed\",\"network\":\"shared\",\"blockBackings\":[\"/dev/vdb\"]}"
+  }
+}
+```
+
+`block` accepts `copy` (default) or `borrowed`.
+`network` accepts `copy` (default) or `shared`; shared mode requires enabled networking.
+The choices are independent.
+Omitting the annotation preserves the existing copying devices.
+Native builds retain their existing I/O paths.
+Applications continue using ordinary file, `mmap`, TCP, and UDP calls with the same Linux ABI.
+
+Borrowed block mode uses `BORROWED_BLOCK` with the existing Image VirtIO block driver.
+The Host submits BIOs over the Image's registered DMA pages and retains their leases until physical I/O ends.
+It does not allocate a Host staging payload buffer or copy payload bytes across this boundary.
+The backend currently supports coherent x86-64, non-confidential VMs, disabled IOMMU DMA remapping,
+and opened whole-device VirtIO block backings.
+Regular files, partitions, other drivers, and unsupported DMA environments fail attachment with `EOPNOTSUPP`.
+There is no copying fallback for a requested borrowed device.
+
+Borrowed mode requires explicit absolute `blockBackings` paths.
+The array supplies the root backing first, then directory-bind image backings in OCI mount order.
+Its length must match the generated root and bind-image count.
+Prepare the corresponding filesystems in advance, including the agent in the root backing.
+The runtime does not copy its generated filesystem images onto these devices.
+The runtime retains its read-only backing and writable tmpfs-overlay policy in both block modes.
+Control clients can also attach a writable `BORROWED_BLOCK` directly before `START`.
+
+Shared network mode attaches `SHARED_NET` to the configured Host NAT endpoint.
+The Image's shared Ethernet device implements the ordinary network-device interface used by `aster-bigtcp`.
+It passes owning packet storage across the Host/Image boundary without staging payload copies.
+Bounded buffer pools, import credit, and return notifications recycle allocations.
+Shared queues and NAT receive tokens carry compact allocation handles.
+The copying device keeps its inline Ethernet frames.
+The worker retains one prepared shared transmit buffer when a paired receive token leaves it unused.
+Worker-local progress does not notify the worker again; external handoffs and cancellation still wake it.
+The Image exchanges up to 32 empty returns and 32 received grants in one private device call.
+This call combines receipt with activation and leaves rejected return buffers with their original owner.
+Host forwarding and socket configuration remain in the existing kernel network path.
+TCP stream storage, application buffers, native Host sockets, and physical NICs can still involve copies;
+this device does not establish zero-copy operation throughout TCP/IP.
+
+`Sandbox::io_path_stats` and the `IO_PATH_STATS` ioctl expose borrowed block activity,
+original DMA address checks, shared network traffic, allocation reuse, and compatibility-copy counters.
+They describe the selected device boundaries, not all copies in the system.
+
+## Explicit zero-copy block attachments
+
+Native I/O and existing `BLOCK` attachments keep their existing paths.
+An additional `ZERO_COPY_BLOCK` attachment exposes the shared-buffer interface.
+Its indices are independent of VirtIO MMIO device IDs and Linux disk names.
+Before `Sandbox::start`, a control client can call:
+
+```rust,ignore
+let index = sandbox.attach_zero_copy_block(&backing, true)?;
+```
+
+The backing must be an opened whole-device VirtIO block device.
+Buffered files, partitions, and unsupported drivers fail with `EOPNOTSUPP`.
+The ordinary `BLOCK` interface remains available for those backends.
+Zero-copy attachments do not replace the root filesystem's ordinary block device.
+
+Image kernel clients use `ostd::kernelet::shared_buffer::ZeroCopyBlock::open(index)`.
+Its `read`, `write`, and `write_read_only` methods consume shared buffer wrappers.
+Rejection returns the original wrapper; accepted work returns a fresh grant through `PendingIo::poll`.
+Cancellation retains storage until backend access ends.
+These devices use no guest descriptor ring or staging payload buffer.
+The OCI runtime accepts explicit attachments through an annotation containing a JSON array:
+
+```json
+"org.asterinas.kernelet.zero-copy-blocks": "[{\"path\":\"/dev/vdb\",\"readOnly\":true}]"
+```
+
+Array order determines zero-copy device indices.
+The annotation defaults to no attachments and does not change the root disk or copying devices.
+
+See [the implementation contract](decisions/0014-shared-buffers-and-service-stacks.md)
+for ownership, accounting, stack handling, and validation limits.
+
+## Shared-buffer datagram devices
+
+Authorize a connection between two running instances through their private holder sockets:
+
+```sh
+kernelet-runtime --root /run/kernelet shared-buffer-connect producer consumer
+```
+
+The command holds capabilities for both sandboxes and prints their connection identities.
+Repeating it returns the existing connection.
+The raw `SHARED_BUFFER_CONNECT` ioctl and `Sandbox::connect_shared_buffers` expose the same operation.
+
+Each connection exposes an independent `ZeroCopyNet` device in both images.
+Image kernel clients open it with `ZeroCopyNet::open(index)` and create an owning-buffer datagram socket with `socket()`.
+Producers allocate shared storage, write directly through its exclusive writer, and consume it through `try_send`.
+Consumers obtain `ZeroCopyDatagram` through `try_recv` and parse the original allocation through `reader()`.
+The kernel socket adapter also supports importing and forwarding an existing grant without copying payload bytes.
+
+This interface supports datagrams of 0 to 65535 bytes and nonblocking backpressure.
+It provides no Ethernet, IP, or UDP framing and does not select a physical network interface.
+These connections are independent of the startup-selected Ethernet device and Host NAT endpoint.
+Ordinary Linux socket traffic uses the selected copying or shared Ethernet path.
+Accepted datagrams survive sender exit; the receiver can discover and drain them before the disconnected device disappears.
+
+## Shared I/O functional regression
+
+Inside the development container, install this checkout's OSDK and run:
+
+```sh
+OSDK_LOCAL_DEV=1 cargo install --path osdk --locked
+python3 tools/test_kernelet_shared_io.py all
+```
+
+The test creates dedicated images under `target/kernelet-shared-io`.
+It boots a paired Host/Image build in QEMU/KVM with a dedicated VirtIO block disk.
+Two images exercise the real buffer and socket APIs, validate block readback, and compare allocation addresses across datagram round trips.
+The temporary procfs test entry exists only in builds with `KERNELET_SHARED_IO_TEST=1`.
+Results and complete build and VM logs remain in that directory.
+This functional test does not measure performance or establish physical NIC copy elimination.
+
+The transparent-device regression exercises ordinary file, mapping, TCP, and UDP calls:
+
+```sh
+python3 tools/test_kernelet_transparent_io.py all
+```
+
+It prepares separate copying and shared root disks under `target/kernelet-transparent-io`.
+Both Images read and write files, persist a `MAP_SHARED` modification, and exchange TCP/UDP data with native Host servers.
+The runner checks Image exit status, device counters, completed teardown, and both disks' contents offline.
+Results apply to the tested Host/Image pair; rerun the regression after the final source freeze.
+Complete results and logs remain in that test directory.
+No latency or throughput result is established by these fixtures.
 
 ## C ABI header
 

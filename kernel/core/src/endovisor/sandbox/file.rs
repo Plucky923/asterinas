@@ -7,11 +7,11 @@ use alloc::format;
 use core::fmt::Display;
 
 use kernelet_abi::{
-    BudgetArgs, ImageInfoRaw, KILL_ENTRY_FAILED, KILL_HOST_HOOK_PANICKED, KILL_KERNEL_FAULT,
-    KILL_OOPS_BUDGET, KILL_REQUESTED, KILL_STACK_OVERFLOW, KILL_STACK_RESERVE, STATE_CONFIGURING,
-    STATE_DESTROYED, STATE_DESTROYING, STATE_DYING, STATE_EXITED, STATE_RUNNING, STATE_STARTING,
-    STATUS_REASON_EXITED, STATUS_REASON_KILLED, STATUS_REASON_NONE, STATUS_REASON_PANICKED,
-    StatsRaw, StatusRaw,
+    BudgetArgs, ImageInfoRaw, IoPathStatsRaw, KILL_ENTRY_FAILED, KILL_HOST_HOOK_PANICKED,
+    KILL_KERNEL_FAULT, KILL_OOPS_BUDGET, KILL_REQUESTED, KILL_STACK_OVERFLOW, KILL_STACK_RESERVE,
+    STATE_CONFIGURING, STATE_DESTROYED, STATE_DESTROYING, STATE_DYING, STATE_EXITED, STATE_RUNNING,
+    STATE_STARTING, STATUS_REASON_EXITED, STATUS_REASON_KILLED, STATUS_REASON_NONE,
+    STATUS_REASON_PANICKED, StatsRaw, StatusRaw,
 };
 use ostd::{
     kernelet::control::{
@@ -32,8 +32,8 @@ use crate::{
 
 mod ioctl_defs {
     use kernelet_abi::{
-        AttachArgs, BudgetArgs, CreateArgs, EndpointArgs, ImageInfoRaw, StatsRaw, StatusRaw,
-        VsockArgs, VsockPolicyArgs,
+        AttachArgs, BudgetArgs, CreateArgs, EndpointArgs, ImageInfoRaw, IoPathStatsRaw,
+        SharedBufferConnectArgs, StatsRaw, StatusRaw, VsockArgs, VsockPolicyArgs,
     };
 
     use crate::{
@@ -55,6 +55,9 @@ mod ioctl_defs {
     pub(super) type VsockListen = ioc!(KERNELET_VSOCK_LISTEN, 0xc7, 0x31, InData<VsockArgs>);
     pub(super) type VsockConnect = ioc!(KERNELET_VSOCK_CONNECT, 0xc7, 0x30, InData<VsockArgs>);
     pub(super) type VsockPolicy = ioc!(KERNELET_VSOCK_POLICY, 0xc7, 0x33, InData<VsockPolicyArgs>);
+    pub(super) type SharedBufferConnect =
+        ioc!(KERNELET_SHARED_BUFFER_CONNECT, 0xc7, 0x34, InOutData<SharedBufferConnectArgs>);
+    pub(super) type IoPathStats = ioc!(KERNELET_IO_PATH_STATS, 0xc7, 0x35, OutData<IoPathStatsRaw>);
 }
 
 /// Arms diagnostics through a sandbox capability held by the calling process.
@@ -350,6 +353,47 @@ impl SandboxFile {
             .map_err(|_| Error::with_message(Errno::EINVAL, "kernelet budget update failed"))
     }
 
+    fn io_path_stats(&self) -> Result<IoPathStatsRaw> {
+        let hooks = {
+            let state = self.state.lock();
+            match &*state {
+                SandboxState::Running { hooks, .. } => hooks.clone(),
+                SandboxState::Exited {
+                    hooks: Some(hooks), ..
+                } => hooks.clone(),
+                _ => return_errno_with_message!(Errno::ENODEV, "device counters are unavailable"),
+            }
+        };
+        let mut raw = IoPathStatsRaw::default();
+        let devices = hooks
+            .devices
+            .get()
+            .ok_or_else(|| Error::with_message(Errno::ENODEV, "devices are not initialized"))?;
+        for block in &devices.blocks {
+            if let Some(stats) = block.borrowed_stats() {
+                raw.borrowed_block_devices += 1;
+                raw.borrowed_block_requests += stats.requests;
+                raw.borrowed_block_bytes += stats.bytes;
+                raw.borrowed_block_identity_checks += stats.identity_checks;
+                raw.borrowed_block_copy_bytes += stats.copied_bytes;
+            }
+        }
+        if let Some(net) = &devices.shared_net {
+            let stats = net.stats();
+            raw.shared_net_devices = 1;
+            raw.shared_net_tx_packets = stats.tx_packets;
+            raw.shared_net_tx_bytes = stats.tx_bytes;
+            raw.shared_net_rx_packets = stats.rx_packets;
+            raw.shared_net_rx_bytes = stats.rx_bytes;
+            raw.shared_net_payload_copy_bytes = stats.payload_copy_bytes;
+            raw.shared_net_native_fallback_packets = stats.native_fallback_packets;
+            raw.shared_net_native_fallback_bytes = stats.native_fallback_bytes;
+            raw.shared_net_allocations = stats.allocations;
+            raw.shared_net_reuses = stats.reuses;
+        }
+        Ok(raw)
+    }
+
     fn stats(&self) -> StatsRaw {
         let kernelet = {
             let state = self.state.lock();
@@ -435,6 +479,10 @@ impl FileLike for SandboxFile {
                 cmd.write(&self.stats())?;
                 Ok(0)
             }
+            cmd @ IoPathStats => {
+                cmd.write(&self.io_path_stats()?)?;
+                Ok(0)
+            }
             _cmd @ Destroy => {
                 self.destroy()?;
                 Ok(0)
@@ -451,6 +499,11 @@ impl FileLike for SandboxFile {
             }
             cmd @ VsockPolicy => {
                 self.vsock_policy(cmd.read()?)?;
+                Ok(0)
+            }
+            cmd @ SharedBufferConnect => {
+                let args = self.shared_buffer_connect(cmd.read()?)?;
+                cmd.write(&args)?;
                 Ok(0)
             }
             _ => return_errno_with_message!(Errno::ENOTTY, "unknown kernelet ioctl"),

@@ -1979,8 +1979,8 @@ mod tests {
                 (
                     String::new(),
                     ProcessRecord {
-                        state: ProcessState::Exited(0),
                         agent_id: None,
+                        state: ProcessState::Exited(0),
                         ..running_process()
                     },
                 ),
@@ -2124,8 +2124,8 @@ mod tests {
             processes: BTreeMap::from([(
                 "e1".into(),
                 ProcessRecord {
-                    state: ProcessState::Exited(17),
                     agent_id: None,
+                    state: ProcessState::Exited(17),
                     ..running_process()
                 },
             )]),

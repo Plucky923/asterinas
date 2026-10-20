@@ -26,3 +26,5 @@ mod util;
 
 pub use dma_coherent::DmaCoherent;
 pub use dma_stream::{DmaDirection, DmaStream, FromAndToDevice, FromDevice, ToDevice};
+#[cfg(feature = "kernelet-host")]
+pub(crate) use util::supports_borrowed_identity_dma;

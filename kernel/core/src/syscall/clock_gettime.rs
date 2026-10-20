@@ -34,6 +34,37 @@ pub(super) fn sys_clock_gettime(
     Ok(SyscallReturn::Return(0))
 }
 
+pub(super) fn sys_clock_getres(
+    clockid: clockid_t,
+    timespec_addr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    let tick_based = if clockid >= 0 {
+        matches!(
+            ClockId::try_from(clockid)?,
+            ClockId::CLOCK_PROCESS_CPUTIME_ID
+                | ClockId::CLOCK_THREAD_CPUTIME_ID
+                | ClockId::CLOCK_REALTIME_COARSE
+                | ClockId::CLOCK_MONOTONIC_COARSE
+        )
+    } else {
+        // libc also uses a null-output query to validate a CPU clock ID.
+        // Check the target and clock type even when no result is requested.
+        let _ = read_clock(clockid, ctx)?;
+        true
+    };
+    let resolution = if tick_based {
+        Duration::from_nanos(1_000_000_000 / ostd::timer::TIMER_FREQ)
+    } else {
+        Duration::from_nanos(1)
+    };
+    if timespec_addr != 0 {
+        ctx.user_space()
+            .write_val(timespec_addr, &timespec_t::from(resolution))?;
+    }
+    Ok(SyscallReturn::Return(0))
+}
+
 // The hard-coded clock IDs.
 #[expect(non_camel_case_types)]
 #[repr(i32)]
@@ -97,7 +128,9 @@ impl TryFrom<clockid_t> for DynamicClockIdInfo {
 pub(super) enum DynamicClockType {
     Profiling = 0,
     Virtual = 1,
-    // TODO: Support scheduling clocks and FD clocks.
+    // Use the same tick-based CPU accounting as the fixed CPU clock IDs.
+    Scheduling = 2,
+    // TODO: Support FD clocks.
 }
 
 /// Reads the time of a clock specified by the input clock ID.
@@ -120,21 +153,39 @@ pub(super) fn read_clock(clockid: clockid_t, ctx: &Context) -> Result<Duration> 
         let dynamic_clockid_info = DynamicClockIdInfo::try_from(clockid)?;
         match dynamic_clockid_info {
             DynamicClockIdInfo::Pid(pid, clock_type) => {
-                let process = pid_table::pid_table_mut()
-                    .get_process(pid)
-                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
+                let process = if pid == 0 {
+                    ctx.process.clone()
+                } else {
+                    pid_table::pid_table_mut()
+                        .get_process(pid)
+                        .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?
+                };
                 match clock_type {
-                    DynamicClockType::Profiling => Ok(process.prof_clock().read_time()),
+                    DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                        Ok(process.prof_clock().read_time())
+                    }
                     DynamicClockType::Virtual => Ok(process.prof_clock().user_clock().read_time()),
                 }
             }
             DynamicClockIdInfo::Tid(tid, clock_type) => {
+                if tid == 0 {
+                    return match clock_type {
+                        DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                            Ok(ctx.posix_thread.prof_clock().read_time())
+                        }
+                        DynamicClockType::Virtual => {
+                            Ok(ctx.posix_thread.prof_clock().user_clock().read_time())
+                        }
+                    };
+                }
                 let thread = pid_table::pid_table_mut()
                     .get_thread(tid)
                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
                 let posix_thread = thread.as_posix_thread().unwrap();
                 match clock_type {
-                    DynamicClockType::Profiling => Ok(posix_thread.prof_clock().read_time()),
+                    DynamicClockType::Profiling | DynamicClockType::Scheduling => {
+                        Ok(posix_thread.prof_clock().read_time())
+                    }
                     DynamicClockType::Virtual => {
                         Ok(posix_thread.prof_clock().user_clock().read_time())
                     }

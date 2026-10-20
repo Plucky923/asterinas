@@ -5,9 +5,11 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use aster_block::SECTOR_SIZE;
 use kernelet_abi::{
-    AttachArgs, BLOCK, BLOCK_READ_ONLY, CONSOLE, CreateArgs, EndpointArgs, LOG, NET, RNG, VSOCK,
-    VsockArgs, VsockPolicyArgs,
+    AttachArgs, BLOCK, BLOCK_READ_ONLY, BORROWED_BLOCK, CONSOLE, CreateArgs, EndpointArgs, LOG,
+    NET, RNG, SHARED_NET, SharedBufferConnectArgs, VSOCK, VsockArgs, VsockPolicyArgs,
+    ZERO_COPY_BLOCK,
 };
 use ostd::{
     kernelet::control::{BudgetError, CpuBudget, KerneletPolicy},
@@ -24,13 +26,15 @@ use crate::endovisor::policy::{QuotaClass, QuotaTag};
 use crate::{
     endovisor::{
         log_endpoint::LogEndpoint,
-        policy::PrestartEndpointReservation,
+        policy::UserEndpointReservation,
+        virtio_block::VirtioBlock,
         virtio_console::{ConsoleEndpoint, EndpointFile},
         virtio_net::{NetEndpoint, NetEndpointFile},
         vsock_switch,
+        zero_copy_block::ZeroCopyBlock,
     },
     fs::{
-        file::{AccessMode, FileCommon, FileLike, SeekFrom, StatusFlags, file_table::FdFlags},
+        file::{AccessMode, FileCommon, FileLike, StatusFlags, file_table::FdFlags},
         pseudofs::AnonInodeFs,
     },
     prelude::*,
@@ -54,6 +58,7 @@ pub(super) struct Pending {
     pub(super) budget: CpuBudget,
     pub(super) policy: KerneletPolicy,
     pub(super) blocks: Vec<BlockAttachment>,
+    pub(super) zero_copy_blocks: Vec<BlockAttachment>,
     pub(super) console: Option<Arc<ConsoleEndpoint>>,
     pub(super) log: Option<Arc<LogEndpoint>>,
     pub(super) console_attached: bool,
@@ -64,9 +69,10 @@ pub(super) struct Pending {
     pub(super) rng_vcpu: u16,
     pub(super) net: Option<Arc<NetEndpoint>>,
     pub(super) net_attached: bool,
+    pub(super) net_shared: bool,
     pub(super) net_vcpu: u16,
     pub(super) net_mac: [u8; 6],
-    pub(super) endpoint_reservations: Vec<Arc<PrestartEndpointReservation>>,
+    pub(super) endpoint_reservations: Vec<Arc<UserEndpointReservation>>,
 }
 
 impl Pending {
@@ -89,6 +95,7 @@ pub(super) struct BlockAttachment {
     pub(super) backing: Arc<dyn FileLike>,
     pub(super) capacity_sectors: u64,
     pub(super) read_only: bool,
+    pub(super) borrowed: bool,
     pub(super) vcpu: u16,
 }
 
@@ -160,6 +167,7 @@ impl SandboxFile {
                 ask_before_oom: true,
             },
             blocks: Vec::new(),
+            zero_copy_blocks: Vec::new(),
             console: None,
             log: None,
             console_attached: false,
@@ -170,6 +178,7 @@ impl SandboxFile {
             rng_vcpu: 0,
             net: None,
             net_attached: false,
+            net_shared: false,
             net_vcpu: 0,
             net_mac: [0; 6],
             endpoint_reservations: Vec::with_capacity(3),
@@ -216,7 +225,7 @@ impl SandboxFile {
             + log
                 .as_ref()
                 .map_or(0, |endpoint| endpoint.reservation_bytes());
-        let reservation = Arc::new(PrestartEndpointReservation::reserve(
+        let reservation = Arc::new(UserEndpointReservation::reserve(
             self.owner,
             bytes,
             #[cfg(kernelet_nat_failure_diag_host)]
@@ -268,16 +277,19 @@ impl SandboxFile {
     }
 
     pub(super) fn attach(&self, mut args: AttachArgs) -> Result<AttachArgs> {
-        if !matches!(args.kind, BLOCK | CONSOLE | VSOCK | NET | RNG)
-            || (args.kind == BLOCK && args.flags & !BLOCK_READ_ONLY != 0)
-            || (args.kind != BLOCK && args.flags != 0)
+        if !matches!(
+            args.kind,
+            BLOCK | BORROWED_BLOCK | ZERO_COPY_BLOCK | CONSOLE | VSOCK | NET | SHARED_NET | RNG
+        ) || (matches!(args.kind, BLOCK | BORROWED_BLOCK | ZERO_COPY_BLOCK)
+            && args.flags & !BLOCK_READ_ONLY != 0)
+            || (!matches!(args.kind, BLOCK | BORROWED_BLOCK | ZERO_COPY_BLOCK) && args.flags != 0)
             || args.reserved0 != 0
             || args.out_index != 0
-            || (args.kind != NET && args.arg != 0)
+            || (!matches!(args.kind, NET | SHARED_NET) && args.arg != 0)
         {
             return_errno_with_message!(Errno::EINVAL, "invalid kernelet attachment");
         }
-        if args.kind == NET {
+        if matches!(args.kind, NET | SHARED_NET) {
             let mac = args.arg.to_le_bytes();
             if mac[6..] != [0; 2] || mac[..6] == [0; 6] || mac[0] & 1 != 0 {
                 return_errno_with_message!(Errno::EINVAL, "invalid network MAC address");
@@ -304,7 +316,7 @@ impl SandboxFile {
                     .clone(),
             )
         };
-        let block = if args.kind == BLOCK {
+        let block = if matches!(args.kind, BLOCK | BORROWED_BLOCK | ZERO_COPY_BLOCK) {
             let file = file.as_ref().unwrap();
             let read_only = args.flags & BLOCK_READ_ONLY != 0;
             if !file.access_mode().is_readable()
@@ -312,15 +324,20 @@ impl SandboxFile {
             {
                 return_errno_with_message!(Errno::EBADF, "block backing access mode is invalid");
             }
-            let bytes = file.seek(SeekFrom::End(0))?;
-            file.seek(SeekFrom::Start(0))?;
-            if bytes == 0 || !bytes.is_multiple_of(512) {
+            let bytes = VirtioBlock::backing_capacity(file.as_ref())?;
+            if bytes == 0 || !bytes.is_multiple_of(SECTOR_SIZE) {
                 return_errno_with_message!(Errno::EINVAL, "block backing size is invalid");
+            }
+            if args.kind == ZERO_COPY_BLOCK {
+                ZeroCopyBlock::backend(file.as_ref())?;
+            } else if args.kind == BORROWED_BLOCK {
+                VirtioBlock::borrowed_backend(file.as_ref())?;
             }
             Some(BlockAttachment {
                 backing: file.clone(),
-                capacity_sectors: (bytes / 512) as u64,
+                capacity_sectors: (bytes / SECTOR_SIZE) as u64,
                 read_only,
+                borrowed: args.kind == BORROWED_BLOCK,
                 vcpu: args.vcpu,
             })
         } else {
@@ -350,14 +367,22 @@ impl SandboxFile {
             pending.console_attached = true;
             pending.console_vcpu = args.vcpu;
             args.out_index = DeviceSlot::Console.wire_id();
-        } else if args.kind == BLOCK {
+        } else if matches!(args.kind, BLOCK | BORROWED_BLOCK) {
             let next = pending.blocks.len();
             if next >= DeviceSlot::MAX_BLOCKS {
                 return_errno_with_message!(Errno::ENOSPC, "too many block devices");
             }
             args.out_index = DeviceSlot::Block(next as u16).wire_id();
             pending.blocks.push(block.unwrap());
-        } else if args.kind == NET {
+        } else if args.kind == ZERO_COPY_BLOCK {
+            let next = pending.zero_copy_blocks.len();
+            if next >= kernelet_abi::MAX_ZERO_COPY_BLOCKS {
+                return_errno_with_message!(Errno::ENOSPC, "too many zero-copy block devices");
+            }
+            // This index belongs only to the shared-buffer device namespace.
+            args.out_index = next as u16;
+            pending.zero_copy_blocks.push(block.unwrap());
+        } else if matches!(args.kind, NET | SHARED_NET) {
             let endpoint = file
                 .as_ref()
                 .unwrap()
@@ -375,6 +400,7 @@ impl SandboxFile {
                 return_errno_with_message!(Errno::EINVAL, "network endpoint cannot be attached");
             }
             pending.net_attached = true;
+            pending.net_shared = args.kind == SHARED_NET;
             pending.net_vcpu = args.vcpu;
             pending
                 .net_mac
@@ -477,6 +503,66 @@ impl SandboxFile {
         }
         vsock_switch::set_peer_allowed(self.cid, peer.cid, args.allow != 0)
     }
+
+    pub(super) fn shared_buffer_connect(
+        &self,
+        mut args: SharedBufferConnectArgs,
+    ) -> Result<SharedBufferConnectArgs> {
+        if args.flags != 0 || args.out_connection != 0 || args.out_peer_connection != 0 {
+            return_errno_with_message!(Errno::EINVAL, "invalid shared-buffer connection arguments");
+        }
+        let fd = args
+            .peer_fd
+            .try_into()
+            .map_err(|_| Error::with_message(Errno::EBADF, "invalid peer sandbox fd"))?;
+        let task = Task::current().unwrap();
+        let thread_local = task.as_thread_local().unwrap();
+        let peer_file = thread_local
+            .borrow_file_table()
+            .unwrap()
+            .read()
+            .get_file(fd)?
+            .clone();
+        let peer = peer_file
+            .downcast_ref::<SandboxFile>()
+            .ok_or_else(|| Error::with_message(Errno::EBADF, "peer fd is not a sandbox"))?;
+        let connection = self.connect_shared_buffer_peer(peer)?;
+        args.out_connection = connection;
+        args.out_peer_connection = connection;
+        Ok(args)
+    }
+
+    fn connect_shared_buffer_peer(&self, peer: &Self) -> Result<u64> {
+        if core::ptr::eq(self, peer) {
+            return_errno_with_message!(Errno::EINVAL, "a sandbox cannot connect to itself");
+        }
+        // Possession of both sandbox files authorizes this pair. A capability
+        // explicitly passed across UIDs retains that authority, as other
+        // sandbox-control ioctls do. Neither a CID nor an owner UID is a key.
+        let live_instance_fn = |sandbox: &Self| {
+            let state = sandbox.state.lock();
+            match &*state {
+                SandboxState::Running { kernelet, .. } => Ok(kernelet.clone()),
+                _ => Err(Error::with_message(
+                    Errno::ENODEV,
+                    "both sandboxes must be live",
+                )),
+            }
+        };
+        let local = live_instance_fn(self)?;
+        let remote = live_instance_fn(peer)?;
+        // Drop lifecycle guards before OSTD's pool lock. OSTD serializes its
+        // lifetime check and connection publication against buffer operations.
+        local.connect_shared_buffers(&remote).map_err(|error| {
+            let errno = match error {
+                ostd::Error::InvalidArgs => Errno::EINVAL,
+                ostd::Error::AccessDenied => Errno::ENODEV,
+                ostd::Error::NotEnoughResources | ostd::Error::Overflow => Errno::ENOSPC,
+                _ => Errno::ENOMEM,
+            };
+            Error::with_message(errno, "cannot connect shared-buffer peers")
+        })
+    }
 }
 
 #[cfg(ktest)]
@@ -549,6 +635,7 @@ pub(super) mod tests {
                 },
                 policy: KerneletPolicy::default(),
                 blocks: Vec::new(),
+                zero_copy_blocks: Vec::new(),
                 console: None,
                 log: None,
                 console_attached: false,
@@ -559,6 +646,7 @@ pub(super) mod tests {
                 rng_vcpu: 0,
                 net: None,
                 net_attached: false,
+                net_shared: false,
                 net_vcpu: 0,
                 net_mac: [0; 6],
                 endpoint_reservations: Vec::new(),

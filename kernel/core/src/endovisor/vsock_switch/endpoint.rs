@@ -23,7 +23,7 @@ use crate::{
     dispatch_ioctl,
     endovisor::{
         io_accounting::{ChargedSpan, WorkCategory},
-        policy::{Admission, EndpointReservation, PrestartEndpointReservation},
+        policy::{Admission, EndpointReservation, UserEndpointReservation},
         virtio_vsock::{EnqueueError, VirtioVsock},
     },
     events::IoEvents,
@@ -147,7 +147,7 @@ impl Drop for EndpointStateGuard<'_> {
 }
 
 enum EndpointBaseReservation {
-    Prestart(PrestartEndpointReservation),
+    Prestart(UserEndpointReservation),
     Running(EndpointReservation),
 }
 
@@ -227,7 +227,7 @@ impl HostEndpoint {
         switch: Weak<VsockSwitch>,
         owner: Uid,
     ) -> Result<Arc<Self>> {
-        let reservation = PrestartEndpointReservation::reserve(
+        let reservation = UserEndpointReservation::reserve(
             owner,
             HOST_ENDPOINT_CHARGE,
             #[cfg(kernelet_nat_failure_diag_host)]

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#[cfg(feature = "kernelet")]
+pub(crate) mod device;
 mod iface;
 #[cfg(ktest)]
 pub(crate) use iface::{init_loopback_for_ktest, poll_loopback_for_ktest};

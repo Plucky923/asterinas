@@ -45,6 +45,43 @@ use ostd::{
 };
 use ostd_pod::Pod;
 
+#[cfg(feature = "kernelet")]
+mod shared;
+#[cfg(feature = "kernelet")]
+pub use shared::{SharedPacket, SharedPacketStatistics, shared_packet_statistics};
+
+enum Storage {
+    Native(USegment),
+    #[cfg(feature = "kernelet")]
+    Shared(shared::SharedStorage),
+}
+
+impl Storage {
+    fn native(&self) -> Option<&USegment> {
+        match self {
+            Self::Native(segment) => Some(segment),
+            #[cfg(feature = "kernelet")]
+            Self::Shared(_) => None,
+        }
+    }
+
+    fn reader(&self) -> VmReader<'_, Infallible> {
+        match self {
+            Self::Native(segment) => segment.reader(),
+            #[cfg(feature = "kernelet")]
+            Self::Shared(storage) => storage.reader(),
+        }
+    }
+
+    fn writer(&mut self) -> VmWriter<'_, Infallible> {
+        match self {
+            Self::Native(segment) => HasVmReaderWriter::writer(&*segment),
+            #[cfg(feature = "kernelet")]
+            Self::Shared(storage) => storage.writer(),
+        }
+    }
+}
+
 /// A network layer.
 pub trait Layer {
     /// The network layer preceding to this layer.
@@ -107,7 +144,7 @@ impl Layer for ApplicationLayer {
 }
 
 struct Common<D: DmaDirection> {
-    segment: USegment,
+    storage: Storage,
     /// The range of allocation, starting from the beginning of `segment`.
     alloc_range: Range<usize>,
     /// The range of data, starting from the beginning of `segment`.
@@ -145,7 +182,7 @@ impl<L: Layer> FreshTxPacket<L> {
         let segment = FrameAllocOptions::new().alloc_segment(nframes)?.into();
 
         let common = Common {
-            segment,
+            storage: Storage::Native(segment),
             alloc_range: 0..total_len,
             data_range: head_room_size..head_room_size,
             dma_buffer: None,
@@ -173,7 +210,7 @@ impl<L: Layer> FreshTxPacket<L> {
         let (segment, alloc_range) = dma_segment.storage().into_parts();
 
         let common = Common {
-            segment,
+            storage: Storage::Native(segment),
             alloc_range: alloc_range.clone(),
             data_range: alloc_range.start + head_room_size..alloc_range.start + head_room_size,
             dma_buffer: Some(DmaBuffer::Pooled(dma_segment)),
@@ -201,7 +238,7 @@ pub struct TxPacketBuilder<L>(Box<TxCommon>, PhantomData<L>);
 impl<L> TxPacketBuilder<L> {
     /// Returns a writer that can append the payload to the end of the packet.
     pub fn append_writer(&mut self) -> VmWriter<'_, Infallible> {
-        let mut writer = self.0.segment.writer();
+        let mut writer = self.0.storage.writer();
         writer
             .skip(self.0.data_range.end)
             .limit(self.0.alloc_range.end - self.0.data_range.end);
@@ -257,7 +294,7 @@ impl<L> TxPacket<L> {
     /// This method will panic if `header_len` exceeds the allocated header size.
     pub fn reader_with_header(&self, header_len: usize) -> VmReader<'_, Infallible> {
         assert!(header_len <= self.0.data_range.start - self.0.alloc_range.start);
-        let mut reader = self.0.segment.reader();
+        let mut reader = self.0.storage.reader();
         reader
             .skip(self.0.data_range.start - header_len)
             .limit(self.0.data_range.end - self.0.data_range.start + header_len);
@@ -277,7 +314,7 @@ impl<L> TxPacket<L> {
     /// This method will panic if `header_len` exceeds the allocated header size.
     pub fn prepend_writer(&mut self, header_len: usize) -> VmWriter<'_, Infallible> {
         assert!(header_len <= self.0.data_range.start - self.0.alloc_range.start);
-        let mut writer = self.0.segment.writer();
+        let mut writer = self.0.storage.writer();
         writer
             .skip(self.0.data_range.start - header_len)
             .limit(header_len);
@@ -311,7 +348,7 @@ impl<L> TxPacket<L> {
         }
 
         let common = Box::map(self.0, |common| Common {
-            segment: common.segment,
+            storage: common.storage,
             alloc_range: common.alloc_range,
             data_range: common.data_range,
             dma_buffer: None,
@@ -360,7 +397,10 @@ impl<L: Layer<Preceding = ()>> TxPacket<L> {
     /// and associate the packet with it.
     pub fn map_dma(mut self, is_cache_coherent: bool) -> Result<TxBuffer> {
         if self.0.dma_buffer.is_none() {
-            let dma_stream = DmaStream::<ToDevice>::map(self.0.segment.clone(), is_cache_coherent)?;
+            #[cfg(feature = "kernelet")]
+            self.ensure_native_storage()?;
+            let segment = self.0.storage.native().unwrap();
+            let dma_stream = DmaStream::<ToDevice>::map(segment.clone(), is_cache_coherent)?;
             self.0.dma_buffer = Some(DmaBuffer::Direct(dma_stream));
         }
 
@@ -409,7 +449,7 @@ impl RxBuffer {
         let (segment, alloc_range) = dma_segment.storage().into_parts();
 
         let common = Common {
-            segment,
+            storage: Storage::Native(segment),
             alloc_range: alloc_range.clone(),
             data_range: alloc_range.start..alloc_range.start,
             dma_buffer: Some(DmaBuffer::Pooled(dma_segment)),
@@ -487,7 +527,7 @@ impl<L> RxPacket<L> {
     /// This method will panic if `header_len` exceeds the allocated header size.
     pub fn reader_with_header(&self, header_len: usize) -> VmReader<'_, Infallible> {
         assert!(header_len <= self.0.data_range.start - self.0.alloc_range.start);
-        let mut reader = self.0.segment.reader();
+        let mut reader = self.0.storage.reader();
         reader
             .skip(self.0.data_range.start - header_len)
             .limit(self.0.data_range.end - self.0.data_range.start + header_len);

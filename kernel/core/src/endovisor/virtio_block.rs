@@ -35,13 +35,73 @@ use crate::{
 
 mod backing;
 use backing::{BlockIo, IO_DEPTH, STAGING_BYTES};
+mod borrowed;
+use borrowed::{BorrowedBackend, BorrowedIo};
 
-const QUEUE_SIZE: usize = 64;
+/// Counts physical BIO submissions on the explicit borrowing path.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct BorrowedBlockStats {
+    pub(super) requests: u64,
+    pub(super) bytes: u64,
+    pub(super) copied_bytes: u64,
+    pub(super) identity_checks: u64,
+}
+
+enum RawBackend {
+    Copy(BlockIo),
+    Borrowed(BorrowedIo),
+}
+
+impl RawBackend {
+    fn submit(
+        &mut self,
+        slot: usize,
+        memory: &GuestMemory,
+        buffers: &[Buffer],
+        offset: usize,
+        len: usize,
+        operation: u32,
+    ) -> Result<RawTransfer> {
+        match self {
+            Self::Copy(io) => io
+                .submit(slot, memory, buffers, offset, len, operation)
+                .map(RawTransfer::Copy),
+            Self::Borrowed(io) => io
+                .submit(memory, buffers, offset, len, operation)
+                .map(RawTransfer::Borrowed),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        transfer: RawTransfer,
+        memory: &GuestMemory,
+        buffers: &[Buffer],
+        publish_allowed_fn: impl FnOnce() -> bool,
+    ) -> Result<u32, (crate::prelude::Error, u32)> {
+        match (self, transfer) {
+            (Self::Copy(_), RawTransfer::Copy(transfer)) => {
+                transfer.finish(memory, buffers, publish_allowed_fn)
+            }
+            (Self::Borrowed(io), RawTransfer::Borrowed(transfer)) => {
+                io.finish(transfer, publish_allowed_fn)
+            }
+            _ => unreachable!("transfer must belong to its submitting backend"),
+        }
+    }
+}
+
+enum RawTransfer {
+    Copy(backing::PendingTransfer),
+    Borrowed(borrowed::PendingTransfer),
+}
+
+pub(super) const QUEUE_SIZE: usize = 64;
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const HEADER_BYTES: usize = 16;
 const STATUS_BYTES: usize = 1;
 const MAX_CHAIN_BYTES: usize = MAX_REQUEST_BYTES + HEADER_BYTES + STATUS_BYTES;
-const SECTOR_BYTES: u64 = 512;
+const SECTOR_BYTES: u64 = aster_block::SECTOR_SIZE as u64;
 const MAGIC: u32 = 0x7472_6976;
 const VERSION: u32 = 2;
 const DEVICE_ID_BLOCK: u32 = 2;
@@ -146,6 +206,7 @@ pub(super) struct VirtioBlock {
     admission: Arc<Admission>,
     memory: GuestMemory,
     backing: Arc<dyn FileLike>,
+    borrowed: Option<Arc<BorrowedBackend>>,
     capacity_sectors: u64,
     read_only: bool,
     irq: u8,
@@ -165,6 +226,122 @@ impl VirtioBlock {
         read_only: bool,
         irq: u8,
     ) -> ostd::Result<Arc<Self>> {
+        let backing = Self::retain_backing_file(backing).map_err(|_| ostd::Error::AccessDenied)?;
+        Self::new_with_backend(
+            kernelet,
+            admission,
+            backing,
+            capacity_sectors,
+            read_only,
+            irq,
+            None,
+        )
+    }
+
+    fn retain_backing_file(backing: Arc<dyn FileLike>) -> Result<Arc<dyn FileLike>> {
+        use crate::fs::file::{InodeHandle, InodeType, StatusFlags};
+
+        let Some(file) = backing.downcast_ref::<InodeHandle>() else {
+            return Ok(backing);
+        };
+        if file.path().inode().type_() != InodeType::File {
+            return Ok(backing);
+        }
+        // Retain the already authorized inode, without resolving a pathname
+        // or rechecking permissions. The private file description snapshots
+        // flags except O_APPEND and cannot be changed through the original FD.
+        let private = InodeHandle::new_unchecked_access(
+            file.path().clone(),
+            file.access_mode(),
+            file.status_flags() & !StatusFlags::O_APPEND,
+        )?;
+        Ok(Arc::new(private))
+    }
+
+    /// Reads backing capacity without changing the caller's shared file offset.
+    pub(super) fn backing_capacity(backing: &dyn FileLike) -> Result<usize> {
+        use crate::fs::file::{InodeHandle, InodeType, StatusFlags};
+
+        if backing.status_flags().contains(StatusFlags::O_PATH) {
+            return_errno_with_message!(Errno::EBADF, "block backing is opened as a path");
+        }
+        if let Some(device) = crate::device::block_device_from_file(backing) {
+            return device
+                .metadata()
+                .nr_sectors
+                .checked_mul(SECTOR_BYTES as usize)
+                .ok_or_else(|| {
+                    crate::prelude::Error::with_message(
+                        Errno::EOVERFLOW,
+                        "block backing size overflow",
+                    )
+                });
+        }
+        if let Some(file) = backing.downcast_ref::<InodeHandle>()
+            && file.path().inode().type_() == InodeType::File
+        {
+            return file.size_for_positional_io();
+        }
+        return_errno_with_message!(
+            Errno::EINVAL,
+            "block backing must be a regular file or block device"
+        );
+    }
+
+    /// Checks compatibility before publishing a borrowing attachment.
+    pub(super) fn borrowed_backend(
+        backing: &dyn FileLike,
+    ) -> Result<Arc<dyn aster_block::BlockDevice>> {
+        use aster_virtio::device::block::device::BlockDevice as VirtioBlockDriver;
+
+        if !ostd::kernelet::guest_dma::GuestDmaLease::is_supported() {
+            return_errno_with_message!(Errno::EOPNOTSUPP, "borrowed DMA mapping is unsupported");
+        }
+        crate::device::block_device_from_file(backing)
+            .filter(|device| device.downcast_ref::<VirtioBlockDriver>().is_some())
+            .ok_or_else(|| {
+                crate::prelude::Error::with_message(
+                    Errno::EOPNOTSUPP,
+                    "backend cannot borrow Image DMA buffers",
+                )
+            })
+    }
+
+    pub(super) fn new_borrowed(
+        kernelet: Arc<Kernelet>,
+        admission: Arc<Admission>,
+        backing: Arc<dyn FileLike>,
+        capacity_sectors: u64,
+        read_only: bool,
+        irq: u8,
+    ) -> ostd::Result<Arc<Self>> {
+        let device =
+            Self::borrowed_backend(backing.as_ref()).map_err(|_| ostd::Error::AccessDenied)?;
+        let borrowed = BorrowedBackend::new(device, &kernelet, &admission)?;
+        Self::new_with_backend(
+            kernelet,
+            admission,
+            backing,
+            capacity_sectors,
+            read_only,
+            irq,
+            Some(borrowed),
+        )
+    }
+
+    pub(super) fn borrowed_stats(&self) -> Option<BorrowedBlockStats> {
+        self.borrowed.as_ref().map(|backend| backend.stats())
+    }
+
+    fn new_with_backend(
+        kernelet: Arc<Kernelet>,
+        admission: Arc<Admission>,
+        backing: Arc<dyn FileLike>,
+        capacity_sectors: u64,
+        read_only: bool,
+        irq: u8,
+        borrowed: Option<Arc<BorrowedBackend>>,
+    ) -> ostd::Result<Arc<Self>> {
         let registers = Registers::new();
         let charged_bytes = registers
             .inbox
@@ -181,6 +358,7 @@ impl VirtioBlock {
             kernelet,
             admission,
             backing,
+            borrowed,
             capacity_sectors,
             read_only,
             irq,
@@ -486,12 +664,14 @@ impl VirtioBlock {
             return;
         }
         // Resolve the retained open-file capability once, never a pathname.
-        if let Some(device) = crate::device::block_device_from_file(self.backing.as_ref()) {
-            self.raw_worker(&mut BlockIo::new(
+        if let Some(backend) = &self.borrowed {
+            self.raw_worker(&mut RawBackend::Borrowed(BorrowedIo::new(backend.clone())));
+        } else if let Some(device) = crate::device::block_device_from_file(self.backing.as_ref()) {
+            self.raw_worker(&mut RawBackend::Copy(BlockIo::new(
                 device,
                 self.kernelet.clone(),
                 self.admission.clone(),
-            ));
+            )));
         } else {
             loop {
                 match self.requests.wait_until(|| self.take_request()) {
@@ -510,7 +690,7 @@ impl VirtioBlock {
         self.kernelet.disown_current_task();
     }
 
-    fn raw_worker(&self, io: &mut BlockIo) {
+    fn raw_worker(&self, io: &mut RawBackend) {
         let mut deferred = None;
         let mut pending = Vec::with_capacity(IO_DEPTH);
         loop {
@@ -597,11 +777,15 @@ impl VirtioBlock {
             // pending until all active references drain, so a concurrent reset
             // cannot enable reuse of buffers during a copy already in progress.
             for (request, transfer) in pending.drain(..) {
-                let result =
-                    transfer.finish(&self.memory, &request.buffers[1..request.len - 1], || {
+                let result = io.finish(
+                    transfer,
+                    &self.memory,
+                    &request.buffers[1..request.len - 1],
+                    || {
                         request.generation == self.registers.lock().generation
                             && !self.cancelled.load(Ordering::Acquire)
-                    });
+                    },
+                );
                 let result = match result {
                     Ok(len) => (0, len),
                     Err((_, len)) => (STATUS_IO_ERROR, len),
@@ -907,6 +1091,147 @@ mod tests {
 
     use super::*;
     use crate::prelude::Error;
+
+    fn file_backing_fixture() -> Arc<crate::fs::file::InodeHandle> {
+        use crate::fs::ramfs::memfd::{MemfdFlags, MemfdInodeHandle};
+
+        aster_time::init_for_ktest();
+        crate::time::clocks::init_for_ktest();
+        let original = Arc::new(
+            crate::fs::file::InodeHandle::new_memfd(
+                "block-backing-regression".into(),
+                MemfdFlags::empty(),
+            )
+            .unwrap(),
+        );
+        original.resize(4096).unwrap();
+        original
+    }
+
+    fn assert_backing_write_is_positional(
+        backing: &dyn FileLike,
+        original: &crate::fs::file::InodeHandle,
+    ) {
+        let data = [0x5au8; 512];
+        assert_eq!(
+            backing
+                .write_at(0, &mut VmReader::from(data.as_slice()).to_fallible())
+                .unwrap(),
+            512
+        );
+        assert_eq!(
+            original.path().size(),
+            4096,
+            "block write appended beyond capacity"
+        );
+        let mut actual = [0u8; 512];
+        assert_eq!(
+            backing
+                .read_at(0, &mut VmWriter::from(actual.as_mut_slice()).to_fallible())
+                .unwrap(),
+            512
+        );
+        assert_eq!(actual, data);
+    }
+
+    #[ktest]
+    fn file_block_backing_ignores_append_at_attachment() {
+        use crate::fs::file::{StatusFlags, StatusFlagsUpdate};
+        let original = file_backing_fixture();
+        let file: Arc<dyn FileLike> = original.clone();
+        file.update_status_flags(StatusFlagsUpdate::set(StatusFlags::O_APPEND))
+            .unwrap();
+        let backing = VirtioBlock::retain_backing_file(file.clone()).unwrap();
+        assert_backing_write_is_positional(backing.as_ref(), &original);
+        assert!(file.status_flags().contains(StatusFlags::O_APPEND));
+        let data = [0xa5u8; 512];
+        file.write_at(0, &mut VmReader::from(data.as_slice()).to_fallible())
+            .unwrap();
+        assert_eq!(
+            original.path().size(),
+            4608,
+            "original FD lost append semantics"
+        );
+    }
+
+    #[ktest]
+    fn file_block_backing_isolates_later_append_flag_changes() {
+        use crate::fs::file::{StatusFlags, StatusFlagsUpdate};
+        let original = file_backing_fixture();
+        let file: Arc<dyn FileLike> = original.clone();
+        let backing = VirtioBlock::retain_backing_file(file.clone()).unwrap();
+        file.update_status_flags(StatusFlagsUpdate::set(StatusFlags::O_APPEND))
+            .unwrap();
+        assert_backing_write_is_positional(backing.as_ref(), &original);
+    }
+
+    #[ktest]
+    fn file_block_backing_preserves_read_only_capability() {
+        use crate::fs::file::{AccessMode, InodeHandle, StatusFlags};
+
+        let original = file_backing_fixture();
+        let file: Arc<dyn FileLike> = Arc::new(
+            InodeHandle::new_unchecked_access(
+                original.path().clone(),
+                AccessMode::O_RDONLY,
+                StatusFlags::empty(),
+            )
+            .unwrap(),
+        );
+        let backing = VirtioBlock::retain_backing_file(file).unwrap();
+        let data = [0x5au8; 512];
+        let error = backing
+            .write_at(0, &mut VmReader::from(data.as_slice()).to_fallible())
+            .unwrap_err();
+        assert_eq!(error.error(), Errno::EBADF);
+        assert_eq!(original.path().size(), 4096);
+        let mut actual = [0u8; 512];
+        assert_eq!(
+            backing
+                .read_at(0, &mut VmWriter::from(actual.as_mut_slice()).to_fallible())
+                .unwrap(),
+            512
+        );
+        assert_eq!(actual, [0u8; 512]);
+    }
+
+    #[ktest]
+    fn block_capacity_probe_preserves_shared_file_offset() {
+        use crate::fs::file::SeekFrom;
+
+        let original = file_backing_fixture();
+        original.seek(SeekFrom::Start(512)).unwrap();
+        assert_eq!(
+            VirtioBlock::backing_capacity(original.as_ref()).unwrap(),
+            4096
+        );
+        assert_eq!(original.offset(), 512);
+        original.resize(4097).unwrap();
+        assert_eq!(
+            VirtioBlock::backing_capacity(original.as_ref()).unwrap(),
+            4097
+        );
+        assert_eq!(original.offset(), 512);
+    }
+
+    #[ktest]
+    fn block_capacity_probe_rejects_path_only_backing() {
+        use crate::fs::file::{AccessMode, InodeHandle, StatusFlags};
+
+        let original = file_backing_fixture();
+        let path_only = InodeHandle::new_unchecked_access(
+            original.path().clone(),
+            AccessMode::O_RDONLY,
+            StatusFlags::O_PATH,
+        )
+        .unwrap();
+        assert_eq!(
+            VirtioBlock::backing_capacity(&path_only)
+                .unwrap_err()
+                .error(),
+            Errno::EBADF
+        );
+    }
 
     fn buffer(paddr: u64, len: u32) -> Buffer {
         Buffer {

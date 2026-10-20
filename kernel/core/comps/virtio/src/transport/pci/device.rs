@@ -24,7 +24,7 @@ use crate::{
     VirtioDeviceType,
     queue::{AvailRing, Descriptor, UsedRing},
     transport::{
-        ConfigManager, DeviceStatus, VirtioTransport, VirtioTransportError,
+        ConfigGeneration, ConfigManager, DeviceStatus, VirtioTransport, VirtioTransportError,
         pci::capability::{VirtioPciCapabilityData, VirtioPciCpabilityType},
     },
 };
@@ -263,9 +263,26 @@ impl VirtioTransport for VirtioPciModernTransport {
         &mut self,
         func: Box<IrqCallbackFunction>,
     ) -> Result<(), VirtioTransportError> {
-        let (_, irq) = self.msix_manager.config_msix_irq();
+        let (vector, irq) = self.msix_manager.config_msix_irq();
+        let register = field_ptr!(&self.common_cfg, VirtioPciCommonCfg, config_msix_vector);
+        register
+            .write_once(&vector)
+            .map_err(|_| VirtioTransportError::DeviceStatusError)?;
+        if register
+            .read_once()
+            .map_err(|_| VirtioTransportError::DeviceStatusError)?
+            != vector
+        {
+            return Err(VirtioTransportError::DeviceStatusError);
+        }
         irq.on_active(func);
         Ok(())
+    }
+
+    fn device_config_generation(&self) -> Option<ConfigGeneration> {
+        let mut register = self.common_cfg.clone();
+        register.byte_add(core::mem::offset_of!(VirtioPciCommonCfg, config_generation));
+        Some(ConfigGeneration::Pci(register.cast()))
     }
 
     fn is_legacy_version(&self) -> bool {

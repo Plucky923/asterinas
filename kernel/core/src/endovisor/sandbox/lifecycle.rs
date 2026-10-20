@@ -20,8 +20,9 @@ use super::{
 use crate::{
     endovisor::{
         placement::CpuReservation, policy::Admission, reaper, scheduling::ExecutionThreads,
-        virtio_block::VirtioBlock, virtio_console::VirtioConsole, virtio_net::VirtioNet,
-        virtio_rng::VirtioRng, virtio_vsock::VirtioVsock, vsock_switch,
+        shared_net::SharedNet, virtio_block::VirtioBlock, virtio_console::VirtioConsole,
+        virtio_net::VirtioNet, virtio_rng::VirtioRng, virtio_vsock::VirtioVsock, vsock_switch,
+        zero_copy_block::ZeroCopyBlock,
     },
     events::IoEvents,
     prelude::*,
@@ -172,6 +173,9 @@ impl SandboxFile {
             .get()
             .unwrap()
             .for_each(|device| device.start_worker(&hooks.execution));
+        for block in &hooks.devices.get().unwrap().zero_copy_blocks {
+            block.start_worker(&hooks.execution);
+        }
         let kill = {
             let mut state = self.state.lock();
             let kill = match &*state {
@@ -233,13 +237,16 @@ impl SandboxFile {
         let mut cmdline = pending.cmdline.clone();
         let mut devices = Vec::with_capacity(slots.len());
         for slot in &slots {
-            cmdline.push_str(&format!(
-                " {}{}@0x{:x}:{}",
-                MMIO_CMDLINE_PREFIX,
-                MMIO_WINDOW_BYTES,
-                slot.mmio_base(),
-                slot.irq()
-            ));
+            let shared_net = pending.net_shared && matches!(slot, DeviceSlot::Net);
+            if !shared_net {
+                cmdline.push_str(&format!(
+                    " {}{}@0x{:x}:{}",
+                    MMIO_CMDLINE_PREFIX,
+                    MMIO_WINDOW_BYTES,
+                    slot.mmio_base(),
+                    slot.irq()
+                ));
+            }
             if matches!(slot, DeviceSlot::Console) {
                 cmdline.push_str(" console=hvc0");
             }
@@ -252,7 +259,11 @@ impl SandboxFile {
             };
             devices.push(DeviceEntry {
                 id: slot.wire_id(),
-                kind: 1,
+                kind: if shared_net {
+                    ostd::kernelet::abi::DEVICE_KIND_SHARED_NET
+                } else {
+                    ostd::kernelet::abi::DEVICE_KIND_VIRTIO
+                },
                 irq: slot.irq(),
                 reserved: 0,
                 vcpu,
@@ -274,7 +285,8 @@ impl SandboxFile {
             cpus: placement.cpu_set(),
         };
         let kind = crate::endovisor::image_kind()?;
-        let admission = Admission::reserve_instance(self.owner, kind, &config)?;
+        let admission =
+            Admission::reserve_instance(self.owner, kind, &config, pending.zero_copy_blocks.len())?;
         let hooks = Arc::new(SandboxHooks {
             cid: self.cid,
             devices: Once::new(),
@@ -284,10 +296,12 @@ impl SandboxFile {
             _endpoint_reservations: pending.endpoint_reservations.clone(),
             admission: admission.clone(),
             _placement: placement,
-            execution: ExecutionThreads::new(pending.budget.nice, pending.num_vcpus, devices.len())
-                .map_err(|_| {
-                    Error::with_message(Errno::EINVAL, "invalid execution thread policy")
-                })?,
+            execution: ExecutionThreads::new(
+                pending.budget.nice,
+                pending.num_vcpus,
+                devices.len() + pending.zero_copy_blocks.len(),
+            )
+            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid execution thread policy"))?,
         });
         let kernelet = kind
             .create(&config, hooks.clone())
@@ -306,7 +320,12 @@ impl SandboxFile {
             .iter()
             .enumerate()
             .map(|(index, block)| {
-                VirtioBlock::new(
+                let create_fn = if block.borrowed {
+                    VirtioBlock::new_borrowed
+                } else {
+                    VirtioBlock::new
+                };
+                create_fn(
                     kernelet.clone(),
                     admission.clone(),
                     block.backing.clone(),
@@ -317,6 +336,19 @@ impl SandboxFile {
             })
             .collect::<ostd::Result<Vec<_>>>()
             .map_err(|_| Error::with_message(Errno::ENOMEM, "cannot charge block device"))?;
+        let zero_copy_blocks = pending
+            .zero_copy_blocks
+            .iter()
+            .map(|block| {
+                ZeroCopyBlock::new(
+                    &admission,
+                    kernelet.clone(),
+                    ZeroCopyBlock::backend(block.backing.as_ref())?,
+                    block.capacity_sectors,
+                    block.read_only,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let console = pending.console_attached.then(|| {
             VirtioConsole::new(
                 kernelet.clone(),
@@ -335,7 +367,7 @@ impl SandboxFile {
                 )
             })
             .transpose()?;
-        let net = pending.net_attached.then(|| {
+        let net = (pending.net_attached && !pending.net_shared).then(|| {
             VirtioNet::new(
                 kernelet.clone(),
                 pending.net.as_ref().unwrap().clone(),
@@ -343,6 +375,21 @@ impl SandboxFile {
                 DeviceSlot::Net.irq(),
             )
         });
+        let shared_net = pending
+            .net_shared
+            .then(|| {
+                SharedNet::new(
+                    &admission,
+                    kernelet.clone(),
+                    pending.net.as_ref().unwrap().clone(),
+                    pending.net_mac,
+                    DeviceSlot::Net.irq(),
+                )
+            })
+            .transpose()
+            .map_err(|_| {
+                Error::with_message(Errno::ENOMEM, "cannot create shared network device")
+            })?;
         let rng = pending
             .rng_attached
             .then(|| VirtioRng::new(kernelet.clone(), DeviceSlot::Rng.irq()));
@@ -377,9 +424,11 @@ impl SandboxFile {
         }
         hooks.devices.call_once(|| SandboxDevices {
             blocks,
+            zero_copy_blocks,
             console,
             vsock,
             net,
+            shared_net,
             rng,
         });
         unstarted.kernelet = None;
@@ -574,7 +623,7 @@ mod tests {
         use crate::{
             endovisor::{
                 log_endpoint::LogEndpoint,
-                policy::{PrestartEndpointReservation, endpoint_bytes_for_test},
+                policy::{UserEndpointReservation, endpoint_bytes_for_test},
             },
             fs::file::FileLike,
         };
@@ -585,7 +634,7 @@ mod tests {
             let endpoint = LogEndpoint::new();
             let file = endpoint.file();
             let reservation = Arc::new(
-                PrestartEndpointReservation::reserve(
+                UserEndpointReservation::reserve(
                     sandbox.owner,
                     endpoint.reservation_bytes(),
                     #[cfg(kernelet_nat_failure_diag_host)]

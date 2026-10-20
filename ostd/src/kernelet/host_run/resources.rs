@@ -249,6 +249,14 @@ impl ExecutionResources {
         let (index, base, mapped, arena) = {
             let mut stacks = self.stacks.lock();
             if stacks.active_tasks >= stacks.max_tasks {
+                let active = stacks.active_tasks;
+                let limit = stacks.max_tasks;
+                drop(stacks);
+                crate::error!(
+                    "Kernelet Task limit reached: active={}, limit={}",
+                    active,
+                    limit,
+                );
                 return Err(crate::Error::NoMemory);
             }
             let Some(index) = stacks.slots.iter().enumerate().find_map(|(index, slot)| {
@@ -285,6 +293,8 @@ impl ExecutionResources {
         stacks.slots[index].allocating = false;
         if let Err(error) = result {
             stacks.active_tasks -= 1;
+            drop(stacks);
+            crate::error!("Kernelet Task stack mapping failed: {:?}", error);
             return Err(error);
         }
         stacks.slots[index].mapped = true;

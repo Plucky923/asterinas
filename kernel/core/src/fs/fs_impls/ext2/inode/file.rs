@@ -312,8 +312,13 @@ impl InodeInner {
         let discard_start_bytes = offset.min(old_size);
         let discard_end_bytes = end.min(old_size);
         if discard_start_bytes < discard_end_bytes {
-            self.page_cache()
-                .invalidate_range(discard_start_bytes..discard_end_bytes)?;
+            if let Err(err) = self
+                .page_cache()
+                .invalidate_range(discard_start_bytes..discard_end_bytes)
+            {
+                self.rollback_write(old_size, end);
+                return Err(err);
+            }
         }
 
         if let Err(err) = self.write_direct_blocks(fs, offset, reader) {
@@ -347,7 +352,7 @@ impl InodeInner {
             match range {
                 IoRange::Mapped(device_range) => {
                     let nblocks = device_range.len();
-                    let bio_segment = BioSegment::alloc(nblocks, BioDirection::FromDevice);
+                    let bio_segment = BioSegment::try_alloc(nblocks, BioDirection::FromDevice)?;
                     fs.read_blocks(device_range.start, bio_segment.clone())?;
                     let mut segment_reader = bio_segment.reader()?;
                     segment_reader.read_fallible(writer)?;
@@ -381,28 +386,42 @@ impl InodeInner {
         let mut range_iter = self.block_manager()?.iter_io_ranges(iblock_range);
 
         let mut io_batch = IoBatch::new();
-        while let Some(range) = range_iter.next()? {
-            match range {
-                IoRange::Mapped(device_range) => {
-                    let nblocks = device_range.len();
-                    let bio_segment = BioSegment::alloc(nblocks, BioDirection::ToDevice);
-                    bio_segment.writer().unwrap().write_fallible(reader)?;
-                    fs.write_blocks_async(device_range.start, bio_segment, None, &mut io_batch)?;
-                }
-                IoRange::Hole(_) => {
-                    // TODO: Consider falling back to buffered write like Linux.
-                    // The upper layer should have performed allocation for the write
-                    // range. Linux does not allocate blocks in the direct write path;
-                    // when it encounters a hole it falls back to buffered write to
-                    // prevent stale data exposure. We pre-allocate in `prepare_write`
-                    // so holes here indicate a bug. Stale-read is not a concern
-                    // because our inode-level lock serializes reads after this write.
-                    return_errno_with_message!(Errno::EIO, "unexpected hole in direct write path");
+        let submission_result = (|| -> Result<()> {
+            while let Some(range) = range_iter.next()? {
+                match range {
+                    IoRange::Mapped(device_range) => {
+                        let nblocks = device_range.len();
+                        let bio_segment = BioSegment::try_alloc(nblocks, BioDirection::ToDevice)?;
+                        bio_segment.writer()?.write_fallible(reader)?;
+                        fs.write_blocks_async(
+                            device_range.start,
+                            bio_segment,
+                            None,
+                            &mut io_batch,
+                        )?;
+                    }
+                    IoRange::Hole(_) => {
+                        // TODO: Consider falling back to buffered write like Linux.
+                        // The upper layer should have performed allocation for the write
+                        // range. Linux does not allocate blocks in the direct write path;
+                        // when it encounters a hole it falls back to buffered write to
+                        // prevent stale data exposure. We pre-allocate in `prepare_write`
+                        // so holes here indicate a bug. Stale-read is not a concern
+                        // because our inode-level lock serializes reads after this write.
+                        return_errno_with_message!(
+                            Errno::EIO,
+                            "unexpected hole in direct write path"
+                        );
+                    }
                 }
             }
-        }
-
-        io_batch.wait_all()?;
+            Ok(())
+        })();
+        // Rollback may release blocks targeted by an accepted BIO. Drain every
+        // accepted request before returning even if a later submission failed.
+        let completion_result = io_batch.wait_all();
+        submission_result?;
+        completion_result?;
         Ok(())
     }
 
@@ -457,20 +476,192 @@ fn is_block_aligned(offset: usize) -> bool {
 
 #[cfg(ktest)]
 mod test {
-    use ostd::prelude::ktest;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use aster_block::{
+        BlockDevice, BlockDeviceMeta,
+        bio::{BioEnqueueError, BioType, SubmittedBio},
+    };
+    use ostd::{
+        prelude::ktest,
+        task::{Task, TaskOptions},
+    };
 
     use super::{super::RAW_BLOCK_PTRS_LEN, *};
     use crate::{
         fs::{
             ext2::{
                 inode::test::make_live_file_inode,
-                test_utils::{Ext2FixtureBuilder, assert_errno, create_file},
+                test_utils::{Ext2FixtureBuilder, Ext2MemoryDisk, assert_errno, create_file},
             },
             vfs::inode::Inode,
         },
         time::clocks,
         vm::page_cache::VmoMapMode,
     };
+
+    #[derive(Debug)]
+    struct DelayedWriteDisk {
+        disk: Arc<Ext2MemoryDisk>,
+        armed: AtomicBool,
+        reject_writes: AtomicBool,
+        rejected_writebacks: AtomicUsize,
+        attempts: AtomicUsize,
+        pending: SpinLock<Option<SubmittedBio>>,
+    }
+
+    impl BlockDevice for DelayedWriteDisk {
+        fn enqueue(&self, bio: SubmittedBio) -> core::result::Result<(), BioEnqueueError> {
+            let first_byte = if bio.type_() == BioType::Write {
+                bio.segments()[0]
+                    .dma_slice()
+                    .reader()
+                    .unwrap()
+                    .read_val::<u8>()
+                    .unwrap()
+            } else {
+                0
+            };
+            // Initialization writes contain zeros. Inject errors only into
+            // the distinct dirty-cache (0x41) and direct-payload (0x66) writes.
+            if first_byte == 0x41 && self.reject_writes.load(Ordering::Acquire) {
+                self.rejected_writebacks.fetch_add(1, Ordering::Relaxed);
+                return Err(BioEnqueueError::Refused);
+            }
+            if first_byte == 0x66 && self.armed.load(Ordering::Acquire) {
+                match self.attempts.fetch_add(1, Ordering::AcqRel) {
+                    0 => {
+                        *self.pending.lock() = Some(bio);
+                        return Ok(());
+                    }
+                    1 => return Err(BioEnqueueError::Refused),
+                    _ => {}
+                }
+            }
+            self.disk.enqueue(bio)
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            self.disk.metadata()
+        }
+
+        fn name(&self) -> &str {
+            "ext2-delayed-write-test"
+        }
+
+        fn id(&self) -> device_id::DeviceId {
+            self.disk.id()
+        }
+    }
+
+    #[ktest]
+    fn direct_write_failure_drains_accepted_bio_before_rollback() {
+        clocks::init_for_ktest();
+        let device_slot = Mutex::new(None);
+        let fixture = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(16, 16)
+            .with_free_inodes(1000, 1000)
+            .build_with_device(|disk| {
+                let device = Arc::new(DelayedWriteDisk {
+                    disk,
+                    armed: AtomicBool::new(false),
+                    reject_writes: AtomicBool::new(false),
+                    rejected_writebacks: AtomicUsize::new(0),
+                    attempts: AtomicUsize::new(0),
+                    pending: SpinLock::new(None),
+                });
+                *device_slot.lock() = Some(device.clone());
+                device
+            })
+            .unwrap();
+        let device = device_slot.lock().take().unwrap();
+        let root = fixture.root();
+        let file = create_file(&root, "partial_direct");
+        let separator = create_file(&root, "separator");
+        let initial = vec![0x41; BLOCK_SIZE];
+        // Interleave allocations so extending `file` has two physical runs.
+        for target in [&file, &separator] {
+            let mut reader = VmReader::from(initial.as_slice()).to_fallible();
+            target.write_direct_at(0, &mut reader).unwrap();
+        }
+        let free_before = fixture.ext2.super_block().free_blocks_count();
+        device.armed.store(true, Ordering::Release);
+        let result = Arc::new(Mutex::new(None));
+        let waiter = {
+            let file = file.clone();
+            let result = result.clone();
+            TaskOptions::new(move || {
+                let payload = vec![0x66; BLOCK_SIZE * 3];
+                let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+                *result.lock() = Some(file.write_direct_at(0, &mut reader));
+            })
+            .spawn()
+            .unwrap()
+        };
+        for _ in 0..100_000 {
+            if device.attempts.load(Ordering::Acquire) >= 2 {
+                break;
+            }
+            Task::yield_now();
+        }
+        assert_eq!(device.attempts.load(Ordering::Acquire), 2);
+        for _ in 0..10 {
+            Task::yield_now();
+        }
+        assert!(result.lock().is_none());
+        let bio = device.pending.lock().take().unwrap();
+        device.disk.enqueue(bio).unwrap();
+        for _ in 0..100_000 {
+            if result.lock().is_some() {
+                break;
+            }
+            Task::yield_now();
+        }
+        assert!(result.lock().take().unwrap().is_err());
+        assert_eq!(file.file_size(), BLOCK_SIZE);
+        assert_eq!(fixture.ext2.super_block().free_blocks_count(), free_before);
+        drop(waiter);
+    }
+
+    #[ktest]
+    fn direct_write_invalidation_failure_rolls_back_extension() {
+        clocks::init_for_ktest();
+        let device_slot = Mutex::new(None);
+        let fixture = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(16, 16)
+            .with_free_inodes(1000, 1000)
+            .build_with_device(|disk| {
+                let device = Arc::new(DelayedWriteDisk {
+                    disk,
+                    armed: AtomicBool::new(false),
+                    reject_writes: AtomicBool::new(false),
+                    rejected_writebacks: AtomicUsize::new(0),
+                    attempts: AtomicUsize::new(0),
+                    pending: SpinLock::new(None),
+                });
+                *device_slot.lock() = Some(device.clone());
+                device
+            })
+            .unwrap();
+        let device = device_slot.lock().take().unwrap();
+        let file = create_file(&fixture.root(), "invalidation_failure");
+        let initial = vec![0x41; BLOCK_SIZE];
+        let mut initial_reader = VmReader::from(initial.as_slice()).to_fallible();
+        file.write_at(0, &mut initial_reader).unwrap();
+        let free_before = fixture.ext2.super_block().free_blocks_count();
+        device.reject_writes.store(true, Ordering::Release);
+        let payload = vec![0x66; BLOCK_SIZE * 2];
+        let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+        assert!(file.write_direct_at(0, &mut reader).is_err());
+        assert_eq!(device.rejected_writebacks.load(Ordering::Relaxed), 1);
+        device.reject_writes.store(false, Ordering::Release);
+        assert_eq!(file.file_size(), BLOCK_SIZE);
+        assert_eq!(fixture.ext2.super_block().free_blocks_count(), free_before);
+        let mut readback = vec![0; BLOCK_SIZE];
+        let mut writer = VmWriter::from(readback.as_mut_slice()).to_fallible();
+        file.read_at(0, &mut writer).unwrap();
+        assert_eq!(readback, initial);
+    }
 
     #[ktest]
     fn file_write_enospc_rollback() {

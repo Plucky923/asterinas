@@ -159,7 +159,7 @@ impl Grant {
         let mut remaining = initial;
         while remaining != 0 {
             // Creation may publish a complete physical section at once;
-            // later control and image requests have the 16-grain bound.
+            // Later control and Image requests use MAX_GRAINS_PER_REQUEST.
             let count = remaining.min(GRAINS_PER_SECTION as u32);
             grant.add_run(&mut growth, count, RunAllocation::Initial)?;
             remaining -= count;
@@ -254,6 +254,8 @@ impl Grant {
             && count as usize == GRAINS_PER_SECTION
         {
             META_SECTION_BYTES
+        } else if count.is_power_of_two() {
+            bytes
         } else {
             GRAIN_SIZE
         };
@@ -469,6 +471,30 @@ fn publish_u32(frames: &[Frame<()>], index: usize, value: u32) {
 mod test {
     use super::*;
     use crate::prelude::ktest;
+
+    #[ktest]
+    fn growth_supplies_a_complete_aligned_64_mib_run() {
+        let identity = super::super::control::identity::Registration::new().unwrap();
+        let grant = Grant::new(identity.owner(), 1, 33, 4).unwrap();
+        assert_eq!(grant.grow_within_ceiling(32, 1).unwrap(), 32);
+        let mut raw = [0u8; size_of::<RunDesc>()];
+        grant.run_frames[0]
+            .read_bytes(size_of::<RunDesc>(), &mut raw)
+            .unwrap();
+        let base = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+        let grains = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+        assert_eq!(grains, 32);
+        assert!(base.is_multiple_of(32 * GRAIN_SIZE));
+        assert!(grant.guest_memory().contains(base as u64, 32 * GRAIN_SIZE));
+        assert!(matches!(
+            grant.grow_within_ceiling(1, 1),
+            Err(Error::AccessDenied)
+        ));
+        assert!(matches!(
+            grant.grow_within_ceiling(33, 1),
+            Err(Error::InvalidArgs)
+        ));
+    }
 
     #[ktest]
     fn published_bitmap_preserves_holes_and_tracks_growth() {

@@ -165,6 +165,12 @@ pub(crate) struct GrantMemory {
     owner: KerneletId,
 }
 
+enum PinAccess {
+    ConstructionOrDma,
+    RegisteredDma,
+    ExistingBorrow,
+}
+
 impl GrantMemory {
     pub(super) fn new(owner: KerneletId) -> Result<Arc<Self>> {
         let owners = OwnerTable::shared()?;
@@ -301,10 +307,10 @@ impl GrantMemory {
     }
 
     fn pin(self: &Arc<Self>, paddr: u64, len: usize) -> Result<MemoryPin> {
-        self.pin_impl(paddr, len, true)
+        self.pin_impl(paddr, len, PinAccess::ConstructionOrDma)
     }
 
-    fn pin_impl(self: &Arc<Self>, paddr: u64, len: usize, dma: bool) -> Result<MemoryPin> {
+    fn pin_impl(self: &Arc<Self>, paddr: u64, len: usize, access: PinAccess) -> Result<MemoryPin> {
         let Range { start, end } = Self::checked_range(paddr, len)?;
         let mut state = self.state.lock();
         if !state.accepts_access() || !self.owners.contains(&(start..end), self.owner) {
@@ -329,7 +335,9 @@ impl GrantMemory {
             held.push((run_base, range));
             cursor = next;
         }
-        let dma_pages = if dma && state.dma_only && start != end {
+        let require_dma = matches!(access, PinAccess::RegisteredDma)
+            || matches!(access, PinAccess::ConstructionOrDma) && state.dma_only;
+        let dma_pages = if require_dma && start != end {
             let first = start / PAGE_SIZE * PAGE_SIZE;
             let last = end.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let mut page = first;
@@ -369,7 +377,7 @@ impl GrantMemory {
     }
 }
 
-struct MemoryPin {
+pub(super) struct MemoryPin {
     memory: Arc<GrantMemory>,
     held: SmallVec<[(usize, Range<usize>); 4]>,
     dma_pages: Range<usize>,
@@ -422,6 +430,51 @@ pub struct GuestMemory {
 }
 
 impl GuestMemory {
+    /// Runs a kernel test with two registered DMA pages in a private grant.
+    #[cfg(ktest)]
+    pub fn with_test_registered_dma<R>(test_fn: impl FnOnce(&Self, u64) -> R) -> R {
+        let (memory, base, _) = test::dma_fixture();
+        {
+            let state = memory.state.lock();
+            for page in [base as usize, base as usize + PAGE_SIZE] {
+                dma::register_owner(state.io_state(page).unwrap()).unwrap();
+            }
+        }
+        memory.restrict_to_dma().unwrap();
+        let result = test_fn(&Self::new(&memory), base);
+        memory.close();
+        memory.reclaim();
+        result
+    }
+
+    /// Returns whether a kernel test's grant still has active pins.
+    #[cfg(ktest)]
+    pub fn is_pinned_for_test(&self) -> bool {
+        self.memory.state.lock().pins != 0
+    }
+
+    /// Revokes a kernel test's private grant.
+    #[cfg(ktest)]
+    pub fn revoke_for_test(&self) {
+        self.memory.close();
+        self.memory.reclaim();
+    }
+
+    /// Lends registered Image DMA bytes to a supported physical device.
+    /// The lease retains the original storage through all asynchronous users.
+    pub fn borrow_dma(
+        &self,
+        paddr: u64,
+        len: usize,
+        access: super::guest_dma::DeviceAccess,
+    ) -> Result<super::guest_dma::GuestDmaLease> {
+        super::guest_dma::GuestDmaLease::new(self, paddr, len, access)
+    }
+
+    pub(super) fn pin_registered_dma(&self, paddr: u64, len: usize) -> Result<MemoryPin> {
+        self.memory.pin_impl(paddr, len, PinAccess::RegisteredDma)
+    }
+
     pub(crate) fn restrict_to_dma(&self) -> Result<()> {
         self.memory.restrict_to_dma()
     }
@@ -554,7 +607,9 @@ impl GuestMemory {
         len: usize,
         f: impl for<'a> FnOnce(&mut VmReader<'a>) -> R,
     ) -> Result<R> {
-        let _pin = self.memory.pin_impl(paddr, len, false)?;
+        let _pin = self
+            .memory
+            .pin_impl(paddr, len, PinAccess::ExistingBorrow)?;
         // SAFETY: The caller establishes byte-read validity; the grant pin
         // keeps the mapping alive, and the callback cannot retain the reader.
         let mut reader = unsafe {
@@ -866,7 +921,7 @@ mod test {
         memory.reclaim();
         assert!(memory.state.lock().runs.is_empty());
     }
-    fn dma_fixture() -> (Arc<GrantMemory>, u64, Frame<()>) {
+    pub(super) fn dma_fixture() -> (Arc<GrantMemory>, u64, Frame<()>) {
         let identity = super::super::control::identity::Registration::new().unwrap();
         let memory = GrantMemory::new(identity.owner()).unwrap();
         memory.bind_identity(Arc::new(identity));
@@ -968,6 +1023,99 @@ mod test {
         memory.restrict_to_dma().unwrap();
         assert!(memory.state.lock().dma_only);
         memory.close();
+        memory.reclaim();
+    }
+
+    #[ktest]
+    fn borrowed_dma_requires_registration_and_retains_storage_after_close() {
+        use super::super::guest_dma::{DeviceAccess, GuestDmaLease};
+        use crate::mm::HasDaddr;
+
+        if !GuestDmaLease::is_supported() {
+            return;
+        }
+        let (memory, base, witness) = dma_fixture();
+        let capability = GuestMemory::new(&memory);
+        // Construction-mode CPU access does not authorize physical DMA.
+        assert!(
+            capability
+                .borrow_dma(base, PAGE_SIZE, DeviceAccess::Write)
+                .is_err()
+        );
+        {
+            let state = memory.state.lock();
+            dma::register_owner(state.io_state(base as usize).unwrap()).unwrap();
+        }
+        let lease = Arc::new(
+            capability
+                .borrow_dma(base, PAGE_SIZE, DeviceAccess::Write)
+                .unwrap(),
+        );
+        assert_eq!(lease.daddr() as u64, base);
+        assert_eq!(lease.size(), PAGE_SIZE);
+        assert_eq!(lease.sync_from_device(0..PAGE_SIZE), Ok(()));
+        assert_eq!(lease.sync_to_device(0..PAGE_SIZE), Err(Error::AccessDenied));
+        assert_eq!(
+            lease.sync_from_device(0..PAGE_SIZE + 1),
+            Err(Error::InvalidArgs)
+        );
+        let callback_hold = lease.clone();
+        assert_eq!(memory.close(), 1);
+        memory.reclaim();
+        drop(capability);
+        drop(lease);
+        assert_eq!(witness.reference_count(), 2);
+        assert!(!memory.state.lock().runs.is_empty());
+        // A callback keeps both the grant and authoritative metadata alive.
+        assert_eq!(callback_hold.daddr() as u64, base);
+        drop(callback_hold);
+        assert_eq!(witness.reference_count(), 1);
+        assert!(memory.state.lock().runs.is_empty());
+    }
+
+    #[ktest]
+    fn borrowed_dma_failure_rolls_back_prior_page_pins() {
+        use super::super::guest_dma::{DeviceAccess, GuestDmaLease};
+
+        if !GuestDmaLease::is_supported() {
+            return;
+        }
+        let (memory, base, _) = dma_fixture();
+        let capability = GuestMemory::new(&memory);
+        {
+            let state = memory.state.lock();
+            dma::register_owner(state.io_state(base as usize).unwrap()).unwrap();
+        }
+        assert!(
+            capability
+                .borrow_dma(base, PAGE_SIZE + 512, DeviceAccess::Read)
+                .is_err()
+        );
+        {
+            let state = memory.state.lock();
+            assert_eq!(
+                state
+                    .io_state(base as usize)
+                    .unwrap()
+                    .load(Ordering::Acquire)
+                    >> 48,
+                0
+            );
+            assert_eq!(state.pins, 0);
+        }
+        let lease = capability
+            .borrow_dma(base, 512, DeviceAccess::Read)
+            .unwrap();
+        assert_eq!(lease.sync_to_device(0..512), Ok(()));
+        assert_eq!(lease.sync_from_device(0..512), Err(Error::AccessDenied));
+        assert!(
+            capability
+                .borrow_dma(u64::MAX, 512, DeviceAccess::Read)
+                .is_err()
+        );
+        assert_eq!(memory.close(), 1);
+        drop(lease);
+        assert_eq!(memory.close(), 0);
         memory.reclaim();
     }
 }

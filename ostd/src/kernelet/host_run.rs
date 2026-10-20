@@ -2,8 +2,9 @@
 
 //! Host-private state for one carrier crossing a kernelet image boundary.
 //!
-//! Ordinary physical traps and service calls use the current shared Task
-//! stack. Only double fault enters a permanent CPU-local IST stack.
+//! Services select a stack using a read-only budget; unknown bounds select
+//! the carrier stack. Physical IRQs leave Image stacks before Rust entry;
+//! non-IST exceptions use the carrier stack, and double fault uses its IST.
 //!
 //! This module owns the authoritative carrier state and the single
 //! enter/return/stop transaction, including trap containment and virtual
@@ -31,6 +32,7 @@ use super::{
 };
 use crate::{arch::cpu::context::FpuContext, irq, sync::WaitQueue, task::Task};
 
+mod buffer;
 mod hook_stack;
 mod hooks;
 mod mem;
@@ -41,9 +43,12 @@ mod roots;
 mod rq1;
 mod tls;
 mod vcpu;
-
+#[cfg(ktest)]
+pub(crate) use hook_stack::test_irq_stack_state;
 pub(crate) use record::recover_host_copy_fault;
 pub(crate) use resources::ExecutionResources;
+#[cfg(ktest)]
+pub(crate) use vcpu::{reset_spin_stack_samples, spin_stack_samples};
 
 // The carrier alone writes its phase while physical IRQs are masked. The
 // instance's separate active word carries the remotely published sticky stop
@@ -96,6 +101,7 @@ global_asm!(
     stack_bytes = const resources::STACK_BYTES,
     stack_reserve = const UPCALL_STACK_RESERVE,
     rq1_bench = const cfg!(kernelet_rq1) as usize,
+    rq1_stack_check_mode = const if cfg!(kernelet_rq1_stack_check_bypass) { 2 } else if cfg!(kernelet_rq1_stack_check_diag) { 1 } else { 0 },
     options(att_syntax)
 );
 
@@ -361,6 +367,11 @@ extern "C" fn stop(_: u32, _: u32, _: *const u8, _: u32) -> ! {
     core::arch::naked_asm!("endbr64", "jmp kernelet_service_stop");
 }
 
+#[unsafe(naked)]
+extern "C" fn buffer(_: u32, _: u64, _: u64, _: u64, _: u64) -> MmioResult {
+    core::arch::naked_asm!("endbr64", "jmp kernelet_service_buffer");
+}
+
 #[cfg(kernelet_rq1)]
 #[unsafe(naked)]
 extern "C" fn rq1_echo(_: u64) -> i64 {
@@ -388,6 +399,7 @@ static SERVICES: ServiceTable = ServiceTable {
     log_write,
     oops,
     stop,
+    buffer,
     #[cfg(kernelet_rq1)]
     rq1_echo,
 };
@@ -419,6 +431,9 @@ pub(crate) unsafe fn enter(
     execution: &ExecutionResources,
     vcpu: u16,
 ) -> crate::Result<u32> {
+    if !crate::irq::InterruptLevel::current().is_task_context() {
+        return Err(crate::Error::InvalidArgs);
+    }
     let boot_stack = execution
         .initial_stack_base(vcpu as usize)
         .ok_or(crate::Error::InvalidArgs)? as u64;
@@ -436,6 +451,12 @@ pub(crate) unsafe fn enter(
     let fpu_stage = FpuContext::new();
     assert!(crate::arch::irq::is_local_enabled());
     let irq_guard = irq::disable_local();
+    // Overflow recovery may attribute one newly accepted fixed-delivery IRQ.
+    // Older in-service work would make that attribution ambiguous. Ordinary
+    // IRQ return acknowledges delivery before resuming Image execution.
+    if !matches!(crate::arch::irq::interrupted_delivery(), Ok(None)) {
+        return Err(crate::Error::InvalidArgs);
+    }
     // SAFETY: The caller passes the live, writable record mapped by the
     // instance; this publish happens before the first image instruction.
     unsafe {
@@ -651,6 +672,9 @@ impl CarrierState<'_> {
 /// # Safety
 ///
 /// The caller must run on the current carrier's pinned physical CPU.
+// Keep pointer authentication visible in the bounded gate's machine code.
+// The linked analyzer otherwise cannot prove a returned pointer's provenance.
+#[inline(always)]
 unsafe fn current_carrier_state<'a>() -> Option<&'a CarrierState<'a>> {
     let state_ptr = KERNELET_HOST_STATE_PTR.load() as *const CarrierState;
     // SAFETY: The caller pins this CPU; the slot retains the current carrier.
@@ -663,6 +687,7 @@ unsafe fn current_carrier_state<'a>() -> Option<&'a CarrierState<'a>> {
 /// The pointer must be null or a live value loaded from this CPU's protected
 /// carrier slot. The caller must remain pinned and retain that carrier through
 /// the returned borrow; it must not use a snapshot across a context switch.
+#[inline(always)]
 unsafe fn carrier_state_from_ptr<'a>(
     state_ptr: *const CarrierState<'a>,
 ) -> Option<&'a CarrierState<'a>> {
@@ -736,8 +761,52 @@ fn containable_image_exception(vector: usize) -> bool {
     vector < 32 && !matches!(vector, 2 | 18)
 }
 
-/// Contains an image exception on the native trap path at service depth zero.
-/// A validated user-copy fault publishes its hardware details before the fixup.
+/// Classifies a double fault without reading failed Image frames or taking locks.
+fn double_fault_reason(
+    state: &CarrierState,
+    frame: &crate::arch::trap::TrapFrame,
+) -> Option<KillReason> {
+    if state.run_state.load(Ordering::Acquire) != IMAGE {
+        return None;
+    }
+    let address = x86_64::registers::control::Cr2::read_raw() as usize;
+    let slot = frame.rsp & !(resources::STACK_STRIDE - 1);
+    let in_guard = slot >= state.stack_pool_start
+        && slot < state.stack_pool_end
+        && address >= slot
+        && address < slot + resources::STACK_BYTES
+        && state.execution.contains_stack_range(
+            slot + resources::STACK_BYTES,
+            slot + resources::STACK_BYTES + 1,
+        );
+    if in_guard {
+        return Some(KillReason::StackOverflow);
+    }
+    // Retain separate containment of an invalid Image RSP. A double fault
+    // without either attribution must follow the ordinary Host fault policy.
+    (state.text.contains(&frame.rip)
+        && (frame.rsp < state.stack_pool_start || frame.rsp >= state.stack_pool_end))
+        .then_some(KillReason::StackReserve)
+}
+
+// SAFETY: Only the double-fault assembly path calls this on its independent
+// IST with a complete frame and masked IRQs. All local authentication guards
+// and references finish before assembly installs the returned Host pointer.
+#[unsafe(no_mangle)]
+extern "C" fn kernelet_host_recovery_stack_impl(frame: &crate::arch::trap::TrapFrame) -> usize {
+    let Some(state) = (unsafe { current_carrier_state() }) else {
+        return 0;
+    };
+    if double_fault_reason(state, frame).is_some()
+        && crate::arch::irq::interrupted_delivery().is_ok()
+    {
+        state.host_rsp
+    } else {
+        0
+    }
+}
+
+/// Contains an Image fault after assembly has selected its safe Host stack.
 pub(crate) fn contain_image_exception(frame: &mut crate::arch::trap::TrapFrame) -> bool {
     if !containable_image_exception(frame.trap_num) {
         return false;
@@ -746,17 +815,40 @@ pub(crate) fn contain_image_exception(frame: &mut crate::arch::trap::TrapFrame) 
     let Some(state) = (unsafe { current_carrier_state() }) else {
         return false;
     };
-    if !state.text.contains(&frame.rip) || state.run_state.load(Ordering::Acquire) != IMAGE {
+    if state.run_state.load(Ordering::Acquire) != IMAGE {
         return false;
     }
     if frame.trap_num == 8 {
-        // Double fault may have interrupted an exhausted stack while it held
-        // Guest locks. Detection must neither inspect that stack nor take locks.
-        state
-            .control
-            .stop(ExitReason::Killed(KillReason::StackOverflow));
+        let Some(reason) = double_fault_reason(state, frame) else {
+            return false;
+        };
+        let Ok(delivery) = crate::arch::irq::interrupted_delivery() else {
+            return false;
+        };
+        if let Some(vector) = delivery {
+            // Reconstruct a valid Host context, never the partially saved IRQ
+            // frame. Complete callbacks and normal EOI ordering exactly once.
+            let context = crate::arch::trap::TrapFrame {
+                trap_num: vector as usize,
+                rip: state.exit_entry,
+                rsp: state.host_rsp,
+                cs: crate::arch::trap::KERNEL_CS_VALUE,
+                ss: crate::arch::trap::KERNEL_SS_VALUE,
+                rflags: 2,
+                ..Default::default()
+            };
+            irq::call_irq_callback_functions(
+                &context,
+                &crate::arch::irq::HwIrqLine::new(vector),
+                crate::cpu::PrivilegeLevel::Kernel,
+            );
+        }
+        state.control.stop(ExitReason::Killed(reason));
         redirect_fatal_image_exception(state, frame);
         return true;
+    }
+    if !state.text.contains(&frame.rip) {
+        return false;
     }
     if frame.trap_num == 14
         && x86_64::registers::control::Cr2::read_raw() < crate::mm::MAX_USERSPACE_VADDR as u64
@@ -814,7 +906,8 @@ fn redirect_fatal_image_exception(state: &CarrierState, frame: &mut crate::arch:
 }
 
 /// Runs at native kernel trap return, after Host callback levels unwind.
-/// Ordinary traps retain the shared Task stack and the currently active root.
+/// The saved frame retains its original stack; handlers use the selected Host
+/// stack. This hook leaves the currently active root unchanged.
 pub(crate) fn finish_image_trap(frame: &mut crate::arch::trap::TrapFrame) {
     // Ordinary Host Tasks have no carrier. Skip all Image return checks before
     // reading the trap frame or querying the native interrupt level.

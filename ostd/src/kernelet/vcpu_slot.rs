@@ -16,6 +16,7 @@ cpu_local_cell! {
 }
 
 /// Returns the GS offset of the Host-written current virtual-CPU slot.
+#[inline(always)]
 pub(super) fn gs_offset() -> u32 {
     CURRENT_SLOT
         .static_offset()
@@ -42,6 +43,7 @@ pub(super) fn restore(identity: Option<CpuSlot>) {
 }
 
 /// Reads the complete authentication identity with one native GS load.
+#[inline(always)]
 pub(super) fn current() -> CpuSlot {
     let identity: u64;
     // SAFETY: Native GS remains the Host CPU-local base even in image code.

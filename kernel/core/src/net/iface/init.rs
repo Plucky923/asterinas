@@ -38,7 +38,11 @@ pub(in crate::net) fn init() {
         // to ensure the loopback interface index is ahead of virtio.
         ifaces.push(new_loopback());
 
-        if let Some(iface_virtio) = new_virtio() {
+        #[cfg(feature = "kernelet")]
+        let shared = new_shared();
+        #[cfg(not(feature = "kernelet"))]
+        let shared = None;
+        if let Some(iface_virtio) = shared.or_else(new_virtio) {
             ifaces.push(iface_virtio);
         }
 
@@ -47,8 +51,17 @@ pub(in crate::net) fn init() {
 
     if let Some(iface_virtio) = virtio_iface() {
         let callback = || iface_virtio.poll();
-        aster_network::register_recv_callback(VIRTIO_DEVICE_NAME, callback);
-        aster_network::register_send_callback(VIRTIO_DEVICE_NAME, callback);
+        #[cfg(feature = "kernelet")]
+        let device_name =
+            if aster_network::get_device(crate::net::device::shared::DEVICE_NAME).is_some() {
+                crate::net::device::shared::DEVICE_NAME
+            } else {
+                VIRTIO_DEVICE_NAME
+            };
+        #[cfg(not(feature = "kernelet"))]
+        let device_name = VIRTIO_DEVICE_NAME;
+        aster_network::register_recv_callback(device_name, callback);
+        aster_network::register_send_callback(device_name, callback);
     }
 
     poll_ifaces();
@@ -110,6 +123,22 @@ fn new_loopback() -> Arc<Iface> {
 }
 
 fn new_virtio() -> Option<Arc<Iface>> {
+    new_ether::<aster_virtio::device::network::device::NetworkDevice>(VIRTIO_DEVICE_NAME)
+}
+
+#[cfg(feature = "kernelet")]
+fn new_shared() -> Option<Arc<Iface>> {
+    use crate::net::device::shared::{DEVICE_NAME, SharedNetworkDevice};
+
+    if !SharedNetworkDevice::init()
+        .expect("startup-selected shared Ethernet device must initialize")
+    {
+        return None;
+    }
+    new_ether::<SharedNetworkDevice>(DEVICE_NAME)
+}
+
+fn new_ether<D: AnyNetworkDevice>(device_name: &str) -> Option<Arc<Iface>> {
     use aster_bigtcp::{
         iface::EtherIface,
         wire::{Ipv4Address, Ipv4Cidr},
@@ -131,14 +160,17 @@ fn new_virtio() -> Option<Arc<Iface>> {
     const VIRTIO_ADDRESS_PREFIX_LEN: u8 = 24; // mask: 255.255.255.0
     const VIRTIO_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
 
-    let virtio_net = aster_network::get_device(VIRTIO_DEVICE_NAME)?;
+    let virtio_net = aster_network::get_device(device_name)?;
 
     let ether_addr = virtio_net.lock().mac_addr();
 
-    struct Wrapper(Arc<SpinLock<dyn AnyNetworkDevice, BottomHalfDisabled>>);
+    struct Wrapper<D>(
+        Arc<SpinLock<dyn AnyNetworkDevice, BottomHalfDisabled>>,
+        core::marker::PhantomData<D>,
+    );
 
-    impl WithDevice for Wrapper {
-        type Device = aster_virtio::device::network::device::NetworkDevice;
+    impl<D: AnyNetworkDevice> WithDevice for Wrapper<D> {
+        type Device = D;
 
         fn with<F, R>(&self, f: F) -> R
         where
@@ -158,7 +190,7 @@ fn new_virtio() -> Option<Arc<Iface>> {
         | InterfaceFlags::LOWER_UP;
 
     Some(EtherIface::new(
-        Wrapper(virtio_net),
+        Wrapper::<D>(virtio_net, core::marker::PhantomData),
         ether_addr,
         Ipv4Cidr::new(VIRTIO_ADDRESS, VIRTIO_ADDRESS_PREFIX_LEN),
         VIRTIO_GATEWAY,

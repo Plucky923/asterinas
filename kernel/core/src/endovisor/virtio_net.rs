@@ -30,11 +30,13 @@ use super::{
 use crate::endovisor::io_copy_profile::{self, Category};
 use crate::prelude::*;
 
-mod endpoint;
+pub(super) mod endpoint;
 mod nat;
 mod sockets;
+mod worker;
 
 pub(super) use endpoint::{NetEndpoint, NetEndpointFile};
+pub(super) use worker::NetWorker;
 
 const QUEUE_SIZE: usize = 64;
 const NUM_QUEUES: usize = 2;
@@ -55,8 +57,7 @@ const FEATURE_STATUS: u64 = 1 << 16;
 const FEATURE_VERSION_1: u64 = 1 << 32;
 const DEVICE_NEEDS_RESET: u32 = 1 << 6;
 
-#[derive(Clone)]
-struct Frame {
+pub(super) struct Frame {
     len: usize,
     bytes: [u8; MAX_FRAME_BYTES],
 }
@@ -67,6 +68,14 @@ impl Frame {
             len: 0,
             bytes: [0; MAX_FRAME_BYTES],
         }
+    }
+
+    pub(super) fn with_bytes<R>(&self, read_fn: impl for<'a> FnOnce(&'a [u8]) -> R) -> R {
+        read_fn(&self.bytes[..self.len])
+    }
+
+    fn with_bytes_mut<R>(&mut self, write_fn: impl for<'a> FnOnce(&'a mut [u8]) -> R) -> R {
+        write_fn(&mut self.bytes[..self.len])
     }
 }
 
@@ -193,8 +202,8 @@ impl VirtioNet {
     }
 
     pub(super) fn start_worker(self: &Arc<Self>, execution: &super::scheduling::ExecutionThreads) {
-        let device = self.clone();
-        execution.spawn_worker(move || device.worker());
+        let worker = NetWorker::for_copy(self.clone());
+        execution.spawn_worker(move || worker.run());
     }
 
     pub(super) fn cancel(&self) {
@@ -451,85 +460,6 @@ impl VirtioNet {
         self.interrupt_status.fetch_or(1, Ordering::Release);
     }
 
-    #[cfg(kernelet_nat_failure_diag_host)]
-    fn diagnostic_cancelled(&self) -> bool {
-        self.registers.lock().cancelled
-    }
-
-    #[cfg(kernelet_nat_failure_diag_host)]
-    fn record_diagnostic(
-        &self,
-        event: endpoint::NatEvent,
-        context: endpoint::NatContext,
-        errno: Option<Errno>,
-    ) {
-        let cancelled = self.diagnostic_cancelled();
-        self.endpoint
-            .record_diagnostic(event, context, errno, None, 0, None, cancelled);
-    }
-
-    fn worker(&self) {
-        let adopted = self.kernelet.adopt_current_task();
-        if adopted.is_err() {
-            #[cfg(kernelet_nat_failure_diag_host)]
-            {
-                self.endpoint.record_diagnostic(
-                    endpoint::NatEvent::Adopt,
-                    endpoint::NatContext::new("worker_adopt_failed"),
-                    None,
-                    adopted.err(),
-                    0,
-                    None,
-                    self.diagnostic_cancelled(),
-                );
-                self.endpoint.emit_diagnostic_summary();
-            }
-            return;
-        }
-        if let Some((backend, reservation)) = self.endpoint.take_backend() {
-            // Native listener observers retain the shared reservation until
-            // the last backlog reference releases its buffers.
-            let result = backend.run(self);
-            #[cfg(kernelet_nat_failure_diag_host)]
-            self.record_diagnostic(
-                endpoint::NatEvent::BackendReturned,
-                endpoint::NatContext::new(if result.is_ok() {
-                    "backend_returned_ok"
-                } else {
-                    "backend_returned_error"
-                }),
-                result.as_ref().err().map(|error| error.error()),
-            );
-            drop(reservation);
-            #[cfg(kernelet_nat_failure_diag_host)]
-            {
-                self.record_diagnostic(
-                    endpoint::NatEvent::ReservationReleased,
-                    endpoint::NatContext::new("backend_reservation_drop_returned"),
-                    None,
-                );
-                self.endpoint.emit_diagnostic_summary();
-            }
-            if let Err(error) = result {
-                error!("kernelet network backend failed: {:?}", error);
-                let _ = self
-                    .kernelet
-                    .kill(ostd::kernelet::control::KillReason::HostPolicy(u32::MAX));
-            }
-        } else {
-            #[cfg(kernelet_nat_failure_diag_host)]
-            {
-                self.record_diagnostic(
-                    endpoint::NatEvent::BackendAbsent,
-                    endpoint::NatContext::new("worker_take_backend_none"),
-                    None,
-                );
-                self.endpoint.emit_diagnostic_summary();
-            }
-        }
-        self.kernelet.disown_current_task();
-    }
-
     fn collect_notified(&self) -> bool {
         let mut registers = self.registers.lock();
         if registers.cancelled || registers.resetting || registers.status & DEVICE_NEEDS_RESET != 0
@@ -594,19 +524,23 @@ impl VirtioNet {
         let mut header = [0u8; NET_HEADER_BYTES];
         let mut frame = Frame::empty();
         frame.len = request.bytes - NET_HEADER_BYTES;
-        if visit_packet(
-            &request.buffers[..request.len],
-            frame.len,
-            |paddr, range| {
-                let bytes = if range.end <= NET_HEADER_BYTES {
-                    return self.memory.read(paddr, &mut header[range]);
-                } else {
-                    &mut frame.bytes[range.start - NET_HEADER_BYTES..range.end - NET_HEADER_BYTES]
-                };
-                self.read_payload(paddr, bytes)
-            },
-        )
-        .is_err()
+        let frame_len = frame.len;
+        if frame
+            .with_bytes_mut(|bytes| {
+                visit_packet(
+                    &request.buffers[..request.len],
+                    frame_len,
+                    |paddr, range| {
+                        let bytes = if range.end <= NET_HEADER_BYTES {
+                            return self.memory.read(paddr, &mut header[range]);
+                        } else {
+                            &mut bytes[range.start - NET_HEADER_BYTES..range.end - NET_HEADER_BYTES]
+                        };
+                        self.read_payload(paddr, bytes)
+                    },
+                )
+            })
+            .is_err()
         {
             self.registers.lock().status |= DEVICE_NEEDS_RESET;
             self.complete(request, 0);
@@ -668,19 +602,22 @@ impl VirtioNet {
             // Ingress category: the receiving instance pays for copying
             // the received frame into its guest buffers.
             let span = ChargedSpan::new(&self.kernelet, WorkCategory::Ingress);
-            let failed = visit_packet(
-                &request.buffers[..request.len],
-                frame.len,
-                |paddr, range| {
-                    let bytes = if range.end <= NET_HEADER_BYTES {
-                        return self.memory.write(paddr, &header[range]);
-                    } else {
-                        &frame.bytes[range.start - NET_HEADER_BYTES..range.end - NET_HEADER_BYTES]
-                    };
-                    self.write_payload(paddr, bytes)
-                },
-            )
-            .is_err();
+            let failed = frame
+                .with_bytes(|bytes| {
+                    visit_packet(
+                        &request.buffers[..request.len],
+                        frame.len,
+                        |paddr, range| {
+                            let bytes = if range.end <= NET_HEADER_BYTES {
+                                return self.memory.write(paddr, &header[range]);
+                            } else {
+                                &bytes[range.start - NET_HEADER_BYTES..range.end - NET_HEADER_BYTES]
+                            };
+                            self.write_payload(paddr, bytes)
+                        },
+                    )
+                })
+                .is_err();
             drop(span);
             if failed {
                 r.status |= DEVICE_NEEDS_RESET;
@@ -784,7 +721,7 @@ impl VirtioNet {
     }
 }
 
-enum Work {
+pub(super) enum Work {
     Cancel,
     Progress,
 }

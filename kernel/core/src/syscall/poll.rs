@@ -13,6 +13,7 @@ use crate::{
     },
     prelude::*,
     process::{ResourceType, signal::Poller},
+    time::wait::TimeoutExt,
 };
 
 pub(super) fn sys_poll(
@@ -73,7 +74,7 @@ pub(super) fn do_sys_poll(
         poll_fds, nfds, timeout
     );
 
-    let result = do_poll(&poll_fds, timeout.as_ref(), ctx);
+    let result = do_poll(&poll_fds, timeout.as_ref().into(), ctx);
 
     // Write back -- even when `do_poll` returns an error
     // because the `revents` field may contain garbage and must be cleared.
@@ -92,7 +93,7 @@ pub(super) fn do_sys_poll(
 
 pub(super) fn do_poll(
     poll_fds: &[PollFd],
-    timeout: Option<&Duration>,
+    timeout: TimeoutExt<'static>,
     ctx: &Context,
 ) -> Result<usize> {
     let mut file_table = ctx.thread_local.borrow_file_table_mut();
@@ -169,8 +170,8 @@ enum PollerResult {
 
 impl PollFiles<'_> {
     /// Registers the files with a poller, or exits early if some events are detected.
-    fn register_poller(&self, timeout: Option<&Duration>) -> PollerResult {
-        let mut poller = Poller::new(timeout);
+    fn register_poller(&self, timeout: TimeoutExt<'static>) -> PollerResult {
+        let mut poller = Poller::new_with_timeout(timeout);
 
         for (index, poll_fd) in self.poll_fds.iter().enumerate() {
             let events = if let Some(file) = self.file_at(index) {

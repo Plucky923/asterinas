@@ -190,6 +190,7 @@ pub fn do_cached_build(
     // Host service panics must unwind back through their protected continuation.
     if features.iter().any(|feature| feature == "kernelet-host") {
         rustflags.push("-C panic=unwind");
+        rustflags.push("-Z emit-stack-sizes");
     }
     let extra_envs = match (build.kernelet, kernelet_image) {
         (false, _) => Vec::new(),
@@ -210,7 +211,7 @@ pub fn do_cached_build(
             &override_configs,
         );
     }
-    let aster_elf = build_kernel_elf(
+    let mut aster_elf = build_kernel_elf(
         config.target_arch,
         &build.profile,
         &features,
@@ -220,7 +221,20 @@ pub fn do_cached_build(
         &rustflags,
         &extra_envs,
     );
-    if build.kernelet {
+    if (build.kernelet || matches!(action, ActionChoice::Test))
+        && features.iter().any(|feature| feature == "kernelet-host")
+    {
+        let path = kernelet::generate_host_budgets(aster_elf.path()).unwrap_or_else(|error| {
+            error_msg!("Cannot generate the Host service stack budgets: {error}");
+            process::exit(Errno::BuildCrate as _);
+        });
+        aster_elf = AsterBin::new(
+            path,
+            aster_elf.arch(),
+            aster_elf.typ().clone(),
+            aster_elf.version().clone(),
+            aster_elf.stripped(),
+        );
         kernelet::audit_host_services(aster_elf.path()).unwrap_or_else(|error| {
             error_msg!("The Host service table failed the linked ELF audit: {error}");
             process::exit(Errno::BuildCrate as _);

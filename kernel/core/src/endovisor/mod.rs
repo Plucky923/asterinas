@@ -19,6 +19,7 @@ mod policy;
 mod reaper;
 mod sandbox;
 mod scheduling;
+mod shared_net;
 mod virtio_block;
 mod virtio_console;
 mod virtio_mmio;
@@ -26,6 +27,7 @@ mod virtio_net;
 mod virtio_rng;
 mod virtio_vsock;
 mod vsock_switch;
+mod zero_copy_block;
 
 use device_id::MajorId;
 use ostd::kernelet::control::{CpuBudget, KerneletKind};
@@ -45,6 +47,7 @@ const _: () = {
     assert!(kernelet_abi::GRAIN_SIZE_BYTES == ostd::kernelet::abi::GRAIN_SIZE as u64);
     assert!(kernelet_abi::MIN_NICE == CpuBudget::MIN_NICE);
     assert!(kernelet_abi::MAX_NICE == CpuBudget::MAX_NICE);
+    assert!(kernelet_abi::MAX_TASKS == ostd::kernelet::control::MAX_TASKS);
 };
 
 pub(crate) fn init(major: MajorId) -> Result<()> {

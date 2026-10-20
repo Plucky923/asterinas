@@ -108,6 +108,9 @@ pub(in crate::arch) fn get_or_init(_guard: &dyn PinCurrentCpu) -> &(dyn Apic + '
 }
 
 pub(in crate::arch) trait Apic: ApicTimer {
+    /// Snapshots fixed-delivery vectors accepted but not acknowledged.
+    #[cfg(feature = "kernelet-host")]
+    fn in_service(&self) -> [u32; 8];
     fn id(&self) -> u32;
 
     fn version(&self) -> u32;

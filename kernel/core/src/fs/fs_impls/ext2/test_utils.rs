@@ -499,7 +499,6 @@ pub(super) struct Ext2FixtureBuilder {
     init_root: bool,
     block_bitmap: Option<BlockBitmapInit>,
     inode_bitmap: Option<InodeBitmapInit>,
-    custom_device: Option<Arc<dyn BlockDevice>>,
 }
 
 impl Ext2FixtureBuilder {
@@ -515,7 +514,6 @@ impl Ext2FixtureBuilder {
             init_root: true,
             block_bitmap: None,
             inode_bitmap: None,
-            custom_device: None,
         }
     }
 
@@ -716,6 +714,13 @@ impl Ext2FixtureBuilder {
     }
 
     pub(super) fn build(self) -> Result<Ext2Fixture> {
+        self.build_with_device(|disk| disk)
+    }
+
+    pub(super) fn build_with_device(
+        self,
+        wrap_device_fn: impl FnOnce(Arc<Ext2MemoryDisk>) -> Arc<dyn BlockDevice>,
+    ) -> Result<Ext2Fixture> {
         let (_, sb, descs, disk, layout) = self.prepare()?;
         self.write_bitmaps(&sb, &descs, &disk, &layout);
 
@@ -725,9 +730,7 @@ impl Ext2FixtureBuilder {
             write_raw_inode_to_disk(&sb, &descs, ROOT_INO, &root_raw, &disk);
         }
 
-        let device: Arc<dyn BlockDevice> = self
-            .custom_device
-            .unwrap_or_else(|| disk.clone() as Arc<dyn BlockDevice>);
+        let device = wrap_device_fn(disk.clone());
         let ext2 = Ext2::open(device, FsFlags::empty(), None)?;
 
         Ok(Ext2Fixture {

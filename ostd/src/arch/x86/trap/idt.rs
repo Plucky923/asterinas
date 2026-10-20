@@ -13,7 +13,7 @@ use x86_64::{
 
 use crate::mm::Vaddr;
 
-global_asm!(include_str!("trap.S"));
+global_asm!(include_str!("trap.S"), kernelet_host = const cfg!(feature = "kernelet-host") as usize);
 
 const NUM_INTERRUPTS: usize = 256;
 

@@ -6,7 +6,7 @@ use super::KerneletConfig;
 use crate::{
     Error,
     kernelet::{
-        abi::{BootArgs, CpuSlot},
+        abi::{self, BootArgs, CpuSlot},
         host_image::RegisteredImage,
     },
     mm::PAGE_SIZE,
@@ -29,8 +29,10 @@ pub(super) fn validate_config(config: &KerneletConfig<'_>) -> crate::Result<()> 
             .mmio_base
             .checked_add(device.reg_bytes as u64)
             .ok_or(Error::InvalidArgs)?;
-        if device.kind != 1
-            || device.irq < 32
+        if !matches!(
+            device.kind,
+            abi::DEVICE_KIND_VIRTIO | abi::DEVICE_KIND_SHARED_NET
+        ) || device.irq < 32
             || device.irq == u8::MAX
             || device.vcpu as usize >= config.cpus.count()
             || device.reg_bytes == 0
@@ -153,7 +155,7 @@ mod test {
         cpus.add(CpuId::bsp());
         let device = super::super::DeviceEntry {
             id: 1,
-            kind: 1,
+            kind: abi::DEVICE_KIND_VIRTIO,
             irq: 254,
             reserved: 0,
             vcpu: 0,

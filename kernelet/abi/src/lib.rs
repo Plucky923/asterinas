@@ -26,8 +26,18 @@ pub const NET_PROTOCOL_TCP: u16 = 1;
 pub const NET_PROTOCOL_UDP: u16 = 2;
 /// Maximum port mappings in one network configuration.
 pub const MAX_NET_PORTS: usize = 32;
+/// Maximum live internal Tasks supported by the Host stack pool.
+pub const MAX_TASKS: u32 = 4096;
 /// Chosen endpoint-only kind following the five device kind values.
 pub const LOG: u16 = 6;
+/// Separate shared-buffer block device; never creates a VirtIO MMIO slot.
+pub const ZERO_COPY_BLOCK: u16 = 7;
+/// Maximum separately attached shared-buffer block devices per instance.
+pub const MAX_ZERO_COPY_BLOCKS: usize = 64;
+/// VirtIO block frontend backed by direct DMA to retained Image pages.
+pub const BORROWED_BLOCK: u16 = 8;
+/// Independent shared-buffer Ethernet device for the ordinary socket stack.
+pub const SHARED_NET: u16 = 9;
 pub const BLOCK_READ_ONLY: u32 = 1;
 pub const STATE_CONFIGURING: u32 = 0;
 pub const STATE_CREATED: u32 = 1;
@@ -108,6 +118,19 @@ pub struct VsockPolicyArgs {
     pub allow: u32,
 }
 
+/// Authorizes buffer exchange using capabilities for both sandbox endpoints.
+///
+/// Input flags and output fields must be zero. Repeating a successful request
+/// returns the existing connection. Both endpoints currently use the same ID.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod)]
+pub struct SharedBufferConnectArgs {
+    pub peer_fd: i32,
+    pub flags: u32,
+    pub out_connection: u64,
+    pub out_peer_connection: u64,
+}
+
 /// One Host-to-guest port mapping on a network endpoint.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod)]
@@ -127,6 +150,27 @@ pub struct NetConfigArgs {
     pub num_ports: u16,
     pub reserved0: u16,
     pub ports: [NetPortMapping; MAX_NET_PORTS],
+}
+
+/// Host/Image payload-path coverage, excluding user copies and NAT rings.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod)]
+pub struct IoPathStatsRaw {
+    pub borrowed_block_devices: u64,
+    pub borrowed_block_requests: u64,
+    pub borrowed_block_bytes: u64,
+    pub borrowed_block_identity_checks: u64,
+    pub borrowed_block_copy_bytes: u64,
+    pub shared_net_devices: u64,
+    pub shared_net_tx_packets: u64,
+    pub shared_net_tx_bytes: u64,
+    pub shared_net_rx_packets: u64,
+    pub shared_net_rx_bytes: u64,
+    pub shared_net_payload_copy_bytes: u64,
+    pub shared_net_native_fallback_packets: u64,
+    pub shared_net_native_fallback_bytes: u64,
+    pub shared_net_allocations: u64,
+    pub shared_net_reuses: u64,
 }
 
 #[repr(C)]
@@ -225,6 +269,9 @@ pub const STATUS: u64 = request(2, 0x25, size_of::<StatusRaw>());
 pub const DESTROY: u64 = request(0, 0x2f, 0);
 pub const VSOCK_CONNECT: u64 = request(1, 0x30, size_of::<VsockArgs>());
 pub const VSOCK_LISTEN: u64 = request(1, 0x31, size_of::<VsockArgs>());
+/// Connects two live sandboxes without changing their vsock routes.
+pub const SHARED_BUFFER_CONNECT: u64 = request(3, 0x34, size_of::<SharedBufferConnectArgs>());
+pub const IO_PATH_STATS: u64 = request(2, 0x35, size_of::<IoPathStatsRaw>());
 
 const _: () = {
     assert!(size_of::<CreateArgs>() == 56);
@@ -236,6 +283,9 @@ const _: () = {
     assert!(size_of::<NetConfigArgs>() == 392);
     assert!(size_of::<VsockArgs>() == 8);
     assert!(size_of::<VsockPolicyArgs>() == 8);
+    assert!(size_of::<SharedBufferConnectArgs>() == 24);
+    assert!(core::mem::offset_of!(SharedBufferConnectArgs, out_connection) == 8);
+    assert!(core::mem::offset_of!(SharedBufferConnectArgs, out_peer_connection) == 16);
     assert!(size_of::<StatusRaw>() == 312);
     assert!(size_of::<StatsRaw>() == 112);
     assert!(size_of::<ImageInfoRaw>() == 64);

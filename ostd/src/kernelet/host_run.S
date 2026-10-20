@@ -48,6 +48,16 @@
 .text
 .code64
 
+.if {rq1_bench}
+.pushsection .rodata.kernelet_service_budgets,"a",@progbits
+
+.balign 8
+.global kernelet_rq1_stack_check_mode
+kernelet_rq1_stack_check_mode:
+    .quad {rq1_stack_check_mode} /* 0 ordinary, 1 checked, 2 bypass diagnostic. */
+.popsection
+.endif
+
 .global kernelet_host_enter
 .type kernelet_host_enter, @function
 .balign 16
@@ -90,11 +100,18 @@ kernelet_host_exit:
     ret
 .size kernelet_host_exit, .-kernelet_host_exit
 
-/* Ordinary service frames share the current image Task stack. Validate its
- * Host-owned pool slot and reserve before the first push or call. Arguments
+/* Ordinary services select a stack using a Host-owned budget. Validate the
+ * caller's live pool slot before the first push or call. Arguments
  * remain in their SysV registers across this entry; only rax/r10/r11 are
  * scratch. The common return handles both scalar and rax:rdx pair results. */
-.macro service name, implementation
+.macro service name, implementation, bounded=0
+.pushsection .rodata.kernelet_service_budgets,"a",@progbits
+
+.balign 8
+.global \name\()_budget
+\name\()_budget:
+    .quad -1 /* HOST_STACK until the linked-build analysis proves a bound. */
+.popsection
 .global \name
 .type \name, @function
 .balign 16
@@ -103,13 +120,28 @@ kernelet_host_exit:
     load_carrier
     commit_phase PHASE_IMAGE, PHASE_ENTERING, .Linvalid_service
     movq %rsp, IMAGE_RSP(%r11)
+    /* Only the private echo fixture may bypass stack validation. Both
+     * diagnostic builds reserve exactly five bytes and keep every following
+     * instruction at the same offset. Normal builds emit neither prefix. */
+.ifc \name,kernelet_service_rq1_echo
+.if {rq1_stack_check_mode}
+.global kernelet_rq1_stack_check_patch
+kernelet_rq1_stack_check_patch:
+.if {rq1_stack_check_mode} == 2
+    .byte 0xe9
+    .long kernelet_rq1_stack_check_end - . - 4
+.else
+    .byte 0x0f, 0x1f, 0x44, 0x00, 0x00
+.endif
+.endif
+.endif
     movq %rsp, %rax
     andq $-STACK_STRIDE, %rax
     cmpq STACK_POOL_START(%r11), %rax
     jb .Linvalid_stack
     cmpq STACK_POOL_END(%r11), %rax
     jae .Linvalid_stack
-    leaq STACK_BYTES+STACK_RESERVE(%rax), %r10
+    leaq STACK_BYTES(%rax), %r10
     cmpq %r10, %rsp
     jb .Linvalid_stack
     subq STACK_POOL_START(%r11), %rax
@@ -117,6 +149,38 @@ kernelet_host_exit:
     movq STACK_POOL_LIVE(%r11), %r10
     btq %rax, (%r10)
     jnc .Linvalid_stack
+    movq %rsp, %rax
+    andq $-STACK_STRIDE, %rax
+    addq $STACK_BYTES, %rax
+    movq %rsp, %r10
+    subq %rax, %r10
+    cmpq \name\()_budget(%rip), %r10
+    jae .Lservice_admitted\@
+.if \bounded
+    jmp .Lservice_host\@
+.Lservice_admitted\@:
+    cld
+    subq $8, %rsp
+    call kernelet_host_vcpu_on_spin_bounded_impl
+    testl %eax, %eax
+    jnz kernelet_service_bounded_return
+    load_carrier
+.Lservice_host\@:
+.endif
+    /* Unknown/unbounded services and insufficient space use HOST_STACK.
+     * The budget includes the complete wrapper, cleanup and entry prefix. */
+.ifc \name,kernelet_service_rq1_echo
+.if {rq1_stack_check_mode}
+.global kernelet_rq1_stack_check_end
+kernelet_rq1_stack_check_end:
+.endif
+.endif
+    movq HOST_RSP(%r11), %rsp
+    /* Stack selection does not change the active-root reservation. Services
+     * that can schedule leave it through the existing VmSpace protocol. */
+.if !\bounded
+.Lservice_admitted\@:
+.endif
     cld
     subq $8, %rsp
     call \implementation
@@ -128,7 +192,7 @@ service kernelet_service_log_write, kernelet_host_log_write_impl
 service kernelet_service_mmio_read, kernelet_host_mmio_read_impl
 service kernelet_service_mmio_write, kernelet_host_mmio_write_impl
 service kernelet_service_vcpu_idle, kernelet_host_vcpu_idle_impl
-service kernelet_service_vcpu_on_spin, kernelet_host_vcpu_on_spin_impl
+service kernelet_service_vcpu_on_spin, kernelet_host_vcpu_on_spin_impl, 1
 service kernelet_service_vcpu_boot, kernelet_host_vcpu_boot_impl
 service kernelet_service_vcpu_kick, kernelet_host_vcpu_kick_impl
 service kernelet_service_oops, kernelet_host_oops_impl
@@ -141,12 +205,13 @@ service kernelet_service_vcpu_yield, kernelet_host_vcpu_yield_impl
 service kernelet_service_user_run, kernelet_host_user_run_impl
 service kernelet_service_kstack_alloc, kernelet_host_kstack_alloc_impl
 service kernelet_service_kstack_free, kernelet_host_kstack_free_impl
+service kernelet_service_buffer, kernelet_host_buffer_impl
 .if {rq1_bench}
 service kernelet_service_rq1_echo, kernelet_host_rq1_echo_impl
 .endif
 
 /* Rust service frames and Host guards are gone. Keep the two ABI result words
- * while the common epilogue checks stop on the shared Task stack,
+ * while the common epilogue checks stop on the selected service stack,
  * with physical IRQs masked. */
 .Lservice_return:
     pushq %rax
@@ -177,6 +242,26 @@ service kernelet_service_rq1_echo, kernelet_host_rq1_echo_impl
     call kernelet_host_cancel_service_return_impl
     movq $-5, %rax
     jmp kernelet_host_exit
+.Lservice_return_end:
+
+/* Only a proved, non-scheduling body may use this return. It has neither
+ * changed the active root nor released its reservation. A remote stop first
+ * transfers to the preserved Host stack before any Rust cleanup. */
+.global kernelet_service_bounded_return
+.type kernelet_service_bounded_return, @function
+kernelet_service_bounded_return:
+    load_carrier
+    commit_phase PHASE_RETURNING, PHASE_IMAGE, .Lbounded_stopped
+    movq IMAGE_RSP(%r11), %rsp
+    sti
+    ret
+.Lbounded_stopped:
+    movq HOST_RSP(%r11), %rsp
+    subq $8, %rsp
+    call kernelet_host_cancel_service_return_impl
+    movq $-5, %rax
+    jmp kernelet_host_exit
+.size kernelet_service_bounded_return, .-kernelet_service_bounded_return
 
 .global kernelet_service_stop
 .type kernelet_service_stop, @function

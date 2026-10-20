@@ -6,14 +6,16 @@
 //! Once creation succeeds, the reservation remains charged until OSTD has
 //! destroyed that instance. The initial memory reservation includes the rounded
 //! bounded Host storage as well as the Guest grant ceiling.
-//! Endpoint structures created before START have
-//! separate guards charged to the same user's endpoint limit. Grant
+//! Endpoint structures and transferable buffers have separate UID-owned
+//! guards that can outlive their originating instance. Grant
 //! authorizations are pending charges in the same ledger; settlement transfers
 //! the committed part to the live ceiling and refunds the remainder.
 //!
 //! All ledger updates use one IRQ-disabled lock. No allocation, OSTD call or
 //! wait occurs while it is held. The preallocated user and instance tables make
 //! the memory-exhaustion hook safe to call from a carrier's Host service path.
+
+mod limits;
 
 use ostd::{
     kernelet::{abi::MAX_GRAINS_PER_REQUEST, control::HostByteCharge},
@@ -28,7 +30,6 @@ use crate::{prelude::*, process::Uid};
 const MAX_USERS: usize = 64;
 const MAX_INSTANCES: usize = 64;
 const MAX_LIVE_PER_USER: u16 = 8;
-const MAX_GRAINS_PER_USER: u32 = 512; // 1 GiB at 2 MiB per grain.
 const MAX_VCPUS_PER_USER: u16 = 32;
 const MAX_ENDPOINT_BYTES_PER_USER: usize = 16 * 1024 * 1024;
 
@@ -77,8 +78,17 @@ impl Admission {
         owner: Uid,
         kind: &ostd::kernelet::control::KerneletKind,
         config: &ostd::kernelet::control::KerneletConfig<'_>,
+        additional_workers: usize,
     ) -> Result<Arc<Self>> {
-        let bytes = kind.instance_reservation_bytes(config, MAX_GRAINS_PER_USER)?;
+        let workers = additional_workers
+            .checked_mul(ostd::kernelet::control::host_worker_reservation_bytes())
+            .ok_or_else(|| Error::with_message(Errno::EOVERFLOW, "worker reservation overflow"))?;
+        let bytes = kind
+            .instance_reservation_bytes(config, limits::max_grains_per_user())?
+            .checked_add(workers)
+            .ok_or_else(|| {
+                Error::with_message(Errno::EOVERFLOW, "instance reservation overflow")
+            })?;
         Self::reserve_storage(
             owner,
             config.max_grains,
@@ -199,6 +209,43 @@ impl Admission {
             bytes,
         })
     }
+
+    /// Charges transferable storage to its user until the final owner drops it.
+    pub(super) fn reserve_shared_buffer(&self, bytes: usize) -> Result<UserEndpointReservation> {
+        if bytes == 0 {
+            return_errno_with_message!(Errno::EINVAL, "empty shared-buffer reservation");
+        }
+        let mut ledger = LEDGER.lock();
+        let instance = ledger
+            .instances
+            .get(self.slot)
+            .filter(|instance| {
+                instance.generation == self.generation && instance.phase == Phase::Live
+            })
+            .ok_or_else(|| {
+                Error::with_message(Errno::EINVAL, "kernelet admission is unavailable")
+            })?;
+        let owner = ledger.users[instance.user_slot].owner.unwrap();
+        #[cfg(kernelet_nat_failure_diag_host)]
+        let tag = QuotaTag::new(QuotaClass::InstanceEndpoint, None);
+        let user_slot = ledger.reserve_user_endpoint_bytes(
+            owner,
+            bytes,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            tag,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            None,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            None,
+        )?;
+        Ok(UserEndpointReservation {
+            user_slot,
+            owner,
+            bytes,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            tag,
+        })
+    }
 }
 
 impl Drop for Admission {
@@ -260,6 +307,7 @@ pub(super) struct NatQuotaSnapshot {
     pub(super) attempt_overflow: bool,
     pub(super) requested_bytes: usize,
     pub(super) endpoint_bytes: Option<usize>,
+    // Independent UID charges; retain the existing diagnostic field name.
     pub(super) prestart_bytes: Option<usize>,
     pub(super) limit: usize,
     pub(super) reason: NatQuotaReason,
@@ -457,12 +505,12 @@ impl UserCategories {
             .balances
             .iter()
             .try_fold(0usize, |sum, b| sum.checked_add(b.current));
-        let prestart = self
+        let independent_total = self
             .balances
             .iter()
             .try_fold(0usize, |sum, b| sum.checked_add(b.independent_current));
         total == Some(endpoint)
-            && prestart == Some(independent)
+            && independent_total == Some(independent)
             && self
                 .balances
                 .iter()
@@ -519,12 +567,12 @@ impl QuotaCategorySnapshot {
     }
 }
 
-/// A pre-START endpoint charge retained by the endpoint that owns its memory.
+/// An endpoint charge retained by the object that owns its memory.
 ///
-/// A listener can outlive the instance's admission. Its charge therefore
-/// belongs to the user rather than to an instance slot and is refunded when
-/// the listener is dropped.
-pub(super) struct PrestartEndpointReservation {
+/// A listener or shared buffer can outlive the instance's admission.
+/// Its charge therefore belongs to the user rather than to an instance slot
+/// and is refunded when its final owner is dropped.
+pub(super) struct UserEndpointReservation {
     user_slot: usize,
     owner: Uid,
     bytes: usize,
@@ -532,7 +580,7 @@ pub(super) struct PrestartEndpointReservation {
     tag: QuotaTag,
 }
 
-impl PrestartEndpointReservation {
+impl UserEndpointReservation {
     pub(super) fn reserve(
         owner: Uid,
         bytes: usize,
@@ -541,7 +589,7 @@ impl PrestartEndpointReservation {
         if bytes == 0 {
             return_errno_with_message!(Errno::EINVAL, "empty endpoint reservation");
         }
-        let user_slot = LEDGER.lock().reserve_prestart_endpoint_bytes(
+        let user_slot = LEDGER.lock().reserve_user_endpoint_bytes(
             owner,
             bytes,
             #[cfg(kernelet_nat_failure_diag_host)]
@@ -577,7 +625,7 @@ impl PrestartEndpointReservation {
         }
         let user_slot = {
             let mut ledger = LEDGER.lock();
-            ledger.reserve_prestart_endpoint_bytes(owner, bytes, tag, Some(failure), categories)?
+            ledger.reserve_user_endpoint_bytes(owner, bytes, tag, Some(failure), categories)?
         };
         Ok(Self {
             user_slot,
@@ -597,9 +645,13 @@ impl PrestartEndpointReservation {
             return None;
         }
         #[cfg(kernelet_nat_failure_diag_host)]
-        LEDGER
-            .lock()
-            .reclassify_prestart(self.user_slot, self.owner, self.tag.class, class, bytes);
+        LEDGER.lock().reclassify_user_endpoint_bytes(
+            self.user_slot,
+            self.owner,
+            self.tag.class,
+            class,
+            bytes,
+        );
         self.bytes -= bytes;
         Some(Self {
             user_slot: self.user_slot,
@@ -616,18 +668,18 @@ pub(crate) struct NativeTcpBufferCharge {
     // A listener reserves UID quota before START. Its native observer can
     // already be shared with backlog sockets when Host accounting is bound.
     host: Once<HostByteCharge>,
-    _user: PrestartEndpointReservation,
+    _user: UserEndpointReservation,
 }
 
 impl NativeTcpBufferCharge {
-    pub(super) fn new(host: HostByteCharge, user: PrestartEndpointReservation) -> Self {
+    pub(super) fn new(host: HostByteCharge, user: UserEndpointReservation) -> Self {
         Self {
             host: Once::initialized(host),
             _user: user,
         }
     }
 
-    pub(super) fn prestart(user: PrestartEndpointReservation) -> Self {
+    pub(super) fn prestart(user: UserEndpointReservation) -> Self {
         Self {
             host: Once::new(),
             _user: user,
@@ -649,7 +701,7 @@ impl NativeTcpBufferCharge {
 
     #[cfg(ktest)]
     pub(crate) fn reserve_for_ktest(owner: Uid, bytes: usize) -> Result<Self> {
-        Ok(Self::prestart(PrestartEndpointReservation::reserve(
+        Ok(Self::prestart(UserEndpointReservation::reserve(
             owner,
             bytes,
             #[cfg(kernelet_nat_failure_diag_host)]
@@ -668,12 +720,12 @@ impl NativeTcpBufferCharge {
     }
 }
 
-impl Drop for PrestartEndpointReservation {
+impl Drop for UserEndpointReservation {
     fn drop(&mut self) {
         if self.bytes == 0 {
             return;
         }
-        LEDGER.lock().release_prestart_endpoint_bytes(
+        LEDGER.lock().release_user_endpoint_bytes(
             self.user_slot,
             self.owner,
             self.bytes,
@@ -689,10 +741,10 @@ struct UserEntry {
     live: u16,
     grains: u32,
     vcpus: u16,
-    // Includes both instance-owned and pre-START endpoint charges.
+    // Includes both instance-owned and independent UID endpoint charges.
     endpoint_bytes: usize,
     // Keeps the user slot occupied after its last instance is destroyed.
-    prestart_endpoint_bytes: usize,
+    independent_endpoint_bytes: usize,
     #[cfg(kernelet_nat_failure_diag_host)]
     categories: UserCategories,
 }
@@ -704,7 +756,7 @@ impl UserEntry {
         grains: 0,
         vcpus: 0,
         endpoint_bytes: 0,
-        prestart_endpoint_bytes: 0,
+        independent_endpoint_bytes: 0,
         #[cfg(kernelet_nat_failure_diag_host)]
         categories: UserCategories::EMPTY,
     };
@@ -724,7 +776,7 @@ impl UserEntry {
             categories: Some(self.categories),
             totals_match: Some(
                 self.categories
-                    .totals_match(self.endpoint_bytes, self.prestart_endpoint_bytes),
+                    .totals_match(self.endpoint_bytes, self.independent_endpoint_bytes),
             ),
             sequence_overflow: overflow,
         }
@@ -784,7 +836,7 @@ pub(super) const QUOTA_DIAGNOSTIC_LAYOUT: [usize; 4] = [
     size_of::<Ledger>(),
     size_of::<UserCategories>(),
     size_of::<InstanceEntry>(),
-    size_of::<PrestartEndpointReservation>(),
+    size_of::<UserEndpointReservation>(),
 ];
 
 impl Ledger {
@@ -819,7 +871,7 @@ impl Ledger {
     }
 
     #[cfg(kernelet_nat_failure_diag_host)]
-    fn reclassify_prestart(
+    fn reclassify_user_endpoint_bytes(
         &mut self,
         user_slot: usize,
         owner: Uid,
@@ -873,7 +925,7 @@ impl Ledger {
             return_errno_with_message!(Errno::ENOSPC, "kernelet endpoint limit reached");
         };
         if new_live > MAX_LIVE_PER_USER
-            || new_grains > MAX_GRAINS_PER_USER
+            || new_grains > limits::max_grains_per_user()
             || new_vcpus > MAX_VCPUS_PER_USER
             || new_endpoint_bytes > MAX_ENDPOINT_BYTES_PER_USER
         {
@@ -903,7 +955,7 @@ impl Ledger {
             grains: new_grains,
             vcpus: new_vcpus,
             endpoint_bytes: new_endpoint_bytes,
-            prestart_endpoint_bytes: user.prestart_endpoint_bytes,
+            independent_endpoint_bytes: user.independent_endpoint_bytes,
             #[cfg(kernelet_nat_failure_diag_host)]
             categories,
         };
@@ -940,7 +992,7 @@ impl Ledger {
             return 0;
         }
         let user = &self.users[instance.user_slot];
-        let available = MAX_GRAINS_PER_USER.saturating_sub(user.grains);
+        let available = limits::max_grains_per_user().saturating_sub(user.grains);
         let amount = requested.min(MAX_GRAINS_PER_REQUEST).min(available);
         if amount == 0 {
             return 0;
@@ -957,7 +1009,7 @@ impl Ledger {
             return_errno_with_message!(Errno::EINVAL, "kernelet admission is unavailable");
         }
         let user = &self.users[instance.user_slot];
-        if requested > MAX_GRAINS_PER_USER.saturating_sub(user.grains) {
+        if requested > limits::max_grains_per_user().saturating_sub(user.grains) {
             return_errno_with_message!(Errno::ENOSPC, "kernelet grain limit reached");
         }
         self.add_pending(slot, requested);
@@ -1017,7 +1069,7 @@ impl Ledger {
         Ok(())
     }
 
-    fn reserve_prestart_endpoint_bytes(
+    fn reserve_user_endpoint_bytes(
         &mut self,
         owner: Uid,
         bytes: usize,
@@ -1073,7 +1125,7 @@ impl Ledger {
         #[cfg(kernelet_nat_failure_diag_host)]
         {
             snapshot.endpoint_bytes = Some(user.endpoint_bytes);
-            snapshot.prestart_bytes = Some(user.prestart_endpoint_bytes);
+            snapshot.prestart_bytes = Some(user.independent_endpoint_bytes);
         }
         let Some(total) = user.endpoint_bytes.checked_add(bytes) else {
             #[cfg(kernelet_nat_failure_diag_host)]
@@ -1090,7 +1142,7 @@ impl Ledger {
             }
             return_errno_with_message!(Errno::ENOSPC, "kernelet endpoint limit reached");
         };
-        let Some(prestart_total) = user.prestart_endpoint_bytes.checked_add(bytes) else {
+        let Some(independent_total) = user.independent_endpoint_bytes.checked_add(bytes) else {
             #[cfg(kernelet_nat_failure_diag_host)]
             {
                 snapshot.reason = NatQuotaReason::PrestartOverflow;
@@ -1132,14 +1184,14 @@ impl Ledger {
         }
         user.owner = Some(owner);
         user.endpoint_bytes = total;
-        user.prestart_endpoint_bytes = prestart_total;
+        user.independent_endpoint_bytes = independent_total;
         #[cfg(kernelet_nat_failure_diag_host)]
         user.categories
             .reserve(tag.class, bytes, CategoryOwner::Independent);
         Ok(user_slot)
     }
 
-    fn release_prestart_endpoint_bytes(
+    fn release_user_endpoint_bytes(
         &mut self,
         user_slot: usize,
         owner: Uid,
@@ -1151,7 +1203,7 @@ impl Ledger {
             && bytes != 0
             && self.users.get(user_slot).is_some_and(|user| {
                 user.owner == Some(owner)
-                    && user.prestart_endpoint_bytes >= bytes
+                    && user.independent_endpoint_bytes >= bytes
                     && user.endpoint_bytes >= bytes
             }) {
             self.next_diagnostic_sequence()
@@ -1159,17 +1211,17 @@ impl Ledger {
             None
         };
         let Some(user) = self.users.get_mut(user_slot) else {
-            debug_assert!(false, "invalid pre-START endpoint user slot");
+            debug_assert!(false, "invalid UID endpoint user slot");
             return;
         };
         if user.owner != Some(owner)
-            || user.prestart_endpoint_bytes < bytes
+            || user.independent_endpoint_bytes < bytes
             || user.endpoint_bytes < bytes
         {
-            debug_assert!(false, "pre-START endpoint reservation refunded twice");
+            debug_assert!(false, "UID endpoint reservation refunded twice");
             return;
         }
-        user.prestart_endpoint_bytes -= bytes;
+        user.independent_endpoint_bytes -= bytes;
         user.endpoint_bytes -= bytes;
         #[cfg(kernelet_nat_failure_diag_host)]
         {
@@ -1183,7 +1235,7 @@ impl Ledger {
                 });
             }
         }
-        if user.live == 0 && user.prestart_endpoint_bytes == 0 {
+        if user.live == 0 && user.independent_endpoint_bytes == 0 {
             debug_assert_eq!(user.endpoint_bytes, 0);
             *user = UserEntry::EMPTY;
         }
@@ -1248,7 +1300,7 @@ impl Ledger {
                 None => user.categories.accounting_error = true,
             }
         }
-        if user.live == 0 && user.prestart_endpoint_bytes == 0 {
+        if user.live == 0 && user.independent_endpoint_bytes == 0 {
             debug_assert_eq!(user.endpoint_bytes, 0);
             *user = UserEntry::EMPTY;
         }
@@ -1263,22 +1315,50 @@ mod tests {
     use super::*;
 
     #[ktest]
+    fn shared_storage_charge_survives_sender_destruction() {
+        let owner = Uid::new(u32::MAX - 61);
+        let sender = Admission::reserve(owner, 1, 1, 64).unwrap();
+        sender.mark_created();
+        let retained = sender.reserve_shared_buffer(4096).unwrap();
+        assert_eq!(endpoint_bytes_for_test(owner), 4160);
+        sender.release_after_destroy();
+        assert_eq!(endpoint_bytes_for_test(owner), 4096);
+        assert!(sender.reserve_shared_buffer(1).is_err());
+        let replacement = Admission::reserve(owner, 1, 1, 0).unwrap();
+        replacement.mark_created();
+        assert!(
+            replacement
+                .reserve_shared_buffer(MAX_ENDPOINT_BYTES_PER_USER)
+                .is_err()
+        );
+        drop(retained);
+        assert_eq!(endpoint_bytes_for_test(owner), 0);
+        let full = replacement
+            .reserve_shared_buffer(MAX_ENDPOINT_BYTES_PER_USER)
+            .unwrap();
+        replacement.release_after_destroy();
+        assert_eq!(endpoint_bytes_for_test(owner), MAX_ENDPOINT_BYTES_PER_USER);
+        drop(full);
+        assert_eq!(endpoint_bytes_for_test(owner), 0);
+    }
+
+    #[ktest]
     fn host_execution_storage_shares_and_refunds_the_uid_memory_budget() {
         let owner = Uid::new(u32::MAX - 60);
         assert!(
-            matches!(Admission::reserve_execution(owner, MAX_GRAINS_PER_USER, 1, 0, 1),
+            matches!(Admission::reserve_execution(owner, limits::max_grains_per_user(), 1, 0, 1),
             Err(error) if error.error() == Errno::ENOSPC)
         );
         let first = Admission::reserve_execution(owner, 1, 1, 0, 8).unwrap();
         let charged = LEDGER.lock().instances[first.slot].committed_grains;
         assert!(charged > 1);
-        let remaining = MAX_GRAINS_PER_USER - charged;
+        let remaining = limits::max_grains_per_user() - charged;
         let second = Admission::reserve(owner, remaining, 1, 0).unwrap();
         assert!(matches!(Admission::reserve(owner, 1, 1, 0),
             Err(error) if error.error() == Errno::ENOSPC));
         drop((first, second));
         // Both uncreated reservations refund their full charge, including Host storage.
-        let replacement = Admission::reserve(owner, MAX_GRAINS_PER_USER, 1, 0).unwrap();
+        let replacement = Admission::reserve(owner, limits::max_grains_per_user(), 1, 0).unwrap();
         drop(replacement);
         assert!(
             Admission::reserve_execution(owner, 1, 1, 0, ostd::kernelet::control::MAX_TASKS + 1)
@@ -1291,7 +1371,7 @@ mod tests {
         let mut ledger = Ledger::new();
         let owner = Uid::new(1000);
         let user_slot = ledger
-            .reserve_prestart_endpoint_bytes(
+            .reserve_user_endpoint_bytes(
                 owner,
                 64,
                 #[cfg(kernelet_nat_failure_diag_host)]
@@ -1309,7 +1389,7 @@ mod tests {
         assert_eq!(ledger.users[user_slot].owner, Some(owner));
         assert_eq!(ledger.users[user_slot].endpoint_bytes, 64);
 
-        ledger.release_prestart_endpoint_bytes(
+        ledger.release_user_endpoint_bytes(
             user_slot,
             owner,
             64,
@@ -1324,7 +1404,7 @@ mod tests {
         let mut ledger = Ledger::new();
         let owner = Uid::new(1001);
         let user_slot = ledger
-            .reserve_prestart_endpoint_bytes(
+            .reserve_user_endpoint_bytes(
                 owner,
                 64,
                 #[cfg(kernelet_nat_failure_diag_host)]
@@ -1341,7 +1421,7 @@ mod tests {
                 .is_err()
         );
 
-        ledger.release_prestart_endpoint_bytes(
+        ledger.release_user_endpoint_bytes(
             user_slot,
             owner,
             64,
@@ -1365,7 +1445,7 @@ mod tests {
         let mut ledger = Ledger::new();
         let owner = Uid::new(2000);
         let user_slot = ledger
-            .reserve_prestart_endpoint_bytes(
+            .reserve_user_endpoint_bytes(
                 owner,
                 TOTAL,
                 #[cfg(kernelet_nat_failure_diag_host)]
@@ -1378,7 +1458,7 @@ mod tests {
             .unwrap();
         let (instance_slot, generation) = ledger.reserve(owner, 1, 1, 32).unwrap();
         ledger.release(instance_slot, generation);
-        ledger.release_prestart_endpoint_bytes(
+        ledger.release_user_endpoint_bytes(
             user_slot,
             owner,
             TOTAL - NATIVE,
@@ -1388,7 +1468,7 @@ mod tests {
         assert_eq!(ledger.users[user_slot].owner, Some(owner));
         assert_eq!(ledger.users[user_slot].live, 0);
         assert_eq!(ledger.users[user_slot].endpoint_bytes, NATIVE);
-        assert_eq!(ledger.users[user_slot].prestart_endpoint_bytes, NATIVE);
+        assert_eq!(ledger.users[user_slot].independent_endpoint_bytes, NATIVE);
         assert!(matches!(
             ledger.reserve(owner, 1, 1, MAX_ENDPOINT_BYTES_PER_USER - NATIVE + 1),
             Err(error) if error.error() == Errno::ENOSPC
@@ -1398,7 +1478,7 @@ mod tests {
         for index in 1..MAX_USERS {
             let other = Uid::new(2000 + index as u32);
             let slot = ledger
-                .reserve_prestart_endpoint_bytes(
+                .reserve_user_endpoint_bytes(
                     other,
                     1,
                     #[cfg(kernelet_nat_failure_diag_host)]
@@ -1413,7 +1493,7 @@ mod tests {
         }
         let replacement = Uid::new(3000);
         assert!(matches!(
-                    ledger.reserve_prestart_endpoint_bytes(
+                    ledger.reserve_user_endpoint_bytes(
         replacement,
         1,
         #[cfg(kernelet_nat_failure_diag_host)] QuotaTag::TEST,
@@ -1424,7 +1504,7 @@ mod tests {
                     Err(error) if error.error() == Errno::ENOSPC
                 ));
 
-        ledger.release_prestart_endpoint_bytes(
+        ledger.release_user_endpoint_bytes(
             user_slot,
             owner,
             NATIVE,
@@ -1433,9 +1513,9 @@ mod tests {
         );
         assert_eq!(ledger.users[user_slot].owner, None);
         assert_eq!(ledger.users[user_slot].endpoint_bytes, 0);
-        assert_eq!(ledger.users[user_slot].prestart_endpoint_bytes, 0);
+        assert_eq!(ledger.users[user_slot].independent_endpoint_bytes, 0);
         let reused = ledger
-            .reserve_prestart_endpoint_bytes(
+            .reserve_user_endpoint_bytes(
                 replacement,
                 1,
                 #[cfg(kernelet_nat_failure_diag_host)]
@@ -1457,7 +1537,7 @@ mod tests {
         let mut ledger = Ledger::new();
         let owner = Uid::new(4000);
         let slot = ledger
-            .reserve_prestart_endpoint_bytes(
+            .reserve_user_endpoint_bytes(
                 owner,
                 MAX_ENDPOINT_BYTES_PER_USER - 1,
                 #[cfg(kernelet_nat_failure_diag_host)]
@@ -1468,7 +1548,7 @@ mod tests {
             )
             .unwrap();
         let mut failure = None;
-        let result = ledger.reserve_prestart_endpoint_bytes(
+        let result = ledger.reserve_user_endpoint_bytes(
             owner,
             2,
             #[cfg(kernelet_nat_failure_diag_host)]
@@ -1498,7 +1578,7 @@ mod tests {
             MAX_ENDPOINT_BYTES_PER_USER - 1
         );
         assert_eq!(
-            ledger.users[slot].prestart_endpoint_bytes,
+            ledger.users[slot].independent_endpoint_bytes,
             MAX_ENDPOINT_BYTES_PER_USER - 1
         );
     }
@@ -1509,7 +1589,7 @@ mod tests {
         let mut ledger = Ledger::new();
         for index in 0..MAX_USERS {
             ledger
-                .reserve_prestart_endpoint_bytes(
+                .reserve_user_endpoint_bytes(
                     Uid::new(5000 + index as u32),
                     1,
                     #[cfg(kernelet_nat_failure_diag_host)]
@@ -1522,7 +1602,7 @@ mod tests {
         }
         let owner = Uid::new(6000);
         let mut failure = None;
-        let result = ledger.reserve_prestart_endpoint_bytes(
+        let result = ledger.reserve_user_endpoint_bytes(
             owner,
             1,
             #[cfg(kernelet_nat_failure_diag_host)]
@@ -1549,7 +1629,7 @@ mod tests {
         let mut ledger = Ledger::new();
         let owner = Uid::new(6001);
         let slot = ledger
-            .reserve_prestart_endpoint_bytes(
+            .reserve_user_endpoint_bytes(
                 owner,
                 1,
                 #[cfg(kernelet_nat_failure_diag_host)]
@@ -1561,7 +1641,7 @@ mod tests {
             .unwrap();
         let mut failure = None;
         // A real request overflows the addition; no ledger value is fabricated.
-        let result = ledger.reserve_prestart_endpoint_bytes(
+        let result = ledger.reserve_user_endpoint_bytes(
             owner,
             usize::MAX,
             #[cfg(kernelet_nat_failure_diag_host)]
@@ -1578,7 +1658,7 @@ mod tests {
         assert_eq!(snapshot.endpoint_bytes, Some(1));
         assert_eq!(snapshot.prestart_bytes, Some(1));
         assert_eq!(ledger.users[slot].endpoint_bytes, 1);
-        assert_eq!(ledger.users[slot].prestart_endpoint_bytes, 1);
+        assert_eq!(ledger.users[slot].independent_endpoint_bytes, 1);
     }
 
     #[cfg(kernelet_nat_failure_diag_host)]
@@ -1591,7 +1671,7 @@ mod tests {
         };
         assert!(!before, "diagnostic test UID is already reserved");
         let mut failure = None;
-        let reservation = PrestartEndpointReservation::reserve_diagnostic(
+        let reservation = UserEndpointReservation::reserve_diagnostic(
             owner,
             32,
             QuotaTag::TEST,
@@ -1605,7 +1685,7 @@ mod tests {
                 .users
                 .iter()
                 .find(|user| user.owner == Some(owner))
-                .map(|user| (user.endpoint_bytes, user.prestart_endpoint_bytes))
+                .map(|user| (user.endpoint_bytes, user.independent_endpoint_bytes))
         };
         assert!(failure.is_none());
         assert_eq!(charged, Some((32, 32)));
@@ -1622,7 +1702,7 @@ mod tests {
         let user = &ledger.users[slot];
         assert!(
             user.categories
-                .totals_match(user.endpoint_bytes, user.prestart_endpoint_bytes)
+                .totals_match(user.endpoint_bytes, user.independent_endpoint_bytes)
         );
         assert!(!user.categories.accounting_error);
         assert!(!user.categories.counter_overflow);
@@ -1647,13 +1727,7 @@ mod tests {
         ];
         for class in classes {
             let slot = ledger
-                .reserve_prestart_endpoint_bytes(
-                    owner,
-                    32,
-                    QuotaTag::new(class, Some(3)),
-                    None,
-                    None,
-                )
+                .reserve_user_endpoint_bytes(owner, 32, QuotaTag::new(class, Some(3)), None, None)
                 .unwrap();
             assert_categories(&ledger, slot);
             assert_eq!(
@@ -1676,7 +1750,7 @@ mod tests {
         assert_eq!(ledger.users[slot].categories.balances[initial].current, 0);
         assert_eq!(ledger.users[slot].categories.balances[dynamic].current, 0);
         for class in classes {
-            ledger.release_prestart_endpoint_bytes(slot, owner, 32, QuotaTag::new(class, Some(3)));
+            ledger.release_user_endpoint_bytes(slot, owner, 32, QuotaTag::new(class, Some(3)));
             if ledger.users[slot].owner.is_some() {
                 assert_categories(&ledger, slot);
             }
@@ -1691,18 +1765,12 @@ mod tests {
         let owner = Uid::new(6101);
         let tag = QuotaTag::new(QuotaClass::NatFlow, Some(4));
         let slot = ledger
-            .reserve_prestart_endpoint_bytes(
-                owner,
-                MAX_ENDPOINT_BYTES_PER_USER - 1,
-                tag,
-                None,
-                None,
-            )
+            .reserve_user_endpoint_bytes(owner, MAX_ENDPOINT_BYTES_PER_USER - 1, tag, None, None)
             .unwrap();
         let before = ledger.users[slot].categories;
         let mut scalar = None;
         let mut category = None;
-        let failure = ledger.reserve_prestart_endpoint_bytes(
+        let failure = ledger.reserve_user_endpoint_bytes(
             owner,
             2,
             tag,
@@ -1721,7 +1789,7 @@ mod tests {
         assert!(category.is_consistent());
         assert_eq!(ledger.users[slot].categories, before);
         assert_categories(&ledger, slot);
-        ledger.release_prestart_endpoint_bytes(slot, owner, MAX_ENDPOINT_BYTES_PER_USER - 1, tag);
+        ledger.release_user_endpoint_bytes(slot, owner, MAX_ENDPOINT_BYTES_PER_USER - 1, tag);
     }
 
     #[cfg(kernelet_nat_failure_diag_host)]
@@ -1732,7 +1800,7 @@ mod tests {
         for native_first in [false, true] {
             let owner = Uid::new(u32::MAX - 43 - u32::from(native_first));
             let tag = QuotaTag::new(QuotaClass::NatFlow, Some(27));
-            let mut front = PrestartEndpointReservation::reserve(owner, TOTAL, tag).unwrap();
+            let mut front = UserEndpointReservation::reserve(owner, TOTAL, tag).unwrap();
             let slot = front.user_slot;
             let before = { LEDGER.lock().users[slot].categories };
             assert!(front.split_off(0, QuotaClass::NatNativeTcp).is_none());
@@ -1749,7 +1817,7 @@ mod tests {
                 let ledger = LEDGER.lock();
                 let user = &ledger.users[slot];
                 assert_eq!(user.endpoint_bytes, TOTAL);
-                assert_eq!(user.prestart_endpoint_bytes, TOTAL);
+                assert_eq!(user.independent_endpoint_bytes, TOTAL);
                 assert_eq!(
                     user.categories.balances[QuotaClass::NatFlow as usize].current,
                     TOTAL - NATIVE
@@ -1797,7 +1865,7 @@ mod tests {
     #[ktest]
     fn destroy_and_stale_dynamic_drop_preserve_independent_epoch_and_balance() {
         let owner = Uid::new(u32::MAX - 45);
-        let guard = PrestartEndpointReservation::reserve(
+        let guard = UserEndpointReservation::reserve(
             owner,
             128,
             QuotaTag::new(QuotaClass::NatNativeTcp, Some(28)),
@@ -1821,7 +1889,7 @@ mod tests {
         drop(admission);
         drop(guard);
         assert_eq!(LEDGER.lock().users[slot].owner, None);
-        let replacement = PrestartEndpointReservation::reserve(owner, 1, QuotaTag::TEST).unwrap();
+        let replacement = UserEndpointReservation::reserve(owner, 1, QuotaTag::TEST).unwrap();
         assert!(
             LEDGER.lock().users[replacement.user_slot]
                 .categories
@@ -1838,13 +1906,13 @@ mod tests {
         let mut ledger = Ledger::new();
         let owner = Uid::new(6102);
         let slot = ledger
-            .reserve_prestart_endpoint_bytes(owner, 1, QuotaTag::TEST, None, None)
+            .reserve_user_endpoint_bytes(owner, 1, QuotaTag::TEST, None, None)
             .unwrap();
         // Seed only the diagnostic operation counter, never quota balances.
         ledger.users[slot].categories.balances[QuotaClass::TestOnly as usize].reserve_count =
             u64::MAX;
         ledger
-            .reserve_prestart_endpoint_bytes(owner, 1, QuotaTag::TEST, None, None)
+            .reserve_user_endpoint_bytes(owner, 1, QuotaTag::TEST, None, None)
             .unwrap();
         assert_eq!(ledger.users[slot].endpoint_bytes, 2);
         assert_eq!(
@@ -1852,7 +1920,7 @@ mod tests {
             2
         );
         assert!(ledger.users[slot].categories.counter_overflow);
-        ledger.release_prestart_endpoint_bytes(slot, owner, 2, QuotaTag::TEST);
+        ledger.release_user_endpoint_bytes(slot, owner, 2, QuotaTag::TEST);
         assert_eq!(ledger.users[slot].owner, None);
     }
 
@@ -1866,9 +1934,8 @@ mod tests {
         aster_time::init_for_ktest();
         let owner = Uid::new(u32::MAX - 49);
         let tag = QuotaTag::new(QuotaClass::NatFlow, Some(29));
-        let held =
-            PrestartEndpointReservation::reserve(owner, MAX_ENDPOINT_BYTES_PER_USER - 1024, tag)
-                .unwrap();
+        let held = UserEndpointReservation::reserve(owner, MAX_ENDPOINT_BYTES_PER_USER - 1024, tag)
+            .unwrap();
         let worker_entered = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
@@ -1877,7 +1944,7 @@ mod tests {
         let entered = worker_entered.clone();
         let task = TaskOptions::new(move || {
             while !worker_stop.load(Ordering::Acquire) {
-                let mut flow = PrestartEndpointReservation::reserve(owner, 512, tag).unwrap();
+                let mut flow = UserEndpointReservation::reserve(owner, 512, tag).unwrap();
                 let native = flow.split_off(288, QuotaClass::NatNativeTcp).unwrap();
                 entered.store(true, Ordering::Release);
                 Task::yield_now();
@@ -1901,7 +1968,7 @@ mod tests {
         for _ in 0..16 {
             let mut failure = None;
             let mut categories = None;
-            let result = PrestartEndpointReservation::reserve_diagnostic(
+            let result = UserEndpointReservation::reserve_diagnostic(
                 owner,
                 2048,
                 tag,
@@ -1931,7 +1998,7 @@ mod tests {
             user.endpoint_bytes == MAX_ENDPOINT_BYTES_PER_USER - 1024
                 && user
                     .categories
-                    .totals_match(user.endpoint_bytes, user.prestart_endpoint_bytes)
+                    .totals_match(user.endpoint_bytes, user.independent_endpoint_bytes)
                 && !user.categories.accounting_error
         };
         drop((held, task));
@@ -1945,7 +2012,7 @@ mod tests {
         let mut ledger = Ledger::new();
         for index in 0..MAX_USERS {
             ledger
-                .reserve_prestart_endpoint_bytes(
+                .reserve_user_endpoint_bytes(
                     Uid::new(6200 + index as u32),
                     1,
                     QuotaTag::new(QuotaClass::NetFixed, Some(3)),
@@ -1956,7 +2023,7 @@ mod tests {
         }
         let mut failure = None;
         let mut category = None;
-        let result = ledger.reserve_prestart_endpoint_bytes(
+        let result = ledger.reserve_user_endpoint_bytes(
             Uid::new(6300),
             1,
             QuotaTag::new(QuotaClass::NatFlow, Some(4)),

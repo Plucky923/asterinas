@@ -10,3 +10,4 @@ SUBDIRS := \
 include ../common/Makefile
 
 $(OBJ_OUTPUT_DIR)/cpu_tick_accounting: EXTRA_C_FLAGS += -pthread
+$(OBJ_OUTPUT_DIR)/dynamic_cpu_clocks: EXTRA_C_FLAGS += -pthread

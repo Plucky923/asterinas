@@ -137,10 +137,73 @@ _trap_from_kernel:
     push rbx
     push rax
 
-    # Host and kernelet kernel traps share the native Task-stack path.
-    # The Rust trap-return hook selects a checked image redirect, if needed.
+    # Preserve the frame pointer across a Host stack handoff. No ownership,
+    # interrupt accounting, callback or Rust frame precedes this prefix.
+.if {kernelet_host}
+    mov rbx, rsp
+    xor r12d, r12d
+    lea r11, [rip + KERNELET_HOST_STATE_PTR]
+    lea r10, [rip + __cpu_local_start]
+    sub r11, r10
+    mov r11, gs:[r11]
+    test r11, r11
+    jz .Ltrap_stack_ready
+    cmp qword ptr [rbx + 15*8], 8
+    je .Ltrap_doublefault_stack
+    # Authenticate the saved stack against the pinned pool geometry. Native
+    # Host/IST stacks and nested IRQ stacks keep their interrupted pointer.
+    mov rax, [rbx + 20*8]
+    and rax, -524288
+    cmp rax, [r11 + 64]
+    jb .Ltrap_stack_ready
+    cmp rax, [r11 + 72]
+    jae .Ltrap_stack_ready
+    cmp qword ptr [rbx + 15*8], 32
+    jb .Ltrap_exception_stack
+    lea r12, [rip + KERNELET_IRQ_STACK_BUSY]
+    sub r12, r10
+    cmp qword ptr gs:[r12], 0
+    jne .Ltrap_nested_stack
+    lea rax, [rip + KERNELET_IRQ_STACK_TOP]
+    sub rax, r10
+    mov rax, gs:[rax]
+    test rax, rax
+    jz .Ltrap_nested_stack
+    mov qword ptr gs:[r12], 1
+    mov rsp, rax
+    jmp .Ltrap_stack_ready
+.Ltrap_nested_stack:
+    xor r12d, r12d
+    jmp .Ltrap_stack_ready
+.Ltrap_exception_stack:
+    mov rsp, [r11]
+    and rsp, -16
+    jmp .Ltrap_stack_ready
+.Ltrap_doublefault_stack:
+    # The bounded precheck runs on the independent IST. Only attributed,
+    # discardable Image execution may use the preserved carrier continuation.
+    # No precheck frame or Host resource survives this synchronous call.
+    mov rdi, rbx
+    call kernelet_host_recovery_stack_impl
+    test rax, rax
+    jz .Ltrap_stack_ready
+    mov rsp, rax
+    and rsp, -16
+.Ltrap_stack_ready:
+    mov rdi, rbx
+.else
     mov rdi, rsp
+.endif
     call trap_handler
+.if {kernelet_host}
+    mov rsp, rbx
+    # Leave the per-CPU stack before making it available to another entry.
+    # IRQs remain masked through the fixed IRET tail.
+    test r12, r12
+    jz .Ltrap_stack_released
+    mov qword ptr gs:[r12], 0
+.Ltrap_stack_released:
+.endif
 
     pop rax
     pop rbx
@@ -162,3 +225,5 @@ _trap_from_kernel:
     add rsp, 16
 
     iretq
+.global kernelet_kernel_trap_end
+kernelet_kernel_trap_end:

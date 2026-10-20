@@ -24,6 +24,8 @@ pub(crate) mod options;
 pub(crate) mod unix;
 pub(crate) mod util;
 pub(crate) mod vsock;
+#[cfg(feature = "kernelet")]
+pub(crate) mod zero_copy;
 
 mod private {
     use core::time::Duration;

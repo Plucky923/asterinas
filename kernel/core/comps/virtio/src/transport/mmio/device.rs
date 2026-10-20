@@ -24,7 +24,9 @@ use super::{
 use crate::{
     VirtioDeviceType,
     queue::{AvailRing, Descriptor, UsedRing},
-    transport::{ConfigManager, DeviceStatus, VirtioTransport, VirtioTransportError},
+    transport::{
+        ConfigGeneration, ConfigManager, DeviceStatus, VirtioTransport, VirtioTransportError,
+    },
 };
 
 #[derive(Debug)]
@@ -89,6 +91,16 @@ impl VirtioMmioTransport {
 }
 
 impl VirtioTransport for VirtioMmioTransport {
+    fn device_config_generation(&self) -> Option<ConfigGeneration> {
+        if self.is_legacy_version() {
+            return None;
+        }
+        Some(ConfigGeneration::Mmio(SafePtr::new(
+            self.common_device.io_mem().clone(),
+            offset_of!(VirtioMmioLayout, config_generation),
+        )))
+    }
+
     fn device_type(&self) -> VirtioDeviceType {
         VirtioDeviceType::try_from(self.device.device_id() as u8).unwrap()
     }

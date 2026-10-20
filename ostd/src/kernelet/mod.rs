@@ -19,6 +19,8 @@ pub(crate) mod account;
 mod deadline;
 #[cfg(any(feature = "kernelet", feature = "kernelet-host", ktest))]
 pub(crate) mod dma;
+#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+pub mod shared_buffer;
 
 #[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
 pub(crate) mod clock;
@@ -32,6 +34,8 @@ pub mod entry;
 #[cfg(feature = "kernelet-host")]
 pub(crate) mod host_image;
 
+#[cfg(feature = "kernelet-host")]
+pub mod guest_dma;
 #[cfg(feature = "kernelet-host")]
 pub mod guest_memory;
 #[cfg(feature = "kernelet-host")]

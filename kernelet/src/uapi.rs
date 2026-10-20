@@ -42,6 +42,32 @@ impl Sandbox {
         self.attach_with_arg(kind, backing, flags, 0)
     }
 
+    /// Adds an independent shared-buffer device. This does not change BLOCK
+    /// attachments or the image's ordinary VirtIO device enumeration.
+    pub fn attach_zero_copy_block(&self, backing: &File, read_only: bool) -> Result<u16> {
+        self.attach(
+            ZERO_COPY_BLOCK,
+            Some(backing),
+            if read_only { BLOCK_READ_ONLY } else { 0 },
+        )
+    }
+
+    /// Attaches a transparent disk using retained Image DMA pages.
+    pub fn attach_borrowed_block(&self, backing: &File, read_only: bool) -> Result<u16> {
+        self.attach(
+            BORROWED_BLOCK,
+            Some(backing),
+            if read_only { BLOCK_READ_ONLY } else { 0 },
+        )
+    }
+
+    /// Reads actual payload-path coverage for the selected devices.
+    pub fn io_path_stats(&self) -> Result<IoPathStatsRaw> {
+        let mut stats = IoPathStatsRaw::default();
+        call(&self.file, IO_PATH_STATS, &mut stats as *mut _ as usize)?;
+        Ok(stats)
+    }
+
     pub fn attach_with_arg(
         &self,
         kind: u16,
@@ -78,6 +104,25 @@ impl Sandbox {
     pub fn vsock_policy(&self, args: &VsockPolicyArgs) -> Result<()> {
         call(&self.file, VSOCK_POLICY, args as *const _ as usize)?;
         Ok(())
+    }
+
+    /// Authorizes whole-buffer handoff with a second live sandbox capability.
+    /// Repeated calls return the existing connection rather than using quota.
+    pub fn connect_shared_buffers(&self, peer: &Self) -> Result<(u64, u64)> {
+        let mut args = SharedBufferConnectArgs {
+            peer_fd: peer.file.as_raw_fd(),
+            ..Default::default()
+        };
+        call(
+            &self.file,
+            SHARED_BUFFER_CONNECT,
+            &mut args as *mut _ as usize,
+        )?;
+        anyhow::ensure!(
+            args.out_connection != 0 && args.out_peer_connection != 0,
+            "host returned an invalid shared-buffer connection"
+        );
+        Ok((args.out_connection, args.out_peer_connection))
     }
 
     pub fn start(&self) -> Result<()> {

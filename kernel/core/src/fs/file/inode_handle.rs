@@ -102,6 +102,23 @@ impl InodeHandle {
         *offset
     }
 
+    /// Queries the current positional-I/O size without changing the shared offset.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn size_for_positional_io(&self) -> Result<usize> {
+        if self.status_flags().contains(StatusFlags::O_PATH) {
+            return_errno_with_message!(Errno::EBADF, "the file is opened as a path");
+        }
+        self.file_ops_for_positional_io()?;
+        if let Some(open_file) = &self.open_file {
+            // Keep filesystem-specific revalidation, including virtiofs's
+            // retained open handle, without performing a seek on this FD.
+            return open_file.seek_end()?.ok_or_else(|| {
+                Error::with_message(Errno::ESPIPE, "file size is unavailable for positional I/O")
+            });
+        }
+        Ok(self.path().metadata()?.size)
+    }
+
     fn file_ops_and_is_offset_aware(&self) -> (&dyn FileOps, bool) {
         if let Some(ref open_file) = self.open_file {
             let is_offset_aware = open_file.is_offset_aware();
@@ -646,4 +663,85 @@ fn do_seek_util(offset: &Mutex<usize>, pos: SeekFrom, end: Option<usize>) -> Res
 
     *offset = new_offset;
     Ok(new_offset)
+}
+
+#[cfg(all(ktest, feature = "kernelet-host"))]
+mod test {
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::fs::ramfs::memfd::{MemfdFlags, MemfdInodeHandle};
+
+    struct RefreshedEnd {
+        end: Result<usize>,
+        seekable: bool,
+    }
+
+    impl FileOps for RefreshedEnd {
+        fn read_at(&self, _: usize, _: &mut VmWriter, _: StatusFlags) -> Result<usize> {
+            unreachable!("size query must not read payload");
+        }
+        fn write_at(&self, _: usize, _: &mut VmReader, _: StatusFlags) -> Result<usize> {
+            unreachable!("size query must not write payload");
+        }
+    }
+
+    impl Pollable for RefreshedEnd {
+        fn poll(&self, _: IoEvents, _: Option<&mut PollHandle>) -> IoEvents {
+            IoEvents::empty()
+        }
+    }
+
+    impl PerOpenFileOps for RefreshedEnd {
+        fn check_seekable(&self) -> Result<()> {
+            if !self.seekable {
+                return_errno!(Errno::ESPIPE);
+            }
+            Ok(())
+        }
+        fn is_offset_aware(&self) -> bool {
+            true
+        }
+        fn seek_end(&self) -> Result<Option<usize>> {
+            self.end.map(Some)
+        }
+    }
+
+    #[ktest]
+    fn positional_size_preserves_open_file_refresh_and_errors() {
+        aster_time::init_for_ktest();
+        crate::time::clocks::init_for_ktest();
+        let mut file =
+            InodeHandle::new_memfd("positional-size".into(), MemfdFlags::empty()).unwrap();
+        file.resize(4096).unwrap();
+        file.seek(SeekFrom::Start(512)).unwrap();
+        file.open_file = Some(Box::new(RefreshedEnd {
+            end: Ok(8192),
+            seekable: true,
+        }));
+        assert_eq!(file.path().size(), 4096);
+        assert_eq!(file.size_for_positional_io().unwrap(), 8192);
+        assert_eq!(file.offset(), 512);
+        file.open_file = Some(Box::new(RefreshedEnd {
+            end: Err(Error::with_message(
+                Errno::EIO,
+                "injected attribute refresh failure",
+            )),
+            seekable: true,
+        }));
+        assert_eq!(
+            file.size_for_positional_io().unwrap_err().error(),
+            Errno::EIO
+        );
+        assert_eq!(file.offset(), 512);
+        file.open_file = Some(Box::new(RefreshedEnd {
+            end: Ok(8192),
+            seekable: false,
+        }));
+        assert_eq!(
+            file.size_for_positional_io().unwrap_err().error(),
+            Errno::ESPIPE
+        );
+        assert_eq!(file.offset(), 512);
+    }
 }

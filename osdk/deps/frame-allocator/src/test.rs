@@ -15,6 +15,35 @@ use ostd::{
 use super::FrameAllocator;
 
 #[ktest]
+fn refill_covers_non_power_of_two_size_and_alignment() {
+    const MIB: usize = 1024 * 1024;
+    let allocator = FrameAllocator;
+    for (size, alignment, expected) in [
+        (0x1080000, PAGE_SIZE, 32 * MIB),
+        (33 * MIB, PAGE_SIZE, 64 * MIB),
+        (PAGE_SIZE, 64 * MIB, 64 * MIB),
+    ] {
+        let request = Layout::from_size_align(size, alignment).unwrap();
+        let refill = allocator.refill_layout(request).unwrap();
+        assert_eq!(refill.size(), expected);
+        assert_eq!(refill.align(), expected);
+
+        // Import the fresh run into an isolated buddy pool, then allocate
+        // the original request without relying on neighboring free memory.
+        let region = MockMemoryRegion::alloc(expected);
+        let mut pool = super::set::BuddySet::<18>::new_empty();
+        let order = super::chunk::greater_order_of(expected);
+        pool.insert_chunk(region.paddr(), order);
+        let required_order =
+            super::chunk::greater_order_of(size).max(super::chunk::greater_order_of(alignment));
+        let allocated = pool.alloc_chunk(required_order).unwrap();
+        assert_eq!(allocated, region.paddr());
+        assert!(expected >= size);
+        assert!(allocated.is_multiple_of(alignment));
+    }
+}
+
+#[ktest]
 fn frame_allocator_alloc_layout_match() {
     assert_allocation_well_formed(Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap());
     assert_allocation_well_formed(Layout::from_size_align(PAGE_SIZE * 2, PAGE_SIZE).unwrap());

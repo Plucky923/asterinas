@@ -63,6 +63,14 @@ pub fn load_total_free_size() -> usize {
 pub struct FrameAllocator;
 
 impl GlobalFrameAllocator for FrameAllocator {
+    fn refill_layout(&self, layout: Layout) -> Option<Layout> {
+        let bytes = layout
+            .size()
+            .max(layout.align())
+            .checked_next_power_of_two()?;
+        Layout::from_size_align(bytes, bytes).ok()
+    }
+
     fn alloc(&self, layout: Layout) -> Option<Paddr> {
         let guard = irq::disable_local();
         let res = cache::alloc(&guard, layout);

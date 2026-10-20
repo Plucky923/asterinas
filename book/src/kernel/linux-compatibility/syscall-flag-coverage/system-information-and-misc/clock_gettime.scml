@@ -6,4 +6,6 @@ predefined_clockid = CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW |
 clock_gettime(clockid = <predefined_clockid>, tp);
 
 // Get the time of a clock specified by a dynamic ID
+// CPU clocks: profiling, virtual, or scheduling; zero PID/TID means the caller.
+// Scheduling uses tick-based profiling accounting; FD clocks are unsupported.
 clock_gettime(clockid = <INTEGER>, tp);

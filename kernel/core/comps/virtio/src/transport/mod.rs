@@ -57,12 +57,16 @@ pub(crate) trait VirtioTransport: Sync + Send + Debug {
     /// Get access to the device config BAR space.
     fn device_config_bar(&self) -> Option<(BarAccess, usize)>;
 
+    /// Returns the configuration generation register, absent on legacy devices.
+    fn device_config_generation(&self) -> Option<ConfigGeneration>;
+
     // ====================Virtqueue related APIs====================
 
     /// Get the total number of queues
     fn num_queues(&self) -> u16;
 
-    /// Set virtqueue information. Some transport may set other necessary information such as MSI-X vector in PCI transport.
+    /// Sets virtqueue information.
+    /// A transport may also set its queue's MSI-X vector.
     fn set_queue(
         &mut self,
         idx: u16,
@@ -101,6 +105,23 @@ pub(crate) trait VirtioTransport: Sync + Send + Debug {
         &mut self,
         func: Box<IrqCallbackFunction>,
     ) -> Result<(), VirtioTransportError>;
+}
+
+/// Transport-specific widths of the read-only configuration generation register.
+#[derive(Debug)]
+pub(crate) enum ConfigGeneration {
+    Pci(SafePtr<u8, IoMem>),
+    Mmio(SafePtr<u32, IoMem>),
+}
+
+impl ConfigGeneration {
+    pub(crate) fn read(&self) -> Result<u32, VirtioTransportError> {
+        match self {
+            Self::Pci(register) => register.read_once().map(u32::from),
+            Self::Mmio(register) => register.read_once(),
+        }
+        .map_err(|_| VirtioTransportError::DeviceStatusError)
+    }
 }
 
 /// Manage PCI device/notify configuration space (legacy/modern).

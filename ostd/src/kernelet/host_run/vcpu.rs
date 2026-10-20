@@ -27,6 +27,64 @@ use crate::{
 
 const MIN_IDLE_NS: u64 = 50_000;
 
+#[cfg(ktest)]
+static SPIN_BOUNDED_STACK_ROUTE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(ktest)]
+static SPIN_HOST_STACK_ROUTE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(ktest)]
+pub(crate) fn spin_stack_samples() -> (usize, usize) {
+    (
+        SPIN_BOUNDED_STACK_ROUTE.load(Ordering::Relaxed),
+        SPIN_HOST_STACK_ROUTE.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(ktest)]
+pub(crate) fn reset_spin_stack_samples() {
+    SPIN_BOUNDED_STACK_ROUTE.store(0, Ordering::Relaxed);
+    SPIN_HOST_STACK_ROUTE.store(0, Ordering::Relaxed);
+}
+
+/// Observes the selected stack without copying or publishing its pointer.
+/// One means Image pool; two means a Host stack. Zero means no observation.
+#[cfg(ktest)]
+#[inline(always)]
+fn sampled_stack_route(state: &super::CarrierState<'_>) -> usize {
+    let above: u8;
+    let below: u8;
+    // SAFETY: This compares RSP against pinned Host bounds without memory
+    // access, stack adjustment or an escaping stack-derived register.
+    unsafe {
+        core::arch::asm!(
+            "cmp rsp, {start}",
+            "setae {above}",
+            "cmp rsp, {end}",
+            "setb {below}",
+            start = in(reg) state.stack_pool_start,
+            end = in(reg) state.stack_pool_end,
+            above = out(reg_byte) above,
+            below = out(reg_byte) below,
+            options(nostack, nomem),
+        );
+    }
+    if above & below != 0 { 1 } else { 2 }
+}
+
+// SAFETY: The trusted assembly fixture calls with physical IRQs masked, before
+// lowering its stack. This establishes the real same-tick admission condition.
+#[cfg(ktest)]
+#[unsafe(no_mangle)]
+extern "C" fn kernelet_test_prime_spin_tick() {
+    if let Some(state) = unsafe { current_carrier_state() } {
+        state
+            .last_spin
+            .set(crate::timer::Jiffies::elapsed().as_u64());
+    }
+}
+
 // SAFETY: Both services are entered through authenticated Host-stack stubs.
 #[unsafe(no_mangle)]
 extern "C" fn kernelet_host_vcpu_boot_impl(vcpu: u32) -> i64 {
@@ -111,6 +169,8 @@ extern "C" fn kernelet_host_vcpu_on_spin_impl() {
     let Some(state) = (unsafe { current_carrier_state() }) else {
         return;
     };
+    #[cfg(ktest)]
+    SPIN_HOST_STACK_ROUTE.store(sampled_stack_route(state), Ordering::Relaxed);
     let Some(_admission) = state.admit_service() else {
         return;
     };
@@ -122,6 +182,39 @@ extern "C" fn kernelet_host_vcpu_on_spin_impl() {
         crate::arch::irq::disable_local();
     }
     state.set_phase(RETURNING);
+}
+
+/// Handles another spin hint in the current tick without scheduling.
+///
+/// The linked-build analyzer proves the complete machine-code call closure.
+/// Rejection leaves ENTERING intact so assembly can use the ordinary Host
+/// stack implementation. Successful admission preserves the active root;
+/// its assembly return therefore needs no root-registration cleanup.
+// SAFETY: Only the checked on-spin gate calls with physical IRQs masked.
+#[unsafe(no_mangle)]
+extern "C" fn kernelet_host_vcpu_on_spin_bounded_impl() -> u32 {
+    // SAFETY: The gate retains the pinned carrier through its final return.
+    let Some(state) = (unsafe { current_carrier_state() }) else {
+        return 0;
+    };
+    let Some(carrier) = state.control.carriers.get(state.vcpu as usize) else {
+        return 0;
+    };
+    if state.last_spin.get() != crate::timer::Jiffies::elapsed().as_u64()
+        || state.sample_stop()
+        || state.run_state.load(Ordering::Acquire) != super::ENTERING
+    {
+        return 0;
+    }
+    carrier
+        .counters
+        .service_calls
+        .fetch_add(1, Ordering::Relaxed);
+    #[cfg(ktest)]
+    SPIN_BOUNDED_STACK_ROUTE.store(sampled_stack_route(state), Ordering::Relaxed);
+    state.run_state.store(SERVICE, Ordering::Release);
+    state.run_state.store(RETURNING, Ordering::Release);
+    1
 }
 
 // SAFETY: The assembly stub authenticated this crossing and its shared Task

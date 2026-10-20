@@ -12,8 +12,11 @@ use super::{
 use crate::{
     fs::file::file_table::RawFileDesc,
     prelude::*,
-    process::{posix_thread::ContextPthreadAdminApi, signal::sig_mask::SigMask},
-    time::timespec_t,
+    process::{
+        posix_thread::{ContextPthreadAdminApi, Personality},
+        signal::sig_mask::SigMask,
+    },
+    time::{read_monotonic_time, timespec_t},
 };
 
 pub(super) fn sys_pselect6(
@@ -34,6 +37,14 @@ pub(super) fn sys_pselect6(
         None
     };
 
+    let end_time = timeout.map(|timeout| {
+        if timeout.is_zero() {
+            Duration::ZERO
+        } else {
+            read_monotonic_time().saturating_add(timeout)
+        }
+    });
+
     if sigmask_addr != 0 {
         let sigmask_with_size = user_space.read_val::<SigMaskWithSize>(sigmask_addr)?;
         if sigmask_with_size.addr != 0 {
@@ -46,14 +57,25 @@ pub(super) fn sys_pselect6(
         }
     }
 
-    do_sys_select(
+    let result = do_sys_select(
         nfds,
         readfds_addr,
         writefds_addr,
         exceptfds_addr,
-        timeout,
+        end_time,
         ctx,
-    )
+    );
+
+    if let Some(end_time) = end_time.filter(|end_time| !end_time.is_zero())
+        && ctx.posix_thread.personality() & Personality::STICKY_TIMEOUTS.bits() == 0
+    {
+        let remaining = timespec_t::from(end_time.saturating_sub(read_monotonic_time()));
+        // This is the raw Linux ABI; libc pselect protects its const argument
+        // with a copy. Timeout copy failures do not replace the syscall result.
+        let _ = user_space.write_val(timespec_addr, &remaining);
+    }
+
+    result
 }
 
 // Reference: <https://elixir.bootlin.com/linux/v6.19.8/source/fs/select.c#L763-L772>

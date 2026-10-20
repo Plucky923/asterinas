@@ -4,6 +4,8 @@
 
 set -e
 
+./clock_resolution
+
 ./clock_tsc
 ./cpu_tick_accounting
 

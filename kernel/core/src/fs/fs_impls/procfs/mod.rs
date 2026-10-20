@@ -55,6 +55,8 @@ mod kernelet_rq1_crossing;
 mod kernelet_rq1_echo;
 #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
 mod kernelet_rq1_tlb;
+#[cfg(all(kernelet_shared_io_test, feature = "kernelet"))]
+mod kernelet_shared_io_test;
 mod loadavg;
 mod meminfo;
 mod mounts;
@@ -182,6 +184,12 @@ impl RootDirOps {
     const STATIC_ENTRIES: &'static [StaticEntry] = &[
         ("cmdline", InodeType::File, CmdLineFileOps::new_inode),
         ("cpuinfo", InodeType::File, CpuInfoFileOps::new_inode),
+        #[cfg(all(kernelet_shared_io_test, feature = "kernelet"))]
+        (
+            "kernelet_shared_io_test",
+            InodeType::File,
+            kernelet_shared_io_test::SharedIoTestFileOps::new_inode,
+        ),
         (
             "filesystems",
             InodeType::File,

@@ -31,13 +31,14 @@ use crate::{
 
 /// Locations and resource limits shared by the CLI parser and the shim's
 /// in-process create path, so the two entry points cannot drift apart.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CreateSettings {
     cache: PathBuf,
     agent: PathBuf,
     mke2fs: PathBuf,
     vcpus: u16,
     max_grains: u32,
+    max_tasks: u32,
 }
 
 impl Default for CreateSettings {
@@ -48,6 +49,7 @@ impl Default for CreateSettings {
             mke2fs: super::DEFAULT_MKE2FS.into(),
             vcpus: super::DEFAULT_VCPUS,
             max_grains: super::DEFAULT_MAX_GRAINS,
+            max_tasks: super::DEFAULT_MAX_TASKS,
         }
     }
 }
@@ -60,6 +62,7 @@ impl From<&Cli> for CreateSettings {
             mke2fs: cli.mke2fs.clone(),
             vcpus: cli.vcpus,
             max_grains: cli.max_grains,
+            max_tasks: cli.max_tasks,
         }
     }
 }
@@ -79,7 +82,107 @@ enum HolderPlacement {
 const HOLDER_HANDOFF_TIMEOUT_SECS: u64 = 10;
 
 const LOG_LEVEL_ANNOTATION: &str = "org.asterinas.kernelet.log-level";
+const MAX_TASKS_ANNOTATION: &str = "org.asterinas.kernelet.max-tasks";
 const IMAGE_CMDLINE: &str = "root=/dev/vda rootfstype=ext2 ro init=/sbin/kernelet-agent";
+
+const ZERO_COPY_BLOCKS_ANNOTATION: &str = "org.asterinas.kernelet.zero-copy-blocks";
+const IO_DEVICES_ANNOTATION: &str = "org.asterinas.kernelet.io-devices";
+
+#[derive(Clone, Copy, Default, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BlockIoMode {
+    #[default]
+    Copy,
+    Borrowed,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum NetworkIoMode {
+    #[default]
+    Copy,
+    Shared,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct IoDevices {
+    block: BlockIoMode,
+    network: NetworkIoMode,
+    block_backings: Option<Vec<PathBuf>>,
+    data_backings: Vec<DataBlockAttachment>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DataBlockAttachment {
+    path: PathBuf,
+    read_only: bool,
+}
+
+fn io_devices(config: &Config, image_count: usize) -> Result<IoDevices> {
+    let devices: IoDevices = match config.annotations.get(IO_DEVICES_ANNOTATION) {
+        Some(value) => {
+            serde_json::from_str(value).with_context(|| format!("parse {IO_DEVICES_ANNOTATION}"))?
+        }
+        None => IoDevices::default(),
+    };
+    if let Some(backings) = &devices.block_backings {
+        ensure!(
+            backings.len() == image_count,
+            "blockBackings must match the root and bind-image count"
+        );
+        ensure!(
+            backings.iter().all(|path| path.is_absolute()),
+            "blockBackings must be absolute paths"
+        );
+    }
+    ensure!(
+        devices.block != BlockIoMode::Borrowed || devices.block_backings.is_some(),
+        "borrowed block devices require explicit whole-device blockBackings"
+    );
+    for (index, attachment) in devices.data_backings.iter().enumerate() {
+        ensure!(
+            attachment.path.is_absolute(),
+            "dataBackings must be absolute paths"
+        );
+        ensure!(
+            devices.data_backings[..index]
+                .iter()
+                .all(|previous| previous.path != attachment.path)
+                && devices
+                    .block_backings
+                    .as_ref()
+                    .is_none_or(|roots| !roots.contains(&attachment.path)),
+            "dataBackings must not duplicate root or data backing paths"
+        );
+    }
+    Ok(devices)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ZeroCopyBlockAttachment {
+    path: PathBuf,
+    read_only: bool,
+}
+
+fn zero_copy_blocks(config: &Config) -> Result<Vec<ZeroCopyBlockAttachment>> {
+    let Some(value) = config.annotations.get(ZERO_COPY_BLOCKS_ANNOTATION) else {
+        return Ok(Vec::new());
+    };
+    let devices: Vec<ZeroCopyBlockAttachment> = serde_json::from_str(value)
+        .with_context(|| format!("parse {ZERO_COPY_BLOCKS_ANNOTATION}"))?;
+    ensure!(
+        devices.len() <= kernelet_abi::MAX_ZERO_COPY_BLOCKS,
+        "at most 64 zero-copy block devices are supported"
+    );
+    ensure!(
+        devices.iter().all(|device| device.path.is_absolute()),
+        "zero-copy block device paths must be absolute"
+    );
+    Ok(devices)
+}
 
 /// Carries one validated early-parser value through the existing boot command line.
 fn image_cmdline(config: &Config) -> Result<String> {
@@ -371,6 +474,8 @@ impl BootedSandbox {
         console_socket: Option<&Path>,
     ) -> Result<Self> {
         let mut args = create_args(settings, config)?;
+        let zero_copy_blocks = zero_copy_blocks(config)?;
+        let io_devices = io_devices(config, images.len())?;
         let rq1_ram = if rq1_io_requested(config, images.len())? {
             Some(open_rq1_ram()?)
         } else {
@@ -385,6 +490,10 @@ impl BootedSandbox {
         };
         let sandbox = &capability.sandbox;
         config.network = crate::network::configure(&config.annotations, args.out_cid)?;
+        ensure!(
+            io_devices.network != NetworkIoMode::Shared || config.network.is_some(),
+            "shared network mode requires an enabled network configuration"
+        );
         record.persist(config, args.out_cid)?;
         // The image's VirtIO MMIO driver pops transports in reverse attachment
         // order. With exactly one root image, attaching RAM first keeps the
@@ -395,11 +504,60 @@ impl BootedSandbox {
                 .context("attach diagnostic RQ1 RAM backing as vdb")?;
         }
         // Reverse discovery must preserve root=vda and bind1=vdb, bind2=vdc.
-        for image in images.iter().rev() {
+        // Reverse discovery places explicit data disks after all root/bind
+        // images. Their read/write policy does not change the OCI root image.
+        for attachment in io_devices.data_backings.iter().rev() {
+            let backing = OpenOptions::new()
+                .read(true)
+                .write(!attachment.read_only)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&attachment.path)
+                .with_context(|| format!("open data backing {}", attachment.path.display()))?;
+            sandbox
+                .attach(
+                    if io_devices.block == BlockIoMode::Borrowed {
+                        uapi::BORROWED_BLOCK
+                    } else {
+                        uapi::BLOCK
+                    },
+                    Some(&backing),
+                    if attachment.read_only {
+                        uapi::BLOCK_READ_ONLY
+                    } else {
+                        0
+                    },
+                )
+                .with_context(|| format!("attach data backing {}", attachment.path.display()))?;
+        }
+        let block_images = io_devices.block_backings.as_deref().unwrap_or(images);
+        for image in block_images.iter().rev() {
             let block = uapi::open_image(image)?;
             sandbox
-                .attach(uapi::BLOCK, Some(&block), uapi::BLOCK_READ_ONLY)
+                .attach(
+                    if io_devices.block == BlockIoMode::Borrowed {
+                        uapi::BORROWED_BLOCK
+                    } else {
+                        uapi::BLOCK
+                    },
+                    Some(&block),
+                    uapi::BLOCK_READ_ONLY,
+                )
                 .with_context(|| format!("attach rootfs image {}", image.display()))?;
+        }
+        // These attachments have their own namespace and never affect the
+        // copying devices' order or Linux disk names.
+        for attachment in zero_copy_blocks {
+            let backing = OpenOptions::new()
+                .read(true)
+                .write(!attachment.read_only)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&attachment.path)
+                .with_context(|| format!("open zero-copy backing {}", attachment.path.display()))?;
+            sandbox
+                .attach_zero_copy_block(&backing, attachment.read_only)
+                .with_context(|| {
+                    format!("attach zero-copy backing {}", attachment.path.display())
+                })?;
         }
         let log = sandbox.endpoint(uapi::LOG).context("open log endpoint")?;
         let console = sandbox
@@ -423,7 +581,16 @@ impl BootedSandbox {
             let mut mac = [0; 8];
             mac[..6].copy_from_slice(&network.mac);
             sandbox
-                .attach_with_arg(uapi::NET, Some(&endpoint), 0, u64::from_le_bytes(mac))
+                .attach_with_arg(
+                    if io_devices.network == NetworkIoMode::Shared {
+                        uapi::SHARED_NET
+                    } else {
+                        uapi::NET
+                    },
+                    Some(&endpoint),
+                    0,
+                    u64::from_le_bytes(mac),
+                )
                 .context("attach network")?;
             // Forwarding belongs to the Host kernel: the endpoint descriptor
             // is dropped here instead of being handed off, and the runtime
@@ -570,11 +737,21 @@ fn create_args(settings: &CreateSettings, config: &Config) -> Result<CreateArgs>
     let mut args = CreateArgs {
         num_vcpus: settings.vcpus,
         max_grains: settings.max_grains,
-        max_tasks: 256,
+        max_tasks: settings.max_tasks,
         oops_budget: 4,
         log_bytes_per_sec: 64 * 1024,
         ..Default::default()
     };
+    if let Some(limit) = config.annotations.get(MAX_TASKS_ANNOTATION) {
+        args.max_tasks = limit
+            .parse()
+            .with_context(|| format!("{MAX_TASKS_ANNOTATION} must be an unsigned task count"))?;
+    }
+    ensure!(
+        (1..=kernelet_abi::MAX_TASKS).contains(&args.max_tasks),
+        "max_tasks must be between 1 and {}",
+        kernelet_abi::MAX_TASKS,
+    );
     if let Some(limit) = config
         .linux
         .pointer("/resources/memory/limit")
@@ -617,6 +794,10 @@ fn create_args(settings: &CreateSettings, config: &Config) -> Result<CreateArgs>
                 .try_into()?;
         }
     }
+    ensure!(
+        args.max_tasks >= u32::from(args.num_vcpus),
+        "max_tasks must cover every configured vCPU"
+    );
     Ok(args)
 }
 
@@ -834,6 +1015,96 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn io_device_modes_preserve_defaults_and_require_explicit_backings() {
+        let mut config = log_level_config(None);
+        let defaults = io_devices(&config, 1).unwrap();
+        assert!(defaults.block == BlockIoMode::Copy);
+        assert!(defaults.network == NetworkIoMode::Copy);
+        for invalid in [
+            r#"{"block":"borrowed"}"#,
+            r#"{"block":"borrowed","blockBackings":["relative"]}"#,
+            r#"{"block":"borrowed","blockBackings":[]}"#,
+            r#"{"network":"typo"}"#,
+            r#"{"network":"shared","typo":true}"#,
+        ] {
+            config
+                .annotations
+                .insert(IO_DEVICES_ANNOTATION.into(), invalid.into());
+            assert!(io_devices(&config, 1).is_err(), "{invalid}");
+        }
+        config.annotations.insert(
+            IO_DEVICES_ANNOTATION.into(),
+            r#"{"block":"borrowed","network":"shared","blockBackings":["/dev/vdb"]}"#.into(),
+        );
+        let devices = io_devices(&config, 1).unwrap();
+        assert!(devices.block == BlockIoMode::Borrowed);
+        assert!(devices.network == NetworkIoMode::Shared);
+        assert_eq!(
+            devices.block_backings.unwrap(),
+            vec![PathBuf::from("/dev/vdb")]
+        );
+    }
+
+    #[test]
+    fn explicit_data_backings_preserve_their_read_write_policy() {
+        let mut config = log_level_config(None);
+        for invalid in [
+            r#"{"dataBackings":[{"path":"relative","readOnly":false}]}"#,
+            r#"{"dataBackings":[{"path":"/dev/vdb"}]}"#,
+            r#"{"blockBackings":["/dev/vda"],"dataBackings":[{"path":"/dev/vda","readOnly":false}]}"#,
+            r#"{"dataBackings":[{"path":"/dev/vdb","readOnly":false},{"path":"/dev/vdb","readOnly":true}]}"#,
+        ] {
+            config
+                .annotations
+                .insert(IO_DEVICES_ANNOTATION.into(), invalid.into());
+            assert!(io_devices(&config, 1).is_err(), "{invalid}");
+        }
+        config.annotations.insert(IO_DEVICES_ANNOTATION.into(),
+            r#"{"block":"borrowed","blockBackings":["/dev/vda"],"dataBackings":[{"path":"/dev/vdb","readOnly":false}]}"#.into());
+        let devices = io_devices(&config, 1).unwrap();
+        assert_eq!(devices.data_backings.len(), 1);
+        assert!(!devices.data_backings[0].read_only);
+        assert_eq!(devices.data_backings[0].path, PathBuf::from("/dev/vdb"));
+    }
+
+    #[test]
+    fn zero_copy_attachments_are_explicit_and_validate_before_creation() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": { "path": "rootfs" },
+            "process": { "args": ["/bin/sh"], "cwd": "/" },
+        }))
+        .unwrap();
+        assert!(zero_copy_blocks(&config).unwrap().is_empty());
+        config.annotations.insert(
+            ZERO_COPY_BLOCKS_ANNOTATION.into(),
+            r#"[{"path":"/dev/vdb","readOnly":true},{"path":"/dev/vdc","readOnly":false}]"#.into(),
+        );
+        let devices = zero_copy_blocks(&config).unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].path, Path::new("/dev/vdb"));
+        assert!(devices[0].read_only);
+        assert!(!devices[1].read_only);
+        for invalid in [
+            r#"[{"path":"relative","readOnly":true}]"#,
+            r#"[{"path":"/dev/vdb"}]"#,
+            r#"[{"path":"/dev/vdb","readOnly":true,"typo":1}]"#,
+            r#"{"path":"/dev/vdb","readOnly":true}"#,
+        ] {
+            config
+                .annotations
+                .insert(ZERO_COPY_BLOCKS_ANNOTATION.into(), invalid.into());
+            assert!(zero_copy_blocks(&config).is_err(), "{invalid}");
+        }
+        let too_many = vec![serde_json::json!({"path":"/dev/vdb","readOnly":true}); 65];
+        config.annotations.insert(
+            ZERO_COPY_BLOCKS_ANNOTATION.into(),
+            serde_json::to_string(&too_many).unwrap(),
+        );
+        assert!(zero_copy_blocks(&config).is_err());
+    }
+
     fn log_level_config(value: Option<&str>) -> Config {
         let mut config: Config = serde_json::from_value(serde_json::json!({
             "ociVersion": "1.0.2",
@@ -990,5 +1261,63 @@ mod tests {
             8388608 / kernelet_abi::GRAIN_SIZE_BYTES
         );
         assert_eq!(args.max_grains, 4);
+    }
+
+    #[test]
+    fn large_workloads_can_select_task_and_guest_memory_limits() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": { "path": "rootfs" },
+            "process": { "args": ["/bin/sh"], "cwd": "/" },
+            "annotations": { "org.asterinas.kernelet.max-tasks": "4096" },
+            "linux": { "resources": { "memory": { "limit": 2147483648i64 } } },
+        }))
+        .unwrap();
+        let args = create_args(&CreateSettings::default(), &config).unwrap();
+        assert_eq!(args.max_tasks, 4096);
+        assert_eq!(args.max_grains, 1024);
+        assert_eq!(args.initial_grains, 256);
+    }
+
+    #[test]
+    fn invalid_task_limits_are_rejected_before_creation() {
+        for value in ["0", "1", "4097", "-1", "256 extra", ""] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "ociVersion": "1.0.2",
+                "root": { "path": "rootfs" },
+                "process": { "args": ["/bin/sh"], "cwd": "/" },
+                "annotations": { "org.asterinas.kernelet.max-tasks": value },
+            }))
+            .unwrap();
+            assert!(
+                create_args(&CreateSettings::default(), &config).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_limit_cli_applies_without_an_oci_override() {
+        let cli = Cli::parse_from([
+            "kernelet-runtime",
+            "--max-tasks",
+            "4096",
+            "create",
+            "test",
+            "--bundle",
+            "/tmp",
+        ]);
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": { "path": "rootfs" },
+            "process": { "args": ["/bin/sh"], "cwd": "/" },
+        }))
+        .unwrap();
+        assert_eq!(
+            create_args(&CreateSettings::from(&cli), &config)
+                .unwrap()
+                .max_tasks,
+            4096
+        );
     }
 }

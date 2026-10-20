@@ -3,7 +3,10 @@
 //! The image-side view of Host-published frame grants and metadata.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::{
+    alloc::Layout,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+};
 
 use super::{
     abi::{GRAIN_SIZE, InfoPage, META_SECTION_BYTES, NO_META_BLOCK, RunDesc},
@@ -79,9 +82,19 @@ pub(crate) fn rescan_grants() {
 }
 
 /// Requests one bounded refill after the image allocator releases its lock.
-pub(crate) fn request_grains(bytes: usize) -> bool {
-    let grains = bytes.div_ceil(GRAIN_SIZE).max(1);
+pub(crate) fn request_grains(layout: Layout) -> bool {
+    let grains = layout.size().div_ceil(GRAIN_SIZE).max(1);
     if grains > super::abi::MAX_GRAINS_PER_REQUEST as usize || is_dying() {
+        return false;
+    }
+    // Growth runs with a power-of-two grain count have the same alignment
+    // as their size. Other runs guarantee only grain alignment.
+    let alignment = if grains.is_power_of_two() {
+        grains * GRAIN_SIZE
+    } else {
+        GRAIN_SIZE
+    };
+    if layout.align() > alignment {
         return false;
     }
     let result = (entry::services().grains_request)(grains as u32, 1);

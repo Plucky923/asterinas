@@ -3,6 +3,7 @@
 //! Host control of a kernelet image.
 
 use alloc::{
+    boxed::Box,
     string::String,
     sync::{Arc, Weak},
     vec::Vec,
@@ -54,6 +55,11 @@ pub const MAX_TASKS: u32 = 4096;
 /// before constructing execution resources and refunds them after destroy.
 pub fn execution_reservation_bytes(max_tasks: u32, vcpus: u16) -> crate::Result<usize> {
     host_run::ExecutionResources::reservation_bytes(max_tasks, vcpus as usize)
+}
+
+/// Reserves one native device worker's stack, Task and scheduler metadata.
+pub fn host_worker_reservation_bytes() -> usize {
+    crate::task::native_stack_reservation_bytes() + size_of::<Task>() + 8 * crate::mm::PAGE_SIZE
 }
 
 static REAPER_PENDING: AtomicBool = AtomicBool::new(false);
@@ -119,6 +125,44 @@ pub trait KerneletHooks: Send + Sync {
     /// Reports exit on the reaper after every carrier Task has retired.
     /// This callback may sleep or call `destroy`; no control lock is held.
     fn on_exited(&self, _kernelet: &Kernelet, _status: &ExitStatus) {}
+
+    /// Looks up a separately attached zero-copy block device. MMIO devices
+    /// are not implicitly available through this interface.
+    fn shared_block_info(&self, _device: u32) -> Option<super::shared_buffer::ZeroCopyBlockInfo> {
+        None
+    }
+
+    /// Discovers a separately bound shared Ethernet device; queries are scalar.
+    fn shared_net_info(&self, _device: u32, _query: u32) -> MmioResult {
+        MmioResult {
+            status: 0,
+            value: 0,
+        }
+    }
+
+    /// Wakes an Ethernet worker after a bounded batch of owning handoffs.
+    fn shared_net_kick(&self, _device: u32) -> bool {
+        false
+    }
+
+    /// Publishes an accepted shared-buffer request. Retain a buffer clone for
+    /// every backend access and callback; record a result before releasing it.
+    /// This hook cannot sleep. Queue physical submission on a schedulable worker.
+    /// The default completes with an unsupported-operation error.
+    fn submit_buffer(
+        &self,
+        buffer: super::shared_buffer::BackendBuffer,
+        _request: super::shared_buffer::IoRequest,
+    ) {
+        let _ = buffer.complete(-super::abi::INVALID, 0);
+    }
+
+    /// Reserves storage and metadata before granting a shared allocation.
+    /// The returned charge outlives the sender while receivers or backends
+    /// retain storage. Hosts without an external quota use the default.
+    fn reserve_shared_buffer(&self, _bytes: usize) -> crate::Result<Box<dyn Send + Sync>> {
+        Ok(Box::new(()))
+    }
 
     /// Updates the fair scheduling weight of every prepared carrier Thread.
     fn set_vcpu_nice(&self, nice: i8) -> crate::Result<()>;
@@ -205,11 +249,11 @@ impl KerneletKind {
     pub fn register_dormant_fixture() -> crate::Result<Self> {
         let mut bytes = super::host_image::fixture_image();
         // This fixture's entry is UD2 and it never returns into caller data.
-        let source = host_source_hash()?;
-        bytes[0x1000 + 40..0x1000 + 72].copy_from_slice(&source);
         let entry = 0x1000 + size_of::<super::abi::EntryTable>();
         bytes[entry..entry + 8].copy_from_slice(&[0x0f, 0x0b, 0x0f, 0x0b, 0x0f, 0x0b, 0x0f, 0x0b]);
-        let image = RegisteredImage::register(&bytes, source)?;
+        // Use the fixed loader fixture's own hash, as the loader tests do.
+        // Kernel tests need no paired production Image or source-hash setting.
+        let image = RegisteredImage::register(&bytes, [0; 32])?;
         Ok(Self { image })
     }
 
@@ -250,11 +294,7 @@ impl KerneletKind {
         let workers = config
             .devices
             .len()
-            .checked_mul(
-                crate::task::native_stack_reservation_bytes()
-                    + size_of::<Task>()
-                    + 8 * crate::mm::PAGE_SIZE,
-            )
+            .checked_mul(host_worker_reservation_bytes())
             .ok_or(Error::Overflow)?;
         // Control/identity/accounting/queues and Arc headers are bounded by
         // the Task/device limits; retain a conservative page per such owner.
@@ -268,7 +308,11 @@ impl KerneletKind {
         // Hook stacks are prepared once for every physical CPU. The first
         // instance can trigger that global allocation, so reserve its bound.
         let hook_stacks = crate::cpu::num_cpus()
-            .checked_mul(64 * 1024 + 4 * crate::mm::PAGE_SIZE)
+            .checked_mul(
+                64 * 1024
+                    + 4 * crate::mm::PAGE_SIZE
+                    + crate::task::native_stack_reservation_bytes(),
+            )
             .ok_or(Error::Overflow)?;
         [execution, grant, image, workers, owners, hook_stacks]
             .into_iter()
@@ -605,6 +649,7 @@ pub(crate) struct RunControl {
     #[cfg(all(kernelet_rq1_crossing_diag, target_arch = "x86_64"))]
     pub(crate) crossing_profile: super::crossing_profile::CrossingProfile,
     pub(crate) account: Arc<Account>,
+    pub(crate) shared_buffers: Arc<super::shared_buffer::Participant>,
     hooks: SpinLock<Option<Arc<dyn KerneletHooks>>, LocalIrqDisabled>,
     budget_change: Mutex<()>,
     lifecycle: Arc<AtomicU8>,
@@ -658,6 +703,7 @@ impl RunControl {
         #[cfg(ktest)]
         super::deadline::test::init();
         let control = Arc::new(Self {
+            shared_buffers: super::shared_buffer::Participant::new(account.clone()),
             identity: Arc::new(identity),
             #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
             tlb_profile: super::tlb_profile::TlbProfile::new(),
@@ -780,6 +826,7 @@ impl RunControl {
             return None;
         }
         // SAFETY: The claim gives this call exclusive initialization rights.
+        self.shared_buffers.mark_dying();
         unsafe { (*self.reason.get()).write(reason) };
         self.marked_at
             .store(crate::timer::Jiffies::elapsed().as_u64(), Ordering::Relaxed);
@@ -913,6 +960,8 @@ impl RunControl {
 
 impl Drop for RunControl {
     fn drop(&mut self) {
+        // No carrier can retain local access after its last control owner.
+        self.shared_buffers.close();
         // Also covers failed construction before a Kernelet can be destroyed.
         // Withdraw the address before any of this owner's fields are dropped.
         self.identity.unpublish(self);
@@ -1153,7 +1202,7 @@ impl Kernelet {
         );
     }
 
-    /// Adds 1–16 grains and raises the live ceiling by the published amount.
+    /// Adds up to `MAX_GRAINS_PER_REQUEST` grains and raises the live ceiling.
     pub fn grant(&self, grains: u32) -> Result<u32, GrantError> {
         if grains == 0 || grains > super::abi::MAX_GRAINS_PER_REQUEST {
             return Err(GrantError::Limit);
@@ -1234,6 +1283,75 @@ impl Kernelet {
             })
             .map_err(|_| Error::Overflow)?;
         Ok(())
+    }
+
+    /// Connects two instances for whole-buffer imports. The Host must authorize
+    /// the pair before publishing this connection identifier to either image.
+    pub fn connect_shared_buffers(&self, peer: &Self) -> crate::Result<u64> {
+        super::shared_buffer::Participant::connect(
+            &self.control.shared_buffers,
+            &peer.control.shared_buffers,
+        )
+    }
+
+    /// Runs owning-buffer transitions without executing an Image in kernel tests.
+    /// Allocation and device submission remain unavailable through this adapter.
+    #[cfg(ktest)]
+    pub fn test_shared_buffer_service(
+        &self,
+        operation: u32,
+        token: u64,
+        args: [u64; 3],
+    ) -> MmioResult {
+        super::shared_buffer::dispatch_device(
+            &self.control.shared_buffers,
+            operation,
+            token,
+            args,
+            |_| None,
+            |_| Err(Error::AccessDenied),
+            |_, _| unreachable!("kernel test adapter cannot submit device I/O"),
+        )
+    }
+
+    /// Submits to a test-supplied backend through the real pool validation path.
+    /// This fixture does not execute an Image or perform device discovery.
+    #[cfg(ktest)]
+    pub fn test_shared_buffer_submit(
+        &self,
+        token: u64,
+        info: super::shared_buffer::ZeroCopyBlockInfo,
+        request: super::shared_buffer::IoRequest,
+        submit_fn: impl FnOnce(super::shared_buffer::BackendBuffer, super::shared_buffer::IoRequest),
+    ) -> MmioResult {
+        super::shared_buffer::dispatch_device(
+            &self.control.shared_buffers,
+            super::abi::buffer::SUBMIT,
+            token,
+            [
+                u64::from(request.device),
+                request.offset,
+                (u64::from(request.device_writes) << 32) | request.len as u64,
+            ],
+            |_| Some(info),
+            |_| Err(Error::AccessDenied),
+            submit_fn,
+        )
+    }
+
+    /// Creates a Host-local grant participant during device binding. Its backing
+    /// charges the same instance account but does not retain the instance itself.
+    pub fn shared_buffer_host_endpoint(
+        &self,
+    ) -> crate::Result<super::shared_buffer::HostLocalEndpoint> {
+        let _admission = self
+            .control
+            .admit_operation(&[KerneletState::Created, KerneletState::Running])
+            .map_err(|_| Error::AccessDenied)?;
+        super::shared_buffer::HostLocalEndpoint::bind(
+            self.control.account.clone(),
+            &self.control.shared_buffers,
+        )
     }
 
     /// Reserves Host buffers with an owner that can outlive instance teardown.
@@ -1364,6 +1482,7 @@ impl Kernelet {
         if !self.control.try_detach() {
             return None;
         }
+        self.control.shared_buffers.close();
         Some(self.publish_exit())
     }
 
@@ -1714,6 +1833,8 @@ mod test {
 
     core::arch::global_asm!(
         ".text",
+        ".code64",
+        "",
         ".global kernelet_test_exit",
         "kernelet_test_exit:",
         "endbr64",
@@ -1751,6 +1872,49 @@ mod test {
         "ud2",
         ".global kernelet_test_stack_guard_end",
         "kernelet_test_stack_guard_end:",
+        ".global kernelet_test_low_stack_service",
+        "kernelet_test_low_stack_service:",
+        "mov r12, rdi",
+        "mov rsp, [rsi + {probe_stack}]",
+        "add rsp, 1024",
+        "mov edi, {buffer_connection}",
+        "xor esi, esi",
+        "xor edx, edx",
+        "xor ecx, ecx",
+        "xor r8d, r8d",
+        "call [r12 + {buffer_service}]",
+        "test rax, rax",
+        "jnz 2f",
+        "mov edi, {stop_exit}",
+        "mov esi, 42",
+        "xor edx, edx",
+        "xor ecx, ecx",
+        "call [r12 + {stop}]",
+        "2: ud2",
+        ".global kernelet_test_low_stack_service_end",
+        "kernelet_test_low_stack_service_end:",
+        ".global kernelet_test_spin_stack_routes",
+        "kernelet_test_spin_stack_routes:",
+        "cli",
+        "sub rsp, 8",
+        "mov r12, rdi",
+        "mov r13, rsi",
+        "call kernelet_test_prime_spin_tick",
+        "call [r12 + {on_spin}]",
+        "cli",
+        "call kernelet_test_prime_spin_tick",
+        "mov rsp, [r13 + {probe_stack}]",
+        "add rsp, 128",
+        "call [r12 + {on_spin}]",
+        "cli",
+        "mov edi, {stop_exit}",
+        "mov esi, 42",
+        "xor edx, edx",
+        "xor ecx, ecx",
+        "call [r12 + {stop}]",
+        "ud2",
+        ".global kernelet_test_spin_stack_routes_end",
+        "kernelet_test_spin_stack_routes_end:",
         ".global kernelet_test_bounded_service",
         "kernelet_test_bounded_service:",
         "sub rsp, 8",
@@ -1807,6 +1971,15 @@ mod test {
         "inc r14d",
         "cmp r14d, 7",
         "jb 4b",
+        // Exercise a caught buffer hook after all root probes completed.
+        "mov edi, {buffer_block_info}",
+        "xor esi, esi",
+        "xor edx, edx",
+        "xor ecx, ecx",
+        "xor r8d, r8d",
+        "call [r12 + {buffer_service}]",
+        "test rax, rax",
+        "jnz 2f",
         "mov byte ptr [rip + KERNELET_TEST_SERVICE_RETURNED], 1",
         // An invalid request still completes the admitted return protocol.
         "xor edi, edi",
@@ -1850,6 +2023,7 @@ mod test {
         shootdown = const core::mem::offset_of!(super::super::abi::ServiceTable, tlb_shootdown),
         mmio = const core::mem::offset_of!(super::super::abi::ServiceTable, mmio_read),
         idle = const core::mem::offset_of!(super::super::abi::ServiceTable, vcpu_idle),
+        on_spin = const core::mem::offset_of!(super::super::abi::ServiceTable, vcpu_on_spin),
         vcpu_records = const core::mem::offset_of!(BootArgs, vcpu_records),
         pending = const core::mem::offset_of!(VcpuRecord, pending),
         stop = const core::mem::offset_of!(super::super::abi::ServiceTable, stop),
@@ -1860,6 +2034,9 @@ mod test {
         probe_stack = const core::mem::offset_of!(TrapProbeBoot, stack_base),
         probe_state = const core::mem::offset_of!(TrapProbeBoot, stop_state),
         probe_host_root = const core::mem::offset_of!(TrapProbeBoot, host_root),
+        buffer_service = const core::mem::offset_of!(super::super::abi::ServiceTable, buffer),
+        buffer_connection = const super::super::abi::buffer::CONNECTION,
+        buffer_block_info = const super::super::abi::buffer::BLOCK_INFO,
     );
     unsafe extern "C" {
         fn kernelet_test_exit();
@@ -1870,6 +2047,11 @@ mod test {
         fn kernelet_test_invalid_rsp_end();
         fn kernelet_test_stack_guard();
         fn kernelet_test_stack_guard_end();
+        fn kernelet_test_low_stack_service();
+        fn kernelet_test_low_stack_service_end();
+        fn kernelet_test_spin_stack_routes();
+        fn kernelet_test_spin_stack_routes_end();
+        static kernelet_service_vcpu_on_spin_budget: u64;
         fn kernelet_test_bounded_service();
         fn kernelet_test_bounded_service_end();
         fn kernelet_test_idle_service();
@@ -2066,7 +2248,7 @@ mod test {
         );
         assert!(matches!(
             reason,
-            ExitReason::Killed(KillReason::StackOverflow)
+            ExitReason::Killed(KillReason::StackReserve)
         ));
     }
 
@@ -2097,11 +2279,56 @@ mod test {
     }
 
     #[ktest]
+    fn insufficient_service_stack_uses_the_carrier_stack_and_returns() {
+        let reason = run_entry_fixture(
+            kernelet_test_low_stack_service as *const () as usize,
+            kernelet_test_low_stack_service_end as *const () as usize,
+            false,
+        );
+        assert!(matches!(reason, ExitReason::Exited(42)));
+    }
+
+    #[ktest]
+    fn linked_spin_budget_selects_image_and_host_stack_routes() {
+        host_run::reset_spin_stack_samples();
+        // SAFETY: The linker retains this read-only eight-byte budget cell.
+        let budget = unsafe { core::ptr::read_volatile(&kernelet_service_vcpu_on_spin_budget) };
+        if !cfg!(debug_assertions) {
+            assert_ne!(
+                budget,
+                u64::MAX,
+                "optimized on-spin closure must have a proved bound"
+            );
+        }
+        let reason = run_entry_fixture(
+            kernelet_test_spin_stack_routes as *const () as usize,
+            kernelet_test_spin_stack_routes_end as *const () as usize,
+            false,
+        );
+        assert!(matches!(reason, ExitReason::Exited(42)));
+        let (bounded, host) = host_run::spin_stack_samples();
+        if budget != u64::MAX {
+            assert_eq!(bounded, 1, "admitted hint left its Image stack");
+        } else {
+            assert_eq!(bounded, 0);
+        }
+        assert_eq!(host, 2, "low-space hint failed to use the Host stack");
+    }
+
+    #[ktest]
     fn stopped_image_irq_runs_host_callback_before_exit() {
         let mut irq = crate::irq::IrqLine::alloc_specific(STOPPED_IMAGE_IRQ).unwrap();
         STOPPED_IMAGE_IRQ_CALLS.store(0, Ordering::Release);
         irq.on_active(|frame| {
-            STOPPED_IMAGE_IRQ_CALLS.fetch_add(1, Ordering::Relaxed);
+            let invocation = STOPPED_IMAGE_IRQ_CALLS.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(host_run::test_irq_stack_state(), (true, true));
+            if invocation == 0 {
+                // SAFETY: This fixture owns vector 240 and its callback. One
+                // nested software entry must retain the outer IRQ frames.
+                unsafe {
+                    core::arch::asm!("int {vector}", vector = const STOPPED_IMAGE_IRQ);
+                }
+            }
             // This real carrier already has a stop request, but its IRQ
             // callback is still L1. Only the outer trap return may redirect it.
             let mut during_irq = *frame;
@@ -2116,7 +2343,8 @@ mod test {
             false,
         );
         assert!(matches!(reason, ExitReason::Killed(KillReason::Requested)));
-        assert_eq!(STOPPED_IMAGE_IRQ_CALLS.load(Ordering::Acquire), 1);
+        assert_eq!(STOPPED_IMAGE_IRQ_CALLS.load(Ordering::Acquire), 2);
+        assert_eq!(host_run::test_irq_stack_state(), (false, false));
     }
 
     #[ktest]
@@ -2174,7 +2402,7 @@ mod test {
 
     #[ktest]
     fn kill_during_service_prevents_image_return() {
-        run_root_probe(false, true);
+        run_root_probe(PanicHook::None, true);
     }
 
     #[ktest]
@@ -3161,17 +3389,35 @@ mod test {
         assert!(execution_weak.upgrade().is_none());
     }
 
+    #[derive(Clone, Copy, PartialEq)]
+    enum PanicHook {
+        None,
+        Mmio,
+        Buffer,
+    }
+
     struct RootProbeHooks {
         kernelet: Arc<Kernelet>,
         roots: [usize; 2],
         host_root: usize,
         execution: Arc<host_run::ExecutionResources>,
         calls: AtomicUsize,
-        panic_in_hook: bool,
+        panic_hook: PanicHook,
         stop_in_hook: bool,
     }
 
     impl KerneletHooks for RootProbeHooks {
+        fn shared_block_info(
+            &self,
+            _: u32,
+        ) -> Option<super::super::shared_buffer::ZeroCopyBlockInfo> {
+            assert_eq!(crate::arch::mm::current_page_table_paddr(), self.host_root);
+            if self.panic_hook == PanicHook::Buffer {
+                panic!("injected shared-buffer Host-hook failure");
+            }
+            None
+        }
+
         fn realtime_now(&self) -> Duration {
             panic!("root probe never samples realtime")
         }
@@ -3247,7 +3493,7 @@ mod test {
                     host_run::SERVICE
                 );
             }
-            if self.panic_in_hook && stage == 6 {
+            if self.panic_hook == PanicHook::Mmio && stage == 6 {
                 let _nested = self
                     .kernelet
                     .control
@@ -3274,15 +3520,21 @@ mod test {
 
     #[ktest]
     fn bounded_service_preserves_root_and_carrier_owners() {
-        run_root_probe(false, false);
+        run_root_probe(PanicHook::None, false);
     }
 
     #[ktest]
     fn hook_unwind_drains_external_admission_and_carrier_owners() {
-        run_root_probe(true, false);
+        run_root_probe(PanicHook::Mmio, false);
     }
 
-    fn run_root_probe(panic_in_hook: bool, stop_in_hook: bool) {
+    #[ktest]
+    fn buffer_hook_panic_stops_only_the_instance() {
+        run_root_probe(PanicHook::Buffer, false);
+    }
+
+    fn run_root_probe(panic_hook: PanicHook, stop_in_hook: bool) {
+        let panic_in_hook = panic_hook != PanicHook::None;
         use crate::mm::{FrameAllocOptions, VmIo};
         let kernelet = created_fixture(1);
         let resources = kernelet.resources.lock().as_ref().unwrap().clone();
@@ -3322,7 +3574,7 @@ mod test {
             host_root: crate::mm::VmSpace::kernel_root_paddr(),
             execution: execution.clone(),
             calls: AtomicUsize::new(0),
-            panic_in_hook,
+            panic_hook,
             stop_in_hook,
         });
         kernelet.control.active.store(1, Ordering::Release);

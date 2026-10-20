@@ -378,6 +378,9 @@ impl IoMem<Insensitive> {
 
 impl VmIoOnce for IoMem<Insensitive> {
     fn read_once<T: PodOnce>(&self, offset: usize) -> Result<T> {
+        // PodOnce is a safe marker; reject unsupported widths before entering
+        // the architecture helper or the virtual-register implementation.
+        const { assert!(matches!(size_of::<T>(), 1 | 2 | 4 | 8)) };
         #[cfg(feature = "kernelet")]
         if let Some((device, register)) = self.virtual_register(offset, size_of::<T>())? {
             let result = (crate::kernelet::entry::services().mmio_read)(
@@ -402,6 +405,7 @@ impl VmIoOnce for IoMem<Insensitive> {
     }
 
     fn write_once<T: PodOnce>(&self, offset: usize, value: &T) -> Result<()> {
+        const { assert!(matches!(size_of::<T>(), 1 | 2 | 4 | 8)) };
         #[cfg(feature = "kernelet")]
         if let Some((device, register)) = self.virtual_register(offset, size_of::<T>())? {
             let mut bytes = [0u8; 8];

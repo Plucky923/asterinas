@@ -135,12 +135,13 @@ impl FileTable {
     }
 
     /// Duplicates `fd` onto the lowest-numbered available descriptor equal to
-    /// or greater than `ceil_fd`.
+    /// or greater than `ceil_fd` and below the exclusive `fd_limit`.
     pub(crate) fn dup_ceil(
         &mut self,
         fd: FileDesc,
         ceil_fd: FileDesc,
         flags: FdFlags,
+        fd_limit: usize,
     ) -> Result<FileDesc> {
         let entry = self.duplicate_entry(fd, flags)?;
 
@@ -151,7 +152,7 @@ impl FileTable {
                 return ceil_fd;
             }
 
-            for idx in ceil_fd + 1..self.len() {
+            for idx in ceil_fd + 1..self.len().min(fd_limit) {
                 if self.table.get(idx).is_none() {
                     return idx;
                 }
@@ -160,6 +161,9 @@ impl FileTable {
         };
 
         let min_free_fd = get_min_free_fd();
+        if min_free_fd >= fd_limit {
+            return_errno!(Errno::EMFILE);
+        }
         self.table.put_at(min_free_fd, entry);
         // Resource limits guarantee the table never exceeds `i32::MAX` entries.
         Ok((min_free_fd as RawFileDesc).try_into().unwrap())

@@ -30,7 +30,7 @@ use nix::fcntl::{FcntlArg, OFlag, fcntl};
 
 use super::{
     Control, CrossingAction, Record, Reply, State, Stats, TlbAction,
-    crossing_capture::CrossingCapture, tlb_capture::TlbCapture, vsock,
+    crossing_capture::CrossingCapture, shared_buffers, tlb_capture::TlbCapture, vsock,
 };
 use crate::{
     fd,
@@ -307,6 +307,14 @@ fn handle(holder: &Arc<Holder>, mut connection: UnixStream) -> Result<()> {
     let operation: Control = protocol::receive_value(&mut connection)?;
     connection.set_read_timeout(None)?;
     match operation {
+        Control::SharedBufferCapability => {
+            ensure!(
+                holder.sandbox.status()?.state == uapi::STATE_RUNNING,
+                "kernelet is not running"
+            );
+            let id = holder.shared.lock().unwrap().state.id.clone();
+            shared_buffers::send_capability(&mut connection, id, holder.sandbox.file())?;
+        }
         Control::VsockCid | Control::VsockCapability => {
             let identity = {
                 let shared = holder.shared.lock().unwrap();
@@ -384,6 +392,29 @@ fn handle(holder: &Arc<Holder>, mut connection: UnixStream) -> Result<()> {
                 }
             };
             protocol::send_value(&mut connection, &reply)?;
+        }
+        Control::IoPathStats => {
+            let stats = holder.sandbox.io_path_stats()?;
+            let snapshot = serde_json::json!({
+                "protocol": "kernelet-io-path-stats-v1",
+                "scope": "Host/Image payload boundary; excludes user copies and NAT rings",
+                "borrowed_block_devices": stats.borrowed_block_devices,
+                "borrowed_block_requests": stats.borrowed_block_requests,
+                "borrowed_block_bytes": stats.borrowed_block_bytes,
+                "borrowed_block_identity_checks": stats.borrowed_block_identity_checks,
+                "borrowed_block_copy_bytes": stats.borrowed_block_copy_bytes,
+                "shared_net_devices": stats.shared_net_devices,
+                "shared_net_tx_packets": stats.shared_net_tx_packets,
+                "shared_net_tx_bytes": stats.shared_net_tx_bytes,
+                "shared_net_rx_packets": stats.shared_net_rx_packets,
+                "shared_net_rx_bytes": stats.shared_net_rx_bytes,
+                "shared_net_payload_copy_bytes": stats.shared_net_payload_copy_bytes,
+                "shared_net_native_fallback_packets": stats.shared_net_native_fallback_packets,
+                "shared_net_native_fallback_bytes": stats.shared_net_native_fallback_bytes,
+                "shared_net_allocations": stats.shared_net_allocations,
+                "shared_net_reuses": stats.shared_net_reuses,
+            });
+            protocol::send_value(&mut connection, &Reply::IoPathStats(snapshot))?;
         }
         Control::Stats => {
             let stats = holder.sandbox.stats()?;

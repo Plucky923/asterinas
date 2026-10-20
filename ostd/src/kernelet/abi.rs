@@ -10,6 +10,14 @@ use core::{
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
+/// Whole-buffer grants and operation arguments.
+pub mod buffer;
+
+/// Device entry with the existing VirtIO MMIO transport.
+pub const DEVICE_KIND_VIRTIO: u16 = 1;
+/// Device entry discovered through the shared Ethernet service.
+pub const DEVICE_KIND_SHARED_NET: u16 = 2;
+
 /// First kernel-half slot in the x86-64 PML4.
 pub(crate) const KERNEL_HALF_START: usize = 256;
 /// Number of kernel-half slots in the 512-entry x86-64 PML4.
@@ -153,13 +161,13 @@ pub struct BootArgs {
     pub monotonic_base_ns: u64,
 }
 
-/// One virtual MMIO device made available to the kernelet.
+/// One virtual device and its reserved address and interrupt resources.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DeviceEntry {
     /// Host-assigned identifier used by the MMIO service calls.
     pub id: u16,
-    /// Device kind; currently a virtio MMIO register file.
+    /// Device kind: 1 for VirtIO MMIO, 2 for a shared-buffer device.
     pub kind: u16,
     /// Virtual interrupt line.
     pub irq: u8,
@@ -425,6 +433,8 @@ pub struct ServiceTable {
     pub oops: extern "C" fn(msg: *const u8, len: u32) -> i64,
     /// Stops the current instance without returning to the image.
     pub stop: extern "C" fn(kind: u32, code: u32, msg: *const u8, len: u32) -> !,
+    /// Whole-buffer grants. Arguments and results are defined in `buffer`.
+    pub buffer: extern "C" fn(u32, u64, u64, u64, u64) -> MmioResult,
     /// Returns a token through the normal service gate in diagnostic builds.
     #[cfg(kernelet_rq1)]
     pub rq1_echo: extern "C" fn(token: u64) -> i64,
@@ -455,7 +465,7 @@ pub const STATE: i64 = 5;
 /// Console log level, written directly to the early serial console.
 pub const LEVEL_CONSOLE: u32 = 8;
 /// Maximum grains granted by one service crossing.
-pub const MAX_GRAINS_PER_REQUEST: u32 = 16;
+pub const MAX_GRAINS_PER_REQUEST: u32 = 32;
 /// Maximum bytes in a log module name.
 pub const MAX_LOG_MODULE_BYTES: u32 = 128;
 /// Maximum bytes in a log text record.
@@ -511,7 +521,7 @@ const _: () = {
     assert!(offset_of!(KletUserContext, error_code) == 19 * 8);
     assert!(offset_of!(KletUserContext, fault_addr) == 20 * 8);
     assert!(size_of::<MmioResult>() == 16);
-    assert!(size_of::<ServiceTable>() == if cfg!(kernelet_rq1) { 160 } else { 152 });
+    assert!(size_of::<ServiceTable>() == if cfg!(kernelet_rq1) { 168 } else { 160 });
     assert!(offset_of!(ServiceTable, user_run) == 104);
     assert!(offset_of!(ServiceTable, mmio_read) == 112);
     assert!(offset_of!(ServiceTable, stop) == 144);

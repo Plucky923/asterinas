@@ -66,6 +66,17 @@ impl XApic {
 }
 
 impl super::Apic for XApic {
+    #[cfg(feature = "kernelet-host")]
+    fn in_service(&self) -> [u32; 8] {
+        const ISR_STRIDE: usize = (xapic::XAPIC_ISR1 - xapic::XAPIC_ISR0) as usize;
+        core::array::from_fn(|index| {
+            // SAFETY: This initialized APIC mapping covers ISR0..ISR7.
+            unsafe {
+                self.io_mem
+                    .read_once(xapic::XAPIC_ISR0 as usize + index * ISR_STRIDE)
+            }
+        })
+    }
     fn id(&self) -> u32 {
         let raw: u32 = unsafe { self.io_mem.read_once(xapic::XAPIC_ID as usize) };
         // Bits 31-24: APIC ID.

@@ -49,6 +49,13 @@ impl BioRequestSingleQueue {
         self.num_requests.load(Ordering::Relaxed)
     }
 
+    /// Holds the physical driver's queue mutex across a controlled test action.
+    #[cfg(ktest)]
+    pub fn with_locked_queue_for_test<R>(&self, action_fn: impl FnOnce() -> R) -> R {
+        let _queue = self.queue.lock();
+        action_fn()
+    }
+
     /// Enqueues a `SubmittedBio` to this queue.
     ///
     /// When enqueueing the `SubmittedBio`, try to insert it into the last request if the

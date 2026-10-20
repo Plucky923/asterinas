@@ -124,7 +124,7 @@ fn request(directory: &Path, operation: &Control) -> Result<(Reply, UnixStream)>
     Ok((reply, stream))
 }
 
-fn connect_control(directory: &Path) -> Result<UnixStream> {
+pub(super) fn connect_control(directory: &Path) -> Result<UnixStream> {
     let descriptor = socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -194,9 +194,8 @@ pub(super) fn send_capability(
 mod tests {
     use std::{
         fs,
-        os::{fd::AsRawFd, unix::net::UnixListener},
+        os::unix::net::UnixListener,
         path::PathBuf,
-        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 

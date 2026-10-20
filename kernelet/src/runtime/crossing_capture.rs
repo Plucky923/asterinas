@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn arm_layout_and_nonce_match_the_private_kernel_request() {
-        assert_eq!(std::mem::size_of::<ArmArgs>(), 16);
+        assert_eq!(size_of::<ArmArgs>(), 16);
         assert_eq!(std::mem::offset_of!(ArmArgs, nonce), 8);
         let mut capture = CrossingCapture::default();
         assert!(

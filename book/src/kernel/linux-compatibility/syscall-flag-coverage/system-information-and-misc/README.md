@@ -102,8 +102,33 @@ Unsupported predefined clock IDs:
 * `CLOCK_BOOTTIME_ALARM`
 * `CLOCK_TAI`
 
+Dynamic process and thread CPU clocks support profiling, virtual, and scheduling modes.
+A zero encoded PID or TID selects the calling process or thread.
+Scheduling mode uses the existing tick-based profiling accounting.
+File-descriptor clocks are unsupported.
+
 For more information,
 see [the man page](https://man7.org/linux/man-pages/man2/clock_gettime.2.html).
+
+### `clock_getres`
+
+Supported functionality in SCML:
+
+```c
+{{#include clock_getres.scml}}
+```
+
+The supported predefined IDs are the same as for `clock_gettime`.
+CPU clocks and coarse clocks report the kernel timer tick as their resolution.
+Other supported clocks report one nanosecond.
+Dynamic process and thread CPU clocks support profiling, virtual, and scheduling modes;
+scheduling mode uses the existing tick-based CPU accounting.
+A zero encoded PID or TID selects the calling process or thread.
+File-descriptor clocks remain unsupported.
+A null output pointer succeeds only after the clock ID and dynamic target are validated.
+
+For more information,
+see [the man page](https://man7.org/linux/man-pages/man2/clock_getres.2.html).
 
 ### `clock_nanosleep`
 

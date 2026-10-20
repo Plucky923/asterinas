@@ -11,6 +11,8 @@ timer_create(
 );
 
 // Create a timer based on a per-process or per-thread clock
+// CPU clocks: profiling, virtual, or scheduling; zero PID/TID means the caller.
+// Scheduling uses tick-based profiling accounting; FD clocks are unsupported.
 timer_create(
     clockid = <INTEGER>,
     sevp = {

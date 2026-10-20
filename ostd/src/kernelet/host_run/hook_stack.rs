@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 use core::{
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use spin::Once;
@@ -24,6 +24,10 @@ use crate::{
 const STACK_BYTES: usize = 64 * 1024;
 const STACK_PAGES: usize = STACK_BYTES / PAGE_SIZE;
 const STACK_STRIDE: usize = STACK_BYTES + 2 * PAGE_SIZE;
+// IRQ callbacks retain the native Task stack capacity; hook-stack sizing
+// does not establish a bound on ordinary Host interrupt handlers.
+const IRQ_BYTES: usize = crate::task::native_stack_reservation_bytes() - 4 * PAGE_SIZE;
+const IRQ_STRIDE: usize = IRQ_BYTES + 2 * PAGE_SIZE;
 const STACK_PROP: PageProperty = PageProperty {
     flags: PageFlags::RW,
     cache: CachePolicy::Writeback,
@@ -33,6 +37,15 @@ const STACK_PROP: PageProperty = PageProperty {
 // Host CPU IDs are fixed before any instance is prepared. Once published,
 // these mappings and their frame ownership remain alive for the Host lifetime.
 static STACKS: Once<HookStacks> = Once::new();
+// Written only by Once's initializer, before the synchronous publication IPI.
+static IRQ_ARENA_BASE: AtomicUsize = AtomicUsize::new(0);
+
+crate::cpu_local_cell! {
+    #[unsafe(no_mangle)]
+    static KERNELET_IRQ_STACK_TOP: usize = 0;
+    #[unsafe(no_mangle)]
+    static KERNELET_IRQ_STACK_BUSY: usize = 0;
+}
 
 struct HookStacks {
     area: KVirtArea,
@@ -46,7 +59,7 @@ impl HookStacks {
             return Err(crate::Error::InvalidArgs);
         }
         let bytes = cpus
-            .checked_mul(STACK_STRIDE)
+            .checked_mul(STACK_STRIDE + IRQ_STRIDE)
             .ok_or(crate::Error::Overflow)?;
         let mut active = Vec::new();
         active
@@ -55,17 +68,25 @@ impl HookStacks {
         active.resize_with(cpus, || AtomicBool::new(false));
         let mut mappings = Vec::new();
         mappings
-            .try_reserve_exact(cpus)
+            .try_reserve_exact(2 * cpus)
             .map_err(|_| crate::Error::NoMemory)?;
-        for cpu in 0..cpus {
+        for cpu in 0..2 * cpus {
+            let (offset, pages) = if cpu < cpus {
+                (cpu * STACK_STRIDE + PAGE_SIZE, STACK_PAGES)
+            } else {
+                (
+                    cpus * STACK_STRIDE + (cpu - cpus) * IRQ_STRIDE + PAGE_SIZE,
+                    IRQ_BYTES / PAGE_SIZE,
+                )
+            };
             let mut frames = Vec::new();
             frames
-                .try_reserve_exact(STACK_PAGES)
+                .try_reserve_exact(pages)
                 .map_err(|_| crate::Error::NoMemory)?;
-            for _ in 0..STACK_PAGES {
+            for _ in 0..pages {
                 frames.push(FrameAllocOptions::new().alloc_frame()?);
             }
-            mappings.push((cpu * STACK_STRIDE + PAGE_SIZE, frames.into_iter()));
+            mappings.push((offset, frames.into_iter()));
         }
         let area = KVirtArea::try_reserve(bytes)?.with_synchronous_reclaim();
         area.map_additional_frames_batch(mappings.into_iter(), STACK_PROP)?;
@@ -75,6 +96,21 @@ impl HookStacks {
             &CpuSet::new_full(),
             crate::arch::mm::tlb_flush_all_including_global,
         )
+        .wait();
+        // Publish every IRQ landing before STACKS becomes visible. A second
+        // concurrent prepare must not enter an image with an unset IRQ top.
+        IRQ_ARENA_BASE.store(area.start(), Ordering::Release);
+        crate::smp::inter_processor_call(&CpuSet::new_full(), || {
+            let guard = crate::task::disable_preempt();
+            let index = guard.current_cpu().as_usize();
+            let base = IRQ_ARENA_BASE.load(Ordering::Acquire);
+            KERNELET_IRQ_STACK_TOP.store(
+                base + num_cpus() as usize * STACK_STRIDE
+                    + index * IRQ_STRIDE
+                    + PAGE_SIZE
+                    + IRQ_BYTES,
+            );
+        })
         .wait();
         Ok(Self { area, active })
     }
@@ -97,10 +133,26 @@ pub(super) fn prepare() -> crate::Result<()> {
     if !crate::arch::irq::is_local_enabled() {
         return Err(crate::Error::AccessDenied);
     }
-    STACKS.try_call_once(HookStacks::new).map(|_| ())
+    STACKS.try_call_once(HookStacks::new)?;
+    Ok(())
 }
 
 struct ActiveStack<'a>(&'a AtomicBool);
+
+#[cfg(ktest)]
+pub(crate) fn test_irq_stack_state() -> (bool, bool) {
+    let _guard = crate::irq::disable_local();
+    let pointer: usize;
+    // SAFETY: Reading RSP changes neither memory nor execution state.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) pointer, options(nomem, nostack, preserves_flags));
+    }
+    let top = KERNELET_IRQ_STACK_TOP.load();
+    (
+        top != 0 && (top - IRQ_BYTES..top).contains(&pointer),
+        KERNELET_IRQ_STACK_BUSY.load() != 0,
+    )
+}
 
 impl Drop for ActiveStack<'_> {
     fn drop(&mut self) {

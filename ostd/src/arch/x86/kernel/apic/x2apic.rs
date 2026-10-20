@@ -4,8 +4,8 @@ use core::arch::asm;
 
 use x86::msr::{
     IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_CUR_COUNT, IA32_X2APIC_DIV_CONF,
-    IA32_X2APIC_EOI, IA32_X2APIC_ICR, IA32_X2APIC_INIT_COUNT, IA32_X2APIC_LVT_TIMER,
-    IA32_X2APIC_SIVR, IA32_X2APIC_VERSION, rdmsr, wrmsr,
+    IA32_X2APIC_EOI, IA32_X2APIC_ICR, IA32_X2APIC_INIT_COUNT, IA32_X2APIC_ISR0,
+    IA32_X2APIC_LVT_TIMER, IA32_X2APIC_SIVR, IA32_X2APIC_VERSION, rdmsr, wrmsr,
 };
 
 use super::ApicTimer;
@@ -63,6 +63,13 @@ impl X2Apic {
 }
 
 impl super::Apic for X2Apic {
+    #[cfg(feature = "kernelet-host")]
+    fn in_service(&self) -> [u32; 8] {
+        core::array::from_fn(|index| {
+            // SAFETY: x2APIC is enabled. ISR0..ISR7 are read-only MSRs.
+            unsafe { rdmsr(IA32_X2APIC_ISR0 + index as u32) as u32 }
+        })
+    }
     fn id(&self) -> u32 {
         unsafe { rdmsr(IA32_X2APIC_APICID) as u32 }
     }

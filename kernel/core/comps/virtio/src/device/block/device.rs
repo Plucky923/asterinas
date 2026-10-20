@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::{
     fmt::Debug,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use aster_block::{
@@ -20,7 +20,7 @@ use ostd::{
     sync::SpinLock,
 };
 
-use super::{BlockFeatures, VirtioBlockConfig};
+use super::{BlockConfigManager, BlockFeatures, VirtioBlockConfig};
 use crate::{
     VIRTIO_BLOCK_MAJOR_ID,
     device::{
@@ -30,7 +30,7 @@ use crate::{
     dma_buf::DmaBuf,
     id_alloc::SyncIdAlloc,
     queue::VirtQueue,
-    transport::{ConfigManager, DeviceTransport},
+    transport::DeviceTransport,
 };
 
 /// The number of virtio block devices, used to assign minor device numbers.
@@ -102,7 +102,7 @@ impl BlockDevice {
     /// processes the request.
     pub fn handle_requests(&self) {
         let request = self.queue.dequeue();
-        info!("Handle Request: {:?}", request);
+        debug!("Handle Request: {:?}", request);
         match request.type_() {
             BioType::Read => self.device.read(request),
             BioType::Write => self.device.write(request),
@@ -124,7 +124,7 @@ impl aster_block::BlockDevice for BlockDevice {
     fn metadata(&self) -> BlockDeviceMeta {
         BlockDeviceMeta {
             max_nr_segments_per_bio: self.queue.max_nr_segments_per_bio(),
-            nr_sectors: self.device.config_manager.capacity_sectors(),
+            nr_sectors: self.device.capacity_sectors.load(Ordering::Relaxed),
         }
     }
 
@@ -143,7 +143,8 @@ impl aster_block::BlockDevice for BlockDevice {
 
 #[derive(Debug)]
 struct DeviceInner {
-    config_manager: ConfigManager<VirtioBlockConfig>,
+    config_manager: BlockConfigManager,
+    capacity_sectors: AtomicUsize,
     features: BlockFeatures,
     queue: SpinLock<VirtQueue>,
     transport: SpinLock<DeviceTransport>,
@@ -202,6 +203,7 @@ impl DeviceInner {
 
         let device = Arc::new(Self {
             config_manager,
+            capacity_sectors: AtomicUsize::new(config.capacity as usize),
             features,
             queue: SpinLock::new(queue),
             transport: SpinLock::new(device_transport),
@@ -212,20 +214,25 @@ impl DeviceInner {
         });
 
         let cloned_device = device.clone();
-        let handle_irq = move |_: &TrapFrame| {
+        let handle_irq_fn = move |_: &TrapFrame| {
             cloned_device.handle_irq();
         };
 
         let cloned_device = device.clone();
-        let handle_config_change = move |_: &TrapFrame| {
+        let handle_config_change_fn = move |_: &TrapFrame| {
             cloned_device.handle_config_change();
         };
 
         {
-            let mut transport = device.transport.lock();
-            transport.register_cfg_callback(Box::new(handle_config_change))?;
-            transport.register_queue_callback(0, Box::new(handle_irq), false)?;
+            let mut transport = device.transport.disable_irq().lock();
+            transport.register_cfg_callback(Box::new(handle_config_change_fn))?;
+            transport.register_queue_callback(0, Box::new(handle_irq_fn), false)?;
             transport.finish_init();
+            // Refresh after DRIVER_OK, when subsequent configuration changes
+            // are notified. Local IRQs stay disabled until this store finishes.
+            device
+                .capacity_sectors
+                .store(device.config_manager.capacity_sectors(), Ordering::Relaxed);
         }
 
         Ok(device)
@@ -233,7 +240,7 @@ impl DeviceInner {
 
     /// Handles the IRQ issued from the device.
     fn handle_irq(&self) {
-        info!("block device handle IRQ");
+        debug!("block device handle IRQ");
         // When we enter the IRQs handling function,
         // IRQs have already been disabled,
         // so there is no need to call `disable_irq`.
@@ -287,6 +294,10 @@ impl DeviceInner {
     }
 
     fn handle_config_change(&self) {
+        // Capacity changes arrive through the configuration interrupt. Ordinary
+        // metadata queries must not perform PCI device-register reads per I/O.
+        self.capacity_sectors
+            .store(self.config_manager.capacity_sectors(), Ordering::Relaxed);
         info!("block device config space change");
     }
 

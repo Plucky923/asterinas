@@ -27,15 +27,18 @@ use smoltcp::{
     },
 };
 
-use super::{
-    super::policy::{NativeTcpBufferCharge, PrestartEndpointReservation},
-    Frame, MAX_FRAME_BYTES, NetEndpoint, VirtioNet, Work,
-    sockets::{TcpListener, TcpStream, UdpSocket},
-};
 #[cfg(kernelet_nat_failure_diag_host)]
 use super::{
     super::policy::{QuotaClass, QuotaTag},
     endpoint::{NatContext, NatEvent},
+};
+use super::{
+    super::{
+        policy::{NativeTcpBufferCharge, UserEndpointReservation},
+        shared_net::{SharedFrame, SharedNetTransport, SharedTxFrame},
+    },
+    Frame, MAX_FRAME_BYTES, NetEndpoint, NetWorker, Work,
+    sockets::{TcpListener, TcpStream, UdpSocket},
 };
 use crate::{events::IoEvents, prelude::*, process::signal::Poller};
 
@@ -45,6 +48,9 @@ const BUFFER_BYTES: usize = 64 * 1024;
 const TCP_FORWARD_BYTES: usize = 16 * 1024;
 const FLOW_RESERVATION_BYTES: usize = 512 * 1024;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
+// Other shared-buffer links can release Image import quota without a NIC IRQ.
+// Retry only that blocked condition; returned NIC buffers retain IRQ wakeups.
+const IMPORT_CREDIT_RETRY_DELAY: Duration = Duration::from_millis(10);
 // Split the existing 64 KiB metadata margin evenly between native TCP and
 // the Guest frontend. Closing snapshots reserve their extra 64 KiB first.
 const NATIVE_TCP_RESERVATION_BYTES: usize = TCP_RECV_BUF_LEN
@@ -111,7 +117,7 @@ impl NatBackend {
         })
     }
 
-    pub(super) fn run(self, model: &VirtioNet) -> Result<()> {
+    pub(super) fn run(self, model: &NetWorker) -> Result<()> {
         let Self {
             config,
             listeners,
@@ -131,7 +137,27 @@ impl NatBackend {
         }
         #[cfg(kernelet_nat_failure_diag_host)]
         model.endpoint.emit_diagnostics();
-        let result = run(model, config, listeners, datagram_listeners);
+        let result = match model.shared_transport() {
+            Some(transport) => run(
+                model,
+                config,
+                listeners,
+                datagram_listeners,
+                FrameDevice::new(SharedFrames {
+                    endpoint: &model.endpoint,
+                    transport,
+                    prepared: None,
+                    import_blocked: false,
+                }),
+            ),
+            None => run(
+                model,
+                config,
+                listeners,
+                datagram_listeners,
+                FrameDevice::new(CopyFrames(&model.endpoint)),
+            ),
+        };
         // run's owned listener parameters have now dropped; this is not a
         // claim that a native registry entry or a background TCP was reclaimed.
         #[cfg(kernelet_nat_failure_diag_host)]
@@ -185,11 +211,11 @@ fn next_source_port(next_port: &mut u16, in_use: impl Fn(u16) -> bool) -> Option
 /// Covers active socket buffers and pending stream data conservatively.
 struct FlowCharge {
     host: HostByteCharge,
-    user: PrestartEndpointReservation,
+    user: UserEndpointReservation,
 }
 impl FlowCharge {
     fn new(
-        model: &VirtioNet,
+        model: &NetWorker,
         #[cfg(kernelet_nat_failure_diag_host)] context: NatContext,
     ) -> Result<Self> {
         Self::with_bytes(
@@ -203,7 +229,7 @@ impl FlowCharge {
     }
 
     fn with_bytes(
-        model: &VirtioNet,
+        model: &NetWorker,
         bytes: usize,
         #[cfg(kernelet_nat_failure_diag_host)] context: NatContext,
         #[cfg(kernelet_nat_failure_diag_host)] class: QuotaClass,
@@ -216,7 +242,7 @@ impl FlowCharge {
             let mut categories = None;
             // Release the endpoint diagnostic lock before taking LEDGER.
             let capture_categories = model.endpoint.wants_quota_categories();
-            let result = PrestartEndpointReservation::reserve_diagnostic(
+            let result = UserEndpointReservation::reserve_diagnostic(
                 model.endpoint.owner(),
                 bytes,
                 QuotaTag::new(class, Some(model.endpoint.diagnostic_cid())),
@@ -277,7 +303,7 @@ struct UdpFrontend {
 }
 
 fn accept_mapped_tcp(
-    model: &VirtioNet,
+    model: &NetWorker,
     listener: &TcpListener,
     #[cfg(kernelet_nat_failure_diag_host)] context: NatContext,
 ) -> Result<Option<(TcpStream, FlowCharge)>> {
@@ -304,7 +330,7 @@ fn accept_mapped_tcp(
 
 /// Masks level-triggered listener readiness while admission cannot progress.
 fn accept_mapped_tcp_with_backoff(
-    model: &VirtioNet,
+    model: &NetWorker,
     listener: &TcpListener,
     retry: &mut Option<Duration>,
     current: Duration,
@@ -326,16 +352,16 @@ fn accept_mapped_tcp_with_backoff(
     result
 }
 
-fn run(
-    model: &VirtioNet,
+// Keep the two transport loops separate so the shared worker's stack does not
+// inherit the copying worker's inline-frame locals. This call occurs once per worker.
+#[inline(never)]
+fn run<B: FrameBackend>(
+    model: &NetWorker,
     config: NetConfigArgs,
     listeners: Vec<(TcpListener, u16)>,
     datagram_listeners: Vec<(UdpSocket, u16)>,
+    mut device: FrameDevice<B>,
 ) -> Result<()> {
-    let mut device = FrameDevice {
-        endpoint: &model.endpoint,
-        received: None,
-    };
     let mut interface_config =
         InterfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(GATEWAY_MAC)));
     let mac = model.mac;
@@ -370,7 +396,7 @@ fn run(
                 NetworkInstant::from_millis(now().as_millis().min(i64::MAX as u128) as i64);
             let mut progressed = false;
             for _ in 0..128 {
-                match model.take_work() {
+                match device.backend.take_work(model) {
                     Some(Work::Cancel) => {
                         #[cfg(kernelet_nat_failure_diag_host)]
                         model.record_diagnostic(
@@ -386,27 +412,33 @@ fn run(
             }
             let mut ingress_progressed = false;
             for _ in 0..32 {
-                if device.received.is_some() || !device.endpoint.input_has_space() {
-                    break;
+                if device.received.is_none() {
+                    let Some(frame) = device.backend.pop_output() else {
+                        break;
+                    };
+                    frame.with_bytes(|bytes| {
+                        prepare_incoming(
+                            bytes,
+                            &config,
+                            model,
+                            &mut sockets,
+                            &mut tcp_flows,
+                            &mut udp_sockets,
+                        )
+                    })?;
+                    device.received = Some(frame);
                 }
-                let Some(frame) = model.endpoint.pop_output() else {
-                    break;
-                };
-                prepare_incoming(
-                    &frame.bytes[..frame.len],
-                    &config,
-                    model,
-                    &mut sockets,
-                    &mut tcp_flows,
-                    &mut udp_sockets,
-                )?;
-                device.received = Some(frame);
                 // Drain the existing bounded ingress batch before scanning all
                 // sockets for egress. Immediate protocol replies still use the
                 // ingress TxToken; the egress pass below dispatches queued data.
-                ingress_progressed |=
-                    interface.poll_ingress_single(timestamp, &mut device, &mut sockets)
-                        != PollIngressSingleResult::None;
+                if interface.poll_ingress_single(timestamp, &mut device, &mut sockets)
+                    == PollIngressSingleResult::None
+                {
+                    // A missing paired transmit credit retains this frame.
+                    // Retry it after a return IRQ or import-credit deadline.
+                    break;
+                }
+                ingress_progressed = true;
             }
             progressed |= ingress_progressed;
             if ingress_progressed {
@@ -644,12 +676,15 @@ fn run(
                 .min();
             if let Some(delay) = interface.poll_delay(timestamp, &sockets) {
                 let delay = Duration::from_millis(delay.total_millis());
-                if !delay.is_zero() || device.endpoint.input_has_space() {
+                if !delay.is_zero() || device.can_transmit() {
                     timeout = Some(timeout.map_or(delay, |previous| previous.min(delay)));
                 }
             }
             for deadline in accept_retry.iter().flatten() {
                 let delay = deadline.saturating_sub(current);
+                timeout = Some(timeout.map_or(delay, |previous| previous.min(delay)));
+            }
+            if let Some(delay) = device.backend.transmit_retry_delay() {
                 timeout = Some(timeout.map_or(delay, |previous| previous.min(delay)));
             }
             if timeout.is_some_and(|duration| duration.is_zero()) {
@@ -779,7 +814,7 @@ impl TcpFlow {
     #[cfg(kernelet_nat_failure_diag)]
     fn log_failure(
         &self,
-        #[cfg(kernelet_nat_failure_diag_host)] model: &VirtioNet,
+        #[cfg(kernelet_nat_failure_diag_host)] model: &NetWorker,
         guest: &tcp::Socket,
         stage: &'static str,
         error: &Error,
@@ -810,7 +845,7 @@ impl TcpFlow {
     }
     fn flush_to_host(
         &mut self,
-        #[cfg(kernelet_nat_failure_diag_host)] model: &VirtioNet,
+        #[cfg(kernelet_nat_failure_diag_host)] model: &NetWorker,
         guest: &mut tcp::Socket,
     ) -> bool {
         loop {
@@ -869,7 +904,7 @@ impl TcpFlow {
         true
     }
 
-    fn forward(&mut self, model: &VirtioNet, guest: &mut tcp::Socket) {
+    fn forward(&mut self, model: &NetWorker, guest: &mut tcp::Socket) {
         if !self.alive {
             return;
         }
@@ -1148,7 +1183,7 @@ struct UdpFlow {
 fn prepare_incoming(
     frame: &[u8],
     config: &NetConfigArgs,
-    model: &VirtioNet,
+    model: &NetWorker,
     sockets: &mut SocketSet<'static>,
     tcp_flows: &mut Vec<TcpFlow>,
     udp_sockets: &mut BTreeMap<SocketAddrV4, UdpFrontend>,
@@ -1340,53 +1375,214 @@ fn tcp_socket() -> tcp::Socket<'static> {
     socket
 }
 
-struct FrameDevice<'a> {
-    endpoint: &'a NetEndpoint,
-    received: Option<Frame>,
+// Monomorphization keeps shared handles out of the copying frame's inline
+// array, including queue removal, the pending receive slot, and RxToken moves.
+trait FrameBytes {
+    fn with_bytes<R>(&self, read_fn: impl for<'a> FnOnce(&'a [u8]) -> R) -> R;
 }
-struct Receive(Frame);
-struct Transmit<'a>(&'a NetEndpoint);
-impl RxToken for Receive {
+
+impl FrameBytes for Frame {
+    fn with_bytes<R>(&self, read_fn: impl for<'a> FnOnce(&'a [u8]) -> R) -> R {
+        Frame::with_bytes(self, read_fn)
+    }
+}
+
+impl FrameBytes for SharedFrame {
+    fn with_bytes<R>(&self, read_fn: impl for<'a> FnOnce(&'a [u8]) -> R) -> R {
+        SharedFrame::with_bytes(self, read_fn)
+    }
+}
+
+trait FrameBackend {
+    type Frame: FrameBytes;
+    type Transmit<'a>: TxToken
+    where
+        Self: 'a;
+
+    fn pop_output(&self) -> Option<Self::Frame>;
+    fn take_work(&self, model: &NetWorker) -> Option<Work>;
+    fn can_transmit(&self) -> bool;
+    fn prepare_transmit(&mut self) -> bool;
+    fn transmit(&mut self) -> Option<Self::Transmit<'_>>;
+
+    fn transmit_retry_delay(&mut self) -> Option<Duration> {
+        None
+    }
+}
+
+struct CopyFrames<'a>(&'a NetEndpoint);
+
+impl FrameBackend for CopyFrames<'_> {
+    type Frame = Frame;
+    type Transmit<'a>
+        = CopyTransmit<'a>
+    where
+        Self: 'a;
+
+    fn pop_output(&self) -> Option<Frame> {
+        self.0.pop_output()
+    }
+
+    fn take_work(&self, model: &NetWorker) -> Option<Work> {
+        model.take_work()
+    }
+
+    fn can_transmit(&self) -> bool {
+        self.0.input_has_space()
+    }
+
+    fn prepare_transmit(&mut self) -> bool {
+        self.can_transmit()
+    }
+
+    fn transmit(&mut self) -> Option<CopyTransmit<'_>> {
+        self.can_transmit().then_some(CopyTransmit(self.0))
+    }
+}
+
+struct SharedFrames<'a> {
+    endpoint: &'a NetEndpoint,
+    transport: &'a Arc<SharedNetTransport>,
+    // Unconsumed tokens borrow this slot, so the complete grant/import-credit
+    // reservation survives the RX poll and can be used by its next reply.
+    prepared: Option<SharedTxFrame>,
+    import_blocked: bool,
+}
+
+impl SharedFrames<'_> {
+    fn active(&self) -> bool {
+        !self.endpoint.is_revoked() && !self.transport.is_cancelled()
+    }
+}
+
+impl FrameBackend for SharedFrames<'_> {
+    type Frame = SharedFrame;
+    type Transmit<'a>
+        = SharedTransmit<'a>
+    where
+        Self: 'a;
+
+    fn pop_output(&self) -> Option<SharedFrame> {
+        self.endpoint.pop_shared_output()
+    }
+
+    fn take_work(&self, _model: &NetWorker) -> Option<Work> {
+        self.transport.take_work()
+    }
+
+    fn can_transmit(&self) -> bool {
+        self.active() && (self.prepared.is_some() || self.transport.can_transmit())
+    }
+
+    fn prepare_transmit(&mut self) -> bool {
+        if !self.active() {
+            self.import_blocked = false;
+            return false;
+        }
+        if self.prepared.is_none() {
+            self.prepared = self.transport.allocate_frame();
+            self.import_blocked = self.prepared.is_none() && self.transport.has_free_buffer();
+        }
+        self.prepared.is_some()
+    }
+
+    fn transmit(&mut self) -> Option<SharedTransmit<'_>> {
+        self.prepare_transmit().then_some(SharedTransmit {
+            prepared: &mut self.prepared,
+        })
+    }
+
+    fn transmit_retry_delay(&mut self) -> Option<Duration> {
+        // Import quota is shared with other connections, whose releases do
+        // not notify this NIC. Retained empty returns need the same retry as
+        // a failed new transmit reservation, including with a prepared token.
+        let transmit_blocked = core::mem::take(&mut self.import_blocked);
+        let return_blocked = self.transport.take_return_retry();
+        ((transmit_blocked || return_blocked) && self.active()).then_some(IMPORT_CREDIT_RETRY_DELAY)
+    }
+}
+
+struct FrameDevice<B: FrameBackend> {
+    backend: B,
+    received: Option<B::Frame>,
+}
+
+impl<B: FrameBackend> FrameDevice<B> {
+    fn new(backend: B) -> Self {
+        Self {
+            backend,
+            received: None,
+        }
+    }
+
+    fn can_transmit(&self) -> bool {
+        self.backend.can_transmit()
+    }
+}
+
+struct Receive<F>(F);
+struct CopyTransmit<'a>(&'a NetEndpoint);
+struct SharedTransmit<'a> {
+    prepared: &'a mut Option<SharedTxFrame>,
+}
+
+impl<T: FrameBytes> RxToken for Receive<T> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.0.bytes[..self.0.len])
+        self.0.with_bytes(f)
     }
 }
-impl TxToken for Transmit<'_> {
+impl TxToken for CopyTransmit<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
         assert!(len <= MAX_FRAME);
+        // Preserve the copying backend's lazy inline-array initialization.
         let mut frame = Frame::empty();
         frame.len = len;
-        let result = f(&mut frame.bytes[..len]);
-        // Only this Task produces input frames; failure during revocation discards the frame.
+        let result = frame.with_bytes_mut(f);
         let _ = self.0.push_input(frame);
         result
     }
 }
-impl Device for FrameDevice<'_> {
+
+impl TxToken for SharedTransmit<'_> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        assert!(len <= MAX_FRAME);
+        let mut frame = self
+            .prepared
+            .take()
+            .expect("reserved shared transmit frame");
+        let result = frame.with_bytes_mut(len, f);
+        // This worker is already running. Publish directly to the Image using
+        // the retained import credit; a concurrent close may discard delivery.
+        let _ = frame.deliver(len);
+        result
+    }
+}
+
+impl<B: FrameBackend> Device for FrameDevice<B> {
     type RxToken<'a>
-        = Receive
+        = Receive<B::Frame>
     where
         Self: 'a;
     type TxToken<'a>
-        = Transmit<'a>
+        = B::Transmit<'a>
     where
         Self: 'a;
-    fn receive(&mut self, _: NetworkInstant) -> Option<(Receive, Transmit<'_>)> {
-        if !self.endpoint.input_has_space() {
-            return None;
-        }
-        Some((Receive(self.received.take()?), Transmit(self.endpoint)))
+    fn receive(&mut self, _: NetworkInstant) -> Option<(Receive<B::Frame>, B::Transmit<'_>)> {
+        self.received.as_ref()?;
+        let transmit = self.backend.transmit()?;
+        Some((Receive(self.received.take()?), transmit))
     }
-    fn transmit(&mut self, _: NetworkInstant) -> Option<Transmit<'_>> {
-        self.endpoint
-            .input_has_space()
-            .then_some(Transmit(self.endpoint))
+    fn transmit(&mut self, _: NetworkInstant) -> Option<B::Transmit<'_>> {
+        self.backend.transmit()
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut result = DeviceCapabilities::default();
@@ -1458,7 +1654,7 @@ mod mapped_tcp_admission_tests {
     };
     use spin::Once;
 
-    use super::*;
+    use super::{super::VirtioNet, *};
     use crate::{
         endovisor::policy::{Admission, NatQuotaSnapshot},
         net::{
@@ -1477,6 +1673,198 @@ mod mapped_tcp_admission_tests {
     static NEXT_FIXTURE_ID: AtomicU32 = AtomicU32::new(0x6f80_0000);
     static NEXT_LISTENER_PORT: AtomicU32 = AtomicU32::new(49152);
     const TEST_WAIT: Duration = Duration::from_secs(5);
+
+    #[ktest]
+    fn shared_import_backpressure_retries_without_a_nic_notification() {
+        let fixture = Fixture::new();
+        let endpoint = NetEndpoint::new(fixture.uid, fixture.port.into());
+        let shared = crate::endovisor::shared_net::SharedNet::new(
+            &fixture.admission,
+            fixture.model.kernelet.clone(),
+            endpoint.clone(),
+            [2, 0x71, 4, 0, 0, 2],
+            33,
+        )
+        .unwrap();
+        let other_link = fixture
+            .model
+            .kernelet
+            .shared_buffer_host_endpoint()
+            .unwrap();
+        // Real import credits from a different private link exhaust the same
+        // Image participant quota used by the NIC.
+        let held: Vec<_> = (0..64)
+            .map(|_| other_link.reserve_send(PAGE_SIZE).unwrap())
+            .collect();
+        let mut backend = SharedFrames {
+            endpoint: &endpoint,
+            transport: shared.transport_for_test(),
+            prepared: None,
+            import_blocked: false,
+        };
+        assert!(!backend.prepare_transmit());
+        let retry = backend
+            .transmit_retry_delay()
+            .expect("import retry deadline");
+        assert!(backend.transmit_retry_delay().is_none());
+        assert!(!backend.prepare_transmit());
+        assert_eq!(backend.transmit_retry_delay(), Some(retry));
+        let generation = endpoint.generation();
+        drop(held);
+        assert_eq!(endpoint.generation(), generation);
+        let mut poller = Poller::new(Some(&retry));
+        assert!(
+            endpoint
+                .poll_change(generation, poller.as_handle_mut())
+                .is_empty()
+        );
+        assert_eq!(poller.wait().unwrap_err().error(), Errno::ETIME);
+        assert!(backend.prepare_transmit());
+        assert!(backend.transmit_retry_delay().is_none());
+
+        // Unused paired transmit tokens must retain the original reservation.
+        for _ in 0..64 {
+            drop(backend.transmit().unwrap());
+        }
+        let held: Vec<_> = (0..63)
+            .map(|_| other_link.reserve_send(PAGE_SIZE).unwrap())
+            .collect();
+        assert!(other_link.reserve_send(PAGE_SIZE).is_err());
+        drop(held);
+        drop(backend);
+        shared.cancel();
+        drop(shared);
+        other_link.close();
+        endpoint.revoke();
+        drop(endpoint);
+        fixture.finish();
+    }
+
+    #[ktest]
+    fn empty_returns_retry_with_an_unused_transmit_credit() {
+        use ostd::kernelet::{abi::buffer, shared_buffer::SharedNetHeader};
+
+        let fixture = Fixture::new();
+        let image = &fixture.model.kernelet;
+        let endpoint = NetEndpoint::new(fixture.uid, fixture.port.into());
+        let shared = crate::endovisor::shared_net::SharedNet::new(
+            &fixture.admission,
+            image.clone(),
+            endpoint.clone(),
+            [2, 0x71, 4, 0, 0, 3],
+            33,
+        )
+        .unwrap();
+        let transport = shared.transport_for_test();
+        let nic_connection = shared.info(buffer::NET_QUERY_CONNECTION).value;
+        let other_link = image.shared_buffer_host_endpoint().unwrap();
+        const TX_POOL_SIZE: usize = 32;
+        const FRAME_LEN: usize = 14;
+        // Put a complete Image TX pool onto the private NIC connection using
+        // real owning handoffs. No response traffic is needed for this test.
+        for _ in 0..TX_POOL_SIZE {
+            let mut grant = other_link.allocate(PAGE_SIZE, Box::new(())).unwrap();
+            grant
+                .with_bytes_mut(0..SharedNetHeader::SIZE, |bytes| {
+                    bytes.copy_from_slice(
+                        &SharedNetHeader::new(SharedNetHeader::SIZE, FRAME_LEN, false)
+                            .unwrap()
+                            .encode(),
+                    );
+                })
+                .unwrap();
+            let payload = SharedNetHeader::SIZE + FRAME_LEN;
+            grant
+                .handoff(other_link.reserve_send(PAGE_SIZE).unwrap(), payload)
+                .map_err(|(_, _, error)| error)
+                .unwrap();
+            let delivery = image.test_shared_buffer_service(
+                buffer::RECEIVE,
+                0,
+                [other_link.connection(), 0, 0],
+            );
+            assert_eq!(delivery.status, 0);
+            assert_ne!(delivery.value, 0);
+            assert!(
+                image
+                    .test_shared_buffer_service(buffer::REDEEM, delivery.value, [0; 3])
+                    .status
+                    >= 0
+            );
+            assert_eq!(
+                image
+                    .test_shared_buffer_service(
+                        buffer::HANDOFF,
+                        delivery.value,
+                        [nic_connection, buffer::READ_WRITE, payload as u64]
+                    )
+                    .status,
+                0
+            );
+        }
+        let mut backend = SharedFrames {
+            endpoint: &endpoint,
+            transport,
+            prepared: None,
+            import_blocked: false,
+        };
+        assert!(backend.prepare_transmit());
+        // The unused paired transmit token owns the final import slot.
+        let held: Vec<_> = (0..63)
+            .map(|_| other_link.reserve_send(PAGE_SIZE).unwrap())
+            .collect();
+        for _ in 0..TX_POOL_SIZE {
+            assert!(matches!(
+                backend.take_work(&fixture.model),
+                Some(Work::Progress)
+            ));
+            drop(endpoint.pop_shared_output().expect("queued Image frame"));
+        }
+        assert!(backend.take_work(&fixture.model).is_none());
+        let retry = backend
+            .transmit_retry_delay()
+            .expect("empty-return retry deadline");
+        assert!(backend.transmit_retry_delay().is_none());
+        // A new failed return attempt arms one more retry, even though the
+        // cached transmit reservation avoids a new transmit attempt.
+        assert!(backend.take_work(&fixture.model).is_none());
+        assert_eq!(backend.transmit_retry_delay(), Some(retry));
+        let generation = endpoint.generation();
+        drop(held);
+        assert_eq!(endpoint.generation(), generation);
+        let mut poller = Poller::new(Some(&retry));
+        assert!(
+            endpoint
+                .poll_change(generation, poller.as_handle_mut())
+                .is_empty()
+        );
+        assert_eq!(poller.wait().unwrap_err().error(), Errno::ETIME);
+        for _ in 0..TX_POOL_SIZE {
+            assert!(matches!(
+                backend.take_work(&fixture.model),
+                Some(Work::Progress)
+            ));
+            let delivery =
+                image.test_shared_buffer_service(buffer::RECEIVE, 0, [nic_connection, 0, 0]);
+            assert_eq!(delivery.status, 0);
+            assert_ne!(delivery.value, 0);
+            assert_eq!(
+                image
+                    .test_shared_buffer_service(buffer::DISCARD, delivery.value, [0; 3])
+                    .status,
+                0
+            );
+        }
+        assert!(backend.take_work(&fixture.model).is_none());
+        assert!(backend.transmit_retry_delay().is_none());
+        drop(backend);
+        shared.cancel();
+        drop(shared);
+        other_link.close();
+        endpoint.revoke();
+        drop(endpoint);
+        fixture.finish();
+    }
 
     #[ktest]
     fn empty_mapped_tcp_listener_does_not_request_full_uid_quota() {
@@ -1643,7 +2031,8 @@ mod mapped_tcp_admission_tests {
 
     struct Fixture {
         uid: Uid,
-        model: Arc<VirtioNet>,
+        model: NetWorker,
+        copy_device: Arc<VirtioNet>,
         admission: Arc<Admission>,
         listener: Option<TcpListener>,
         listener_reservation: Option<Arc<crate::endovisor::NativeTcpBufferCharge>>,
@@ -1690,10 +2079,12 @@ mod mapped_tcp_admission_tests {
             admission.mark_created();
             let baseline_host_bytes = owner.stats().host_bytes_charged;
             let endpoint = NetEndpoint::new(uid, cid);
-            let model = VirtioNet::new(owner, endpoint, [2, 0x71, 4, 0, 0, 1], 32);
+            let copy_device = VirtioNet::new(owner, endpoint, [2, 0x71, 4, 0, 0, 1], 32);
+            let model = NetWorker::for_copy(copy_device.clone());
             let mut fixture = Self {
                 uid,
                 model,
+                copy_device,
                 admission,
                 listener: None,
                 listener_reservation: None,
@@ -1744,7 +2135,7 @@ mod mapped_tcp_admission_tests {
             let mut failure = None;
             // This rejected addition copies the real UID row under LEDGER.
             // It never acquires a charge or allocates a local Ledger.
-            let result = PrestartEndpointReservation::reserve_diagnostic(
+            let result = UserEndpointReservation::reserve_diagnostic(
                 self.uid,
                 usize::MAX,
                 QuotaTag::new(QuotaClass::TestOnly, None),
@@ -1758,13 +2149,13 @@ mod mapped_tcp_admission_tests {
             snapshot
         }
 
-        fn fill_quota(&self, before: NatQuotaSnapshot) -> PrestartEndpointReservation {
+        fn fill_quota(&self, before: NatQuotaSnapshot) -> UserEndpointReservation {
             let available = before
                 .limit
                 .checked_sub(before.endpoint_bytes.unwrap())
                 .unwrap();
             assert!(available > 0);
-            PrestartEndpointReservation::reserve(
+            UserEndpointReservation::reserve(
                 self.uid,
                 available,
                 QuotaTag::new(QuotaClass::TestOnly, None),
@@ -1788,7 +2179,7 @@ mod mapped_tcp_admission_tests {
         fn cleanup(&mut self) -> bool {
             drop(self.listener.take());
             drop(self.listener_reservation.take());
-            self.model.cancel();
+            self.copy_device.cancel();
             self.model.endpoint.revoke();
             if !poll_until(|| self.host_bytes() == self.baseline_host_bytes) {
                 error!(

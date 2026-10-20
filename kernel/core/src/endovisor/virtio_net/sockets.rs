@@ -8,7 +8,7 @@ use aster_bigtcp::socket::{TCP_RECV_BUF_LEN, TCP_SEND_BUF_LEN};
 
 #[cfg(kernelet_nat_failure_diag_host)]
 use super::{
-    VirtioNet,
+    NetWorker,
     endpoint::{NatContext, NatEvent},
 };
 use crate::{
@@ -123,7 +123,7 @@ impl TcpStream {
 
     pub(super) fn take_error(
         &self,
-        #[cfg(kernelet_nat_failure_diag_host)] model: &VirtioNet,
+        #[cfg(kernelet_nat_failure_diag_host)] model: &NetWorker,
         #[cfg(kernelet_nat_failure_diag_host)] handle: smoltcp::iface::SocketHandle,
         #[cfg(kernelet_nat_failure_diag_host)] requested: Option<(
             smoltcp::wire::IpEndpoint,
@@ -256,7 +256,7 @@ impl TcpListener {
     #[cfg(kernelet_nat_failure_diag_host)]
     fn record_accept_failure(
         &self,
-        model: &VirtioNet,
+        model: &NetWorker,
         event: NatEvent,
         mut context: NatContext,
         peer: Option<&SocketAddr>,
@@ -280,7 +280,7 @@ impl TcpListener {
     pub(super) fn accept(
         &self,
         charge: NativeTcpBufferCharge,
-        #[cfg(kernelet_nat_failure_diag_host)] model: &VirtioNet,
+        #[cfg(kernelet_nat_failure_diag_host)] model: &NetWorker,
         #[cfg(kernelet_nat_failure_diag_host)] context: NatContext,
     ) -> Result<TcpStream> {
         let accepted = self.0.accept_nat(true, charge);

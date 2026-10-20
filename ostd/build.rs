@@ -51,6 +51,27 @@ fn main() {
         );
         println!("cargo:rustc-cfg=kernelet_rq1_crossing_diag");
     }
+    println!("cargo:rerun-if-env-changed=KERNELET_RQ1_STACK_CHECK_MODE");
+    println!("cargo:rustc-check-cfg=cfg(kernelet_rq1_stack_check_diag)");
+    println!("cargo:rustc-check-cfg=cfg(kernelet_rq1_stack_check_bypass)");
+    match std::env::var("KERNELET_RQ1_STACK_CHECK_MODE").as_deref() {
+        Err(_) | Ok("off") => {}
+        Ok(mode @ ("checked" | "bypass")) => {
+            assert!(
+                std::env::var("KERNELET_RQ1_BENCH").as_deref() == Ok("1"),
+                "stack-check diagnostics require KERNELET_RQ1_BENCH=1"
+            );
+            assert!(
+                std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64"),
+                "stack-check diagnostics require x86_64"
+            );
+            println!("cargo:rustc-cfg=kernelet_rq1_stack_check_diag");
+            if mode == "bypass" && std::env::var_os("CARGO_FEATURE_KERNELET_HOST").is_some() {
+                println!("cargo:rustc-cfg=kernelet_rq1_stack_check_bypass");
+            }
+        }
+        Ok(_) => panic!("KERNELET_RQ1_STACK_CHECK_MODE must be off, checked or bypass"),
+    }
     println!("cargo:rerun-if-env-changed=KERNELET_GETPID_PROFILE");
     println!("cargo:rustc-check-cfg=cfg(kernelet_getpid_profile)");
     if std::env::var_os("KERNELET_GETPID_PROFILE").as_deref() == Some(std::ffi::OsStr::new("1")) {

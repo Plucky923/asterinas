@@ -4,6 +4,8 @@
 
 set -e
 
+./select_timeout
+
 ./epoll/epoll_err
 ./epoll/poll_err
 ./epoll/test_epoll_pwait.sh
@@ -13,6 +15,7 @@ set -e
 
 ./file_io/access_err
 ./file_io/block_device
+./file_io/dup_rlimit
 ./file_io/fcntl_lock
 ./file_io/fcntl_owner
 ./file_io/fcntl_status_flags

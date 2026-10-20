@@ -17,7 +17,9 @@ use super::super::policy::{
     NatQuotaSnapshot, QUOTA_DIAGNOSTIC_LAYOUT, QuotaCategorySnapshot, QuotaClass, QuotaTag,
 };
 use super::{
-    super::policy::PrestartEndpointReservation, ENDPOINT_SLOTS, Frame, nat::NatBackend,
+    super::{policy::UserEndpointReservation, shared_net::SharedFrame},
+    ENDPOINT_SLOTS, Frame,
+    nat::NatBackend,
     sockets::TCP_LISTENER_RESERVATION_BYTES,
 };
 use crate::{
@@ -182,6 +184,7 @@ pub(in crate::endovisor) struct NetEndpoint {
     diagnostics: SpinLock<NatDiagnostics>,
     input: Mutex<VecDeque<Frame>>,
     output: Mutex<VecDeque<Frame>>,
+    shared_output: Mutex<VecDeque<SharedFrame>>,
     backend: Mutex<BackendState>,
     pollee: Pollee,
     control_pollee: Pollee,
@@ -203,6 +206,7 @@ impl NetEndpoint {
             diagnostics: SpinLock::new(NatDiagnostics::new()),
             input: Mutex::new(VecDeque::with_capacity(ENDPOINT_SLOTS)),
             output: Mutex::new(VecDeque::with_capacity(ENDPOINT_SLOTS)),
+            shared_output: Mutex::new(VecDeque::new()),
             backend: Mutex::new(BackendState::Unconfigured),
             pollee: Pollee::new(),
             control_pollee: Pollee::new(),
@@ -225,7 +229,18 @@ impl NetEndpoint {
 
     pub(in crate::endovisor) fn reservation_bytes(&self) -> usize {
         let capacity = self.input.lock().capacity() + self.output.lock().capacity();
-        capacity * size_of::<Frame>() + size_of::<Self>()
+        capacity * size_of::<Frame>()
+            + self.shared_output.lock().capacity() * size_of::<SharedFrame>()
+            + size_of::<Self>()
+    }
+
+    /// Selects the compact queue before either device worker starts.
+    pub(in crate::endovisor) fn enable_shared_frames(&self) {
+        let input = core::mem::take(&mut *self.input.lock());
+        let output = core::mem::take(&mut *self.output.lock());
+        debug_assert!(input.is_empty() && output.is_empty());
+        drop((input, output));
+        *self.shared_output.lock() = VecDeque::with_capacity(ENDPOINT_SLOTS);
     }
 
     fn configure(&self, config: NetConfigArgs) -> Result<()> {
@@ -314,7 +329,8 @@ impl NetEndpoint {
         drop(prepared);
         let input = core::mem::take(&mut *self.input.lock());
         let output = core::mem::take(&mut *self.output.lock());
-        drop((input, output));
+        let shared_output = core::mem::take(&mut *self.shared_output.lock());
+        drop((input, output, shared_output));
         if let Some((kernelet, bytes)) = self.account.lock().take() {
             kernelet.uncharge_host_bytes(bytes);
         }
@@ -322,11 +338,8 @@ impl NetEndpoint {
         self.control_pollee.notify(IoEvents::HUP | IoEvents::ERR);
     }
 
-    pub(super) fn reserve_backend_bytes(
-        &self,
-        bytes: usize,
-    ) -> Result<PrestartEndpointReservation> {
-        PrestartEndpointReservation::reserve(
+    pub(super) fn reserve_backend_bytes(&self, bytes: usize) -> Result<UserEndpointReservation> {
+        UserEndpointReservation::reserve(
             self.owner,
             bytes,
             #[cfg(kernelet_nat_failure_diag_host)]
@@ -550,7 +563,11 @@ impl NetEndpoint {
         self.generation.load(Ordering::Acquire)
     }
 
-    pub(super) fn wake_backend(&self) {
+    pub(in crate::endovisor) fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    pub(in crate::endovisor) fn wake_backend(&self) {
         self.generation.fetch_add(1, Ordering::Release);
         self.pollee.notify(IoEvents::IN);
     }
@@ -576,11 +593,11 @@ impl NetEndpoint {
         self.input.lock().len() < ENDPOINT_SLOTS
     }
 
-    pub(super) fn output_has_space(&self) -> bool {
+    pub(in crate::endovisor) fn output_has_space(&self) -> bool {
         self.output.lock().len() < ENDPOINT_SLOTS
     }
 
-    pub(super) fn pop_input(&self) -> Option<Frame> {
+    pub(in crate::endovisor) fn pop_input(&self) -> Option<Frame> {
         self.input.lock().pop_front()
     }
 
@@ -588,15 +605,27 @@ impl NetEndpoint {
         self.output.lock().pop_front()
     }
 
+    pub(in crate::endovisor) fn shared_output_has_space(&self) -> bool {
+        self.shared_output.lock().len() < ENDPOINT_SLOTS
+    }
+
+    pub(super) fn pop_shared_output(&self) -> Option<SharedFrame> {
+        self.shared_output.lock().pop_front()
+    }
+
+    pub(in crate::endovisor) fn push_shared_output(&self, frame: SharedFrame) -> bool {
+        Self::push(&self.shared_output, &self.revoked, frame)
+    }
+
     pub(super) fn push_input(&self, frame: Frame) -> bool {
         Self::push(&self.input, &self.revoked, frame)
     }
 
-    pub(super) fn push_output(&self, frame: Frame) -> bool {
+    pub(in crate::endovisor) fn push_output(&self, frame: Frame) -> bool {
         Self::push(&self.output, &self.revoked, frame)
     }
 
-    fn push(queue: &Mutex<VecDeque<Frame>>, revoked: &AtomicBool, frame: Frame) -> bool {
+    fn push<F>(queue: &Mutex<VecDeque<F>>, revoked: &AtomicBool, frame: F) -> bool {
         let mut queue = queue.lock();
         if revoked.load(Ordering::Acquire) || queue.len() == ENDPOINT_SLOTS {
             return false;
@@ -786,16 +815,16 @@ mod diagnostic_tests {
         let cid = 129;
         let endpoint = NetEndpoint::new(owner, cid);
         let tag = QuotaTag::new(QuotaClass::NatFlow, Some(cid));
-        let held = PrestartEndpointReservation::reserve(owner, 16 * 1024 * 1024, tag).unwrap();
+        let held = UserEndpointReservation::reserve(owner, 16 * 1024 * 1024, tag).unwrap();
         let (mut first, mut first_categories, mut second, mut second_categories) =
             (None, None, None, None);
         assert!(endpoint.wants_quota_categories());
         assert!(
-            matches!(PrestartEndpointReservation::reserve_diagnostic(owner, 1, tag,
+            matches!(UserEndpointReservation::reserve_diagnostic(owner, 1, tag,
             &mut first, Some(&mut first_categories)), Err(e) if e.error() == Errno::ENOSPC)
         );
         assert!(
-            matches!(PrestartEndpointReservation::reserve_diagnostic(owner, 2, tag,
+            matches!(UserEndpointReservation::reserve_diagnostic(owner, 2, tag,
             &mut second, Some(&mut second_categories)), Err(e) if e.error() == Errno::ENOSPC)
         );
         assert_ne!(first.unwrap().attempt, second.unwrap().attempt);
@@ -837,11 +866,11 @@ mod diagnostic_tests {
         let owner = Uid::new(u32::MAX - 48);
         let cid = 130;
         let tag = QuotaTag::new(QuotaClass::NatFlow, Some(cid));
-        let held = PrestartEndpointReservation::reserve(owner, 16 * 1024 * 1024, tag).unwrap();
+        let held = UserEndpointReservation::reserve(owner, 16 * 1024 * 1024, tag).unwrap();
         let (mut first, mut first_categories, mut second, mut second_categories) =
             (None, None, None, None);
         assert!(
-            PrestartEndpointReservation::reserve_diagnostic(
+            UserEndpointReservation::reserve_diagnostic(
                 owner,
                 1,
                 tag,
@@ -851,7 +880,7 @@ mod diagnostic_tests {
             .is_err()
         );
         assert!(
-            PrestartEndpointReservation::reserve_diagnostic(
+            UserEndpointReservation::reserve_diagnostic(
                 owner,
                 2,
                 tag,

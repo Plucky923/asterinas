@@ -149,7 +149,8 @@ mod host {
                 basetime: [VdsoInstant::zero(); VDSO_BASES],
                 tz_minuteswest: 0,
                 tz_dsttime: 0,
-                hrtimer_res: 0,
+                // Match clock_getres for high-resolution clocks.
+                hrtimer_res: 1,
                 __unused: 0,
                 arch_data: ArchVdsoData {},
             }

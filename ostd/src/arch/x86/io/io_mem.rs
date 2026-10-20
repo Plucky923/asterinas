@@ -29,6 +29,7 @@ use crate::{
 /// by decoding the faulting CPU instruction.
 /// As such, the kernel must be compiled to emit simple load/store CPU instructions.
 pub(crate) unsafe fn read_once<T: PodOnce>(ptr: *const T) -> T {
+    const { assert!(matches!(size_of::<T>(), 1 | 2 | 4 | 8)) };
     debug_assert!(ptr.is_aligned());
     let mut val: u64 = 0;
 
@@ -72,6 +73,7 @@ pub(crate) unsafe fn read_once<T: PodOnce>(ptr: *const T) -> T {
 ///
 /// Refer to the "Guarantee" section of [`read_once`].
 pub(crate) unsafe fn write_once<T: PodOnce>(ptr: *mut T, val: T) {
+    const { assert!(matches!(size_of::<T>(), 1 | 2 | 4 | 8)) };
     debug_assert!(ptr.is_aligned());
     let mut tmp: u64 = 0;
 

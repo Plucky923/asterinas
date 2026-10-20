@@ -1,0 +1,11 @@
+predefined_clockid = CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW |
+                     CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME |
+                     CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID;
+
+// Predefined clocks, including validation-only queries.
+clock_getres(clockid = <predefined_clockid>, res);
+clock_getres(clockid = <predefined_clockid>, res = NULL);
+
+// Supported dynamic process and thread CPU clocks; FD clocks are unsupported.
+clock_getres(clockid = <INTEGER>, res);
+clock_getres(clockid = <INTEGER>, res = NULL);

@@ -20,7 +20,10 @@ fn allocate_layout(layout: Layout) -> Option<usize> {
     let allocator = get_global_frame_allocator();
     let result = allocator.alloc(layout);
     #[cfg(feature = "kernelet")]
-    if result.is_none() && crate::kernelet::image_grant::request_grains(layout.size()) {
+    if result.is_none()
+        && let Some(refill) = allocator.refill_layout(layout)
+        && crate::kernelet::image_grant::request_grains(refill)
+    {
         return allocator.alloc(layout);
     }
     result
@@ -199,6 +202,14 @@ pub trait GlobalFrameAllocator: Sync {
     /// calling [`GlobalFrameAllocator::dealloc`]. If multiple frames are
     /// allocated, they may be returned in any order with any number of calls.
     fn alloc(&self, layout: Layout) -> Option<Paddr>;
+
+    /// Describes a fresh free range sufficient to retry a failed allocation.
+    ///
+    /// Implementations with size classes must include their rounding and
+    /// alignment requirements. Returning `None` declines an automatic refill.
+    fn refill_layout(&self, layout: Layout) -> Option<Layout> {
+        Some(layout)
+    }
 
     /// Deallocates a contiguous range of frames.
     ///

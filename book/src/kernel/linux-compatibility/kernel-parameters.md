@@ -216,6 +216,21 @@ Notes:
 
 ## Asterinas-specific
 
+### `kernelet_user_memory_mib`
+
+Set the per-user memory reservation limit for the Kernelet Host, in MiB.
+The default is `1024`.
+Accepted values are even integers of at least `2`, matching the two-MiB grain size.
+The budget includes Image memory ceilings and Host execution and metadata storage.
+Raising an Image ceiling does not raise this user budget.
+Physical allocation can still fail within the reservation limit.
+This parameter applies to Host builds with Kernelet support.
+
+Example:
+```text
+kernelet_user_memory_mib=4096
+```
+
 ### `i8042.exist`
 
 Override ACPI's indication of whether a PS/2 (i8042) controller exists.

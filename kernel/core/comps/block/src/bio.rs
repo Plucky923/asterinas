@@ -38,7 +38,24 @@ use crate::{BLOCK_SIZE, SECTOR_SIZE, impl_block_device::general_complete_fn, pre
 pub struct Bio {
     metadata: Arc<BioMetadata>,
     complete_fn: Option<BioCompleteFn>,
-    segments: Vec<BioSegment>,
+    segments: BioSegments,
+}
+
+#[derive(Debug)]
+enum BioSegments {
+    Multiple(Vec<BioSegment>),
+    #[cfg(feature = "kernelet-host")]
+    Single(BioSegment),
+}
+
+impl BioSegments {
+    fn as_slice(&self) -> &[BioSegment] {
+        match self {
+            Self::Multiple(segments) => segments,
+            #[cfg(feature = "kernelet-host")]
+            Self::Single(segment) => core::slice::from_ref(segment),
+        }
+    }
 }
 
 /// The completion function type for BIO operations.
@@ -60,7 +77,35 @@ impl Bio {
         segments: Vec<BioSegment>,
         complete_fn: Option<BioCompleteFn>,
     ) -> Self {
+        Self::with_segments(
+            type_,
+            start_sid,
+            BioSegments::Multiple(segments),
+            complete_fn,
+        )
+    }
+
+    /// Constructs a BIO with one inline segment, without allocating a segment vector.
+    ///
+    /// Submission retains the segment until device completion, as with [`Self::new`].
+    #[cfg(feature = "kernelet-host")]
+    pub fn new_single(
+        type_: BioType,
+        start_sid: Sid,
+        segment: BioSegment,
+        complete_fn: Option<BioCompleteFn>,
+    ) -> Self {
+        Self::with_segments(type_, start_sid, BioSegments::Single(segment), complete_fn)
+    }
+
+    fn with_segments(
+        type_: BioType,
+        start_sid: Sid,
+        segments: BioSegments,
+        complete_fn: Option<BioCompleteFn>,
+    ) -> Self {
         let nsectors = segments
+            .as_slice()
             .iter()
             .map(|segment| segment.nsectors().to_raw())
             .sum();
@@ -90,7 +135,7 @@ impl Bio {
 
     /// Returns the slice to the memory segments currently owned by this handle.
     pub fn segments(&self) -> &[BioSegment] {
-        &self.segments
+        self.segments.as_slice()
     }
 
     /// Returns the status.
@@ -105,9 +150,6 @@ impl Bio {
     ///
     /// Pushes the completion record into `io_batch`.
     ///
-    /// # Panics
-    ///
-    /// The caller must not submit a `Bio` more than once. Otherwise, a panic shall be triggered.
     pub fn submit(
         self,
         block_device: &dyn BlockDevice,
@@ -155,9 +197,6 @@ impl Bio {
     ///
     /// Returns the result status of the `Bio`.
     ///
-    /// # Panics
-    ///
-    /// The caller must not submit a `Bio` more than once. Otherwise, a panic shall be triggered.
     pub fn submit_and_wait(
         self,
         block_device: &dyn BlockDevice,
@@ -203,7 +242,7 @@ pub struct SubmittedBio {
     metadata: Arc<BioMetadata>,
     sid_offset: u64,
     complete_fn: Option<BioCompleteFn>,
-    segments: Vec<BioSegment>,
+    segments: BioSegments,
 }
 
 impl SubmittedBio {
@@ -229,7 +268,7 @@ impl SubmittedBio {
 
     /// Returns the slice to the memory segments.
     pub fn segments(&self) -> &[BioSegment] {
-        &self.segments
+        self.segments.as_slice()
     }
 
     /// Returns the status.
@@ -379,8 +418,33 @@ pub struct BioSegment {
 struct BioSegmentInner {
     /// Internal DMA slice.
     // TODO: The direction is currently `FromAndToDevice`. Implement compile-time checking.
-    storage: Slice<BioBuffer>,
+    storage: BioSegmentStorage,
     direction: BioDirection,
+}
+
+#[derive(Debug)]
+enum BioSegmentStorage {
+    Active(Slice<BioBuffer>),
+    #[cfg(feature = "kernelet-host")]
+    Cached,
+}
+
+impl From<Slice<BioBuffer>> for BioSegmentStorage {
+    fn from(storage: Slice<BioBuffer>) -> Self {
+        Self::Active(storage)
+    }
+}
+
+impl Deref for BioSegmentStorage {
+    type Target = Slice<BioBuffer>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Active(storage) => storage,
+            #[cfg(feature = "kernelet-host")]
+            Self::Cached => unreachable!("only active BIO segments expose storage"),
+        }
+    }
 }
 
 /// The direction of a bio request.
@@ -404,6 +468,56 @@ enum BioBufferInner {
     Owned(DmaBuffer<FromAndToDevice>),
     #[cfg(feature = "kernelet-host")]
     Shared(Arc<DmaBuffer<FromAndToDevice>>),
+    #[cfg(feature = "kernelet-host")]
+    Imported(Arc<ostd::kernelet::shared_buffer::BackendBuffer>),
+    #[cfg(feature = "kernelet-host")]
+    Lent(LentStorage),
+}
+
+#[cfg(feature = "kernelet-host")]
+struct LentStorage {
+    // Drop the pin before refunding the retained device's metadata budget.
+    lease: ostd::kernelet::guest_dma::GuestDmaLease,
+    _owner: Arc<dyn Send + Sync>,
+}
+
+/// Reusable metadata for a borrowed BIO segment, without a retained DMA lease.
+///
+/// A cache can be rebound only with a newly checked lease.
+/// It exposes no DMA
+/// address or CPU access and cannot be submitted as a BIO segment.
+#[cfg(feature = "kernelet-host")]
+pub struct GuestBioSegmentCache {
+    inner: Arc<BioSegmentInner>,
+    _owner: Arc<dyn Send + Sync>,
+}
+
+#[cfg(feature = "kernelet-host")]
+impl Debug for GuestBioSegmentCache {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.inner.fmt(formatter)
+    }
+}
+
+#[cfg(feature = "kernelet-host")]
+impl GuestBioSegmentCache {
+    /// Binds this metadata to a newly acquired DMA lease.
+    pub fn bind(
+        mut self,
+        lease: ostd::kernelet::guest_dma::GuestDmaLease,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<BioSegment, Error> {
+        let inner = BioSegment::guest_dma_inner(lease, owner)?;
+        *Arc::get_mut(&mut self.inner).expect("cached segment must be uniquely owned") = inner;
+        Ok(BioSegment { inner: self.inner })
+    }
+}
+
+#[cfg(feature = "kernelet-host")]
+impl Debug for LentStorage {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.lease.fmt(formatter)
+    }
 }
 
 impl BioBuffer {
@@ -416,27 +530,44 @@ impl BioBuffer {
     }
 }
 
+// Preserve the native public backing interface. Imported grants in Host
+// builds deliberately expose only the restricted BIO accessors below.
+#[cfg(not(feature = "kernelet-host"))]
 impl Deref for BioBuffer {
     type Target = DmaBuffer<FromAndToDevice>;
 
     fn deref(&self) -> &Self::Target {
         match &self.0 {
             BioBufferInner::Owned(buffer) => buffer,
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Shared(buffer) => buffer,
         }
     }
 }
 
 impl HasSize for BioBuffer {
     fn size(&self) -> usize {
-        self.deref().size()
+        match &self.0 {
+            BioBufferInner::Owned(buffer) => buffer.size(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Shared(buffer) => buffer.size(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Imported(buffer) => buffer.size(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Lent(buffer) => buffer.lease.size(),
+        }
     }
 }
 
 impl HasDaddr for BioBuffer {
     fn daddr(&self) -> Daddr {
-        self.deref().daddr()
+        match &self.0 {
+            BioBufferInner::Owned(buffer) => buffer.daddr(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Shared(buffer) => buffer.daddr(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Imported(buffer) => buffer.daddr(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Lent(buffer) => buffer.lease.daddr(),
+        }
     }
 }
 
@@ -444,15 +575,149 @@ impl HasVmReaderWriter for BioBuffer {
     type Types = VmReaderWriterResult;
 
     fn reader(&self) -> Result<VmReader<'_, Infallible>, Error> {
-        self.deref().reader()
+        match &self.0 {
+            BioBufferInner::Owned(buffer) => buffer.reader(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Shared(buffer) => buffer.reader(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Imported(buffer) => buffer.reader(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Lent(_) => Err(Error::AccessDenied),
+        }
     }
 
     fn writer(&self) -> Result<VmWriter<'_, Infallible>, Error> {
-        self.deref().writer()
+        match &self.0 {
+            BioBufferInner::Owned(buffer) => buffer.writer(),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Shared(buffer) => buffer.writer(),
+            // A shared DMA hold cannot create an exclusive CPU writer.
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Imported(_) => Err(Error::AccessDenied),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Lent(_) => Err(Error::AccessDenied),
+        }
+    }
+}
+
+impl BioBuffer {
+    /// Synchronizes this BIO view after device access.
+    pub fn sync_from_device(&self, range: Range<usize>) -> Result<(), Error> {
+        match &self.0 {
+            BioBufferInner::Owned(buffer) => buffer.sync_from_device(range),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Shared(buffer) => buffer.sync_from_device(range),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Imported(buffer) => buffer.sync_from_device(range),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Lent(buffer) => buffer.lease.sync_from_device(range),
+        }
+    }
+
+    /// Synchronizes this BIO view before device access.
+    pub fn sync_to_device(&self, range: Range<usize>) -> Result<(), Error> {
+        match &self.0 {
+            BioBufferInner::Owned(buffer) => buffer.sync_to_device(range),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Shared(buffer) => buffer.sync_to_device(range),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Imported(buffer) => buffer.sync_to_device(range),
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Lent(buffer) => buffer.lease.sync_to_device(range),
+        }
     }
 }
 
 impl BioSegment {
+    /// Borrows registered Image DMA storage without copying or exposing CPU access.
+    /// Every segment clone retains the lease through its last asynchronous use.
+    #[cfg(feature = "kernelet-host")]
+    pub fn from_guest_dma(
+        buffer: ostd::kernelet::guest_dma::GuestDmaLease,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            inner: Arc::new(Self::guest_dma_inner(buffer, owner)?),
+        })
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    fn guest_dma_inner(
+        buffer: ostd::kernelet::guest_dma::GuestDmaLease,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<BioSegmentInner, Error> {
+        use ostd::kernelet::guest_dma::DeviceAccess;
+
+        let len = buffer.size();
+        if len == 0 || !is_sector_aligned(len) {
+            return Err(Error::InvalidArgs);
+        }
+        let direction = match buffer.access() {
+            DeviceAccess::Read => BioDirection::ToDevice,
+            DeviceAccess::Write => BioDirection::FromDevice,
+        };
+        Ok(BioSegmentInner {
+            storage: Slice::new(
+                BioBuffer(BioBufferInner::Lent(LentStorage {
+                    lease: buffer,
+                    _owner: owner,
+                })),
+                0..len,
+            )
+            .into(),
+            direction,
+        })
+    }
+
+    /// Releases a uniquely owned borrowed segment's lease and retains its metadata.
+    ///
+    /// Returns the original segment if another view still owns it or its backing
+    /// is not borrowed. Callers must finish all device access before recycling.
+    #[cfg(feature = "kernelet-host")]
+    pub fn try_recycle_guest_dma(mut self) -> Result<GuestBioSegmentCache, Self> {
+        let Some(inner) = Arc::get_mut(&mut self.inner) else {
+            return Err(self);
+        };
+        if !matches!(inner.storage.mem_obj().0, BioBufferInner::Lent(_)) {
+            return Err(self);
+        }
+        let BioSegmentStorage::Active(storage) =
+            core::mem::replace(&mut inner.storage, BioSegmentStorage::Cached)
+        else {
+            unreachable!("a borrowed segment must have active storage");
+        };
+        let (BioBuffer(BioBufferInner::Lent(storage)), _) = storage.into_parts() else {
+            unreachable!("only borrowed backing can be recycled");
+        };
+        drop(storage.lease);
+        Ok(GuestBioSegmentCache {
+            inner: self.inner,
+            _owner: storage._owner,
+        })
+    }
+
+    /// Imports an accepted shared-buffer operation without copying payload.
+    /// Each cloned segment retains the operation until its last use ends.
+    #[cfg(feature = "kernelet-host")]
+    pub fn from_shared_buffer(
+        buffer: Arc<ostd::kernelet::shared_buffer::BackendBuffer>,
+    ) -> Result<Self, Error> {
+        let request = buffer.request();
+        if request.len == 0 || !is_sector_aligned(request.len) {
+            return Err(Error::InvalidArgs);
+        }
+        Ok(Self {
+            inner: Arc::new(BioSegmentInner {
+                storage: Slice::new(BioBuffer(BioBufferInner::Imported(buffer)), 0..request.len)
+                    .into(),
+                direction: if request.device_writes {
+                    BioDirection::FromDevice
+                } else {
+                    BioDirection::ToDevice
+                },
+            }),
+        })
+    }
     /// Allocates a new `BioSegment` with the wanted blocks count and
     /// the bio direction.
     pub fn alloc(nblocks: usize, direction: BioDirection) -> Self {
@@ -505,7 +770,8 @@ impl BioSegment {
                 storage: Slice::new(
                     BioBuffer(BioBufferInner::Shared(owner.clone())),
                     offset + range.start..offset + range.end,
-                ),
+                )
+                .into(),
                 direction: self.inner.direction,
             }),
         })
@@ -556,7 +822,8 @@ impl BioSegment {
                     storage: Slice::new(
                         BioBuffer::new::<SHARED>(DmaBuffer::Direct(dma_stream)),
                         offset..offset + len,
-                    ),
+                    )
+                    .into(),
                     direction,
                 }
             }
@@ -576,7 +843,8 @@ impl BioSegment {
                 storage: Slice::new(
                     BioBuffer::new::<false>(DmaBuffer::Direct(dma_stream)),
                     0..len,
-                ),
+                )
+                .into(),
                 direction,
             }),
         }
@@ -684,7 +952,8 @@ impl BioSegmentPool {
             storage: Slice::new(
                 BioBuffer::new::<SHARED>(DmaBuffer::Arena(arena)),
                 offset_within_first_block..offset_within_first_block + len,
-            ),
+            )
+            .into(),
             direction: self.direction,
         })
     }

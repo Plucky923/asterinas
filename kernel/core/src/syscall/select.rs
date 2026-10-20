@@ -12,7 +12,11 @@ use crate::{
     events::IoEvents,
     fs::file::file_table::{FileDesc, RawFileDesc},
     prelude::*,
-    time::timeval_t,
+    process::posix_thread::Personality,
+    time::{
+        clocks::MonotonicClock, read_monotonic_time, timer::Timeout, timeval_t,
+        wait::ManagedTimeout,
+    },
 };
 
 pub(super) fn sys_select(
@@ -33,22 +37,42 @@ pub(super) fn sys_select(
         Some(Duration::try_from(timeval)?)
     };
 
-    do_sys_select(
+    let end_time = timeout.map(|timeout| {
+        if timeout.is_zero() {
+            Duration::ZERO
+        } else {
+            read_monotonic_time().saturating_add(timeout)
+        }
+    });
+
+    let result = do_sys_select(
         nfds,
         readfds_addr,
         writefds_addr,
         exceptfds_addr,
-        timeout,
+        end_time,
         ctx,
-    )
+    );
+
+    if let Some(end_time) = end_time.filter(|end_time| !end_time.is_zero())
+        && ctx.posix_thread.personality() & Personality::STICKY_TIMEOUTS.bits() == 0
+    {
+        let remaining = timeval_t::from(end_time.saturating_sub(read_monotonic_time()));
+        // Linux updates timeout even after an error such as EINTR. A failed
+        // timeout copy must preserve the original result, including success.
+        let _ = ctx.user_space().write_val(timeval_addr, &remaining);
+    }
+
+    result
 }
 
+/// Selects using an absolute monotonic deadline; zero polls and None waits indefinitely.
 pub(super) fn do_sys_select(
     nfds: RawFileDesc,
     readfds_addr: Vaddr,
     writefds_addr: Vaddr,
     exceptfds_addr: Vaddr,
-    timeout: Option<Duration>,
+    end_time: Option<Duration>,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
     if nfds < 0 || nfds as usize > FD_SETSIZE {
@@ -70,8 +94,8 @@ pub(super) fn do_sys_select(
     let mut exceptfds = get_fdset(exceptfds_addr)?;
 
     debug!(
-        "nfds = {}, readfds = {:?}, writefds = {:?}, exceptfds = {:?}, timeout = {:?}",
-        nfds, readfds, writefds, exceptfds, timeout
+        "nfds = {}, readfds = {:?}, writefds = {:?}, exceptfds = {:?}, deadline = {:?}",
+        nfds, readfds, writefds, exceptfds, end_time
     );
 
     let num_revents = do_select(
@@ -79,14 +103,9 @@ pub(super) fn do_sys_select(
         readfds.as_mut(),
         writefds.as_mut(),
         exceptfds.as_mut(),
-        timeout.as_ref(),
+        end_time,
         ctx,
     )?;
-
-    // FIXME: The Linux select() and pselect6() system call
-    // modifies its timeout argument to reflect the amount of time not slept.
-    // However, the glibc wrapper function hides this behavior.
-    // Maybe we should follow the Linux behavior.
 
     let set_fdset = |fdset_addr: Vaddr, fdset: Option<FdSet>| -> Result<()> {
         if let Some(fdset) = fdset {
@@ -107,7 +126,7 @@ fn do_select(
     mut readfds: Option<&mut FdSet>,
     mut writefds: Option<&mut FdSet>,
     mut exceptfds: Option<&mut FdSet>,
-    timeout: Option<&Duration>,
+    end_time: Option<Duration>,
     ctx: &Context,
 ) -> Result<usize> {
     // Convert the `FdSet`s to an array of `PollFd`s
@@ -147,8 +166,11 @@ fn do_select(
         fds.clear();
     }
 
-    // Do the `poll` syscall that is equivalent to the `select` syscall
-    let num_revents = do_poll(&poll_fds, timeout, ctx)?;
+    // Wait against the same monotonic deadline that the syscall writes back.
+    let timeout = end_time.map(|end_time| {
+        ManagedTimeout::new_with_manager(Timeout::When(end_time), MonotonicClock::timer_manager())
+    });
+    let num_revents = do_poll(&poll_fds, timeout.into(), ctx)?;
     if num_revents == 0 {
         return Ok(0);
     }

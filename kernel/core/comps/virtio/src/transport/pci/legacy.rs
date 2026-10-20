@@ -18,8 +18,8 @@ use crate::{
     DeviceStatus, VirtioDeviceType,
     queue::UsedElem,
     transport::{
-        AvailRing, ConfigManager, Descriptor, UsedRing, VirtioTransport, VirtioTransportError,
-        pci::msix::VirtioMsixManager,
+        AvailRing, ConfigGeneration, ConfigManager, Descriptor, UsedRing, VirtioTransport,
+        VirtioTransportError, pci::msix::VirtioMsixManager,
     },
 };
 
@@ -301,16 +301,28 @@ impl VirtioTransport for VirtioPciLegacyTransport {
         func: Box<IrqCallbackFunction>,
     ) -> Result<(), VirtioTransportError> {
         let (vector, irq) = self.msix_manager.config_msix_irq();
-        irq.on_active(func);
 
         self.config_bar
             .write_once(CONFIG_MSIX_VECTOR_OFFSET, vector)
-            .unwrap();
+            .map_err(|_| VirtioTransportError::DeviceStatusError)?;
+        if self
+            .config_bar
+            .read_once::<u16>(CONFIG_MSIX_VECTOR_OFFSET)
+            .map_err(|_| VirtioTransportError::DeviceStatusError)?
+            != vector
+        {
+            return Err(VirtioTransportError::DeviceStatusError);
+        }
+        irq.on_active(func);
         Ok(())
     }
 
     fn is_legacy_version(&self) -> bool {
         true
+    }
+
+    fn device_config_generation(&self) -> Option<ConfigGeneration> {
+        None
     }
 }
 

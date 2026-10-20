@@ -5,6 +5,11 @@
 use std::env;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=KERNELET_SHARED_IO_TEST");
+    println!("cargo:rustc-check-cfg=cfg(kernelet_shared_io_test)");
+    if env::var("KERNELET_SHARED_IO_TEST").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=kernelet_shared_io_test");
+    }
     let host = env::var_os("CARGO_FEATURE_KERNELET_HOST").is_some();
     println!("cargo:rerun-if-env-changed=KERNELET_HOST_CONNECT_GATE");
     println!("cargo:rustc-check-cfg=cfg(kernelet_host_connect_gate)");
@@ -75,6 +80,27 @@ fn main() {
             "KERNELET_RQ1_CROSSING_DIAG=1 requires target_arch=x86_64"
         );
         println!("cargo:rustc-cfg=kernelet_rq1_crossing_diag");
+    }
+    println!("cargo:rerun-if-env-changed=KERNELET_RQ1_STACK_CHECK_MODE");
+    println!("cargo:rustc-check-cfg=cfg(kernelet_rq1_stack_check_diag)");
+    println!("cargo:rustc-check-cfg=cfg(kernelet_rq1_stack_check_bypass)");
+    match env::var("KERNELET_RQ1_STACK_CHECK_MODE").as_deref() {
+        Err(_) | Ok("off") => {}
+        Ok(mode @ ("checked" | "bypass")) => {
+            assert!(
+                env::var("KERNELET_RQ1_BENCH").as_deref() == Ok("1"),
+                "stack-check diagnostics require KERNELET_RQ1_BENCH=1"
+            );
+            assert!(
+                env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64"),
+                "stack-check diagnostics require x86_64"
+            );
+            println!("cargo:rustc-cfg=kernelet_rq1_stack_check_diag");
+            if mode == "bypass" && env::var_os("CARGO_FEATURE_KERNELET_HOST").is_some() {
+                println!("cargo:rustc-cfg=kernelet_rq1_stack_check_bypass");
+            }
+        }
+        Ok(_) => panic!("KERNELET_RQ1_STACK_CHECK_MODE must be off, checked or bypass"),
     }
     println!("cargo:rerun-if-env-changed=KERNELET_RQ3_BENCH");
     println!("cargo:rustc-check-cfg=cfg(kernelet_rq3)");

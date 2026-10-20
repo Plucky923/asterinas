@@ -10,10 +10,19 @@ use crate::{
 pub(super) fn sys_dup(old_fd: RawFileDesc, ctx: &Context) -> Result<SyscallReturn> {
     debug!("old_fd = {}", old_fd);
 
+    let fd_limit = ctx
+        .process
+        .resource_limits()
+        .get_rlimit(ResourceType::RLIMIT_NOFILE)
+        .get_cur() as usize;
     let file_table = ctx.thread_local.borrow_file_table();
     let mut file_table_locked = file_table.unwrap().write();
-    let new_fd =
-        file_table_locked.dup_ceil(old_fd.try_into()?, FileDesc::ZERO, FdFlags::empty())?;
+    let new_fd = file_table_locked.dup_ceil(
+        old_fd.try_into()?,
+        FileDesc::ZERO,
+        FdFlags::empty(),
+        fd_limit,
+    )?;
 
     Ok(SyscallReturn::Return(new_fd.into()))
 }

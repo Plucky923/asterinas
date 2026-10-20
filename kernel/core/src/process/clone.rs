@@ -451,6 +451,7 @@ fn clone_child_task(
             child_vmar,
         )
         .process(posix_thread.weak_process().clone())
+        .cpu_affinity(ctx.thread.atomic_cpu_affinity().load(Ordering::Relaxed))
         .sig_mask(sig_mask)
         .file_table(child_file_table)
         .fs(child_fs)
@@ -588,6 +589,7 @@ fn clone_child_process(
                 child_vmar,
             )
             .sig_mask(child_sig_mask)
+            .cpu_affinity(ctx.thread.atomic_cpu_affinity().load(Ordering::Relaxed))
             .file_table(child_file_table)
             .fs(child_fs)
             .fpu_context(child_fpu_context)

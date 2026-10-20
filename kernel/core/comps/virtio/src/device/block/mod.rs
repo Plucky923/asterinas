@@ -4,13 +4,12 @@ pub mod device;
 
 use core::mem::offset_of;
 
-use aster_block::SECTOR_SIZE;
 use aster_util::safe_ptr::SafePtr;
 use bitflags::bitflags;
 use int_to_c_enum::TryFromInt;
 use ostd_pod::FromZeros;
 
-use crate::transport::{ConfigManager, VirtioTransport};
+use crate::transport::{ConfigGeneration, ConfigManager, VirtioTransport};
 
 pub const DEVICE_NAME: &str = "Virtio-Block";
 
@@ -125,58 +124,67 @@ struct VirtioBlockTopology {
 }
 
 impl VirtioBlockConfig {
-    pub(self) fn new_manager(transport: &dyn VirtioTransport) -> ConfigManager<Self> {
+    pub(self) fn new_manager(transport: &dyn VirtioTransport) -> BlockConfigManager {
         let safe_ptr = transport
             .device_config_mem()
             .map(|mem| SafePtr::new(mem, 0));
         let bar_space = transport.device_config_bar();
 
-        ConfigManager::new(safe_ptr, bar_space)
+        BlockConfigManager {
+            registers: ConfigManager::new(safe_ptr, bar_space),
+            generation: transport.device_config_generation(),
+        }
     }
 
     pub(self) const fn sector_size() -> usize {
-        SECTOR_SIZE
+        aster_block::SECTOR_SIZE
     }
 }
 
-impl ConfigManager<VirtioBlockConfig> {
+#[derive(Debug)]
+struct BlockConfigManager {
+    registers: ConfigManager<VirtioBlockConfig>,
+    generation: Option<ConfigGeneration>,
+}
+
+impl BlockConfigManager {
     pub(self) fn read_config(&self) -> VirtioBlockConfig {
         let mut blk_config = VirtioBlockConfig::new_zeroed();
         // Only following fields are defined in legacy interface.
-        let cap_low = self
-            .read_once::<u32>(offset_of!(VirtioBlockConfig, capacity))
-            .unwrap() as u64;
-        let cap_high = self
-            .read_once::<u32>(offset_of!(VirtioBlockConfig, capacity) + 4)
-            .unwrap() as u64;
-        blk_config.capacity = (cap_high << 32) | cap_low;
+        blk_config.capacity = self.capacity_sectors() as u64;
         blk_config.size_max = self
+            .registers
             .read_once::<u32>(offset_of!(VirtioBlockConfig, size_max))
             .unwrap();
         blk_config.seg_max = self
+            .registers
             .read_once::<u32>(offset_of!(VirtioBlockConfig, seg_max))
             .unwrap();
         blk_config.geometry.cylinders = self
+            .registers
             .read_once::<u16>(
                 offset_of!(VirtioBlockConfig, geometry)
                     + offset_of!(VirtioBlockGeometry, cylinders),
             )
             .unwrap();
         blk_config.geometry.heads = self
+            .registers
             .read_once::<u8>(
                 offset_of!(VirtioBlockConfig, geometry) + offset_of!(VirtioBlockGeometry, heads),
             )
             .unwrap();
         blk_config.geometry.sectors = self
+            .registers
             .read_once::<u8>(
                 offset_of!(VirtioBlockConfig, geometry) + offset_of!(VirtioBlockGeometry, sectors),
             )
             .unwrap();
         blk_config.blk_size = self
+            .registers
             .read_once::<u32>(offset_of!(VirtioBlockConfig, blk_size))
             .unwrap();
 
-        if self.is_modern() {
+        if self.registers.is_modern() {
             // TODO: read more field if modern interface exists.
         }
 
@@ -184,18 +192,97 @@ impl ConfigManager<VirtioBlockConfig> {
     }
 
     pub(self) fn block_size(&self) -> usize {
-        self.read_once::<u32>(offset_of!(VirtioBlockConfig, blk_size))
+        self.registers
+            .read_once::<u32>(offset_of!(VirtioBlockConfig, blk_size))
             .unwrap() as usize
     }
 
     pub(self) fn capacity_sectors(&self) -> usize {
-        let cap_low = self
-            .read_once::<u32>(offset_of!(VirtioBlockConfig, capacity))
-            .unwrap() as usize;
-        let cap_high = self
-            .read_once::<u32>(offset_of!(VirtioBlockConfig, capacity) + 4)
-            .unwrap() as usize;
+        read_config_consistently(
+            || {
+                self.generation
+                    .as_ref()
+                    .map(|generation| generation.read().unwrap())
+            },
+            || {
+                let cap_low = self
+                    .registers
+                    .read_once::<u32>(offset_of!(VirtioBlockConfig, capacity))
+                    .unwrap() as usize;
+                let cap_high = self
+                    .registers
+                    .read_once::<u32>(offset_of!(VirtioBlockConfig, capacity) + 4)
+                    .unwrap() as usize;
+                (cap_high << 32) | cap_low
+            },
+        )
+    }
+}
 
-        (cap_high << 32) | cap_low
+/// Reads one device configuration snapshot, retrying a concurrent update.
+fn read_config_consistently<T: PartialEq>(
+    mut generation_fn: impl FnMut() -> Option<u32>,
+    mut read_fn: impl FnMut() -> T,
+) -> T {
+    loop {
+        let before = generation_fn();
+        let value = read_fn();
+        // Modern transports have a generation register. Legacy capacity
+        // fields instead require two consecutive reads with equal values.
+        let consistent = match before {
+            Some(generation) => generation_fn() == Some(generation),
+            None => value == read_fn(),
+        };
+        if consistent {
+            return value;
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use core::cell::Cell;
+
+    use ostd::prelude::*;
+
+    use super::*;
+
+    #[ktest]
+    fn block_capacity_retries_a_split_read_when_generation_changes() {
+        let capacity = Cell::new(0xffff_fff0u64);
+        let generation = Cell::new(1u32);
+        let reads = Cell::new(0);
+        let result = read_config_consistently(
+            || Some(generation.get()),
+            || {
+                let low = capacity.get() as u32 as u64;
+                if reads.get() == 0 {
+                    capacity.set(0x1_0000_0010);
+                    generation.set(2);
+                }
+                reads.set(reads.get() + 1);
+                (capacity.get() & !0xffff_ffff) | low
+            },
+        );
+        assert_eq!(result, 0x1_0000_0010);
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[ktest]
+    fn legacy_block_capacity_requires_consecutive_equal_reads() {
+        let reads = Cell::new(0);
+        let result = read_config_consistently(
+            || None,
+            || {
+                reads.set(reads.get() + 1);
+                if reads.get() == 1 {
+                    0x1_ffff_fff0u64
+                } else {
+                    0x1_0000_0010
+                }
+            },
+        );
+        assert_eq!(result, 0x1_0000_0010);
+        assert_eq!(reads.get(), 4);
     }
 }

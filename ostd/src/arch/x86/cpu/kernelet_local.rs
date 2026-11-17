@@ -2,11 +2,42 @@
 
 //! Accesses the CPU-local replica assigned to the current virtual CPU.
 
-use crate::cpu::local::single_instr::{
-    SingleInstructionAddAssign, SingleInstructionBitAndAssign, SingleInstructionBitOrAssign,
-    SingleInstructionBitXorAssign, SingleInstructionLoad, SingleInstructionStore,
-    SingleInstructionSubAssign,
+use crate::{
+    cpu::local::{
+        CpuLocalCell,
+        single_instr::{
+            SingleInstructionAddAssign, SingleInstructionBitAndAssign,
+            SingleInstructionBitOrAssign, SingleInstructionBitXorAssign, SingleInstructionLoad,
+            SingleInstructionStore, SingleInstructionSubAssign,
+        },
+    },
+    irq::DisabledLocalIrqGuard,
+    kernelet::abi::VcpuRecord,
 };
+
+macro_rules! fast_cpu_asm {
+    ($table_field:ident; $($instruction:expr),+; $($operands:tt)*) => {{
+        core::arch::asm!(
+            "jmp 2f",
+            ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
+            "2:",
+            "lea {record_base}, [rip + {fast_cpu}]",
+            "mov {slot}, qword ptr [{record_base} + {slot_gs_off}]",
+            "movzx {slot:e}, word ptr gs:[{slot} + 2]",
+            "mov {record_base}, qword ptr [{record_base} + {slot} * 8 + {table_ptrs_off}]",
+            $($instruction),+,
+            "jmp 3f",
+            ".popsection",
+            "3:",
+            record_base = out(reg) _,
+            slot = out(reg) _,
+            fast_cpu = sym $crate::kernelet::entry::KERNELET_FAST_CPU,
+            slot_gs_off = const core::mem::offset_of!($crate::kernelet::entry::FastCpuTable, slot_gs_offset),
+            table_ptrs_off = const core::mem::offset_of!($crate::kernelet::entry::FastCpuTable, $table_field),
+            $($operands)*
+        );
+    }};
+}
 
 /// Executes a short access without allowing the Host to redirect its middle.
 ///
@@ -15,51 +46,101 @@ use crate::cpu::local::single_instr::{
 /// delivering an upcall that could migrate the internal Task. Both jumps are
 /// direct and the sequence neither calls nor modifies the stack.
 macro_rules! record_asm {
-    ($($instruction:expr),+; $($operands:tt)*) => {{
-        #[cfg(kernelet_getpid_profile)]
-        let _lookup_span = {
-            use $crate::kernelet::getpid_profile as profile;
-            profile::event(profile::event_id::CPU_LOCAL_LOOKUP);
-            profile::span(profile::stage::GUEST_CPU_LOCAL)
-        };
-        core::arch::asm!(
-            "jmp 2f",
-            ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
-            "2:",
-            "mov {record_base}, [rip + {boot_args}]",
-            "mov {slot:e}, dword ptr [{record_base} + {slot_offset}]",
-            "mov {slot}, gs:[{slot}]",
-            "shr {slot}, 16",
-            "movzx {slot:e}, {slot:x}",
-            "imul {slot}, {record_bytes}",
-            "lea {record_base}, [{record_base} + {slot} + {records_offset}]",
-            $($instruction),+,
-            "jmp 3f",
-            ".popsection",
-            "3:",
-            record_base = out(reg) _,
-            slot = out(reg) _,
-            boot_args = sym $crate::kernelet::entry::KERNELET_BOOT_ARGS,
-            slot_offset = const core::mem::offset_of!($crate::kernelet::abi::BootArgs, cpu_slot_gs_offset),
-            record_bytes = const core::mem::size_of::<$crate::kernelet::abi::VcpuRecord>(),
-            records_offset = const $crate::mm::PAGE_SIZE,
-            $($operands)*
-        );
-    }};
+    ($($instruction:expr),+; $($operands:tt)*) => {
+        $crate::arch::cpu::local::fast_cpu_asm!(record_ptrs; $($instruction),+; $($operands)*)
+    };
 }
+pub(crate) use fast_cpu_asm;
 pub(crate) use record_asm;
+
+/// Reuses this vCPU's addresses while a borrowed IRQ guard prevents Task switches.
+pub(crate) struct CpuLocalAccess<'irq> {
+    record: &'static VcpuRecord,
+    local_base: usize,
+    _irq: core::marker::PhantomData<&'irq DisabledLocalIrqGuard>,
+}
+
+impl<'irq> CpuLocalAccess<'irq> {
+    #[inline]
+    pub(crate) fn new(_irq: &'irq DisabledLocalIrqGuard) -> Self {
+        let record: *const VcpuRecord;
+        let local_base: usize;
+        // SAFETY: Entry populated `KERNELET_FAST_CPU` before any vCPU runs.
+        // Record selection and replica base load complete in one protected access;
+        // the guard pins their use.
+        unsafe {
+            core::arch::asm!(
+                "jmp 2f",
+                ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
+                "2:",
+                "lea {table}, [rip + {fast_cpu}]",
+                "mov {slot}, qword ptr [{table} + {slot_gs_off}]",
+                "movzx {slot:e}, word ptr gs:[{slot} + 2]",
+                "mov {record}, qword ptr [{table} + {slot} * 8 + {record_ptrs_off}]",
+                "mov {local_base}, qword ptr [{table} + {slot} * 8 + {local_bases_off}]",
+                "jmp 3f",
+                ".popsection",
+                "3:",
+                table = out(reg) _,
+                slot = out(reg) _,
+                record = out(reg) record,
+                local_base = out(reg) local_base,
+                fast_cpu = sym crate::kernelet::entry::KERNELET_FAST_CPU,
+                slot_gs_off = const core::mem::offset_of!(crate::kernelet::entry::FastCpuTable, slot_gs_offset),
+                record_ptrs_off = const core::mem::offset_of!(crate::kernelet::entry::FastCpuTable, record_ptrs),
+                local_bases_off = const core::mem::offset_of!(crate::kernelet::entry::FastCpuTable, local_bases),
+                options(nostack, readonly),
+            );
+        }
+        Self {
+            // SAFETY: The Host retains the validated record for the image lifetime.
+            record: unsafe { &*record },
+            local_base,
+            _irq: core::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record(&self) -> &VcpuRecord {
+        self.record
+    }
+
+    #[inline]
+    pub(crate) fn load<T: Copy + SingleInstructionLoad>(
+        &self,
+        cell: &'static CpuLocalCell<T>,
+    ) -> T {
+        // SAFETY: The borrowed guard excludes image IRQs and Task switches.
+        // The Host never accesses the private replica; copying creates no borrow.
+        unsafe { cell.as_mut_ptr_with_base(self.local_base).read_volatile() }
+    }
+
+    #[inline]
+    pub(crate) fn store<T: Copy + SingleInstructionStore>(
+        &self,
+        cell: &'static CpuLocalCell<T>,
+        value: T,
+    ) {
+        // SAFETY: The same exclusion permits a private cell write. Copy types
+        // own no destructor, and the pointer stays in the validated replica.
+        unsafe {
+            cell.as_mut_ptr_with_base(self.local_base)
+                .write_volatile(value)
+        };
+    }
+}
 
 /// Returns the current virtual CPU's private CPU-local base.
 /// Borrowing through this address still requires the caller's CPU pin.
 pub(crate) fn get_base() -> u64 {
     let base;
-    // SAFETY: Entry validates the immutable boot page and record layout. The
-    // complete record lookup and replica read are in the protected CPU-access range.
+    // SAFETY: Entry populated `KERNELET_FAST_CPU`. The complete slot lookup
+    // and replica base read execute in the protected CPU-access range.
     unsafe {
-        record_asm!(
-            "mov {base}, [{record_base} + {replica_offset}]";
+        fast_cpu_asm!(
+            local_bases;
+            "mov {base}, {record_base}";
             base = out(reg) base,
-            replica_offset = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, cpu_local_base),
             options(nostack, readonly),
         );
     }
@@ -68,11 +149,10 @@ pub(crate) fn get_base() -> u64 {
 
 macro_rules! cpu_local_asm {
     ($instruction:expr, $offset:expr; $($operands:tt)*) => {
-        record_asm!(
-            "mov {record_base}, [{record_base} + {replica_offset}]",
+        fast_cpu_asm!(
+            local_bases;
             $instruction;
             offset = in(reg) $offset,
-            replica_offset = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, cpu_local_base),
             $($operands)*
         )
     };

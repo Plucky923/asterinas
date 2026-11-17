@@ -31,19 +31,16 @@ fn invocation_rustflags_reach_both_actions_without_repeating_inherited_flags() {
     let before = config.clone();
     config.append_rustflags("");
     assert_eq!(config, before);
-    let environment = "--cfg kernelet_nat_failure_diag_host";
+    let environment = "--cfg test_env_flag";
     config.append_rustflags(environment);
-    assert_eq!(
-        config.build.rustflags,
-        "--cfg global --cfg kernelet_nat_failure_diag_host"
-    );
+    assert_eq!(config.build.rustflags, "--cfg global --cfg test_env_flag");
     assert_eq!(
         config.run.build.rustflags,
-        "--cfg global --cfg run --cfg kernelet_nat_failure_diag_host"
+        "--cfg global --cfg run --cfg test_env_flag"
     );
     assert_eq!(
         config.test.build.rustflags,
-        "--cfg global --cfg test --cfg kernelet_nat_failure_diag_host"
+        "--cfg global --cfg test --cfg test_env_flag"
     );
 }
 

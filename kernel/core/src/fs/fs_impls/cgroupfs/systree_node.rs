@@ -60,13 +60,17 @@ use aster_systree::{
 };
 use aster_util::printer::VmPrinter;
 use inherit_methods_macro::inherit_methods;
-use ostd::sync::{RwMutexReadGuard, RwMutexWriteGuard};
+use ostd::{
+    cpu::CpuSet,
+    sync::{RwMutexReadGuard, RwMutexWriteGuard},
+};
 use spin::Once;
 
 use crate::{
     fs::cgroupfs::controller::{Controller, PidsPreCharge, SubCtrlSet, SubCtrlType},
     prelude::*,
     process::{Pid, Process, pid_table},
+    thread::AsThread,
 };
 
 /// A type that provides synchronized access to cgroup membership and sub-controller state.
@@ -228,6 +232,9 @@ impl CgroupMembership {
                 process.set_cgroup(Some(new_cgroup.fields.weak_self().upgrade().unwrap()));
             })
             .ok_or(Error::IsDead)?;
+
+        let effective = new_cgroup.controller.effective_cpus();
+        clamp_process_threads_to_cpuset(process, &effective);
 
         Ok(())
     }
@@ -769,12 +776,18 @@ inherit_sys_branch_node!(CgroupNode, fields, {
                 .ok_or(Error::IsDead)?
             }
             // TODO: Add support for writing other attributes.
-            _ => self
-                // This write may target a stale controller if the cgroup's sub-controllers
-                // are being concurrently updated. It is the duty of user-space programs
-                // to use proper synchronization to avoid such races.
-                .with_inner(|_| self.controller.write_attr(name, reader))
-                .ok_or(Error::IsDead)?,
+            _ => {
+                let written = self
+                    // This write may target a stale controller if the cgroup's sub-controllers
+                    // are being concurrently updated. It is the duty of user-space programs
+                    // to use proper synchronization to avoid such races.
+                    .with_inner(|_| self.controller.write_attr(name, reader))
+                    .ok_or(Error::IsDead)??;
+                if name == "cpuset.cpus" {
+                    clamp_subtree_threads_to_cpuset(self);
+                }
+                Ok(written)
+            }
         }
     }
 
@@ -875,5 +888,42 @@ pub(crate) trait CgroupSysNode: SysBranchNode {
         } else {
             Some(Arc::downcast::<CgroupNode>(parent).unwrap())
         }
+    }
+}
+
+fn clamp_process_threads_to_cpuset(process: &Process, effective: &CpuSet) {
+    let tasks = process.tasks().lock();
+    for task in tasks.as_slice() {
+        if let Some(thread) = task.as_thread() {
+            let current = thread.atomic_cpu_affinity().load(Ordering::Acquire);
+            let mut clamped = CpuSet::new_empty();
+            for cpu_id in effective.iter() {
+                if current.contains(cpu_id) {
+                    clamped.add(cpu_id);
+                }
+            }
+            if clamped.is_empty() {
+                clamped = effective.clone();
+            }
+            thread.atomic_cpu_affinity().store(&clamped, Ordering::Release);
+        }
+    }
+}
+
+fn clamp_subtree_threads_to_cpuset(node: &CgroupNode) {
+    let effective = node.controller.effective_cpus();
+    let procs: Vec<Arc<Process>> = node
+        .with_inner(|processes| processes.values().filter_map(|w| w.upgrade()).collect())
+        .unwrap_or_default();
+    for process in procs {
+        clamp_process_threads_to_cpuset(&process, &effective);
+    }
+    let children: Vec<Arc<CgroupNode>> = node
+        .children()
+        .into_iter()
+        .filter_map(|child| Arc::downcast::<CgroupNode>(child).ok())
+        .collect();
+    for child in children {
+        clamp_subtree_threads_to_cpuset(&child);
     }
 }

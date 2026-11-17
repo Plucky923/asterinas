@@ -6,7 +6,7 @@ use core::ops::Range;
 
 use ostd::{
     arch::{
-        cpu::context::{FsBase, GeneralRegs, GsBase, RFlags, UserContext},
+        cpu::context::{FsBase, GeneralRegs, GsBase, OwnedUserContext, RFlags, UserContext},
         trap::{USER_CS_VALUE, USER_SS_VALUE},
     },
     mm::MAX_USERSPACE_VADDR,
@@ -64,7 +64,7 @@ impl CUserRegsStruct {
         for rule in REG_RULES {
             let value = match rule.policy {
                 Policy::Fixed(val) => val,
-                _ => (rule.get.unwrap())(user_context.general_regs()),
+                _ => (rule.get.unwrap())(&*user_context.general_regs()),
             };
             write_word(bytes, rule.offset, value);
         }
@@ -96,7 +96,7 @@ impl CUserRegsStruct {
     /// Returns `EIO` on any invalid value.
     pub(crate) fn apply_to(
         &self,
-        user_context: &mut UserContext,
+        user_context: &mut OwnedUserContext,
         fs_base: &mut FsBase,
         gs_base: &mut GsBase,
     ) -> Result<()> {
@@ -168,13 +168,13 @@ pub(crate) fn read_user_word(
         RegRule::for_offset(offset).expect("offset has been validated by `check_user_offset`");
     Ok(match rule.policy {
         Policy::Fixed(value) => value,
-        _ => (rule.get.unwrap())(user_context.general_regs()),
+        _ => (rule.get.unwrap())(&*user_context.general_regs()),
     })
 }
 
 /// Writes one word to the x86-64 USER area at `offset`.
 pub(crate) fn write_user_word(
-    user_context: &mut UserContext,
+    user_context: &mut OwnedUserContext,
     fs_base: &mut FsBase,
     gs_base: &mut GsBase,
     orig_rax: &mut usize,
@@ -213,17 +213,19 @@ pub(crate) fn write_user_word(
 
     let rule =
         RegRule::for_offset(offset).expect("offset has been validated by `check_user_offset`");
-    rule.apply(user_context.general_regs_mut(), value)
+    rule.apply(&mut *user_context.general_regs_mut(), value)
 }
 
 /// Enables x86-64 single-step execution by setting the trap flag.
-pub(crate) fn enable_single_step(user_context: &mut UserContext) {
-    user_context.set_rflags(user_context.rflags() | RFlags::TRAP_FLAG.bits() as usize);
+pub(crate) fn enable_single_step(user_context: &mut OwnedUserContext) {
+    let rflags = user_context.rflags();
+    user_context.set_rflags(rflags | RFlags::TRAP_FLAG.bits() as usize);
 }
 
 /// Disables x86-64 single-step execution by clearing the trap flag.
-pub(crate) fn disable_single_step(user_context: &mut UserContext) {
-    user_context.set_rflags(user_context.rflags() & !(RFlags::TRAP_FLAG.bits() as usize));
+pub(crate) fn disable_single_step(user_context: &mut OwnedUserContext) {
+    let rflags = user_context.rflags();
+    user_context.set_rflags(rflags & !(RFlags::TRAP_FLAG.bits() as usize));
 }
 
 // =====================================================================

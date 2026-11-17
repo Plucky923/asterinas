@@ -4,6 +4,8 @@
 
 use alloc::boxed::Box;
 use core::arch::x86_64::{_fxrstor64, _fxsave64, _xrstor64, _xsave64};
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use bitflags::bitflags;
 use ostd_pod::{FromZeros, IntoBytes};
@@ -11,7 +13,7 @@ use spin::Once;
 use x86::bits64::segmentation::{rdfsbase, wrfsbase};
 #[cfg(not(feature = "kernelet"))]
 use x86::bits64::segmentation::{rdgsbase, swapgs, wrgsbase};
-#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+#[cfg(feature = "kernelet")]
 use x86::msr::{rdmsr, wrmsr};
 /// Saved processor status bits without exposing architecture instruction APIs.
 pub use x86_64::registers::rflags::RFlags;
@@ -20,16 +22,20 @@ use x86_64::registers::{
     xcontrol::XCr0,
 };
 
-#[cfg(kernelet_getpid_profile)]
-use crate::kernelet::getpid_profile as profile;
 #[cfg(not(feature = "kernelet"))]
-use crate::{arch::irq::HwIrqLine, cpu::PrivilegeLevel, irq::call_irq_callback_functions};
 use crate::{
-    arch::trap::{RawUserContext, TrapFrame},
+    arch::irq::HwIrqLine,
+    arch::trap::RawUserContext,
+    cpu::PrivilegeLevel,
+    irq::call_irq_callback_functions,
+    user::{ReturnReason, UserModeHooks},
+};
+use crate::{
+    arch::trap::TrapFrame,
     debug,
     irq::DisabledLocalIrqGuard,
-    mm::Vaddr,
-    user::{ReturnReason, UserContextApi, UserContextApiInternal, UserModeHooks},
+    mm::{FallibleVmRead, Vaddr},
+    user::{UserContextApi, UserContextApiInternal},
 };
 
 cfg_select! {
@@ -61,12 +67,13 @@ pub const USER_MODIFIABLE_RFLAGS: usize = (RFlags::CARRY_FLAG.bits()
     | RFlags::ALIGNMENT_CHECK.bits()
     | RFlags::NESTED_TASK.bits()) as usize;
 
-#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+#[cfg(feature = "kernelet")]
 mod kernelet;
-#[cfg(feature = "kernelet-host")]
-pub(crate) use kernelet::run_host_user;
+#[cfg(feature = "kernelet")]
+pub(crate) use kernelet::{LinuxPtRegs, RFLAGS_FIXED, RFLAGS_USER};
 
 /// Userspace CPU context, including general-purpose registers and exception information.
+#[cfg(not(feature = "kernelet"))]
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub struct UserContext {
@@ -74,6 +81,7 @@ pub struct UserContext {
     exception: Option<CpuException>,
 }
 
+#[cfg(not(feature = "kernelet"))]
 impl Default for UserContext {
     fn default() -> Self {
         // RFLAGS bit 1 is reserved, and Linux always sets it to 1 on x86.
@@ -88,11 +96,117 @@ impl Default for UserContext {
                 rflags: USER_MODE_INITIAL_RFLAGS,
                 trap_num: 0,
                 error_code: 0,
-                #[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
-                fault_addr: 0,
             },
             exception: None,
         }
+    }
+}
+
+#[cfg(feature = "kernelet")]
+#[derive(Debug)]
+enum UserContextRepr {
+    Owned(Box<LinuxPtRegs>),
+    Frame(*const AtomicPtr<LinuxPtRegs>),
+}
+
+/// Userspace CPU context backed either by an owned [`LinuxPtRegs`] or a live
+/// Host `struct pt_regs` frame on the current vCPU.
+#[cfg(feature = "kernelet")]
+#[derive(Debug)]
+pub struct UserContext {
+    repr: UserContextRepr,
+    exception: Option<CpuException>,
+}
+
+#[cfg(feature = "kernelet")]
+const _: () = assert!(size_of::<UserContext>() <= 40);
+
+#[cfg(feature = "kernelet")]
+impl !Send for UserContext {}
+#[cfg(feature = "kernelet")]
+impl !Sync for UserContext {}
+
+#[cfg(feature = "kernelet")]
+impl Clone for UserContext {
+    fn clone(&self) -> Self {
+        Self {
+            repr: UserContextRepr::Owned(Box::new(self.read_pt_regs())),
+            exception: self.exception,
+        }
+    }
+}
+
+#[cfg(feature = "kernelet")]
+impl Default for UserContext {
+    fn default() -> Self {
+        Self {
+            repr: UserContextRepr::Owned(Box::new(LinuxPtRegs::new_initial())),
+            exception: None,
+        }
+    }
+}
+
+/// An owned, thread-safe snapshot of [`UserContext`].
+#[derive(Clone, Debug, Default)]
+pub struct OwnedUserContext(UserContext);
+
+#[cfg(feature = "kernelet")]
+// SAFETY: Construction always copies registers into the `Owned` representation.
+// The private field has no mutable accessor that can replace its representation.
+unsafe impl Send for OwnedUserContext {}
+#[cfg(feature = "kernelet")]
+// SAFETY: Same as `Send`; `OwnedUserContext` holds plain register state only.
+unsafe impl Sync for OwnedUserContext {}
+
+impl From<&UserContext> for OwnedUserContext {
+    fn from(ctx: &UserContext) -> Self {
+        Self(ctx.clone())
+    }
+}
+
+impl core::ops::Deref for OwnedUserContext {
+    type Target = UserContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(not(feature = "kernelet"))]
+impl core::ops::DerefMut for OwnedUserContext {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(feature = "kernelet")]
+impl OwnedUserContext {
+    /// Borrows the snapshot's general-purpose registers for modification.
+    pub fn general_regs_mut(&mut self) -> GeneralRegsMut<'_> {
+        self.0.general_regs_mut()
+    }
+
+    /// Updates the snapshot's user-modifiable RFLAGS bits.
+    pub fn set_rflags(&mut self, rflags: usize) {
+        self.0.set_rflags(rflags);
+    }
+}
+
+impl UserContextApi for OwnedUserContext {
+    fn set_instruction_pointer(&mut self, ip: usize) {
+        self.0.set_instruction_pointer(ip);
+    }
+
+    fn instruction_pointer(&self) -> usize {
+        self.0.instruction_pointer()
+    }
+
+    fn set_stack_pointer(&mut self, sp: usize) {
+        self.0.set_stack_pointer(sp);
+    }
+
+    fn stack_pointer(&self) -> usize {
+        self.0.stack_pointer()
     }
 }
 
@@ -198,7 +312,7 @@ impl GsBase {
     }
 
     /// Saves the inactive user GS base without changing the native GS base.
-    #[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+    #[cfg(feature = "kernelet")]
     pub(crate) fn save_inactive(&mut self) {
         // SAFETY: At CPL 0, the fixed MSR holds the inactive user GS base.
         // Reading it keeps the active native GS base valid for Host IRQs.
@@ -206,7 +320,8 @@ impl GsBase {
     }
 
     /// Loads the inactive user GS base without changing the native GS base.
-    #[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+    #[cfg(feature = "kernelet")]
+    #[inline(never)]
     pub(crate) fn load_inactive(&self) {
         // SAFETY: At CPL 0, writing this fixed MSR changes only the user base
         // restored by the native entry stubs' next SWAPGS, not the active
@@ -215,7 +330,7 @@ impl GsBase {
     }
 }
 
-#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+#[cfg(feature = "kernelet")]
 const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
 
 /// Architectural CPU exceptions (x86-64 vectors 0-31).
@@ -304,7 +419,7 @@ impl CpuException {
         )
     }
 
-    fn from_raw(trap_num: usize, error_code: usize, fault_addr: usize) -> Option<Self> {
+    pub(crate) fn from_raw(trap_num: usize, error_code: usize, fault_addr: usize) -> Option<Self> {
         let exception = match trap_num {
             0 => Self::DivisionError,
             1 => Self::Debug,
@@ -376,6 +491,7 @@ impl CpuException {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SelectorErrorCode(usize);
 
+#[cfg(not(feature = "kernelet"))]
 impl UserContext {
     // Methods shared across all architectures (i.e., general registers and exceptions).
 
@@ -387,6 +503,16 @@ impl UserContext {
     /// Returns a mutable reference to the general registers.
     pub fn general_regs_mut(&mut self) -> &mut GeneralRegs {
         &mut self.user_context.general
+    }
+
+    /// Copies registers and exception state from `src` in place.
+    pub fn copy_regs_from(&mut self, src: &OwnedUserContext) {
+        *self = src.0.clone();
+    }
+
+    /// Resets the register context to its default initial state in place.
+    pub fn reset(&mut self) {
+        *self = Self::default();
     }
 
     /// Takes the CPU exception out.
@@ -411,9 +537,289 @@ impl UserContext {
     }
 }
 
+/// Borrowed immutable view of general-purpose registers from [`UserContext`].
+#[cfg(feature = "kernelet")]
+pub struct GeneralRegsRef<'a> {
+    regs: GeneralRegs,
+    _marker: core::marker::PhantomData<&'a UserContext>,
+}
+
+#[cfg(feature = "kernelet")]
+impl core::ops::Deref for GeneralRegsRef<'_> {
+    type Target = GeneralRegs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.regs
+    }
+}
+
+/// Borrowed mutable view of general-purpose registers that writes back on drop.
+#[cfg(feature = "kernelet")]
+pub struct GeneralRegsMut<'a> {
+    regs: GeneralRegs,
+    ctx: &'a mut UserContext,
+}
+
+#[cfg(feature = "kernelet")]
+impl core::ops::Deref for GeneralRegsMut<'_> {
+    type Target = GeneralRegs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.regs
+    }
+}
+
+#[cfg(feature = "kernelet")]
+impl core::ops::DerefMut for GeneralRegsMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.regs
+    }
+}
+
+#[cfg(feature = "kernelet")]
+impl Drop for GeneralRegsMut<'_> {
+    fn drop(&mut self) {
+        self.ctx.write_general_regs(&self.regs);
+    }
+}
+
+#[cfg(feature = "kernelet")]
+macro_rules! read_pt_reg {
+    ($self:expr, $field:ident) => {
+        match $self.repr {
+            UserContextRepr::Owned(ref regs) => regs.$field as usize,
+            UserContextRepr::Frame(slot) => {
+                // SAFETY: `slot` points to the current task's `active_pt_regs`,
+                // which holds this vCPU's live `pt_regs` while executing in kernel mode.
+                let ptr = unsafe { (*slot).load(Ordering::Relaxed) };
+                unsafe { core::ptr::addr_of!((*ptr).$field).read() as usize }
+            }
+        }
+    };
+}
+
+#[cfg(feature = "kernelet")]
+macro_rules! write_pt_reg {
+    ($self:expr, $field:ident, $val:expr) => {
+        match $self.repr {
+            UserContextRepr::Owned(ref mut regs) => regs.$field = $val as u64,
+            UserContextRepr::Frame(slot) => {
+                // SAFETY: `slot` points to the current task's `active_pt_regs`,
+                // which holds this vCPU's live `pt_regs` while executing in kernel mode.
+                let ptr = unsafe { (*slot).load(Ordering::Relaxed) };
+                unsafe { core::ptr::addr_of_mut!((*ptr).$field).write($val as u64) }
+            }
+        }
+    };
+}
+
+#[cfg(feature = "kernelet")]
+impl UserContext {
+    /// Constructs a [`UserContext`] borrowing the current user task's active `pt_regs` slot.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must point to the current user task's `active_pt_regs` (which outlives
+    /// this `UserContext` and always holds the live carrier `LinuxPtRegs` on the
+    /// vCPU currently running that task).
+    pub(crate) unsafe fn from_frame(
+        slot: &AtomicPtr<LinuxPtRegs>,
+        exception: Option<CpuException>,
+    ) -> Self {
+        Self {
+            repr: UserContextRepr::Frame(core::ptr::from_ref(slot)),
+            exception,
+        }
+    }
+
+    pub(crate) fn read_pt_regs(&self) -> LinuxPtRegs {
+        match &self.repr {
+            UserContextRepr::Owned(regs) => **regs,
+            // SAFETY: `slot` holds this vCPU's live `pt_regs` owned by the current task.
+            UserContextRepr::Frame(slot) => unsafe { (**slot).load(Ordering::Relaxed).read() },
+        }
+    }
+
+    pub(crate) fn write_pt_regs(&mut self, mut regs: LinuxPtRegs) {
+        regs.sanitize();
+        match &mut self.repr {
+            UserContextRepr::Owned(dst) => **dst = regs,
+            // SAFETY: `slot` holds this vCPU's live `pt_regs` owned by the current task.
+            UserContextRepr::Frame(slot) => unsafe { (**slot).load(Ordering::Relaxed).write(regs) },
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn sync_to_frame(&mut self, slot: &AtomicPtr<LinuxPtRegs>) {
+        if let UserContextRepr::Frame(existing) = self.repr {
+            debug_assert_eq!(existing, core::ptr::from_ref(slot));
+            return;
+        }
+        self.sync_owned_to_frame(slot);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn sync_owned_to_frame(&mut self, slot: &AtomicPtr<LinuxPtRegs>) {
+        if let UserContextRepr::Owned(ref regs) = self.repr {
+            let mut copy = **regs;
+            copy.sanitize();
+            let frame = slot.load(Ordering::Relaxed);
+            debug_assert!(!frame.is_null());
+            // SAFETY: `frame` points to this vCPU's live `pt_regs`.
+            unsafe { frame.write(copy) };
+            self.repr = UserContextRepr::Frame(core::ptr::from_ref(slot));
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn syscall_args_owned(regs: &LinuxPtRegs) -> [usize; 6] {
+        [
+            regs.rdi as usize,
+            regs.rsi as usize,
+            regs.rdx as usize,
+            regs.r10 as usize,
+            regs.r8 as usize,
+            regs.r9 as usize,
+        ]
+    }
+
+    /// Reads the six Linux syscall argument registers (`rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`)
+    /// with a single `active_pt_regs` pointer load.
+    #[inline(always)]
+    pub fn read_syscall_args(&self) -> [usize; 6] {
+        match &self.repr {
+            UserContextRepr::Frame(slot) => {
+                // SAFETY: `slot` points to the current task's `active_pt_regs`,
+                // which holds this vCPU's live `pt_regs` while executing in kernel mode.
+                let ptr = unsafe { (**slot).load(Ordering::Relaxed) };
+                debug_assert!(!ptr.is_null());
+                // SAFETY: `ptr` is valid and exclusively owned by the current task.
+                unsafe {
+                    [
+                        core::ptr::addr_of!((*ptr).rdi).read() as usize,
+                        core::ptr::addr_of!((*ptr).rsi).read() as usize,
+                        core::ptr::addr_of!((*ptr).rdx).read() as usize,
+                        core::ptr::addr_of!((*ptr).r10).read() as usize,
+                        core::ptr::addr_of!((*ptr).r8).read() as usize,
+                        core::ptr::addr_of!((*ptr).r9).read() as usize,
+                    ]
+                }
+            }
+            UserContextRepr::Owned(regs) => Self::syscall_args_owned(regs),
+        }
+    }
+
+    pub(crate) fn into_sanitized_pt_regs(self) -> LinuxPtRegs {
+        let mut regs = self.read_pt_regs();
+        regs.sanitize();
+        regs
+    }
+
+    fn write_general_regs(&mut self, general: &GeneralRegs) {
+        write_pt_reg!(self, rax, general.rax);
+        write_pt_reg!(self, rbx, general.rbx);
+        write_pt_reg!(self, rcx, general.rcx);
+        write_pt_reg!(self, rdx, general.rdx);
+        write_pt_reg!(self, rsi, general.rsi);
+        write_pt_reg!(self, rdi, general.rdi);
+        write_pt_reg!(self, rbp, general.rbp);
+        write_pt_reg!(self, rsp, general.rsp);
+        write_pt_reg!(self, r8, general.r8);
+        write_pt_reg!(self, r9, general.r9);
+        write_pt_reg!(self, r10, general.r10);
+        write_pt_reg!(self, r11, general.r11);
+        write_pt_reg!(self, r12, general.r12);
+        write_pt_reg!(self, r13, general.r13);
+        write_pt_reg!(self, r14, general.r14);
+        write_pt_reg!(self, r15, general.r15);
+        write_pt_reg!(self, rip, general.rip);
+    }
+
+    /// Returns a view of the general registers.
+    pub fn general_regs(&self) -> GeneralRegsRef<'_> {
+        GeneralRegsRef {
+            regs: self.read_pt_regs().to_general_regs(),
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Returns a mutable view of the general registers that writes back on drop.
+    pub fn general_regs_mut(&mut self) -> GeneralRegsMut<'_> {
+        let regs = self.read_pt_regs().to_general_regs();
+        GeneralRegsMut { regs, ctx: self }
+    }
+
+    /// Copies registers and exception state from `src` in place, preserving the
+    /// underlying frame or owned storage.
+    pub fn copy_regs_from(&mut self, src: &OwnedUserContext) {
+        self.write_pt_regs(src.0.read_pt_regs());
+        self.exception = src.0.exception;
+    }
+
+    /// Resets the register context to its default initial state in place.
+    pub fn reset(&mut self) {
+        self.write_pt_regs(LinuxPtRegs::new_initial());
+        self.exception = None;
+    }
+
+    /// Takes the CPU exception out.
+    pub fn take_exception(&mut self) -> Option<CpuException> {
+        self.exception.take()
+    }
+
+    /// Gets the value of the RFLAGS register.
+    pub fn rflags(&self) -> usize {
+        read_pt_reg!(self, rflags)
+    }
+
+    /// Sets the value of the RFLAGS register.
+    ///
+    /// We only allow the setting or clearing of the bits in [`USER_MODIFIABLE_RFLAGS`].
+    /// Any other bits will be ignored and will remain unchanged.
+    pub fn set_rflags(&mut self, rflags: usize) {
+        let current = self.rflags();
+        let next = (current & !USER_MODIFIABLE_RFLAGS) | (rflags & USER_MODIFIABLE_RFLAGS);
+        let sanitized = (next as u64 & RFLAGS_USER) | RFLAGS_FIXED;
+        write_pt_reg!(self, rflags, sanitized);
+    }
+}
+
+#[cfg(feature = "kernelet")]
+impl UserContextApiInternal for UserContext {
+    fn as_trap_frame(&self) -> TrapFrame {
+        let regs = self.read_pt_regs();
+        TrapFrame {
+            rax: regs.rax as usize,
+            rbx: regs.rbx as usize,
+            rcx: regs.rcx as usize,
+            rdx: regs.rdx as usize,
+            rsi: regs.rsi as usize,
+            rdi: regs.rdi as usize,
+            rbp: regs.rbp as usize,
+            r8: regs.r8 as usize,
+            r9: regs.r9 as usize,
+            r10: regs.r10 as usize,
+            r11: regs.r11 as usize,
+            r12: regs.r12 as usize,
+            r13: regs.r13 as usize,
+            r14: regs.r14 as usize,
+            r15: regs.r15 as usize,
+            trap_num: 0,
+            error_code: 0,
+            rip: regs.rip as usize,
+            cs: regs.cs as usize,
+            rflags: regs.rflags as usize,
+            rsp: regs.rsp as usize,
+            ss: regs.ss as usize,
+        }
+    }
+}
+
+#[cfg(not(feature = "kernelet"))]
 impl UserContextApiInternal for UserContext {
     fn execute<T: UserModeHooks>(&mut self, hooks: &T) -> ReturnReason {
-        #[cfg(not(feature = "kernelet"))]
         const SYSCALL_TRAPNUM: usize = 0x100;
 
         // Return when it is syscall or cpu exception type is Fault or Trap.
@@ -421,89 +827,46 @@ impl UserContextApiInternal for UserContext {
             crate::task::scheduler::might_preempt();
 
             let guard = crate::irq::disable_local();
-            #[cfg(kernelet_getpid_profile)]
-            let hook_span = profile::span(if cfg!(feature = "kernelet") {
-                profile::stage::GUEST_PRE_USER_HOOK
-            } else {
-                profile::stage::NATIVE_PRE_USER_HOOK
-            });
             hooks.pre_user_run(&guard);
-            #[cfg(kernelet_getpid_profile)]
-            let _ = profile::end(hook_span);
-            #[cfg(feature = "kernelet")]
-            {
-                use crate::kernelet::abi::{USER_RETURN_EXCEPTION, USER_RETURN_SYSCALL};
 
-                let reason = kernelet::run_image_user(&mut self.user_context, &guard);
-                // Capture exception details before pending virtual interrupts
-                // can run another task and change this CPU's state.
-                let exception = (reason == USER_RETURN_EXCEPTION).then(|| {
-                    CpuException::from_raw(
-                        self.user_context.trap_num,
-                        self.user_context.error_code,
-                        self.user_context.fault_addr,
-                    )
-                    .expect("user_run returned an exception without a valid trap number")
-                });
-                drop(guard);
-                match reason {
-                    USER_RETURN_SYSCALL => return ReturnReason::UserSyscall,
-                    USER_RETURN_EXCEPTION => {
-                        self.exception = exception;
-                        return ReturnReason::UserException;
-                    }
-                    _ => {}
+            let fault_addr = self.user_context.run(guard);
+            let exception = CpuException::from_raw(
+                self.user_context.trap_num,
+                self.user_context.error_code,
+                fault_addr,
+            );
+            match exception {
+                #[cfg(feature = "cvm_guest")]
+                Some(CpuException::VirtualizationException) => {
+                    let ve_handler = VirtualizationExceptionHandler::new();
+                    // Check out the doc of `VirtualizationExceptionHandler::new` to
+                    // see why IRQs must enabled _after_ instantiating a `VirtualizationExceptionHandler`.
+                    crate::arch::irq::enable_local();
+                    ve_handler.handle(self);
                 }
-            }
-
-            #[cfg(not(feature = "kernelet"))]
-            {
-                let fault_addr = self.user_context.run(guard);
-                let exception = CpuException::from_raw(
-                    self.user_context.trap_num,
-                    self.user_context.error_code,
-                    fault_addr,
-                );
-                match exception {
-                    #[cfg(feature = "cvm_guest")]
-                    Some(CpuException::VirtualizationException) => {
-                        let ve_handler = VirtualizationExceptionHandler::new();
-                        // Check out the doc of `VirtualizationExceptionHandler::new` to
-                        // see why IRQs must enabled _after_ instantiating a `VirtualizationExceptionHandler`.
-                        crate::arch::irq::enable_local();
-                        ve_handler.handle(self);
-                    }
-                    Some(exception) if exception.type_().is_fault_or_trap() => {
-                        crate::arch::irq::enable_local();
-                        self.exception = Some(exception);
-                        return ReturnReason::UserException;
-                    }
-                    Some(exception) => {
-                        panic!(
-                            "Cannot handle user CPU exception: {:?}; trapframe: {:?}",
-                            exception,
-                            self.as_trap_frame()
-                        );
-                    }
-                    None if self.user_context.trap_num == SYSCALL_TRAPNUM => {
-                        crate::arch::irq::enable_local();
-                        return ReturnReason::UserSyscall;
-                    }
-                    None => {
-                        #[cfg(all(kernelet_getpid_profile, not(feature = "kernelet")))]
-                        let irq_span = {
-                            profile::event(profile::event_id::PHYSICAL_IRQ);
-                            profile::span(profile::stage::HOST_IRQ)
-                        };
-                        call_irq_callback_functions(
-                            &self.as_trap_frame(),
-                            &HwIrqLine::new(self.as_trap_frame().trap_num as u8),
-                            PrivilegeLevel::User,
-                        );
-                        #[cfg(all(kernelet_getpid_profile, not(feature = "kernelet")))]
-                        let _ = profile::end(irq_span);
-                        crate::arch::irq::enable_local();
-                    }
+                Some(exception) if exception.type_().is_fault_or_trap() => {
+                    crate::arch::irq::enable_local();
+                    self.exception = Some(exception);
+                    return ReturnReason::UserException;
+                }
+                Some(exception) => {
+                    panic!(
+                        "Cannot handle user CPU exception: {:?}; trapframe: {:?}",
+                        exception,
+                        self.as_trap_frame()
+                    );
+                }
+                None if self.user_context.trap_num == SYSCALL_TRAPNUM => {
+                    crate::arch::irq::enable_local();
+                    return ReturnReason::UserSyscall;
+                }
+                None => {
+                    call_irq_callback_functions(
+                        &self.as_trap_frame(),
+                        &HwIrqLine::new(self.as_trap_frame().trap_num as u8),
+                        PrivilegeLevel::User,
+                    );
+                    crate::arch::irq::enable_local();
                 }
             }
 
@@ -518,6 +881,7 @@ impl UserContextApiInternal for UserContext {
     }
 }
 
+#[cfg(not(feature = "kernelet"))]
 impl RawUserContext {
     pub(crate) fn as_trap_frame(&self) -> TrapFrame {
         TrapFrame {
@@ -647,13 +1011,27 @@ macro_rules! cpu_context_impl_getter_setter {
                 #[doc = concat!("Gets the value of ", stringify!($field))]
                 #[inline(always)]
                 pub fn $field(&self) -> usize {
-                    self.user_context.general.$field
+                    #[cfg(not(feature = "kernelet"))]
+                    {
+                        self.user_context.general.$field
+                    }
+                    #[cfg(feature = "kernelet")]
+                    {
+                        read_pt_reg!(self, $field)
+                    }
                 }
 
                 #[doc = concat!("Sets the value of ", stringify!(field))]
                 #[inline(always)]
                 pub fn $setter_name(&mut self, $field: usize) {
-                    self.user_context.general.$field = $field;
+                    #[cfg(not(feature = "kernelet"))]
+                    {
+                        self.user_context.general.$field = $field;
+                    }
+                    #[cfg(feature = "kernelet")]
+                    {
+                        write_pt_reg!(self, $field, $field);
+                    }
                 }
             )*
         }
@@ -680,6 +1058,18 @@ cpu_context_impl_getter_setter!(
     [rip, set_rip]
 );
 
+/// Cached hardware `MXCSR_MASK` (defaulting to `0xffbf` if hardware leaves it zero).
+static MXCSR_MASK: Once<u32> = Once::new();
+
+fn mxcsr_mask() -> u32 {
+    *MXCSR_MASK.call_once(|| {
+        let mut tmp = FpuContext::new();
+        tmp.save();
+        let mask = tmp.xsave_area.fxsave_area.mxcsr_mask;
+        if mask == 0 { 0x0000_ffbf } else { mask }
+    })
+}
+
 /// The FPU context of user task.
 ///
 /// This could be used for saving both legacy and modern state format.
@@ -691,6 +1081,7 @@ pub struct FpuContext {
 
 impl FpuContext {
     /// Creates a new FPU context.
+    #[cfg_attr(feature = "kernelet", inline(never))]
     pub fn new() -> Self {
         let mut area_size = size_of::<FxSaveArea>();
         if let Some(xsave_area_size) = XSAVE_AREA_SIZE.get() {
@@ -703,6 +1094,61 @@ impl FpuContext {
         }
     }
 
+    /// Returns the size in bytes of the FPU save area for this CPU.
+    pub fn area_size(&self) -> usize {
+        self.area_size
+    }
+
+    /// Reads and validates a user-supplied FPU context from `reader`.
+    ///
+    /// Rejects unaligned or short frames, reserved `MXCSR` bits above hardware
+    /// `MXCSR_MASK`, unsupported `XSTATE_BV` bits, nonzero `XCOMP_BV`, or nonzero
+    /// reserved XSAVE header words with [`crate::Error::InvalidArgs`].
+    #[cfg_attr(feature = "kernelet", inline(never))]
+    pub fn read_from(
+        &mut self,
+        reader: &mut crate::mm::VmReader<'_, crate::mm::Fallible>,
+    ) -> crate::Result<()> {
+        let align = if XSTATE_MAX_FEATURES.is_completed() {
+            64
+        } else {
+            16
+        };
+        if !reader.cursor().addr().is_multiple_of(align) || reader.remain() < self.area_size {
+            return Err(crate::Error::InvalidArgs);
+        }
+
+        let mut staging = Self::new();
+        let allowed = staging.xsave_area.features;
+        staging.as_bytes_mut().fill(0);
+
+        {
+            let buf = staging.as_bytes_mut();
+            // SAFETY: `buf` is kernel memory valid for writes of `buf.len()` bytes.
+            let mut writer =
+                unsafe { crate::mm::VmWriter::from_kernel_space(buf.as_mut_ptr(), buf.len()) };
+            match reader.read_fallible(&mut writer) {
+                Ok(copied) if copied == self.area_size => {}
+                Ok(_) => return Err(crate::Error::PageFault),
+                Err((err, _)) => return Err(err),
+            }
+        }
+
+        if (staging.xsave_area.fxsave_area.mxcsr & !mxcsr_mask()) != 0 {
+            return Err(crate::Error::InvalidArgs);
+        }
+        if XSTATE_MAX_FEATURES.is_completed()
+            && ((staging.xsave_area.features & !allowed) != 0
+                || staging.xsave_area.compaction != 0
+                || staging.xsave_area.reserved != [0; 6])
+        {
+            return Err(crate::Error::InvalidArgs);
+        }
+
+        *self = staging;
+        Ok(())
+    }
+
     /// Saves CPU's current FPU context to this instance.
     // Keep Image state instructions in the wrapper recognized by the artifact
     // audit, independent of ThinLTO's caller-dependent inlining decisions.
@@ -710,18 +1156,12 @@ impl FpuContext {
     pub fn save(&mut self) {
         let mem_addr = self.as_bytes_mut().as_mut_ptr();
 
-        #[cfg(kernelet_getpid_profile)]
-        profile::event(profile::event_id::FPU_SAVE);
         // SAFETY: XSaveArea has the required alignment and size. CPU feature
         // initialization records whether the Host has enabled XSAVE.
         if XSTATE_MAX_FEATURES.is_completed() {
             unsafe { _xsave64(mem_addr, XFEATURE_MASK_USER_RESTORE) };
-            #[cfg(kernelet_rq1_diagnostics)]
-            crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Xsave);
         } else {
             unsafe { _fxsave64(mem_addr) };
-            #[cfg(kernelet_rq1_diagnostics)]
-            crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Fxsave);
         }
 
         debug!("Save FPU context");
@@ -732,20 +1172,14 @@ impl FpuContext {
     pub fn load(&self) {
         let mem_addr = self.as_bytes().as_ptr();
 
-        #[cfg(kernelet_getpid_profile)]
-        profile::event(profile::event_id::FPU_LOAD);
         // SAFETY: XSaveArea has the required alignment and size. CPU feature
         // initialization records the supported state restored by this path.
         if let Some(xstate_max_features) = XSTATE_MAX_FEATURES.get() {
             let rs_mask = XFEATURE_MASK_USER_RESTORE & *xstate_max_features;
 
             unsafe { _xrstor64(mem_addr, rs_mask) };
-            #[cfg(kernelet_rq1_diagnostics)]
-            crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Xrstor);
         } else {
             unsafe { _fxrstor64(mem_addr) };
-            #[cfg(kernelet_rq1_diagnostics)]
-            crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Fxrstor);
         }
 
         debug!("Load FPU context");
@@ -780,8 +1214,6 @@ impl Clone for FpuContext {
                 .copy_from_slice(&self.xsave_area.extended_state_area[..len]);
         }
 
-        #[cfg(kernelet_rq1_diagnostics)]
-        crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Clone);
         Self {
             xsave_area,
             area_size: self.area_size,
@@ -874,15 +1306,6 @@ pub(in crate::arch) fn record_fpu_features() {
             xsave_area_size
         });
     }
-}
-
-#[cfg(feature = "kernelet-host")]
-pub(crate) fn fpu_area_bytes() -> usize {
-    XSAVE_AREA_SIZE
-        .get()
-        .copied()
-        .unwrap_or(size_of::<FxSaveArea>())
-        .max(size_of::<FxSaveArea>())
 }
 
 pub(in crate::arch) fn enable_essential_features() {

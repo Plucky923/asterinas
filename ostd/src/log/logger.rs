@@ -31,7 +31,9 @@ pub(super) fn __logger() -> Option<&'static dyn Log> {
 /// if no logger has been registered yet.
 ///
 /// Called by the `log!` macro. Not intended for direct use.
+#[cold]
 #[doc(hidden)]
+#[inline(never)]
 pub fn __write_log_record(record: &Record) {
     if let Some(logger) = __logger() {
         logger.log(record);

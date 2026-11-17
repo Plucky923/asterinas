@@ -69,13 +69,33 @@ pub(in crate::task) fn leave_boot_task() {
     PREEMPT_INFO.bitand_assign(!BOOT_TASK_MASK);
 }
 
+#[cfg(not(feature = "kernelet"))]
 pub(in crate::task) fn inc_guard_count() {
     PREEMPT_INFO.add_assign(1);
 }
 
+#[cfg(not(feature = "kernelet"))]
 pub(in crate::task) fn dec_guard_count() {
     debug_assert!(get_guard_count() > 0);
     PREEMPT_INFO.sub_assign(1);
+}
+
+#[cfg(feature = "kernelet")]
+pub(in crate::task) fn inc_guard_count_with(access: &crate::arch::cpu::local::CpuLocalAccess<'_>) {
+    access.store(&PREEMPT_INFO, access.load(&PREEMPT_INFO).wrapping_add(1));
+}
+
+#[cfg(feature = "kernelet")]
+pub(in crate::task) fn dec_guard_count_with(access: &crate::arch::cpu::local::CpuLocalAccess<'_>) {
+    let value = access.load(&PREEMPT_INFO);
+    debug_assert!(value & GUARD_COUNT_MASK > 0);
+    access.store(&PREEMPT_INFO, value.wrapping_sub(1));
+}
+
+#[cfg(feature = "kernelet")]
+#[inline(always)]
+pub(in crate::task) fn preempt_info_offset() -> usize {
+    PREEMPT_INFO.offset()
 }
 
 cpu_local_cell! {

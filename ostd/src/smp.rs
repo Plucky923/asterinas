@@ -158,19 +158,6 @@ pub(crate) static IPI_SENDER: Once<IpiSender> = Once::new();
 
 #[cfg(not(feature = "kernelet"))]
 impl IpiSender {
-    /// Notifies a remote CPU without queuing a callback; does nothing for self.
-    /// Callers must publish work and wake its waiters before notifying.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn notify_remote_cpu(&self, cpu_id: crate::cpu::CpuId) {
-        let irq_guard = irq::disable_local();
-        if cpu_id == irq_guard.current_cpu() {
-            return;
-        }
-        let hw_cpu_id = self.hw_cpu_ids[cpu_id.as_usize()];
-        crate::arch::irq::send_ipi(hw_cpu_id, &irq_guard)
-            .expect("failed to send inter-processor interrupt");
-    }
-
     /// Executes a function on other processors.
     ///
     /// See [`inter_processor_call`] for details. The purpose of exporting this

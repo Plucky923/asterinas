@@ -118,7 +118,17 @@ fn bsp_idle_loop() {
     }
 
     #[cfg(feature = "kernelet")]
-    ostd::power::exit_with_code(init_process.status().exit_code());
+    {
+        let status = init_process.status().exit_code();
+        let signal = status & 0x7f;
+        // Process status uses wait(2) encoding; the Host receives an exit code.
+        let code = if signal == 0 {
+            (status >> 8) & 0xff
+        } else {
+            128 + signal
+        };
+        ostd::power::exit_with_code(code);
+    }
 
     #[cfg(not(feature = "kernelet"))]
     panic!(

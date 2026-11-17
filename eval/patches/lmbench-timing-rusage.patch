@@ -1,0 +1,87 @@
+--- a/src/lib_timing.c
++++ b/src/lib_timing.c
+@@ -44,6 +44,11 @@
+ #define	mine(f)		(int)(ru_stop.f - ru_start.f)
+ 
+ static struct rusage ru_start, ru_stop;
++static int	ru_start_ok, ru_stop_ok;
++static int	timing_rusage_valid;
++static long	timing_intervals;
++static long	timing_minflt;
++static long	timing_majflt;
+ 
+ void
+ rusage(void)
+@@ -625,6 +630,14 @@
+ 
+ 	if (!_benchmp_child_state.r) return;
+ 	insertinit(_benchmp_child_state.r);
++#ifdef RUSAGE
++	ru_start_ok = 0;
++	ru_stop_ok = 0;
++	timing_rusage_valid = 1;
++	timing_intervals = 0;
++	timing_minflt = 0;
++	timing_majflt = 0;
++#endif
+ 	set_results(_benchmp_child_state.r);
+ 
+ 	need_warmup = 1;
+@@ -670,6 +683,23 @@
+ 
+ 	if (!state->need_warmup) {
+ 		result = stop(0,0);
++#ifdef RUSAGE
++		if (state->state == timing_interval) {
++			if (ru_start_ok && ru_stop_ok) {
++				long dmin = ru_stop.ru_minflt - ru_start.ru_minflt;
++				long dmaj = ru_stop.ru_majflt - ru_start.ru_majflt;
++				if (dmin < 0 || dmaj < 0)
++					timing_rusage_valid = 0;
++				else {
++					timing_minflt += dmin;
++					timing_majflt += dmaj;
++				}
++			} else {
++				timing_rusage_valid = 0;
++			}
++			timing_intervals++;
++		}
++#endif
+ 		if (state->cleanup) {
+ 			if (benchmp_sigchld_handler == SIG_DFL)
+ 				signal(SIGCHLD, SIG_DFL);
+@@ -752,6 +782,15 @@
+ 			 * From this point on, we will do no more "work".
+ 			 */
+ 			read(state->result_signal, (void*)&c, sizeof(char));
++#ifdef RUSAGE
++			if (getenv("LMBENCH_TIMING_RUSAGE") != NULL) {
++				fprintf(stderr,
++					"LMBENCH_TIMING_RUSAGE valid=%d intervals=%ld minflt=%ld majflt=%ld\n",
++					(timing_rusage_valid && timing_intervals > 0) ? 1 : 0,
++					timing_intervals, timing_minflt, timing_majflt);
++				fflush(stderr);
++			}
++#endif
+ 			write(state->response, (void*)get_results(), state->r_size);
+ 			if (state->cleanup) {
+ 				if (benchmp_sigchld_handler == SIG_DFL)
+@@ -791,7 +830,7 @@
+ 		tv = &start_tv;
+ 	}
+ #ifdef	RUSAGE
+-	getrusage(RUSAGE_SELF, &ru_start);
++	ru_start_ok = (getrusage(RUSAGE_SELF, &ru_start) == 0);
+ #endif
+ 	(void) gettimeofday(tv, (struct timezone *) 0);
+ }
+@@ -807,7 +846,7 @@
+ 	}
+ 	(void) gettimeofday(end, (struct timezone *) 0);
+ #ifdef	RUSAGE
+-	getrusage(RUSAGE_SELF, &ru_stop);
++	ru_stop_ok = (getrusage(RUSAGE_SELF, &ru_stop) == 0);
+ #endif
+ 
+ 	if (begin == NULL) {

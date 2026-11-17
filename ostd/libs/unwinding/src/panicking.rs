@@ -25,6 +25,7 @@ pub fn begin_panic<E: Exception>(exception: E) -> UnwindReasonCode {
     }
 }
 
+#[cfg_attr(feature = "kernelet", inline(always))]
 pub fn catch_unwind<E: Exception, R, F: FnOnce() -> R>(f: F) -> Result<R, Option<E>> {
     #[repr(C)]
     union Data<F, R, E> {

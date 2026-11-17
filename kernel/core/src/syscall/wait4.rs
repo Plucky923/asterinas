@@ -51,6 +51,7 @@ pub(super) fn sys_wait4(
         let rusage = rusage_t {
             ru_utime: wait_status.prof_clock().user_clock().read_time().into(),
             ru_stime: wait_status.prof_clock().kernel_clock().read_time().into(),
+            ru_minflt: wait_status.minor_faults(),
             ..Default::default()
         };
 

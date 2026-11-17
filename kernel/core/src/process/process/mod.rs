@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use core::{
-    sync::atomic::{AtomicBool, AtomicI16, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicI16, AtomicU32, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -150,6 +150,8 @@ pub struct Process {
     timer_manager: PosixTimerManager,
     /// Process start time since boot.
     start_time: Jiffies,
+    /// Minor page faults handled by threads in this process.
+    minflt: AtomicU64,
 
     // Namespaces
     /// The user namespace
@@ -267,6 +269,7 @@ impl Process {
                 prof_clock,
                 timer_manager,
                 start_time: Jiffies::elapsed(),
+                minflt: AtomicU64::new(0),
                 user_ns: Mutex::new(user_ns),
             }
         })
@@ -304,6 +307,16 @@ impl Process {
     /// Returns the process start time since boot.
     pub(crate) fn start_time(&self) -> Jiffies {
         self.start_time
+    }
+
+    /// Increments the minor page-fault counter for this process.
+    pub(crate) fn record_minor_fault(&self) {
+        self.minflt.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the minor page-fault count for this process.
+    pub(crate) fn minor_faults(&self) -> u64 {
+        self.minflt.load(Ordering::Relaxed)
     }
 
     pub(crate) fn tasks(&self) -> &Mutex<TaskSet> {
@@ -856,15 +869,21 @@ pub(crate) fn broadcast_signal_async(process_group: Weak<ProcessGroup>, signum: 
 pub(crate) struct ReapedChildrenStats {
     user_time: Duration,
     kernel_time: Duration,
+    minflt: u64,
 }
 
 impl ReapedChildrenStats {
-    pub(crate) fn add(&mut self, utime: Duration, stime: Duration) {
+    pub(crate) fn add(&mut self, utime: Duration, stime: Duration, minflt: u64) {
         self.user_time += utime;
         self.kernel_time += stime;
+        self.minflt = self.minflt.saturating_add(minflt);
     }
 
     pub(crate) fn get(&self) -> (Duration, Duration) {
         (self.user_time, self.kernel_time)
+    }
+
+    pub(crate) fn minflt(&self) -> u64 {
+        self.minflt
     }
 }

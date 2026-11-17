@@ -16,7 +16,7 @@ pub(crate) const ENTRY_TABLE_OFFSET: u64 = 0x1000;
 /// `ostd::kernelet::abi::EntryTable`.
 pub(crate) mod entry_table {
     /// The table size in bytes that the OSTD ABI fixes.
-    pub(crate) const SIZE: u64 = 136;
+    pub(crate) const SIZE: u64 = 144;
 
     /// The byte offset of the `size` field.
     pub(crate) const SIZE_FIELD_OFFSET: usize = 0;
@@ -46,6 +46,8 @@ pub(crate) mod entry_table {
     pub(crate) const CPU_ACCESS_START_OFFSET: usize = 120;
     /// The byte offset of the `cpu_access_end_offset` field.
     pub(crate) const CPU_ACCESS_END_OFFSET: usize = 128;
+    /// The byte offset of the `user_event_entry_offset` field.
+    pub(crate) const USER_EVENT_ENTRY_OFFSET: usize = 136;
 }
 
 #[cfg(test)]
@@ -71,6 +73,7 @@ mod tests {
             (entry_table::STUB_RANGE_END_OFFSET, 8),
             (entry_table::CPU_ACCESS_START_OFFSET, 8),
             (entry_table::CPU_ACCESS_END_OFFSET, 8),
+            (entry_table::USER_EVENT_ENTRY_OFFSET, 8),
         ];
         for pair in fields.windows(2) {
             assert_eq!(

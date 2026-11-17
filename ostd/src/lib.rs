@@ -41,17 +41,7 @@ pub mod cpu;
 mod error;
 pub mod io;
 pub mod irq;
-#[cfg(all(
-    target_arch = "x86_64",
-    any(
-        feature = "kernelet",
-        feature = "kernelet-host",
-        kernelet_rq1,
-        kernelet_rq1_diagnostics,
-        kernelet_getpid_profile,
-        ktest
-    )
-))]
+#[cfg(all(target_arch = "x86_64", any(feature = "kernelet", ktest)))]
 pub mod kernelet;
 pub mod log;
 pub mod mm;
@@ -75,6 +65,8 @@ use core::sync::atomic::AtomicBool;
 #[cfg(not(feature = "kernelet"))]
 use core::sync::atomic::Ordering;
 
+#[cfg(feature = "kernelet")]
+pub use ostd_macros::user_event_handler;
 pub use ostd_macros::{
     early_cmdline_parser, global_frame_allocator, global_heap_allocator,
     global_heap_allocator_slot_map, main, panic_handler,
@@ -182,17 +174,11 @@ pub(crate) fn invoke_ffi_init_funcs() {
 }
 
 mod feature_validation {
-    #[cfg(all(feature = "kernelet", feature = "kernelet-host"))]
-    compile_error!("features `kernelet` and `kernelet-host` cannot be enabled together");
-
     #[cfg(all(feature = "kernelet", feature = "cvm_guest"))]
     compile_error!("features `kernelet` and `cvm_guest` cannot be enabled together");
 
     #[cfg(all(feature = "kernelet", not(target_arch = "x86_64")))]
     compile_error!("feature `kernelet` currently supports only x86-64");
-
-    #[cfg(all(feature = "kernelet-host", not(target_arch = "x86_64")))]
-    compile_error!("feature `kernelet-host` currently supports only x86-64");
 
     #[cfg(all(not(target_arch = "riscv64"), feature = "riscv_sv39_mode"))]
     compile_error!(

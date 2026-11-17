@@ -122,7 +122,6 @@ default-members = [
 exclude = [
     "vendor/smoltcp",
     "tools/tests/smoltcp-egress-credit",
-    "kernelet",
     "kernel/libs/comp-sys/cargo-component",
     "kernel/libs/comp-sys/component",
     "kernel/libs/comp-sys/component-macro",
@@ -156,7 +155,6 @@ edition = "2024"
 
 [workspace.dependencies]
 ostd = { path = "ostd", version = "0.19.0", default-features = false }
-kernelet-abi = { path = "kernelet/abi" }
 
 # Crates under ostd/libs
 align_ext = { path = "ostd/libs/align_ext", version = "0.1.0" }

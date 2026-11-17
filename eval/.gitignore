@@ -1,0 +1,7 @@
+/.build/
+/results/
+__pycache__/
+*.pyc
+*.o
+*.cpio
+*.cpio.gz

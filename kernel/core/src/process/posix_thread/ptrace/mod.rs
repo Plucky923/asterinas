@@ -5,7 +5,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_arch = "x86_64")]
-use ostd::arch::cpu::context::{FsBase, GsBase};
+use ostd::arch::cpu::context::{FsBase, GsBase, OwnedUserContext};
 use ostd::{arch::cpu::context::UserContext, sync::Waiter};
 
 use super::{AsPosixThread, PosixThread};
@@ -490,7 +490,7 @@ impl TraceeStatus {
             let supp = ctx.thread_local.supp_user_context();
             state.fs_base = Some(supp.fs_base().get());
             state.gs_base = Some(supp.gs_base().get());
-            state.user_context = Some(user_ctx.clone());
+            state.user_context = Some(OwnedUserContext::from(&*user_ctx));
             state.set_orig_syscall_ret(ctx.thread_local.orig_syscall_ret());
         }
         self.is_stopped.store(true, Ordering::Relaxed);
@@ -534,7 +534,7 @@ impl TraceeStatus {
 
         #[cfg(target_arch = "x86_64")]
         {
-            *user_ctx = state.user_context.take().unwrap();
+            user_ctx.copy_regs_from(&state.user_context.take().unwrap());
             let supp = ctx.thread_local.supp_user_context();
             supp.fs_base().set(state.fs_base.take().unwrap());
             supp.gs_base().set(state.gs_base.take().unwrap());
@@ -770,7 +770,7 @@ struct TraceeState {
     is_tracing_syscall: bool,
     /// The user register context of the tracee at the time of ptrace-stop.
     #[cfg(target_arch = "x86_64")]
-    user_context: Option<UserContext>,
+    user_context: Option<OwnedUserContext>,
     /// The FS base of the tracee at the time of ptrace-stop.
     #[cfg(target_arch = "x86_64")]
     fs_base: Option<FsBase>,

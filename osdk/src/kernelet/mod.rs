@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Building and auditing the kernelet image.
+//! Building and auditing the standalone kernelet image.
 //!
-//! When the OSDK manifest turns the `kernelet` build option on, one OSDK
-//! invocation builds the kernelet image first — from the same kernel and OSTD
-//! sources as the host image, but as a separate Cargo build with
+//! When the OSDK manifest or CLI turns the `kernelet` build option on, OSDK
+//! builds the standalone kernelet image — as a Cargo build with
 //! `--no-default-features --features kernelet`, position-independent, and
-//! linked by a generated kernelet linker script — audits it, and then builds
-//! the host image with `KERNELET_IMAGE_PATH` pointing at the audited
-//! artifact. The image format and the build contract are documented in
-//! `kernelet/ABI.md`.
+//! linked by a generated kernelet linker script — and audits it. The image
+//! format is defined by this module's ABI checks and `ostd/src/kernelet/abi.rs`.
 
 pub(crate) mod abi;
 pub(crate) mod audit;
 mod elf;
 mod external_sources;
-mod host_audit;
 pub(crate) mod rustc_wrapper;
 mod snapshot;
-mod stack_budget;
 mod unsafe_allowlist;
 
 use std::{
@@ -28,9 +23,7 @@ use std::{
     process,
 };
 
-pub(crate) use host_audit::audit_host_services;
 use sha2::{Digest, Sha256};
-pub(crate) use stack_budget::generate_host_budgets;
 
 use crate::{
     arch::Arch,
@@ -45,17 +38,9 @@ use crate::{
     util::{CrateInfo, DirGuard, get_cargo_metadata},
 };
 
-/// The environment variable through which OSDK hands the audited kernelet
-/// image's path to the host image's build.
-pub(crate) const KERNELET_IMAGE_ENV: &str = "KERNELET_IMAGE_PATH";
-const KERNELET_SOURCE_HASH_ENV: &str = "KERNELET_SOURCE_HASH";
-
-/// The audited image and the independent hash expected by the Host build.
+/// The audited standalone kernelet image.
 pub(crate) struct KerneletImage {
     path: PathBuf,
-    source_hash: [u8; 32],
-    toolchain: Option<OsString>,
-    cargo_home: Option<PathBuf>,
 }
 
 struct GuestBuildContext<'a> {
@@ -68,56 +53,9 @@ struct GuestBuildContext<'a> {
 }
 
 impl KerneletImage {
-    /// Supplies both build-time values consumed by the Host control half.
-    pub(crate) fn host_envs(&self) -> Vec<(String, OsString)> {
-        let hash = hex_encode(&self.source_hash);
-        let mut envs = vec![
-            (
-                KERNELET_IMAGE_ENV.to_string(),
-                self.path.as_os_str().to_os_string(),
-            ),
-            (KERNELET_SOURCE_HASH_ENV.to_string(), hash.into()),
-        ];
-        if let Some(home) = &self.cargo_home {
-            envs.push(("CARGO_HOME".into(), home.as_os_str().to_owned()));
-            envs.push(("CARGO_NET_OFFLINE".into(), "true".into()));
-        }
-        if let Some(toolchain) = &self.toolchain {
-            envs.push(("RUSTUP_TOOLCHAIN".to_string(), toolchain.clone()));
-        }
-        envs
-    }
-}
-
-pub(crate) fn host_overrides(image: Option<&KerneletImage>, overrides: &[String]) -> Vec<String> {
-    match image.and_then(|image| image.cargo_home.as_deref()) {
-        Some(home) => snapshot::frozen_overrides(home, overrides).unwrap_or_else(|error| {
-            error_msg!("Cannot freeze Host Cargo overrides: {error}");
-            process::exit(Errno::BuildCrate as _);
-        }),
-        None => overrides.to_vec(),
-    }
-}
-
-pub(crate) fn validate_host_dependencies(
-    image: &KerneletImage,
-    features: &[String],
-    no_default_features: bool,
-    overrides: &[String],
-) {
-    if let Some(home) = &image.cargo_home {
-        snapshot::validate_dependencies(
-            home,
-            &std::env::current_dir().unwrap(),
-            features,
-            no_default_features,
-            overrides,
-            image.toolchain.as_deref(),
-        )
-        .unwrap_or_else(|error| {
-            error_msg!("Host dependencies are not frozen: {error}");
-            process::exit(Errno::BuildCrate as _);
-        });
+    /// Returns the path to the audited kernelet ELF image.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -131,7 +69,9 @@ pub(crate) fn capture_build_if_requested(
     image_build(config, action).kernelet.then(|| {
         let options = image_build(config, action);
         let mut features = options.features.clone();
-        features.extend(["kernelet".into(), "kernelet-host".into()]);
+        if !features.iter().any(|feature| feature == "kernelet") {
+            features.push("kernelet".into());
+        }
         snapshot::BuildSnapshot::capture(
             target,
             output,
@@ -141,7 +81,7 @@ pub(crate) fn capture_build_if_requested(
             options.no_default_features,
         )
         .unwrap_or_else(|error| {
-            error_msg!("Cannot freeze paired build inputs: {error}");
+            error_msg!("Cannot freeze build inputs: {error}");
             process::exit(Errno::BuildCrate as _);
         })
     })
@@ -171,8 +111,7 @@ pub(crate) fn build_image_if_requested(
     ))
 }
 
-// Use the same finalized action options for the Guest and Host builds. The
-// global defaults may differ from action-level profiles, overrides and enablement.
+// Use the finalized action options, including action-level profiles and overrides.
 fn image_build(config: &Config, action: ActionChoice) -> &Build {
     match action {
         ActionChoice::Run => &config.run.build,
@@ -180,8 +119,7 @@ fn image_build(config: &Config, action: ActionChoice) -> &Build {
     }
 }
 
-/// Builds one kernelet image from the same kernel crate the host image is
-/// built from, audits it, and returns the absolute path of the artifact.
+/// Builds and audits the selected kernel crate as a standalone kernelet image.
 fn build_kernelet_image(
     config: &Config,
     build: &Build,
@@ -198,7 +136,7 @@ fn build_kernelet_image(
     let mut frozen_build = build.clone();
     if let Some(home) = &cargo_home {
         frozen_build.override_configs = snapshot::frozen_overrides(home, &build.override_configs)
-            .expect("Cargo override sources are present in the paired snapshot");
+            .expect("Cargo override sources are present in the build snapshot");
     }
     let build = &frozen_build;
     let ostd_directory = ostd_source_directory(target_crate);
@@ -278,9 +216,6 @@ fn build_kernelet_image(
         path: elf_path
             .canonicalize()
             .expect("the built kernelet image exists"),
-        source_hash,
-        toolchain,
-        cargo_home,
     }
 }
 
@@ -311,6 +246,19 @@ fn build_kernelet_elf(
     ];
 
     let mut command = cargo();
+    if std::env::var_os("VDSO_LIBRARY_DIR").is_none() {
+        let default_vdso = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|h| h.join(".local/share/asterinas/linux_vdso"))
+            .filter(|p| p.join("vdso_x86_64.so").is_file())
+            .or_else(|| {
+                let root_vdso = PathBuf::from("/root/linux_vdso");
+                root_vdso.join("vdso_x86_64.so").is_file().then_some(root_vdso)
+            });
+        if let Some(dir) = default_vdso {
+            command.env("VDSO_LIBRARY_DIR", dir);
+        }
+    }
     if let Some(home) = build.cargo_home {
         command
             .env("CARGO_HOME", home)

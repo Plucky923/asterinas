@@ -5,13 +5,11 @@
 #![warn(unused)]
 
 use alloc::{boxed::Box, sync::Arc};
-#[cfg(feature = "kernelet-host")]
-use core::num::NonZeroU16;
 use core::{fmt, ops::Bound, sync::atomic::Ordering};
 
-#[cfg(not(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest)))]
+#[cfg(not(any(feature = "kernelet", ktest)))]
 use ostd::arch::read_tsc as sched_clock;
-#[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+#[cfg(any(feature = "kernelet", ktest))]
 use ostd::task::scheduler::runtime_ticks as sched_clock;
 use ostd::{
     cpu::{CpuId, CpuSet, PinCurrentCpu, all_cpus},
@@ -175,17 +173,6 @@ impl SchedAttr {
         }
     }
 
-    /// Divides the thread's fair weight before it is first published to a run queue.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn with_fair_weight_divisor(mut self, divisor: NonZeroU16) -> Self {
-        let nice = match self.policy() {
-            SchedPolicy::Fair(nice) => nice,
-            _ => Nice::default(),
-        };
-        self.fair = fair::FairAttr::new_with_weight_divisor(nice, divisor);
-        self
-    }
-
     /// Retrieves the current scheduling policy of the thread.
     pub(crate) fn policy(&self) -> SchedPolicy {
         self.policy.get()
@@ -299,10 +286,14 @@ impl ClassScheduler {
 
     // TODO: Implement a better algorithm and replace the current naive implementation.
     fn select_cpu(&self, thread: &Thread, flags: EnqueueFlags) -> CpuId {
+        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
         if let Some(last_cpu) = thread.sched_attr().last_cpu() {
-            return last_cpu;
+            if affinity.contains(last_cpu) {
+                return last_cpu;
+            }
+        } else {
+            debug_assert!(flags == EnqueueFlags::Spawn);
         }
-        debug_assert!(flags == EnqueueFlags::Spawn);
 
         let guard = disable_local();
 
@@ -320,7 +311,6 @@ impl ClassScheduler {
             }
         };
 
-        let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
         match self.last_chosen_cpu.get() {
             Some(cpu) => {
                 // Perform a round-robin selection starting after the last chosen CPU.

@@ -9,7 +9,10 @@ use ostd::{
 use super::SyscallReturn;
 use crate::{
     prelude::*,
-    process::{posix_thread::ContextPthreadAdminApi, signal::c_types::ucontext_t},
+    process::{
+        posix_thread::ContextPthreadAdminApi,
+        signal::{c_types::ucontext_t, constants::SIGSEGV, signals::kernel::KernelSignal},
+    },
     syscall::sigaltstack::set_new_stack,
 };
 
@@ -20,7 +23,43 @@ pub(super) fn sys_rt_sigreturn(ctx: &Context, user_ctx: &mut UserContext) -> Res
         sig_context_addr
     );
 
-    let ucontext = ctx.user_space().read_val::<ucontext_t>(sig_context_addr)?;
+    let user_space = ctx.user_space();
+    let ucontext = match user_space.read_val::<ucontext_t>(sig_context_addr) {
+        Ok(ucontext) => ucontext,
+        Err(err) => {
+            ctx.posix_thread
+                .enqueue_signal(Box::new(KernelSignal::new(SIGSEGV)));
+            return Err(err.into());
+        }
+    };
+
+    // Read and validate the FPU context before mutating any thread state.
+    let fpu_context_addr = cfg_select! {
+        target_arch = "x86_64" => ucontext.uc_mcontext.fpu_context_addr(),
+        any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "aarch64") => {
+            // In RISC-V/LoongArch64/ARM, the FPU context is placed directly after `ucontext_t` on
+            // the signal stack.
+            sig_context_addr + size_of::<ucontext_t>()
+        }
+        _ => compile_error!("unsupported target"),
+    };
+    let mut fpu_context = FpuContext::new();
+    let fpu_res: Result<()> = (|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut reader = user_space.reader(fpu_context_addr, fpu_context.area_size())?;
+            fpu_context.read_from(&mut reader)?;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        user_space.read_bytes(fpu_context_addr, fpu_context.as_bytes_mut())?;
+        Ok(())
+    })();
+    if let Err(err) = fpu_res {
+        ctx.posix_thread
+            .enqueue_signal(Box::new(KernelSignal::new(SIGSEGV)));
+        return Err(err);
+    }
+    drop(user_space);
 
     // Restore general-purpose registers.
     ucontext.uc_mcontext.copy_user_regs_to(user_ctx);
@@ -33,18 +72,6 @@ pub(super) fn sys_rt_sigreturn(ctx: &Context, user_ctx: &mut UserContext) -> Res
     let _ = set_new_stack(stack, ctx, user_ctx.stack_pointer());
 
     // Restore the FPU context.
-    let fpu_context_addr = cfg_select! {
-        target_arch = "x86_64" => ucontext.uc_mcontext.fpu_context_addr(),
-        any(target_arch = "riscv64", target_arch = "loongarch64", target_arch = "aarch64") => {
-            // In RISC-V/LoongArch64/ARM, the FPU context is placed directly after `ucontext_t` on
-            // the signal stack.
-            sig_context_addr + size_of::<ucontext_t>()
-        }
-        _ => compile_error!("unsupported target"),
-    };
-    let mut fpu_context = FpuContext::new();
-    ctx.user_space()
-        .read_bytes(fpu_context_addr, fpu_context.as_bytes_mut())?;
     ctx.thread_local.supp_user_context().fpu().set(fpu_context);
 
     // Restore the signal mask.

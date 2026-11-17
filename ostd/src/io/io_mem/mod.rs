@@ -250,7 +250,7 @@ impl IoMem<Sensitive> {
 
 impl IoMem<Insensitive> {
     #[cfg(feature = "kernelet")]
-    fn is_virtual(&self) -> bool {
+    pub(crate) fn is_virtual(&self) -> bool {
         matches!(self.backend, IoMemBackend::Virtual { .. })
     }
 

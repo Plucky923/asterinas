@@ -244,9 +244,6 @@ impl<E: Ext> IfaceCommon<E> {
 impl<E: Ext> IfaceCommon<E> {
     pub(super) fn poll<D: WithDevice>(&self, driver: &D, phy: &dyn PollPhy) {
         driver.with(|device| self.do_poll_and_notify(device, phy));
-        // `with` has returned: device, interface and socket guards are gone.
-        #[cfg(kernelet_nat_failure_diag)]
-        crate::tx_allocation_diag::flush();
     }
 
     fn do_poll_and_notify(&self, device: &mut dyn AnyNetworkDevice, phy: &dyn PollPhy) {

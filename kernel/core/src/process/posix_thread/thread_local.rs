@@ -13,7 +13,7 @@ use crate::{
     fs::{file::file_table::FileTable, thread_info::ThreadFsInfo},
     prelude::*,
     process::{
-        NsProxy, UserNamespace,
+        NsProxy, Process, UserNamespace,
         signal::{SigStack, sig_mask::SigMask},
     },
     vm::vmar::VmarHandle,
@@ -21,8 +21,7 @@ use crate::{
 
 /// Local data for a POSIX thread.
 pub(crate) struct ThreadLocal {
-    #[cfg(kernelet_rq1_diagnostics)]
-    getpid_timeline: RefCell<ostd::kernelet::getpid_profile::timeline::Timeline>,
+    process: RefCell<Option<Arc<Process>>>,
     // TID pointers.
     // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
     set_child_tid: Cell<Vaddr>,
@@ -63,6 +62,7 @@ pub(crate) struct ThreadLocal {
 impl ThreadLocal {
     #[expect(clippy::too_many_arguments)]
     pub(super) fn new(
+        process: Option<Arc<Process>>,
         set_child_tid: Vaddr,
         clear_child_tid: Vaddr,
         vmar: VmarHandle,
@@ -73,8 +73,7 @@ impl ThreadLocal {
         ns_proxy: Arc<NsProxy>,
     ) -> Self {
         Self {
-            #[cfg(kernelet_rq1_diagnostics)]
-            getpid_timeline: RefCell::new(ostd::kernelet::getpid_profile::timeline::Timeline::new()),
+            process: RefCell::new(process),
             set_child_tid: Cell::new(set_child_tid),
             clear_child_tid: Cell::new(clear_child_tid),
             vmar: RefCell::new(Some(vmar)),
@@ -91,15 +90,12 @@ impl ThreadLocal {
         }
     }
 
-    pub(crate) fn set_child_tid(&self) -> &Cell<Vaddr> {
-        &self.set_child_tid
+    pub(crate) fn process(&self) -> &RefCell<Option<Arc<Process>>> {
+        &self.process
     }
 
-    #[cfg(kernelet_rq1_diagnostics)]
-    pub(crate) fn getpid_timeline(
-        &self,
-    ) -> &RefCell<ostd::kernelet::getpid_profile::timeline::Timeline> {
-        &self.getpid_timeline
+    pub(crate) fn set_child_tid(&self) -> &Cell<Vaddr> {
+        &self.set_child_tid
     }
 
     pub(crate) fn clear_child_tid(&self) -> &Cell<Vaddr> {

@@ -60,14 +60,13 @@ const DATA_PHDR_MEMSZ_OFFSET: usize = EHDR_SIZE + 2 * PHDR_SIZE + 40;
 
 const SOURCE_HASH: [u8; 32] = [0x5a; 32];
 
-/// Re-audit actual linked artifacts after audit-policy-only changes. All paths
+/// Re-audit an actual linked artifact after audit-policy-only changes. The path
 /// and the independently computed OSTD hash are required explicitly; ordinary
 /// unit tests never substitute the synthetic fixture for this integration check.
 #[test]
-#[ignore = "requires linked Guest/Host artifacts and an independently computed source hash"]
+#[ignore = "requires a linked Guest artifact and an independently computed source hash"]
 fn actual_linked_artifacts_pass_production_audits() {
     let guest = std::env::var_os("OSDK_AUDIT_GUEST_ELF").expect("explicit Guest ELF required");
-    let host = std::env::var_os("OSDK_AUDIT_HOST_ELF").expect("explicit Host ELF required");
     let source =
         std::env::var("OSDK_AUDIT_SOURCE_HASH").expect("independent OSTD source hash required");
     assert_eq!(source.len(), 64);
@@ -77,10 +76,6 @@ fn actual_linked_artifacts_pass_production_audits() {
     }
     let bytes = std::fs::read(guest).expect("Guest ELF readable");
     assert_eq!(audit_kernelet_image(&bytes, &expected), Ok(()));
-    assert_eq!(
-        crate::kernelet::audit_host_services(std::path::Path::new(&host)),
-        Ok(())
-    );
 }
 
 /// A mutable byte position inside the fixture image.
@@ -212,6 +207,7 @@ fn fixture() -> Vec<u8> {
         abi::entry_table::EX_TABLE_END_OFFSET,
         EX_TABLE_VADDR + EX_TABLE_ITEM_SIZE,
     );
+    write_entry_table_field(abi::entry_table::USER_EVENT_ENTRY_OFFSET, TEXT_VADDR + 0x20);
     let hash_base = ENTRY_TABLE_FILE_OFFSET + abi::entry_table::SOURCE_HASH_OFFSET;
     bytes[hash_base..hash_base + 32].copy_from_slice(&SOURCE_HASH);
 
@@ -901,6 +897,36 @@ fn non_executable_yield_target_fails() {
             .iter()
             .any(|v| v.contains("audit item 4") && v.contains("yield_entry")),
         "expected a non-executable yield target violation, got: {violations:#?}"
+    );
+}
+
+#[test]
+fn non_executable_user_event_target_fails() {
+    let bytes = image_with(&[Mutation {
+        offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::USER_EVENT_ENTRY_OFFSET,
+        bytes: DATA_VADDR.to_le_bytes().to_vec(),
+    }]);
+    let violations = audit(&bytes).unwrap_err();
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("audit item 4") && v.contains("user_event_entry")),
+        "expected a non-executable user_event_entry violation, got: {violations:#?}"
+    );
+}
+
+#[test]
+fn user_event_entry_without_endbr_fails() {
+    let bytes = image_with(&[Mutation {
+        offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::USER_EVENT_ENTRY_OFFSET,
+        bytes: (TEXT_VADDR + 0x80).to_le_bytes().to_vec(),
+    }]);
+    let violations = audit(&bytes).unwrap_err();
+    assert!(
+        violations.iter().any(|v| v.contains("audit item 10")
+            && v.contains("user event entry")
+            && v.contains("lacks ENDBR64")),
+        "expected a user_event_entry ENDBR64 violation, got: {violations:#?}"
     );
 }
 

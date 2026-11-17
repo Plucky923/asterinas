@@ -49,7 +49,7 @@ fde-static = []
 hide-trace = []
 # Only the kernelet kernel ABI: ordinary code uses no FP state, and user FP
 # state belongs to explicit thread hooks and Host carrier context switches.
-kernelet-no-fp-control = []
+kernelet = []
 libc = ["dep:libc"]
 panic = [
     "panicking",

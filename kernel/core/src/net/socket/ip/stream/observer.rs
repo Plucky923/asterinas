@@ -2,29 +2,16 @@
 
 use aster_bigtcp::socket::{SocketEventObserver, SocketEvents};
 
-#[cfg(feature = "kernelet-host")]
-use crate::{endovisor::NativeTcpBufferCharge, prelude::*};
 use crate::{events::IoEvents, process::signal::Pollee};
 
 #[derive(Clone)]
 pub(crate) struct StreamObserver {
     pollee: Pollee,
-    // Shared only with the native socket file. Background TCP keeps this
-    // charge until its final protocol owner and observer clone are dropped.
-    #[cfg(feature = "kernelet-host")]
-    _nat_charge: Option<Arc<NativeTcpBufferCharge>>,
 }
 
 impl StreamObserver {
-    pub(super) fn new(
-        pollee: Pollee,
-        #[cfg(feature = "kernelet-host")] nat_charge: Option<Arc<NativeTcpBufferCharge>>,
-    ) -> Self {
-        Self {
-            pollee,
-            #[cfg(feature = "kernelet-host")]
-            _nat_charge: nat_charge,
-        }
+    pub(super) fn new(pollee: Pollee) -> Self {
+        Self { pollee }
     }
 }
 

@@ -37,6 +37,8 @@ impl Log for KerneletLogger {
     }
 }
 
+#[cold]
+#[inline(never)]
 fn write_record(level: u32, module: &[u8], args: Arguments) {
     let mut writer = ConsoleWriter {
         level,

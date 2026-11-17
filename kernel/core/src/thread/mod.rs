@@ -59,10 +59,10 @@ fn post_schedule_handler() {
         vm_space.activate();
         return;
     }
-    // Native kernel-only threads retain the upstream address-space behavior.
-    // Leaving a carrier already installs the Host root at its own boundary.
-    #[cfg(feature = "kernelet")]
-    ostd::mm::VmSpace::deactivate();
+    // Kernel-only and idle threads retain the CPU's active user `VmSpace`
+    // (lazy TLB) to avoid two redundant `CR3` switches across blocking syscalls.
+    // Exiting user tasks explicitly deactivate in `exit_current_task`, and
+    // leaving a carrier switches back to `own_mm` at the Host boundary.
 }
 
 pub(super) fn init() {

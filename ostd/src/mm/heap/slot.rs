@@ -7,8 +7,7 @@ use core::{alloc::AllocError, ptr::NonNull};
 use crate::{
     impl_frame_meta_for,
     mm::{
-        FrameAllocOptions, PAGE_SIZE, Paddr, Segment, Vaddr, kspace::LINEAR_MAPPING_BASE_VADDR,
-        paddr_to_vaddr,
+        FrameAllocOptions, PAGE_SIZE, Paddr, Segment, Vaddr, kspace::vaddr_to_paddr, paddr_to_vaddr,
     },
 };
 
@@ -124,7 +123,7 @@ impl HeapSlot {
 
     /// Gets the physical address of the slot.
     pub fn paddr(&self) -> Paddr {
-        self.addr.as_ptr() as Vaddr - LINEAR_MAPPING_BASE_VADDR
+        vaddr_to_paddr(self.addr.as_ptr() as Vaddr)
     }
 
     /// Gets the size of the slot.

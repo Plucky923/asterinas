@@ -3,8 +3,6 @@
 use core::cell::{Cell, RefCell};
 
 use ostd::irq::DisabledLocalIrqGuard;
-#[cfg(kernelet_rq1_diagnostics)]
-use ostd::kernelet::fpu_profile::Event;
 
 /// A smart cache of one user-mode CPU register
 /// to minimize the expensive save/restore traffic
@@ -126,16 +124,8 @@ impl<R: UserReg> CpuSync<R> {
         let _preempt_guard = ostd::task::disable_preempt();
 
         let loc = self.location.get();
-        #[cfg(kernelet_rq1_diagnostics)]
-        R::rq1_event(match loc {
-            CanonicalValueLocation::InMemory => Event::GetInMemory,
-            CanonicalValueLocation::OnCpu => Event::GetOnCpu,
-            CanonicalValueLocation::Both => Event::GetBoth,
-        });
         if loc == CanonicalValueLocation::OnCpu {
             self.reg.borrow_mut().save_from_cpu();
-            #[cfg(kernelet_rq1_diagnostics)]
-            R::rq1_event(Event::SaveGet);
             self.location.set(CanonicalValueLocation::Both);
         }
         self.reg.borrow().clone()
@@ -160,8 +150,6 @@ impl<R: UserReg> CpuSync<R> {
         #[cfg(feature = "kernelet")]
         let _preempt_guard = ostd::task::disable_preempt();
 
-        #[cfg(kernelet_rq1_diagnostics)]
-        R::rq1_event(Event::Set);
         *self.reg.borrow_mut() = new_reg;
         if self.location.get() != CanonicalValueLocation::InMemory {
             self.location.set(CanonicalValueLocation::InMemory);
@@ -177,16 +165,8 @@ impl<R: UserReg> CpuSync<R> {
     /// and the canonical value location is marked `InMemory`.
     pub(super) fn before_schedule(&self, guard: &DisabledLocalIrqGuard) {
         let loc = self.location.get();
-        #[cfg(kernelet_rq1_diagnostics)]
-        R::rq1_event(match loc {
-            CanonicalValueLocation::InMemory => Event::ScheduleInMemory,
-            CanonicalValueLocation::OnCpu => Event::ScheduleOnCpu,
-            CanonicalValueLocation::Both => Event::ScheduleBoth,
-        });
         if loc == CanonicalValueLocation::OnCpu {
             self.reg.borrow_mut().save_from_cpu_with_irq_disabled(guard);
-            #[cfg(kernelet_rq1_diagnostics)]
-            R::rq1_event(Event::SaveSchedule);
         }
         if loc != CanonicalValueLocation::InMemory {
             self.location.set(CanonicalValueLocation::InMemory);
@@ -202,17 +182,12 @@ impl<R: UserReg> CpuSync<R> {
     /// the canonical value of the register `R` is loaded to the CPU hardware
     /// and the canonical value location is marked `OnCpu`.
     pub(super) fn before_user_exec(&self, guard: &DisabledLocalIrqGuard) {
-        let loc = self.location.get();
-        #[cfg(kernelet_rq1_diagnostics)]
-        R::rq1_event(match loc {
-            CanonicalValueLocation::InMemory => Event::UserEntryInMemory,
-            CanonicalValueLocation::OnCpu => Event::UserEntryOnCpu,
-            CanonicalValueLocation::Both => Event::UserEntryBoth,
-        });
-        if loc == CanonicalValueLocation::InMemory {
-            self.reg.borrow().restore_to_cpu_with_irq_disabled(guard);
-            #[cfg(kernelet_rq1_diagnostics)]
-            R::rq1_event(Event::LoadUserEntry);
+        match self.location.get() {
+            CanonicalValueLocation::OnCpu => return,
+            CanonicalValueLocation::InMemory => {
+                self.reg.borrow().restore_to_cpu_with_irq_disabled(guard);
+            }
+            CanonicalValueLocation::Both => {}
         }
         self.location.set(CanonicalValueLocation::OnCpu);
     }
@@ -229,10 +204,6 @@ impl<R: UserReg> CpuSync<R> {
 /// not voluntarily switch the owning Task. Native [`CpuSync`] accessors rely
 /// on this property while borrowing the register and updating its location.
 pub(crate) trait UserReg {
-    /// Only FpuContext participates; other register types erase this hook.
-    #[cfg(kernelet_rq1_diagnostics)]
-    fn rq1_event(_event: Event) {}
-
     /// Saves the current value from the CPU register(s) into `self`.
     ///
     /// May be invoked in any IRQ state.
@@ -278,11 +249,6 @@ enum CanonicalValueLocation {
 // ---------- `UserReg` impls for OSTD register types ----------
 
 impl UserReg for ostd::arch::cpu::context::FpuContext {
-    #[cfg(kernelet_rq1_diagnostics)]
-    fn rq1_event(event: Event) {
-        ostd::kernelet::fpu_profile::event(event);
-    }
-
     fn save_from_cpu(&mut self) {
         self.save();
     }

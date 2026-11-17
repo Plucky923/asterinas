@@ -2,6 +2,9 @@
 
 //! Interrupts.
 
+#[cfg(not(feature = "kernelet"))]
+use super::{cpu, kernel};
+
 // Set this module's log prefix for `ostd::log`.
 macro_rules! __log_prefix {
     () => {
@@ -18,17 +21,18 @@ mod remapping;
 
 #[cfg(not(feature = "kernelet"))]
 pub use chip::{IRQ_CHIP, IrqChip, MappedIrqLine};
-#[cfg(feature = "kernelet-host")]
-pub(crate) use ipi::send_self_ipi;
 #[cfg(not(feature = "kernelet"))]
 pub(crate) use ipi::{HwCpuId, send_ipi};
+#[cfg(feature = "kernelet")]
+pub(crate) use ops::{
+    disable_local_save, disable_local_save_with_guards, finish_enable_local_slow,
+    try_disable_with_guards_if_no_preempt,
+};
+pub(crate) use ops::{disable_local, enable_local, is_local_enabled};
 #[cfg(not(feature = "kernelet"))]
-pub(crate) use ops::enable_local_and_halt;
-pub(crate) use ops::{disable_local, disable_local_and_halt, enable_local, is_local_enabled};
+pub(crate) use ops::{disable_local_and_halt, enable_local_and_halt};
 pub(crate) use remapping::IrqRemapping;
 
-#[cfg(not(feature = "kernelet"))]
-use crate::arch::{cpu, kernel};
 #[cfg(feature = "kernelet")]
 pub use crate::irq::IrqLine as MappedIrqLine;
 
@@ -40,29 +44,6 @@ pub(crate) const IRQ_NUM_MIN: u8 = 32;
 pub(crate) const IRQ_NUM_MAX: u8 = 254;
 /// Reserved local-APIC spurious vector, never allocated to a real IRQ.
 pub(crate) const SPURIOUS_VECTOR: u8 = 255;
-
-/// Captures ISR before recovery performs any acknowledgment. More than one
-/// active vector cannot be attributed to the abandoned entry prefix.
-#[cfg(feature = "kernelet-host")]
-pub(crate) fn interrupted_delivery() -> Result<Option<u8>, ()> {
-    let guard = crate::irq::disable_local();
-    let isr = kernel::apic::get_or_init(&guard).in_service();
-    let mut vector = None;
-    for (index, word) in isr.into_iter().enumerate() {
-        if word == 0 {
-            continue;
-        }
-        if vector.is_some() || word.count_ones() != 1 {
-            return Err(());
-        }
-        let number = index * 32 + word.trailing_zeros() as usize;
-        if number < IRQ_NUM_MIN as usize || number > IRQ_NUM_MAX as usize {
-            return Err(());
-        }
-        vector = Some(number as u8);
-    }
-    Ok(vector)
-}
 
 #[cfg(ktest)]
 #[crate::prelude::ktest]

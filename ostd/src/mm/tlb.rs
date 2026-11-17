@@ -108,11 +108,7 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
 
         #[cfg(feature = "kernelet")]
         if let Some(vmspace) = self.user_root {
-            // Register even a previously inactive root: a concurrent first
-            // activation must observe this shootdown's generation or join its
-            // active set. An image vCPU bitmap cannot track either Host CPUs
-            // or carriers entering and leaving the root during a service.
-            let root = vmspace.register_kernelet_root();
+            let root = vmspace.linux_pgd_paddr() as u64;
             // Publish the PTE writes before the Host advances the root's
             // generation and invalidates its active physical CPUs.
             fence(Ordering::Release);
@@ -176,6 +172,13 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
         } else {
             self.ops_stack.clear_without_flush();
         }
+    }
+
+    /// Retires queued frames after an RCU grace period without issuing a Host
+    /// TLB shootdown (used in VMA baseline mode after `OP_VM_UNMAP` flushes).
+    #[cfg(feature = "kernelet")]
+    pub(crate) fn retire_without_shootdown(&mut self) {
+        self.ops_stack.clear_without_flush();
     }
 
     /// Waits for all the previous TLB flush requests to be completed.
@@ -317,26 +320,6 @@ cpu_local! {
     static FLUSH_OPS: SpinLock<OpsStack, LocalIrqDisabled> = SpinLock::new(OpsStack::new());
 }
 
-/// Queues one operation on each physical CPU and dispatches the callbacks.
-#[cfg(feature = "kernelet-host")]
-pub(crate) fn dispatch_tlb_flush_on_cpus(
-    targets: &crate::cpu::CpuSet,
-    op: TlbFlushOp,
-    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))] request: Option<
-        &crate::kernelet::tlb_profile::Request,
-    >,
-) -> PendingIpis {
-    for cpu in targets.iter() {
-        let mut queue = FLUSH_OPS.get_on_cpu(cpu).lock();
-        queue.push(op.clone(), None);
-        #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-        if let Some(request) = request {
-            queue.flush_tokens.push(request.token());
-        }
-    }
-    crate::smp::inter_processor_call(targets, do_remote_flush)
-}
-
 fn do_remote_flush() {
     // No races because we are in IRQs or have disabled preemption.
     let current_cpu = crate::cpu::CpuId::current_racy();
@@ -348,22 +331,7 @@ fn do_remote_flush() {
         core::mem::swap(&mut *op_queue, &mut new_op_queue);
     }
     // Unlock the locks quickly to avoid contention.
-    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-    let tokens = core::mem::replace(
-        &mut new_op_queue.flush_tokens,
-        crate::kernelet::tlb_profile::FlushTokens::new(),
-    );
-    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-    let kind = if new_op_queue.is_empty() {
-        None
-    } else if new_op_queue.need_flush_all() {
-        Some(crate::kernelet::tlb_profile::BatchFlushKind::FullNonGlobal)
-    } else {
-        Some(crate::kernelet::tlb_profile::BatchFlushKind::Ranges)
-    };
     new_op_queue.flush_all();
-    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-    tokens.complete(current_cpu, kind);
 }
 
 /// If the number of pending pages to flush exceeds this threshold, we flush all the
@@ -384,9 +352,6 @@ struct OpsStack {
     /// The elements cannot be modified after being pushed. And they must be
     /// dropped after the RCU grace period and the TLB flushes.
     frame_keeper: Vec<Frame<dyn AnyFrameMeta>>,
-    // Only physical queues receive tokens; native source batches have none.
-    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-    flush_tokens: crate::kernelet::tlb_profile::FlushTokens,
 }
 
 impl OpsStack {
@@ -396,8 +361,6 @@ impl OpsStack {
             num_ops: 0,
             num_pages_to_flush: 0,
             frame_keeper: Vec::new(),
-            #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-            flush_tokens: crate::kernelet::tlb_profile::FlushTokens::new(),
         }
     }
 
@@ -416,7 +379,7 @@ impl OpsStack {
         if self.is_empty() {
             return None;
         }
-        if self.need_flush_all() || self.num_ops > 4 {
+        if self.need_flush_all() {
             return Some((0, u64::MAX));
         }
 

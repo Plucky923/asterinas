@@ -49,3 +49,14 @@ kernel_task_entry_wrapper:
   call kernel_task_entry
   .cfi_endproc
 .size kernel_task_entry_wrapper, .-kernel_task_entry_wrapper
+
+.global first_user_task_entry_wrapper
+.type first_user_task_entry_wrapper, @function
+first_user_task_entry_wrapper:
+  .cfi_startproc
+  .cfi_undefined rip
+  endbr64
+  add rsp, 8
+  call first_user_task_entry
+  .cfi_endproc
+.size first_user_task_entry_wrapper, .-first_user_task_entry_wrapper

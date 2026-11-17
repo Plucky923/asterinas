@@ -20,6 +20,7 @@ pub(super) fn handle_exception(ctx: &Context, user_ctx: &UserContext, exception:
         let user_space = ctx.user_space();
         let vmar = user_space.vmar();
         if handle_page_fault_from_vmar(vmar, &page_fault_info).is_ok() {
+            ctx.process.record_minor_fault();
             return;
         }
     }

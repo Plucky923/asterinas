@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#[cfg(not(feature = "kernelet-host"))]
-use alloc::collections::BinaryHeap;
 use alloc::{
     boxed::Box,
+    collections::BinaryHeap,
     sync::{Arc, Weak},
     vec::Vec,
 };
-#[cfg(feature = "kernelet-host")]
-use core::sync::atomic::AtomicUsize;
 use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -153,15 +150,6 @@ impl Timer {
     }
 }
 
-#[cfg(feature = "kernelet-host")]
-impl Drop for Timer {
-    fn drop(&mut self) {
-        if let Some(callback) = self.inner.disable_irq().lock().timer_callback.upgrade() {
-            self.timer_manager.cancel(&callback);
-        }
-    }
-}
-
 /// `TimerManager` is used to create timers and manage their expiries. It holds a clock and can
 /// create [`Timer`]s based on this clock.
 ///
@@ -209,8 +197,6 @@ impl TimerManager {
         // serializes cancellation with its invocation, without taking locks in
         // the manager -> timer order.
         callback.cancel();
-        #[cfg(feature = "kernelet-host")]
-        self.timer_callbacks.disable_irq().lock().remove(callback);
     }
 
     #[cfg(ktest)]
@@ -271,102 +257,13 @@ impl TimerManager {
     }
 }
 
-#[cfg(not(feature = "kernelet-host"))]
 type CallbackQueue = BinaryHeap<Arc<TimerCallback>>;
-
-#[cfg(feature = "kernelet-host")]
-struct CallbackQueue(Vec<Arc<TimerCallback>>);
-
-#[cfg(feature = "kernelet-host")]
-impl CallbackQueue {
-    fn new() -> Self {
-        Self(Vec::new())
-    }
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-    fn peek(&self) -> Option<&Arc<TimerCallback>> {
-        self.0.first()
-    }
-    fn push(&mut self, callback: Arc<TimerCallback>) {
-        let index = self.0.len();
-        callback.queue_index.store(index, Ordering::Relaxed);
-        self.0.push(callback);
-        self.sift_up(index);
-    }
-    fn pop(&mut self) -> Option<Arc<TimerCallback>> {
-        (!self.is_empty()).then(|| self.remove_at(0))
-    }
-    fn remove(&mut self, callback: &Arc<TimerCallback>) {
-        // queue_index is only accessed while holding this manager's queue lock.
-        // A popped callback can still be awaiting its TimerGuard on another CPU.
-        let index = callback.queue_index.load(Ordering::Relaxed);
-        if index == usize::MAX {
-            return;
-        }
-        debug_assert!(Arc::ptr_eq(&self.0[index], callback));
-        self.remove_at(index);
-    }
-    fn swap(&mut self, a: usize, b: usize) {
-        self.0.swap(a, b);
-        self.0[a].queue_index.store(a, Ordering::Relaxed);
-        self.0[b].queue_index.store(b, Ordering::Relaxed);
-    }
-    fn sift_up(&mut self, mut index: usize) {
-        while index != 0 {
-            let parent = (index - 1) / 2;
-            if self.0[parent].expired_time <= self.0[index].expired_time {
-                break;
-            }
-            self.swap(parent, index);
-            index = parent;
-        }
-    }
-    fn remove_at(&mut self, index: usize) -> Arc<TimerCallback> {
-        let removed = self.0.swap_remove(index);
-        removed.queue_index.store(usize::MAX, Ordering::Relaxed);
-        if index == self.len() {
-            return removed;
-        }
-        self.0[index].queue_index.store(index, Ordering::Relaxed);
-        if index != 0 && self.0[index].expired_time < self.0[(index - 1) / 2].expired_time {
-            self.sift_up(index);
-        } else {
-            let mut index = index;
-            while index < self.len() / 2 {
-                let left = index * 2 + 1;
-                if left >= self.len() {
-                    break;
-                }
-                let right = left + 1;
-                let child = if right < self.len()
-                    && self.0[right].expired_time < self.0[left].expired_time
-                {
-                    right
-                } else {
-                    left
-                };
-                if self.0[index].expired_time <= self.0[child].expired_time {
-                    break;
-                }
-                self.swap(index, child);
-                index = child;
-            }
-        }
-        removed
-    }
-}
 
 /// A `TimerCallback` can be used to execute a timer callback function.
 struct TimerCallback {
     expired_time: Duration,
     timer: Weak<Timer>,
     is_cancelled: AtomicBool,
-    #[cfg(feature = "kernelet-host")]
-    queue_index: AtomicUsize,
 }
 
 impl TimerCallback {
@@ -376,8 +273,6 @@ impl TimerCallback {
             expired_time: timeout,
             timer,
             is_cancelled: AtomicBool::new(false),
-            #[cfg(feature = "kernelet-host")]
-            queue_index: AtomicUsize::new(usize::MAX),
         }
     }
 

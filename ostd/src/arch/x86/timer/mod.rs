@@ -20,14 +20,6 @@ use crate::irq::IrqLine;
 
 static TIMER_IRQ: Once<IrqLine> = Once::new();
 
-/// Reports whether a physical trap is the native APIC timer line.
-#[cfg(feature = "kernelet-host")]
-pub(crate) fn is_timer_irq(line: usize) -> bool {
-    TIMER_IRQ
-        .get()
-        .is_some_and(|timer| timer.num() as usize == line)
-}
-
 /// Initializes the timer state and enable timer interrupts on BSP.
 pub(super) fn init_on_bsp() {
     // TODO: Currently, we only enable per-CPU APIC timers. We may also need to enable a global

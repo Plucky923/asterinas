@@ -13,6 +13,7 @@ use crate::{const_assert, mm::page_prop::CachePolicy};
 ///
 /// Indices 4-7 are set to match 0-3, so level 1 pages can have PAT bit (bit 7) fixed to 1
 /// (using it as a validity marker) while still accessing all cache policies through indices 4-7.
+#[cfg(not(feature = "kernelet"))]
 const IA32_PAT_MAPPINGS: [CachePolicy; 8] = [
     CachePolicy::Writeback,      // Index 0: PAT=0, PCD=0, PWT=0
     CachePolicy::Writethrough,   // Index 1: PAT=0, PCD=0, PWT=1
@@ -24,9 +25,27 @@ const IA32_PAT_MAPPINGS: [CachePolicy; 8] = [
     CachePolicy::Uncacheable,    // Index 7: PAT=1, PCD=1, PWT=1 (same as 3)
 ];
 
+/// Linux x86-64 default `IA32_PAT` slots:
+/// `0=WB, 1=WC, 2=UC-, 3=UC, 4=WB, 5=WP, 6=UC-, 7=WT`.
+#[cfg(feature = "kernelet")]
+const IA32_PAT_MAPPINGS: [CachePolicy; 8] = [
+    CachePolicy::Writeback,      // Index 0: PAT=0, PCD=0, PWT=0 (WB)
+    CachePolicy::WriteCombining, // Index 1: PAT=0, PCD=0, PWT=1 (WC)
+    CachePolicy::Uncacheable,    // Index 2: PAT=0, PCD=1, PWT=0 (UC-)
+    CachePolicy::Uncacheable,    // Index 3: PAT=0, PCD=1, PWT=1 (UC)
+    CachePolicy::Writeback,      // Index 4: PAT=1, PCD=0, PWT=0 (WB)
+    CachePolicy::WriteProtected, // Index 5: PAT=1, PCD=0, PWT=1 (WP)
+    CachePolicy::Uncacheable,    // Index 6: PAT=1, PCD=1, PWT=0 (UC-)
+    CachePolicy::Writethrough,   // Index 7: PAT=1, PCD=1, PWT=1 (WT)
+];
+
 pub(super) const fn flags_to_cache_policy(flags: PteFlags) -> CachePolicy {
     let bits = flags.bits();
     let mut index = 0usize;
+    #[cfg(feature = "kernelet")]
+    if bits & PteFlags::HUGE.bits() != 0 {
+        index |= 4;
+    }
     if bits & PteFlags::NO_CACHE.bits() != 0 {
         index |= 2;
     }
@@ -37,12 +56,23 @@ pub(super) const fn flags_to_cache_policy(flags: PteFlags) -> CachePolicy {
 }
 
 pub(super) const fn cache_policy_to_flags(cache_policy: CachePolicy) -> PteFlags {
+    #[cfg(not(feature = "kernelet"))]
     let bits = match cache_policy {
         CachePolicy::Writeback => 0,
         CachePolicy::Writethrough => PteFlags::WRITE_THROUGH.bits(),
         CachePolicy::Uncacheable => PteFlags::NO_CACHE.bits() | PteFlags::WRITE_THROUGH.bits(),
         CachePolicy::WriteCombining => PteFlags::NO_CACHE.bits(),
         _ => panic!("unsupported cache policy"),
+    };
+    #[cfg(feature = "kernelet")]
+    let bits = match cache_policy {
+        CachePolicy::Writeback => 0,
+        CachePolicy::WriteCombining => PteFlags::WRITE_THROUGH.bits(),
+        CachePolicy::Uncacheable => PteFlags::NO_CACHE.bits() | PteFlags::WRITE_THROUGH.bits(),
+        CachePolicy::WriteProtected => PteFlags::HUGE.bits() | PteFlags::WRITE_THROUGH.bits(),
+        CachePolicy::Writethrough => {
+            PteFlags::HUGE.bits() | PteFlags::NO_CACHE.bits() | PteFlags::WRITE_THROUGH.bits()
+        }
     };
     PteFlags::from_bits_truncate(bits)
 }

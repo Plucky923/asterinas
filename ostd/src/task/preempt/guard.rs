@@ -26,10 +26,14 @@ impl DisabledPreemptGuard {
         // Keep the image-local and shared counts consistent across virtual IRQ
         // delivery, which may switch to another task on this vCPU.
         #[cfg(feature = "kernelet")]
-        let _irq_guard = crate::irq::disable_local();
+        {
+            let irq_guard = crate::irq::disable_local();
+            let access = crate::arch::cpu::local::CpuLocalAccess::new(&irq_guard);
+            super::cpu_local::inc_guard_count_with(&access);
+            crate::kernelet::entry::enter_preempt_guard(access.record());
+        }
+        #[cfg(not(feature = "kernelet"))]
         super::cpu_local::inc_guard_count();
-        #[cfg(feature = "kernelet")]
-        crate::kernelet::entry::enter_preempt_guard();
         Self { _private: () }
     }
 }
@@ -45,10 +49,14 @@ impl Drop for DisabledPreemptGuard {
         // Native guard release keeps upstream scheduling boundaries. Carriers
         // enter the Host scheduler through dedicated service points.
         #[cfg(feature = "kernelet")]
-        let _irq_guard = crate::irq::disable_local();
+        {
+            let irq_guard = crate::irq::disable_local();
+            let access = crate::arch::cpu::local::CpuLocalAccess::new(&irq_guard);
+            super::cpu_local::dec_guard_count_with(&access);
+            crate::kernelet::entry::leave_preempt_guard(access.record());
+        }
+        #[cfg(not(feature = "kernelet"))]
         super::cpu_local::dec_guard_count();
-        #[cfg(feature = "kernelet")]
-        crate::kernelet::entry::leave_preempt_guard();
     }
 }
 

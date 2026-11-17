@@ -16,8 +16,6 @@ pub mod serial;
 pub(crate) mod task;
 #[cfg(not(feature = "kernelet"))]
 mod timer;
-#[cfg(feature = "kernelet-host")]
-pub(crate) use timer::is_timer_irq;
 pub mod trap;
 #[cfg(not(feature = "kernelet"))]
 pub mod vm;

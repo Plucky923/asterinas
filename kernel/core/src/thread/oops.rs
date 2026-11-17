@@ -35,44 +35,43 @@ pub(crate) struct OopsInfo {
 
 /// Executes the given function and catches any panics that occur.
 ///
-/// All the panics in the given function will be regarded as oops. If a oops
-/// happens, this function returns `None`. Otherwise, it returns the return
-/// value of the given function.
+/// All panics in the given function are regarded as oops. An oops returns
+/// `Err` with its information; success returns `Ok` with the function's value.
 ///
 /// If the kernel is configured to panic on oops, this function will not return
 /// when a oops happens.
+#[inline]
 pub(crate) fn catch_panics_as_oops<F, R>(f: F) -> Result<R, OopsInfo>
 where
     F: FnOnce() -> R,
 {
-    let result = panic::catch_unwind(f);
+    panic::catch_unwind(f).map_err(handle_caught_oops)
+}
 
-    match result {
-        Ok(result) => Ok(result),
-        Err(err) => {
-            let info = err.downcast::<OopsInfo>().unwrap();
+#[cold]
+#[inline(never)]
+fn handle_caught_oops(err: Box<dyn Any + Send>) -> OopsInfo {
+    let info = err.downcast::<OopsInfo>().unwrap();
 
-            #[cfg(feature = "kernelet")]
-            {
-                // Preserve character boundaries within the Host service limit.
-                let mut end = info.message.len().min(1024);
-                while !info.message.is_char_boundary(end) {
-                    end -= 1;
-                }
-                let _ = ostd::kernelet::entry::report_oops(&info.message[..end]);
-            }
-            ostd::error!("Oops! {}", info.message);
-
-            let count = OOPS_COUNT.fetch_add(1, Ordering::Relaxed);
-            if count >= MAX_OOPS_COUNT {
-                // Too many oops. Abort the kernel.
-                ostd::error!("Too many oops. The kernel panics.");
-                panic::abort();
-            }
-
-            Err(*info)
+    #[cfg(feature = "kernelet")]
+    {
+        // Preserve character boundaries within the Host service limit.
+        let mut end = info.message.len().min(1024);
+        while !info.message.is_char_boundary(end) {
+            end -= 1;
         }
+        let _ = ostd::kernelet::entry::report_oops(&info.message[..end]);
     }
+    ostd::error!("Oops! {}", info.message);
+
+    let count = OOPS_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count >= MAX_OOPS_COUNT {
+        // Too many oops. Abort the kernel.
+        ostd::error!("Too many oops. The kernel panics.");
+        panic::abort();
+    }
+
+    *info
 }
 
 /// The maximum number of oops allowed before the kernel panics.
@@ -91,8 +90,6 @@ fn panic_handler(info: &core::panic::PanicInfo) -> ! {
         let panic_on_oops = false;
         #[cfg(not(feature = "kernelet"))]
         let panic_on_oops = PANIC_ON_OOPS.load(Ordering::Relaxed);
-        #[cfg(feature = "kernelet-host")]
-        let panic_on_oops = panic_on_oops && !ostd::kernelet::control::in_host_hook();
         if !panic_on_oops && info.can_unwind() {
             // TODO: eliminate the need for heap allocation.
             let message = if let Some(location) = info.location() {

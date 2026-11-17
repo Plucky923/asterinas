@@ -3,14 +3,14 @@
 //! The fixed entry into a separately linked kernelet image.
 
 use core::{
-    arch::asm,
     fmt::{self, Write},
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
 
 use super::abi::{
-    BootArgs, CopyFaultRecord, DeviceEntry, EntryTable, STOP_PANIC, ServiceTable, VIRQ_LINES,
-    VIRQ_TICK, VcpuRecord, copy_fault_records_offset, vcpu_shared_bytes,
+    BootArgs, CopyFaultRecord, DeviceEntry, EntryTable, STOP_PANIC, ServiceTable, UserEventRecord,
+    VIRQ_LINES, VIRQ_TICK, VcpuRecord, copy_fault_records_offset, user_event_records_offset,
+    vcpu_shared_bytes,
 };
 use crate::mm::PAGE_SIZE;
 
@@ -26,6 +26,31 @@ unsafe extern "C" {
 static KERNELET_SERVICES: AtomicPtr<ServiceTable> = AtomicPtr::new(core::ptr::null_mut());
 #[unsafe(no_mangle)]
 pub(crate) static KERNELET_BOOT_ARGS: AtomicPtr<BootArgs> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Zero-initialized `.bss` lookup table populated once in `_kernelet_entry`
+/// so CPU-local and per-vCPU record lookups avoid `BootArgs` + `imul` chases.
+#[repr(C)]
+pub(crate) struct FastCpuTable {
+    pub slot_gs_offset: usize,
+    pub record_ptrs: [usize; super::abi::MAX_VCPUS],
+    pub local_bases: [usize; super::abi::MAX_VCPUS],
+    pub urec_ptrs: [usize; super::abi::MAX_VCPUS],
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(FastCpuTable, slot_gs_offset) == 0);
+    assert!(
+        size_of::<FastCpuTable>() == (1 + 3 * super::abi::MAX_VCPUS) * size_of::<usize>()
+    );
+};
+
+pub(crate) static KERNELET_FAST_CPU: core::cell::SyncUnsafeCell<FastCpuTable> =
+    core::cell::SyncUnsafeCell::new(FastCpuTable {
+        slot_gs_offset: 0,
+        record_ptrs: [0; super::abi::MAX_VCPUS],
+        local_bases: [0; super::abi::MAX_VCPUS],
+        urec_ptrs: [0; super::abi::MAX_VCPUS],
+    });
 
 // Each relocated image owns this watermark; no Host clock page is written.
 static LAST_CLOCK_NS: AtomicU64 = AtomicU64::new(0);
@@ -93,13 +118,49 @@ pub unsafe extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: 
         || (boot.devices_offset as usize)
             .checked_add(boot.num_devices as usize * size_of::<DeviceEntry>())
             .is_none_or(|end| end > PAGE_SIZE)
-        || boot.reserved != 0
+        || boot.pgtable_levels != 4
+        || boot.pt_mode > 1
+        || (boot.initramfs_len != 0
+            && (boot.initramfs_base == 0
+                || boot
+                    .initramfs_base
+                    .checked_add(boot.initramfs_len)
+                    .is_none()))
     {
         const MESSAGE: &[u8] = b"invalid kernelet boot ABI";
         (services.stop)(STOP_PANIC, 0, MESSAGE.as_ptr(), MESSAGE.len() as u32);
     }
 
     let boot = boot_args();
+    let num_vcpus = boot.num_vcpus as usize;
+    let base_ptr = core::ptr::from_ref(boot).cast::<u8>();
+    let vcpu_records_base = base_ptr.wrapping_add(boot.vcpu_records as usize);
+    let urec_records_base = vcpu_records_base.wrapping_add(user_event_records_offset(num_vcpus));
+    // SAFETY: `_kernelet_entry` runs on vCPU 0 before any secondary vCPU starts
+    // or any `KERNELET_FAST_CPU` reader executes. All carriers have already
+    // populated `vrec.cpu_local_base` before entering `_kernelet_entry`.
+    let fast_cpu = unsafe { &mut *KERNELET_FAST_CPU.get() };
+    fast_cpu.slot_gs_offset = boot.cpu_slot_gs_offset as usize;
+    for vcpu in 0..num_vcpus {
+        let vrec_ptr = vcpu_records_base
+            .wrapping_add(vcpu * size_of::<VcpuRecord>())
+            .cast::<VcpuRecord>();
+        // SAFETY: Entry validation checked `num_vcpus <= MAX_VCPUS` and the
+        // Host maps all per-vCPU shared arrays for the instance lifetime.
+        let cpu_local_base = unsafe { (&*vrec_ptr).cpu_local_base } as usize;
+        if cpu_local_base == 0 {
+            const MESSAGE: &[u8] = b"kernelet vcpu missing cpu_local_base";
+            (services.stop)(STOP_PANIC, 0, MESSAGE.as_ptr(), MESSAGE.len() as u32);
+        }
+        let urec_ptr = urec_records_base
+            .wrapping_add(vcpu * size_of::<UserEventRecord>())
+            .cast::<UserEventRecord>();
+        fast_cpu.record_ptrs[vcpu] = vrec_ptr as usize;
+        fast_cpu.local_bases[vcpu] = cpu_local_base;
+        fast_cpu.urec_ptrs[vcpu] = urec_ptr as usize;
+    }
+    core::sync::atomic::fence(Ordering::Release);
+
     let cmdline_start =
         (boot as *const BootArgs as *const u8).wrapping_add(boot.cmdline_offset as usize);
     // SAFETY: The validated range lies in the Host-pinned, read-only boot page.
@@ -112,6 +173,16 @@ pub unsafe extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: 
             (services.stop)(STOP_PANIC, 0, MESSAGE.as_ptr(), MESSAGE.len() as u32)
         }
     };
+    let initramfs = (boot.initramfs_len > 0).then(|| {
+        // SAFETY: The Host maps and pins the read-only initramfs archive at
+        // `initramfs_base` for `initramfs_len` bytes across the instance lifetime.
+        unsafe {
+            core::slice::from_raw_parts(
+                boot.initramfs_base as *const u8,
+                boot.initramfs_len as usize,
+            )
+        }
+    });
     let early_cmdline = crate::boot::parse_early_cmdline_from(cmdline);
     crate::log::init(&early_cmdline);
     crate::console::init_kernelet_logging();
@@ -119,7 +190,7 @@ pub unsafe extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: 
     crate::cpu::init_kernelet_bsp();
     let regions = crate::kernelet::image_grant::init_initial_grant();
     crate::sync::init();
-    crate::boot::init_kernelet(cmdline, regions);
+    crate::boot::init_kernelet(cmdline, initramfs, regions);
     crate::task::adopt_boot_task();
     crate::arch::irq::enable_local();
     crate::invoke_ffi_init_funcs();
@@ -134,23 +205,46 @@ pub unsafe extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: 
 }
 
 /// Returns the immutable boot page installed at image entry.
+#[inline(always)]
 pub fn boot_args() -> &'static BootArgs {
-    let ptr = KERNELET_BOOT_ARGS.load(Ordering::Acquire);
-    assert!(!ptr.is_null(), "boot arguments used before image entry");
+    let ptr = KERNELET_BOOT_ARGS.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "boot arguments used before image entry");
     // SAFETY: The Host maps and pins the read-only boot page until the image
     // stops, and the pointer is published before the kernel proper starts.
     unsafe { &*ptr }
 }
 
-/// Reads Host-boot monotonic time using the image's read-only TSC calibration.
-pub fn clock_now_ns() -> u64 {
+/// Returns the Host-selected user page-table mode (`0` = direct, `1` = VMA).
+pub fn pt_mode() -> u8 {
+    boot_args().pt_mode
+}
+
+/// Returns whether the Host has PTI enabled.
+pub fn pti_enabled() -> bool {
+    boot_args().pti_enabled != 0
+}
+
+/// Returns whether the Host supports the NX page-table bit.
+pub fn nx_supported() -> bool {
+    boot_args().nx_supported != 0
+}
+
+/// Reads Host-boot monotonic time and its paired TSC sample for vDSO publication.
+pub fn clock_snapshot() -> (u64, u64) {
     let boot = boot_args();
-    super::clock::monotonic_ns_at(
-        crate::arch::read_tsc_ordered(),
+    let tsc = crate::arch::read_tsc_ordered();
+    let nanos = super::clock::monotonic_ns_at(
+        tsc,
         boot.clock_origin_tsc,
         boot.tsc_freq_hz,
         &LAST_CLOCK_NS,
-    )
+    );
+    (nanos, tsc)
+}
+
+/// Reads Host-boot monotonic time using the image's read-only TSC calibration.
+pub fn clock_now_ns() -> u64 {
+    clock_snapshot().0
 }
 
 /// Reads realtime nanoseconds since the Unix epoch from the virtual clock.
@@ -210,9 +304,27 @@ pub(crate) fn copy_fault_record() -> &'static CopyFaultRecord {
     unsafe { &*ptr }
 }
 
+/// Returns the user-event and stack-handoff record for this virtual CPU.
+pub(crate) fn user_event_record() -> &'static UserEventRecord {
+    user_event_record_for(vcpu_record())
+}
+
+/// Locates an event record using an already selected virtual CPU record.
+pub(crate) fn user_event_record_for(record: &VcpuRecord) -> &'static UserEventRecord {
+    let boot = boot_args();
+    let vcpu = record.vcpu as usize;
+    let offset = boot.vcpu_records as usize
+        + user_event_records_offset(boot.num_vcpus as usize)
+        + vcpu * size_of::<UserEventRecord>();
+    let ptr = (boot as *const BootArgs as *const u8)
+        .wrapping_add(offset)
+        .cast::<UserEventRecord>();
+    // SAFETY: The Host pins and maps all per-vCPU shared arrays for the instance lifetime.
+    unsafe { &*ptr }
+}
+
 /// Publishes one nested internal preemption guard to the virtual CPU record.
-pub(crate) fn enter_preempt_guard() {
-    let record = vcpu_record();
+pub(crate) fn enter_preempt_guard(record: &VcpuRecord) {
     debug_assert_ne!(record.irq_off.load(Ordering::Relaxed), 0);
     // The caller masks virtual IRQs across both count updates. This vCPU is
     // the only writer; native carrier preemption cannot introduce another one.
@@ -225,8 +337,7 @@ pub(crate) fn enter_preempt_guard() {
 }
 
 /// Releases one internal preemption guard after the image's own count drops.
-pub(crate) fn leave_preempt_guard() {
-    let record = vcpu_record();
+pub(crate) fn leave_preempt_guard(record: &VcpuRecord) {
     debug_assert_ne!(record.irq_off.load(Ordering::Relaxed), 0);
     // As on entry, virtual IRQ masking excludes another image-side writer.
     let next = record
@@ -280,14 +391,8 @@ pub(crate) fn deliver_pending() -> PendingDelivery {
         record.irq_off.store(was_off, Ordering::Release);
         return PendingDelivery::Handled;
     }
-    // Retain the interrupted Task's identity without an extra Arc count.
-    // Advance its progress before the epilogue is allowed to switch Tasks.
     let batch_task = crate::task::Task::current();
     let pending = record.pending.swap(0, Ordering::AcqRel);
-    #[cfg(kernelet_getpid_profile)]
-    if pending != 0 {
-        super::getpid_profile::event(super::getpid_profile::event_id::VIRTUAL_IRQ);
-    }
     if pending & super::abi::VIRQ_KICK != 0 {
         super::image_grant::rescan_grants();
         crate::smp::do_virtual_inter_processor_call();
@@ -297,7 +402,7 @@ pub(crate) fn deliver_pending() -> PendingDelivery {
     // limit would let continuously raised device lines starve the timer.
     // New ticks and lines remain queued for the next upcall.
     if pending & VIRQ_TICK != 0 {
-        if let Some(task) = batch_task.as_ref() {
+        if let Some(task) = batch_task {
             task.flush_sampled_ticks();
         }
         let user = record.tick_user.swap(0, Ordering::AcqRel);
@@ -334,11 +439,6 @@ pub(crate) fn deliver_pending() -> PendingDelivery {
                     );
                 }
             }
-        }
-    }
-    if pending != 0 {
-        if let Some(task) = batch_task {
-            task.complete_virq_batch();
         }
     }
     finish_virtual_interrupt();
@@ -378,9 +478,10 @@ fn finish_virtual_interrupt() {
 }
 
 /// Returns the Host service table installed at image entry.
+#[inline(always)]
 pub(crate) fn services() -> &'static ServiceTable {
-    let ptr = KERNELET_SERVICES.load(Ordering::Acquire);
-    assert!(!ptr.is_null(), "kernelet services used before image entry");
+    let ptr = KERNELET_SERVICES.load(Ordering::Relaxed);
+    debug_assert!(!ptr.is_null(), "kernelet services used before image entry");
     // SAFETY: `_kernelet_entry` stores a Host-owned static table that remains
     // mapped for the image lifetime before any kernel-proper entry is called.
     unsafe { &*ptr }
@@ -404,13 +505,9 @@ pub fn vcpu_kick_service() -> extern "C" fn(u32) -> i64 {
     services().vcpu_kick
 }
 
-/// Returns the successful diagnostic service through its normal Host gate.
-#[cfg(kernelet_rq1)]
-pub fn rq1_echo_service() -> extern "C" fn(u64) -> i64 {
-    services().rq1_echo
-}
-
 /// Reports an unrecoverable image panic to the Host without allocating.
+#[cold]
+#[inline(never)]
 pub fn stop_panic(message: fmt::Arguments<'_>) -> ! {
     // Larger than the status field so the Host can report truncation.
     const PANIC_RECORD_BYTES: usize = 1024;

@@ -118,6 +118,24 @@ pub fn create_base_and_cached_build(
         cargo_target_directory.as_ref(),
         snapshot.as_ref().map(|inputs| inputs.cargo_home()),
     );
+    if let Some(image) = kernelet_image.as_ref() {
+        let path_file = write_kernelet_image_path(osdk_output_directory.as_ref(), image.path())
+            .unwrap_or_else(|error| {
+                error_msg!("{error}");
+                process::exit(Errno::BuildCrate as _);
+            });
+        println!("Kernelet image: {}", image.path().display());
+        println!("Kernelet image path written to {}", path_file.display());
+        drop(_source_dir);
+        drop(_build_lock);
+        process::exit(0);
+    }
+    if std::env::var_os("OSDK_KERNELET_IMAGE_ONLY").is_some_and(|v| v == "1") {
+        error_msg!(
+            "`OSDK_KERNELET_IMAGE_ONLY=1` requires `--kernelet` (or `build.kernelet = true`)"
+        );
+        process::exit(Errno::Cli as _);
+    }
     let base_crate_path = new_base_crate(
         match action {
             ActionChoice::Run => BaseCrateType::Run,
@@ -136,8 +154,22 @@ pub fn create_base_and_cached_build(
         config,
         action,
         rustflags,
-        kernelet_image.as_ref(),
     )
+}
+
+fn write_kernelet_image_path(
+    osdk_output_directory: &Path,
+    image_path: &Path,
+) -> Result<PathBuf, String> {
+    let path_file = osdk_output_directory.join("kernelet-image-path.txt");
+    let path_str = image_path.display().to_string();
+    std::fs::write(&path_file, format!("{path_str}\n")).map_err(|err| {
+        format!(
+            "Failed to write kernelet image path to {}: {err}",
+            path_file.display()
+        )
+    })?;
+    Ok(path_file)
 }
 
 fn get_reusable_existing_bundle(
@@ -175,71 +207,30 @@ pub fn do_cached_build(
     config: &Config,
     action: ActionChoice,
     rustflags: &[&str],
-    kernelet_image: Option<&kernelet::KerneletImage>,
 ) -> Bundle {
     let (build, boot, grub) = match action {
         ActionChoice::Run => (&config.run.build, &config.run.boot, &config.run.grub),
         ActionChoice::Test => (&config.test.build, &config.test.boot, &config.test.grub),
     };
 
-    // The Image is built separately with `kernelet`; Host support also works
-    // without an embedded image when explicitly requested by its feature.
-    let features = host_features(&build.features, build.kernelet);
+    if build.kernelet {
+        error_msg!(
+            "The `kernelet` build option is only supported for building standalone kernelet images"
+        );
+        process::exit(Errno::Cli as _);
+    }
+
     let mut rustflags = rustflags.to_vec();
     rustflags.push(&build.rustflags);
-    // Host service panics must unwind back through their protected continuation.
-    if features.iter().any(|feature| feature == "kernelet-host") {
-        rustflags.push("-C panic=unwind");
-        rustflags.push("-Z emit-stack-sizes");
-    }
-    let extra_envs = match (build.kernelet, kernelet_image) {
-        (false, _) => Vec::new(),
-        (true, Some(image)) => image.host_envs(),
-        (true, None) => {
-            error_msg!(
-                "The `kernelet` build option is enabled, but this OSDK action does not build the kernelet image first"
-            );
-            process::exit(Errno::Cli as _);
-        }
-    };
-    let override_configs = kernelet::host_overrides(kernelet_image, &build.override_configs);
-    if let Some(image) = kernelet_image {
-        kernelet::validate_host_dependencies(
-            image,
-            &features,
-            build.no_default_features,
-            &override_configs,
-        );
-    }
-    let mut aster_elf = build_kernel_elf(
+    let aster_elf = build_kernel_elf(
         config.target_arch,
         &build.profile,
-        &features,
+        &build.features,
         build.no_default_features,
-        &override_configs,
+        &build.override_configs,
         &cargo_target_directory,
         &rustflags,
-        &extra_envs,
     );
-    if (build.kernelet || matches!(action, ActionChoice::Test))
-        && features.iter().any(|feature| feature == "kernelet-host")
-    {
-        let path = kernelet::generate_host_budgets(aster_elf.path()).unwrap_or_else(|error| {
-            error_msg!("Cannot generate the Host service stack budgets: {error}");
-            process::exit(Errno::BuildCrate as _);
-        });
-        aster_elf = AsterBin::new(
-            path,
-            aster_elf.arch(),
-            aster_elf.typ().clone(),
-            aster_elf.version().clone(),
-            aster_elf.stripped(),
-        );
-        kernelet::audit_host_services(aster_elf.path()).unwrap_or_else(|error| {
-            error_msg!("The Host service table failed the linked ELF audit: {error}");
-            process::exit(Errno::BuildCrate as _);
-        });
-    }
 
     // Check the existing bundle's reusability
     if let Some(existing_bundle) = get_reusable_existing_bundle(&bundle_path, config, action)
@@ -297,15 +288,6 @@ pub fn do_cached_build(
     bundle
 }
 
-fn host_features(features: &[String], build_kernelet: bool) -> Vec<String> {
-    let mut features = features.to_vec();
-    if build_kernelet && !features.iter().any(|feature| feature == "kernelet-host") {
-        features.push("kernelet-host".to_string());
-    }
-    features
-}
-
-#[allow(clippy::too_many_arguments)]
 fn build_kernel_elf(
     arch: Arch,
     profile: &str,
@@ -314,7 +296,6 @@ fn build_kernel_elf(
     override_configs: &[String],
     cargo_target_directory: impl AsRef<Path>,
     rustflags: &[&str],
-    extra_envs: &[(String, OsString)],
 ) -> AsterBin {
     let target_os_string = OsString::from(&arch.triple());
     let rustc_linker_script_arg = format!("-C link-arg=-T{}.ld", arch);
@@ -368,11 +349,6 @@ fn build_kernel_elf(
     );
 
     command.env("RUSTFLAGS", rustflags.join(" "));
-    command.envs(
-        extra_envs
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_os_str())),
-    );
     command.arg("build");
     command.arg("--features").arg(features.join(" "));
     if no_default_features {
@@ -452,26 +428,19 @@ fn get_last_modified_time(path: impl AsRef<Path>) -> SystemTime {
 
 #[cfg(test)]
 mod tests {
-    use super::host_features;
+    use std::path::Path;
+
+    use super::write_kernelet_image_path;
 
     #[test]
-    fn native_build_does_not_enable_host_support() {
-        let features = vec!["cvm_guest".to_string()];
-        assert_eq!(host_features(&features, false), features);
-        assert!(host_features(&[], false).is_empty());
-    }
-
-    #[test]
-    fn paired_build_enables_host_support_without_image_feature() {
-        let features = host_features(&["coverage".to_string()], true);
-        assert_eq!(features, ["coverage", "kernelet-host"]);
-        assert!(!features.iter().any(|feature| feature == "kernelet"));
-    }
-
-    #[test]
-    fn explicit_host_support_does_not_require_embedding_or_duplicate_feature() {
-        let features = vec!["kernelet-host".to_string()];
-        assert_eq!(host_features(&features, false), features);
-        assert_eq!(host_features(&features, true), features);
+    fn kernelet_image_path_file_records_built_elf_path() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let image_path = Path::new("/tmp/target/kernelet-image.elf");
+        let path_file = write_kernelet_image_path(output_dir.path(), image_path).unwrap();
+        assert_eq!(path_file, output_dir.path().join("kernelet-image-path.txt"));
+        assert_eq!(
+            std::fs::read_to_string(&path_file).unwrap(),
+            "/tmp/target/kernelet-image.elf\n"
+        );
     }
 }

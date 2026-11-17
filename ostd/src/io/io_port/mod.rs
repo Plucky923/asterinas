@@ -34,6 +34,12 @@ impl<T, A> IoPort<T, A> {
     ///
     /// This method will mark all ports in the PIO range as occupied.
     pub fn acquire(port: u16) -> Result<IoPort<T, A>> {
+        #[cfg(feature = "kernelet")]
+        {
+            let _ = port;
+            return Err(Error::AccessDenied);
+        }
+        #[cfg(not(feature = "kernelet"))]
         allocator::IO_PORT_ALLOCATOR
             .get()
             .unwrap()
@@ -45,6 +51,12 @@ impl<T, A> IoPort<T, A> {
     ///
     /// This method will only mark the first port in the PIO range as occupied.
     pub fn acquire_overlapping(port: u16) -> Result<IoPort<T, A>> {
+        #[cfg(feature = "kernelet")]
+        {
+            let _ = port;
+            return Err(Error::AccessDenied);
+        }
+        #[cfg(not(feature = "kernelet"))]
         allocator::IO_PORT_ALLOCATOR
             .get()
             .unwrap()
@@ -96,6 +108,9 @@ impl<T, A> IoPort<T, A> {
 impl<T: PortRead, A: IoPortReadAccess> IoPort<T, A> {
     /// Reads from the I/O port
     pub fn read(&self) -> T {
+        #[cfg(feature = "kernelet")]
+        panic!("direct PIO port read ({:#x}) is forbidden in a kernelet image", self.port);
+        #[cfg(not(feature = "kernelet"))]
         unsafe { PortRead::read_from_port(self.port) }
     }
 }
@@ -103,20 +118,29 @@ impl<T: PortRead, A: IoPortReadAccess> IoPort<T, A> {
 impl<T: PortWrite, A: IoPortWriteAccess> IoPort<T, A> {
     /// Writes to the I/O port
     pub fn write(&self, value: T) {
+        #[cfg(feature = "kernelet")]
+        {
+            let _ = value;
+            panic!("direct PIO port write ({:#x}) is forbidden in a kernelet image", self.port);
+        }
+        #[cfg(not(feature = "kernelet"))]
         unsafe { PortWrite::write_to_port(self.port, value) }
     }
 }
 
 impl<T, A> Drop for IoPort<T, A> {
     fn drop(&mut self) {
-        let range = if !self.is_overlapping {
-            self.port..(self.port + size_of::<T>() as u16)
-        } else {
-            self.port..(self.port + 1)
-        };
+        #[cfg(not(feature = "kernelet"))]
+        {
+            let range = if !self.is_overlapping {
+                self.port..(self.port + size_of::<T>() as u16)
+            } else {
+                self.port..(self.port + 1)
+            };
 
-        // SAFETY: We have ownership of the PIO region.
-        unsafe { allocator::IO_PORT_ALLOCATOR.get().unwrap().recycle(range) };
+            // SAFETY: We have ownership of the PIO region.
+            unsafe { allocator::IO_PORT_ALLOCATOR.get().unwrap().recycle(range) };
+        }
     }
 }
 

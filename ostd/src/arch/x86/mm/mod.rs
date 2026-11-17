@@ -2,11 +2,9 @@
 
 use core::ops::Range;
 
-#[cfg(feature = "kernelet-host")]
-pub(crate) use util::__memcpy_fallible_end;
-pub(crate) use util::{
-    __atomic_cmpxchg_fallible, __atomic_load_fallible, __memcpy_fallible, __memset_fallible,
-};
+pub(crate) use util::__memcpy_fallible;
+#[cfg(not(feature = "kernelet"))]
+pub(crate) use util::{__atomic_cmpxchg_fallible, __atomic_load_fallible, __memset_fallible};
 use x86_64::{VirtAddr, instructions::tlb};
 #[cfg(not(feature = "kernelet"))]
 use x86_64::{
@@ -67,6 +65,11 @@ bitflags::bitflags! {
         /// Indicates that the mapping is present in all address spaces, so it isn't flushed from
         /// the TLB on an address space switch.
         const GLOBAL =          1 << 8;
+        /// Software-defined special-page marker (Linux `_PAGE_SPECIAL`, bit 9).
+        const SPECIAL =         1 << 9;
+        /// Software-defined bit 10 (Linux `_PAGE_SOFTW2`), used for `!R` (`PROT_NONE`)
+        /// leaf PTEs under `kernelet` so `PRESENT` and `_PAGE_PROTNONE` (bit 8) remain clear.
+        const SOFTW2 =          1 << 10;
         /// TDX shared bit.
         #[cfg(feature = "cvm_guest")]
         const SHARED =          1 << 51;
@@ -186,13 +189,6 @@ pub(crate) fn current_page_table_paddr() -> Paddr {
 #[derive(Clone, Copy, Debug, Pod)]
 pub(crate) struct PageTableEntry(usize);
 
-#[cfg(feature = "kernelet")]
-impl PageTableEntry {
-    pub(crate) fn from_raw_bits(bits: usize) -> Self {
-        Self(bits)
-    }
-}
-
 /// Parses a bit-flag bits `val` in the representation of `from` to `to` in bits.
 macro_rules! parse_flags {
     ($val:expr, $from:expr, $to:expr) => {
@@ -226,13 +222,23 @@ impl PageTableEntry {
     }
 
     fn is_present(&self) -> bool {
-        // For PT children, `PRESENT` should be set; for huge pages, `HUGE`
-        // should be set; for leaf child pages, `PAT`, which is the same bit as
-        // the `HUGE` bit in upper levels, should be set.
-        self.0 & PteFlags::PRESENT.bits() != 0 || self.0 & PteFlags::HUGE.bits() != 0
+        #[cfg(feature = "kernelet")]
+        {
+            // Under Linux PAT/PTE compatibility, level-1 `!R` (`PROT_NONE`)
+            // mappings clear `PRESENT` and `GLOBAL` and set `SOFTW2`.
+            self.0 & (PteFlags::PRESENT.bits() | PteFlags::SOFTW2.bits() | PteFlags::HUGE.bits())
+                != 0
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            // For PT children, `PRESENT` should be set; for huge pages, `HUGE`
+            // should be set; for leaf child pages, `PAT`, which is the same bit as
+            // the `HUGE` bit in upper levels, should be set.
+            self.0 & PteFlags::PRESENT.bits() != 0 || self.0 & PteFlags::HUGE.bits() != 0
+        }
     }
 
-    fn prop(&self) -> PageProperty {
+    fn prop(&self, level: PagingLevel) -> PageProperty {
         let flags = parse_flags!(self.0, PteFlags::PRESENT, PageFlags::R)
             | parse_flags!(self.0, PteFlags::WRITABLE, PageFlags::W)
             | parse_flags!(!self.0, PteFlags::NO_EXECUTE, PageFlags::X)
@@ -247,8 +253,14 @@ impl PageTableEntry {
         #[cfg(feature = "cvm_guest")]
         let priv_flags = priv_flags | parse_flags!(self.0, PteFlags::SHARED, PrivFlags::SHARED);
 
-        // Determine cache policy from PCD, PWT bits.
-        let cache = flags_to_cache_policy(PteFlags::from_bits_truncate(self.0));
+        // Determine cache policy from PAT, PCD, PWT bits.
+        // At levels above 1, bit 7 is PS (`HUGE`), not level-1 PAT.
+        let mut pat_flags = PteFlags::from_bits_truncate(self.0);
+        if cfg!(feature = "kernelet") && level > 1 {
+            pat_flags.remove(PteFlags::HUGE);
+        }
+        let _ = level;
+        let cache = flags_to_cache_policy(pat_flags);
 
         PageProperty {
             flags: PageFlags::from_bits(flags as u8).unwrap(),
@@ -265,34 +277,77 @@ impl PageTableEntry {
     }
 
     fn new_page(paddr: Paddr, level: PagingLevel, prop: PageProperty) -> Self {
-        let mut flags = PteFlags::HUGE.bits();
-
-        flags |= parse_flags!(prop.flags.bits(), PageFlags::R, PteFlags::PRESENT)
-            | parse_flags!(prop.flags.bits(), PageFlags::W, PteFlags::WRITABLE)
-            | parse_flags!(!prop.flags.bits(), PageFlags::X, PteFlags::NO_EXECUTE)
-            | parse_flags!(prop.flags.bits(), PageFlags::ACCESSED, PteFlags::ACCESSED)
-            | parse_flags!(prop.flags.bits(), PageFlags::DIRTY, PteFlags::DIRTY)
-            | parse_flags!(
-                prop.priv_flags.bits(),
-                PrivFlags::AVAIL1,
-                PteFlags::HIGH_IGN1
-            )
-            | parse_flags!(prop.flags.bits(), PageFlags::AVAIL2, PteFlags::HIGH_IGN2)
-            | parse_flags!(prop.priv_flags.bits(), PrivFlags::USER, PteFlags::USER)
-            | parse_flags!(prop.priv_flags.bits(), PrivFlags::GLOBAL, PteFlags::GLOBAL);
-        #[cfg(feature = "cvm_guest")]
+        #[cfg(feature = "kernelet")]
         {
-            flags |= parse_flags!(prop.priv_flags.bits(), PrivFlags::SHARED, PteFlags::SHARED);
+            let mut flags = PteFlags::SPECIAL.bits();
+            if prop.flags.contains(PageFlags::R) {
+                flags |= PteFlags::PRESENT.bits() | PteFlags::ACCESSED.bits();
+            } else {
+                // `!R` (`PROT_NONE`) leaves `PRESENT` and `GLOBAL` (`_PAGE_PROTNONE`)
+                // clear so Linux's `pte_present()` sees false while OSTD round-trips it.
+                flags |= PteFlags::SOFTW2.bits()
+                    | parse_flags!(prop.flags.bits(), PageFlags::ACCESSED, PteFlags::ACCESSED);
+            }
+            if level > 1 {
+                flags |= PteFlags::HUGE.bits();
+            }
+            flags |= parse_flags!(prop.flags.bits(), PageFlags::W, PteFlags::WRITABLE)
+                | parse_flags!(prop.flags.bits(), PageFlags::DIRTY, PteFlags::DIRTY)
+                | parse_flags!(
+                    prop.priv_flags.bits(),
+                    PrivFlags::AVAIL1,
+                    PteFlags::HIGH_IGN1
+                )
+                | parse_flags!(prop.flags.bits(), PageFlags::AVAIL2, PteFlags::HIGH_IGN2)
+                | parse_flags!(prop.priv_flags.bits(), PrivFlags::USER, PteFlags::USER);
+            if crate::kernelet::entry::boot_args().nx_supported != 0 {
+                flags |= parse_flags!(!prop.flags.bits(), PageFlags::X, PteFlags::NO_EXECUTE);
+            }
+            if level == 1 {
+                flags |= cache_policy_to_flags(prop.cache).bits();
+            } else {
+                flags |= (cache_policy_to_flags(prop.cache) - PteFlags::HUGE).bits();
+            }
+
+            assert_eq!(
+                paddr & !Self::pa_mask_at_level(level),
+                0,
+                "page physical address contains invalid bits"
+            );
+            return Self(paddr | flags);
         }
 
-        flags |= cache_policy_to_flags(prop.cache).bits();
+        #[cfg(not(feature = "kernelet"))]
+        {
+            let mut flags = PteFlags::HUGE.bits();
 
-        assert_eq!(
-            paddr & !Self::pa_mask_at_level(level),
-            0,
-            "page physical address contains invalid bits"
-        );
-        Self(paddr | flags)
+            flags |= parse_flags!(prop.flags.bits(), PageFlags::R, PteFlags::PRESENT)
+                | parse_flags!(prop.flags.bits(), PageFlags::W, PteFlags::WRITABLE)
+                | parse_flags!(!prop.flags.bits(), PageFlags::X, PteFlags::NO_EXECUTE)
+                | parse_flags!(prop.flags.bits(), PageFlags::ACCESSED, PteFlags::ACCESSED)
+                | parse_flags!(prop.flags.bits(), PageFlags::DIRTY, PteFlags::DIRTY)
+                | parse_flags!(
+                    prop.priv_flags.bits(),
+                    PrivFlags::AVAIL1,
+                    PteFlags::HIGH_IGN1
+                )
+                | parse_flags!(prop.flags.bits(), PageFlags::AVAIL2, PteFlags::HIGH_IGN2)
+                | parse_flags!(prop.priv_flags.bits(), PrivFlags::USER, PteFlags::USER)
+                | parse_flags!(prop.priv_flags.bits(), PrivFlags::GLOBAL, PteFlags::GLOBAL);
+            #[cfg(feature = "cvm_guest")]
+            {
+                flags |= parse_flags!(prop.priv_flags.bits(), PrivFlags::SHARED, PteFlags::SHARED);
+            }
+
+            flags |= cache_policy_to_flags(prop.cache).bits();
+
+            assert_eq!(
+                paddr & !Self::pa_mask_at_level(level),
+                0,
+                "page physical address contains invalid bits"
+            );
+            Self(paddr | flags)
+        }
     }
 
     fn new_pt(paddr: Paddr, flags: PageTableFlags) -> Self {
@@ -300,18 +355,23 @@ impl PageTableEntry {
         // as the most permissive child (to reduce hardware page walk accesses). But we
         // don't have a mechanism to keep it generic across architectures, thus just
         // setting it to be the most permissive.
-        let flags = PteFlags::PRESENT.bits()
+        let raw_flags = PteFlags::PRESENT.bits()
             | PteFlags::WRITABLE.bits()
             | PteFlags::USER.bits()
             | parse_flags!(flags.bits(), PageTableFlags::AVAIL1, PteFlags::HIGH_IGN1)
-            | parse_flags!(flags.bits(), PageTableFlags::AVAIL2, PteFlags::HIGH_IGN2);
+            | parse_flags!(flags.bits(), PageTableFlags::AVAIL2, PteFlags::HIGH_IGN2)
+            | if cfg!(feature = "kernelet") {
+                PteFlags::ACCESSED.bits()
+            } else {
+                0
+            };
 
         assert_eq!(
             paddr & !Self::CHILD_PT_ADDR_MASK,
             0,
             "page table physical address contains invalid bits"
         );
-        Self(paddr | flags)
+        Self(paddr | raw_flags)
     }
 }
 
@@ -335,9 +395,14 @@ unsafe impl PteTrait for PageTableEntry {
             return PteScalar::Absent;
         }
 
-        if self.0 & PteFlags::HUGE.bits() != 0 {
+        let is_leaf = if cfg!(feature = "kernelet") {
+            level == 1 || self.0 & PteFlags::HUGE.bits() != 0
+        } else {
+            self.0 & PteFlags::HUGE.bits() != 0
+        };
+        if is_leaf {
             let paddr = self.0 & Self::pa_mask_at_level(level);
-            PteScalar::Mapped(paddr, self.prop())
+            PteScalar::Mapped(paddr, self.prop(level))
         } else {
             let paddr = self.0 & Self::CHILD_PT_ADDR_MASK;
             PteScalar::PageTable(paddr, self.pt_flags())

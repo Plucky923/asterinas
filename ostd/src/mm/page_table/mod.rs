@@ -88,6 +88,12 @@ pub(crate) unsafe trait PageTableConfig:
     /// Other page tables do not need to set this to `false`.
     const TOP_LEVEL_CAN_UNMAP: bool = true;
 
+    /// If we can remove and recycle an intermediate page table subtree during unmap.
+    ///
+    /// When `false`, `unmap` clears leaf entries without detaching lower page table nodes;
+    /// lower nodes stay attached until the page table is dropped.
+    const CAN_PRUNE_SUBTREE: bool = true;
+
     /// The type of the page table entry.
     type E: PteTrait;
 
@@ -308,7 +314,7 @@ const fn nr_pte_index_bits<C: PagingConstsTrait>() -> usize {
 }
 
 /// The index of a VA's PTE in a page table node at the given level.
-const fn pte_index<C: PagingConstsTrait>(va: Vaddr, level: PagingLevel) -> usize {
+pub(in crate::mm) const fn pte_index<C: PagingConstsTrait>(va: Vaddr, level: PagingLevel) -> usize {
     (va >> pte_index_bit_offset::<C>(level)) & (nr_subpage_per_huge::<C>() - 1)
 }
 
@@ -330,53 +336,32 @@ pub(crate) struct PageTable<C: PageTableConfig> {
 }
 
 impl PageTable<UserPtConfig> {
-    pub(in crate::mm) fn activate(
-        &self,
-        #[cfg(feature = "kernelet-host")] irq_guard: &crate::irq::DisabledLocalIrqGuard,
-    ) {
+    pub(in crate::mm) fn activate(&self) {
         // SAFETY: The user mode page table is safe to activate since the kernel
         // mappings are shared.
         unsafe {
-            self.root.activate(
-                #[cfg(feature = "kernelet-host")]
-                irq_guard,
-            );
+            self.root.activate();
         }
     }
 
     #[cfg(feature = "kernelet")]
     pub(in crate::mm) fn new_kernelet_user_page_table() -> Self {
-        let root = PageTableNode::alloc(PagingConsts::NR_LEVELS);
-        let preempt_guard = disable_preempt();
-        let mut node = root.borrow().lock(&preempt_guard);
-        for (index, bits) in crate::kernelet::entry::boot_args()
-            .kernel_half_entries
-            .iter()
-            .enumerate()
-        {
-            // SAFETY: The Host published its stable kernel-half top-level
-            // entries in the immutable boot page. User cursors cannot modify
-            // this index range, and the shared children outlive the image.
-            unsafe { node.write_pte(256 + index, PageTableEntry::from_raw_bits(*bits as usize)) };
+        Self {
+            root: PageTableNode::alloc(PagingConsts::NR_LEVELS),
         }
-        drop(node);
-        Self { root }
+    }
+
+    #[cfg(feature = "kernelet")]
+    pub(in crate::mm) fn set_linux_pgd_paddr(&self, pgd_paddr: Paddr) {
+        self.root.set_linux_pgd_paddr(pgd_paddr);
     }
 }
 
 impl PageTable<KernelPtConfig> {
     #[cfg(not(feature = "kernelet"))]
-    pub(in crate::mm) fn activate(
-        &self,
-        #[cfg(feature = "kernelet-host")] irq_guard: &crate::irq::DisabledLocalIrqGuard,
-    ) {
-        // SAFETY: The permanent kernel root owns all shared Host mappings.
-        unsafe {
-            self.root.activate(
-                #[cfg(feature = "kernelet-host")]
-                irq_guard,
-            )
-        };
+    pub(in crate::mm) fn activate(&self) {
+        // SAFETY: The kernel page table is safe to activate.
+        unsafe { self.root.activate() };
     }
 
     /// Creates a new kernel page table.
@@ -682,7 +667,7 @@ pub(crate) unsafe trait PteTrait:
 /// # Safety
 ///
 /// The safety preconditions are same as those of [`AtomicUsize::from_ptr`].
-unsafe fn load_pte<E: PteTrait>(ptr: *mut E, ordering: Ordering) -> E {
+pub(in crate::mm) unsafe fn load_pte<E: PteTrait>(ptr: *mut E, ordering: Ordering) -> E {
     // SAFETY: The safety is upheld by the caller.
     let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
     let pte_raw = atomic.load(ordering);

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::Ordering;
+
 use aster_util::printer::VmPrinter;
+use ostd::{cpu::num_cpus, util::id_set::Id};
 
 use super::TidDirOps;
 use crate::{
@@ -197,6 +200,69 @@ impl ProcFileOps for StatusFileOps {
             "CapAmb:\t{:016x}",
             credentials.ambient_capset().bits()
         )?;
+
+        if let Some(thread) = self.0.thread() {
+            let affinity = thread.atomic_cpu_affinity().load(Ordering::Relaxed);
+            write!(printer, "Cpus_allowed:\t")?;
+            let words = num_cpus().div_ceil(32).max(1);
+            for word_idx in (0..words).rev() {
+                let mut mask: u32 = 0;
+                for bit in 0..32 {
+                    let raw_cpu = word_idx * 32 + bit;
+                    if let Ok(cpu_id) = ostd::cpu::CpuId::try_from(raw_cpu)
+                        && affinity.contains(cpu_id)
+                    {
+                        mask |= 1u32 << bit;
+                    }
+                }
+                if word_idx + 1 < words {
+                    write!(printer, ",")?;
+                }
+                write!(printer, "{:08x}", mask)?;
+            }
+            writeln!(printer)?;
+
+            write!(printer, "Cpus_allowed_list:\t")?;
+            let mut range_start: Option<usize> = None;
+            let mut range_end: usize = 0;
+            let mut first_range = true;
+            for cpu_id in affinity.iter() {
+                let id = cpu_id.as_usize();
+                match range_start {
+                    None => {
+                        range_start = Some(id);
+                        range_end = id;
+                    }
+                    Some(_) if id == range_end + 1 => {
+                        range_end = id;
+                    }
+                    Some(start) => {
+                        if !first_range {
+                            write!(printer, ",")?;
+                        }
+                        first_range = false;
+                        if start == range_end {
+                            write!(printer, "{}", start)?;
+                        } else {
+                            write!(printer, "{}-{}", start, range_end)?;
+                        }
+                        range_start = Some(id);
+                        range_end = id;
+                    }
+                }
+            }
+            if let Some(start) = range_start {
+                if !first_range {
+                    write!(printer, ",")?;
+                }
+                if start == range_end {
+                    write!(printer, "{}", start)?;
+                } else {
+                    write!(printer, "{}-{}", start, range_end)?;
+                }
+            }
+            writeln!(printer)?;
+        }
 
         Ok(printer.bytes_written())
     }

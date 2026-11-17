@@ -13,8 +13,6 @@
 
 pub(crate) use clock_gettime::ClockId;
 use ostd::arch::cpu::context::UserContext;
-#[cfg(kernelet_getpid_profile)]
-use ostd::kernelet::getpid_profile as profile;
 pub(crate) use timer_create::create_timer_for_clock;
 
 use crate::{cpu::LinuxAbi, prelude::*};
@@ -363,9 +361,6 @@ struct SyscallArgument {
     args: [u64; 6],
 }
 
-#[cfg(any(kernelet_getpid_profile, kernelet_rq1_diagnostics))]
-pub(crate) const GETPID_PROFILE_SYSCALL_NUMBER: u64 = arch::SYS_GETPID;
-
 /// Syscall return
 #[derive(Clone, Copy, Debug)]
 enum SyscallReturn {
@@ -387,23 +382,6 @@ impl SyscallArgument {
 }
 
 pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
-    #[cfg(kernelet_rq1_diagnostics)]
-    if user_ctx.syscall_num() as u64 == GETPID_PROFILE_SYSCALL_NUMBER {
-        ctx.thread_local
-            .getpid_timeline()
-            .borrow_mut()
-            .mark(ostd::kernelet::getpid_profile::timeline::Boundary::DispatcherEnter);
-    }
-    #[cfg(kernelet_getpid_profile)]
-    let _getpid_span = if user_ctx.syscall_num() as u64 == GETPID_PROFILE_SYSCALL_NUMBER {
-        profile::span(if cfg!(feature = "kernelet") {
-            profile::stage::GUEST_SYSCALL_HANDLE
-        } else {
-            profile::stage::NATIVE_SYSCALL_HANDLE
-        })
-    } else {
-        None
-    };
     let syscall_frame = SyscallArgument::new_from_context(user_ctx);
     let syscall_return = arch::syscall_dispatch(
         syscall_frame.syscall_number,
@@ -423,13 +401,6 @@ pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
             let errno = err.error() as i32;
             user_ctx.set_syscall_ret((-errno) as usize)
         }
-    }
-    #[cfg(kernelet_rq1_diagnostics)]
-    if syscall_frame.syscall_number == GETPID_PROFILE_SYSCALL_NUMBER {
-        ctx.thread_local
-            .getpid_timeline()
-            .borrow_mut()
-            .dispatch_complete(user_ctx.syscall_ret() as u64);
     }
 }
 

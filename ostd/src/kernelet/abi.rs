@@ -10,13 +10,8 @@ use core::{
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
-/// Whole-buffer grants and operation arguments.
-pub mod buffer;
-
 /// Device entry with the existing VirtIO MMIO transport.
 pub const DEVICE_KIND_VIRTIO: u16 = 1;
-/// Device entry discovered through the shared Ethernet service.
-pub const DEVICE_KIND_SHARED_NET: u16 = 2;
 
 /// First kernel-half slot in the x86-64 PML4.
 pub(crate) const KERNEL_HALF_START: usize = 256;
@@ -45,19 +40,6 @@ impl CpuSlot {
         generation: 0,
         _reserved: 0,
     };
-
-    pub(crate) const fn identity_word(self) -> u64 {
-        self.kernelet as u64 | ((self.vcpu as u64) << 16) | ((self.generation as u64) << 32)
-    }
-
-    pub(crate) const fn from_identity_word(word: u64) -> Self {
-        Self {
-            kernelet: word as u16,
-            vcpu: (word >> 16) as u16,
-            generation: (word >> 32) as u32,
-            _reserved: 0,
-        }
-    }
 }
 
 /// Records the image-relative targets and template bounds validated at registration.
@@ -91,6 +73,8 @@ pub struct EntryTable {
     pub cpu_access_start_offset: u64,
     /// Image-relative exclusive end of the CPU-local access sequences.
     pub cpu_access_end_offset: u64,
+    /// Image-relative entry for user-mode returns (syscalls, exceptions, kernel events).
+    pub user_event_entry_offset: u64,
 }
 
 /// Bootstrap version of the read-only boot page shared by the Host and image.
@@ -153,12 +137,22 @@ pub struct BootArgs {
     pub devices_offset: u32,
     /// Number of virtual devices in the table.
     pub num_devices: u32,
-    /// Reserved and always zero.
-    pub reserved: u32,
+    /// Nonzero if the Host kernel enables page table isolation (PTI).
+    pub pti_enabled: u8,
+    /// Nonzero if the Host CPU and page tables support the NX bit.
+    pub nx_supported: u8,
+    /// Number of hardware page-table levels on the Host (`4` or `5`).
+    pub pgtable_levels: u8,
+    /// User page-table mode: `0` for direct PTEs in OSTD, `1` for VMA services.
+    pub pt_mode: u8,
     /// Host realtime nanoseconds since the Unix epoch at the clock snapshot.
     pub realtime_base_ns: u64,
     /// Host monotonic nanoseconds at the same clock snapshot.
     pub monotonic_base_ns: u64,
+    /// Host kernel VA of the read-only initramfs CPIO archive, or `0`.
+    pub initramfs_base: u64,
+    /// Byte length of the initramfs CPIO archive, or `0`.
+    pub initramfs_len: u64,
 }
 
 /// One virtual device and its reserved address and interrupt resources.
@@ -238,13 +232,24 @@ pub(crate) const KSTACK_USABLE_BYTES: usize = KSTACK_MAPPING_BYTES;
 pub(crate) struct PendingTaskTicks(AtomicU64);
 
 impl PendingTaskTicks {
+    #[cfg(ktest)]
     pub(crate) fn record(&self, user: bool) -> bool {
         let shift = if user { 0 } else { 32 };
-        self.0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                ((value >> shift) as u32 != u32::MAX).then(|| value + (1 << shift))
-            })
-            .is_ok()
+        let mut old = self.0.load(Ordering::Relaxed);
+        loop {
+            if (old >> shift) as u32 == u32::MAX {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                old,
+                old + (1 << shift),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(next) => old = next,
+            }
+        }
     }
 
     /// Atomically transfers this batch to the current Image-side consumer.
@@ -344,14 +349,42 @@ pub struct CopyFaultRecord {
     pub pending: AtomicU32,
 }
 
+/// User-mode event and stack-handoff record for one virtual CPU.
+///
+/// These records follow the complete `CopyFaultRecord` array in the
+/// Host-pinned shared pages.
+#[repr(C, align(64))]
+#[derive(Default)]
+pub struct UserEventRecord {
+    /// Host address of the carrier's live `struct pt_regs`.
+    pub pt_regs: AtomicU64,
+    /// Current user task's save-area-below event RSP (16-byte aligned).
+    pub event_rsp: AtomicU64,
+    /// Current user task's kernel stack lower bound.
+    pub event_stack_limit: AtomicU64,
+    /// Returned trap number for `UserEvent::Exception`.
+    pub trap_num: AtomicU64,
+    /// Returned trap error code for `UserEvent::Exception`.
+    pub error_code: AtomicU64,
+    /// Fault address (`CR2` on `#PF`) for `UserEvent::Exception`.
+    pub fault_addr: AtomicU64,
+    /// Reserved and always zero.
+    pub _pad: [u64; 2],
+}
+
 /// Byte offset of the fault-record array from the first `VcpuRecord`.
 pub const fn copy_fault_records_offset(vcpus: usize) -> usize {
     vcpus * size_of::<VcpuRecord>()
 }
 
-/// Number of bytes mapped for both per-vCPU shared arrays.
-pub const fn vcpu_shared_bytes(vcpus: usize) -> usize {
+/// Byte offset of the user-event record array from the first `VcpuRecord`.
+pub const fn user_event_records_offset(vcpus: usize) -> usize {
     copy_fault_records_offset(vcpus) + vcpus * size_of::<CopyFaultRecord>()
+}
+
+/// Number of bytes mapped for all per-vCPU shared arrays.
+pub const fn vcpu_shared_bytes(vcpus: usize) -> usize {
+    user_event_records_offset(vcpus) + vcpus * size_of::<UserEventRecord>()
 }
 
 /// The x86-64 register file borrowed in place by the `user_run` service.
@@ -433,12 +466,23 @@ pub struct ServiceTable {
     pub oops: extern "C" fn(msg: *const u8, len: u32) -> i64,
     /// Stops the current instance without returning to the image.
     pub stop: extern "C" fn(kind: u32, code: u32, msg: *const u8, len: u32) -> !,
-    /// Whole-buffer grants. Arguments and results are defined in `buffer`.
+    /// VMA-baseline service call (`OP_VM_*`). Keeps the 160-byte `ServiceTable` ABI.
     pub buffer: extern "C" fn(u32, u64, u64, u64, u64) -> MmioResult,
-    /// Returns a token through the normal service gate in diagnostic builds.
-    #[cfg(kernelet_rq1)]
-    pub rq1_echo: extern "C" fn(token: u64) -> i64,
 }
+
+/// VMA-baseline map operation: `token=linux_pgd_paddr`, `arg0=va`, `arg1=paddr`, `arg2=prot_bits`.
+pub const OP_VM_MAP: u32 = 0x100;
+/// VMA-baseline protect operation: `token=linux_pgd_paddr`, `arg0=va`, `arg1=prot_bits`, `arg2=0`.
+pub const OP_VM_PROTECT: u32 = 0x101;
+/// VMA-baseline unmap operation: `token=linux_pgd_paddr`, `arg0=va`, `arg1=len`, `arg2=0`.
+pub const OP_VM_UNMAP: u32 = 0x102;
+
+/// Read permission bit for `OP_VM_MAP` and `OP_VM_PROTECT`.
+pub const KLET_PROT_READ: u64 = 1;
+/// Write permission bit for `OP_VM_MAP` and `OP_VM_PROTECT`.
+pub const KLET_PROT_WRITE: u64 = 2;
+/// Execute permission bit for `OP_VM_MAP` and `OP_VM_PROTECT`.
+pub const KLET_PROT_EXEC: u64 = 4;
 
 /// Virtual timer tick is pending.
 pub const VIRQ_TICK: u64 = 1 << 0;
@@ -453,6 +497,13 @@ pub const USER_RETURN_SYSCALL: i32 = 0;
 pub const USER_RETURN_EXCEPTION: i32 = 1;
 /// A physical interrupt or virtual work requires image-side processing.
 pub const USER_RETURN_PENDING: i32 = 2;
+
+/// User event code passed to `user_event_entry` for a system call.
+pub const USER_EVENT_SYSCALL: u64 = 0;
+/// User event code passed to `user_event_entry` for a CPU exception.
+pub const USER_EVENT_EXCEPTION: u64 = 1;
+/// User event code passed to `user_event_entry` for a pending kernel event.
+pub const USER_EVENT_KERNEL_EVENT: u64 = 2;
 
 /// The requested resource is not owned by this kernelet.
 pub const NOT_OWNED: i64 = 2;
@@ -487,7 +538,7 @@ const _: () = {
     assert!(offset_of!(CpuSlot, vcpu) == 2);
     assert!(offset_of!(CpuSlot, generation) == 4);
     assert!(offset_of!(CpuSlot, _reserved) == 8);
-    assert!(size_of::<EntryTable>() == 136);
+    assert!(size_of::<EntryTable>() == 144);
     assert!(offset_of!(EntryTable, source_hash) == 40);
     assert!(offset_of!(EntryTable, ex_table_start_offset) == 72);
     assert!(offset_of!(EntryTable, yield_entry_offset) == 88);
@@ -496,7 +547,8 @@ const _: () = {
     assert!(offset_of!(EntryTable, stub_range_end_offset) == 112);
     assert!(offset_of!(EntryTable, cpu_access_start_offset) == 120);
     assert!(offset_of!(EntryTable, cpu_access_end_offset) == 128);
-    assert!(size_of::<BootArgs>() == 2336);
+    assert!(offset_of!(EntryTable, user_event_entry_offset) == 136);
+    assert!(size_of::<BootArgs>() == 2352);
     assert!(size_of::<DeviceEntry>() == 24);
     assert!(size_of::<RunDesc>() == 16);
     assert!(size_of::<InfoPage>() == 24);
@@ -504,8 +556,14 @@ const _: () = {
     assert!(offset_of!(BootArgs, generation) == 4);
     assert!(offset_of!(BootArgs, source_hash) == 8);
     assert!(offset_of!(BootArgs, clock_origin_tsc) == 48);
+    assert!(offset_of!(BootArgs, pti_enabled) == 2316);
+    assert!(offset_of!(BootArgs, nx_supported) == 2317);
+    assert!(offset_of!(BootArgs, pgtable_levels) == 2318);
+    assert!(offset_of!(BootArgs, pt_mode) == 2319);
     assert!(offset_of!(BootArgs, realtime_base_ns) == 2320);
     assert!(offset_of!(BootArgs, monotonic_base_ns) == 2328);
+    assert!(offset_of!(BootArgs, initramfs_base) == 2336);
+    assert!(offset_of!(BootArgs, initramfs_len) == 2344);
     assert!(size_of::<VcpuRecord>() == 128);
     assert!(offset_of!(VcpuRecord, stolen_ns) == 64);
     assert!(offset_of!(VcpuRecord, guards) == 80);
@@ -514,6 +572,14 @@ const _: () = {
     assert!(offset_of!(VcpuRecord, task_ticks) == 120);
     assert!(size_of::<CopyFaultRecord>() == 64);
     assert!(offset_of!(CopyFaultRecord, pending) == 16);
+    assert!(size_of::<UserEventRecord>() == 64);
+    assert!(offset_of!(UserEventRecord, pt_regs) == 0);
+    assert!(offset_of!(UserEventRecord, event_rsp) == 8);
+    assert!(offset_of!(UserEventRecord, event_stack_limit) == 16);
+    assert!(offset_of!(UserEventRecord, trap_num) == 24);
+    assert!(offset_of!(UserEventRecord, error_code) == 32);
+    assert!(offset_of!(UserEventRecord, fault_addr) == 40);
+    assert!(vcpu_shared_bytes(1) == 256);
     assert!(size_of::<KletUserContext>() == 168);
     assert!(offset_of!(KletUserContext, general) == 0);
     assert!(offset_of!(KletUserContext, rflags) == 17 * 8);
@@ -521,7 +587,7 @@ const _: () = {
     assert!(offset_of!(KletUserContext, error_code) == 19 * 8);
     assert!(offset_of!(KletUserContext, fault_addr) == 20 * 8);
     assert!(size_of::<MmioResult>() == 16);
-    assert!(size_of::<ServiceTable>() == if cfg!(kernelet_rq1) { 168 } else { 160 });
+    assert!(size_of::<ServiceTable>() == 160);
     assert!(offset_of!(ServiceTable, user_run) == 104);
     assert!(offset_of!(ServiceTable, mmio_read) == 112);
     assert!(offset_of!(ServiceTable, stop) == 144);

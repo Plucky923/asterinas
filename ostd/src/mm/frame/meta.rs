@@ -100,14 +100,6 @@ pub const FRAME_METADATA_MAX_ALIGN: usize = META_SLOT_SIZE;
 
 pub(crate) const META_SLOT_SIZE: usize = 64;
 
-/// Byte offset of the reference count in the Host-created metadata pages.
-#[cfg(feature = "kernelet-host")]
-pub(crate) const META_REF_COUNT_OFFSET: usize = core::mem::offset_of!(MetaSlot, ref_count);
-
-/// Packed image DMA/list state, addressed through Host-owned metadata pages.
-#[cfg(feature = "kernelet-host")]
-pub(crate) const META_IO_STATE_OFFSET: usize = core::mem::offset_of!(MetaSlot, in_list);
-
 #[repr(C)]
 pub(in crate::mm) struct MetaSlot {
     /// The metadata of a frame.

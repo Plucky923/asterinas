@@ -49,8 +49,11 @@ pub(super) fn audit(
     virq_entry: u64,
     yield_entry: u64,
     exit_entry: u64,
+    user_event_entry: u64,
     stub_start: u64,
     stub_end: u64,
+    cpu_access_start: u64,
+    cpu_access_end: u64,
 ) -> Result<(), String> {
     let symbol = |name| find_symbol(symbols, names, name);
     let entry = symbol("_kernelet_entry")?;
@@ -70,6 +73,13 @@ pub(super) fn audit(
         || exit.value != exit_entry
         || symbol("__kernelet_stubs_start")?.value != stub_start
         || symbol("__kernelet_stubs_end")?.value != stub_end
+        || symbol("__kernelet_cpu_access_start")?.value != cpu_access_start
+        || symbol("__kernelet_cpu_access_end")?.value != cpu_access_end
+        || symbols
+            .iter()
+            .zip(names)
+            .find(|(_, candidate)| candidate.as_str() == "user_event_entry")
+            .is_some_and(|(sym, _)| sym.value != user_event_entry)
     {
         return Err("audit item 11: a linked entry symbol disagrees with its entry table".into());
     }

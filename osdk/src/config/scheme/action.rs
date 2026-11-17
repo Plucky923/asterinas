@@ -28,8 +28,8 @@ pub struct BuildScheme {
     pub encoding: Option<PayloadEncoding>,
     #[serde(default)]
     pub rustflags: String,
-    /// Whether to build the position-independent kernelet image from the same
-    /// sources, audit it, and embed it into the host image.
+    /// Whether to build and audit the standalone position-independent kernelet
+    /// image.
     #[serde(default)]
     pub kernelet: bool,
 }
@@ -50,8 +50,8 @@ pub struct Build {
     pub encoding: PayloadEncoding,
     #[serde(default)]
     pub rustflags: String,
-    /// Whether to build the position-independent kernelet image from the same
-    /// sources, audit it, and embed it into the host image.
+    /// Whether to build and audit the standalone position-independent kernelet
+    /// image.
     #[serde(default)]
     pub kernelet: bool,
 }

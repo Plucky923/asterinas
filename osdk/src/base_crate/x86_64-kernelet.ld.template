@@ -60,6 +60,7 @@ SECTIONS
         QUAD(__kernelet_stubs_end - __kernelet_image_base);    /* stub_range_end_offset */
         QUAD(__kernelet_cpu_access_start - __kernelet_image_base); /* cpu_access_start_offset */
         QUAD(__kernelet_cpu_access_end - __kernelet_image_base);   /* cpu_access_end_offset */
+        QUAD(user_event_entry - __kernelet_image_base);            /* user_event_entry_offset */
     } : text
 
     . = ALIGN(HUGE_PAGE);

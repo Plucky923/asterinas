@@ -43,13 +43,326 @@
 //! unsafe { memcpy::<Io, Infallible>(dst_io, src_kbuf, len) };
 //! ```
 
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use super::{Fallible, Infallible, Io};
-use crate::arch::{
-    io::io_mem::{
-        copy_from_mmio, copy_from_mmio_fallible, copy_to_mmio, copy_to_mmio_fallible, memset_mmio,
-    },
-    mm::{__memcpy_fallible, __memset_fallible},
+use crate::arch::io::io_mem::{
+    copy_from_mmio, copy_from_mmio_fallible, copy_to_mmio, copy_to_mmio_fallible, memset_mmio,
 };
+#[cfg(not(feature = "kernelet"))]
+use crate::arch::mm::{__memcpy_fallible, __memset_fallible};
+#[cfg(feature = "kernelet")]
+use crate::{
+    arch::{cpu::context::PageFaultErrorCode, mm::PageTableEntry},
+    mm::{
+        MAX_USERSPACE_VADDR, Paddr, PageFlags, PagingConstsTrait, Vaddr,
+        fault::publish_image_copy_fault,
+        kspace::KERNEL_BASE_VADDR,
+        paddr_to_vaddr, page_size,
+        page_table::{PageTable, PteScalar, PteTrait, load_pte, pte_index},
+        vm_space::{UserPtConfig, VmSpace},
+    },
+    task::disable_preempt,
+};
+
+#[cfg(feature = "kernelet")]
+#[inline]
+unsafe fn copy_opaque(dst: *mut u8, src: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: Caller ensures `dst` is valid for writes and `src` is valid for reads
+    // of `len` bytes, and the direction flag is clear per the x86-64 SysV ABI.
+    unsafe {
+        core::arch::asm!(
+            "rep movsb",
+            inout("rdi") dst => _,
+            inout("rsi") src => _,
+            inout("rcx") len => _,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[cfg(feature = "kernelet")]
+#[inline]
+unsafe fn fill_opaque(dst: *mut u8, value: u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: Caller ensures `dst` is valid for writes of `len` bytes,
+    // and the direction flag is clear per the x86-64 SysV ABI.
+    unsafe {
+        core::arch::asm!(
+            "rep stosb",
+            inout("rdi") dst => _,
+            inout("rcx") len => _,
+            in("al") value,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Walks the user page table locklessly under preemption disabled.
+///
+/// On success, returns the resolved byte physical address and the remaining bytes
+/// contiguous within that page. On missing or insufficient permission, returns
+/// `Err(present_bit_if_mapped)`.
+#[cfg(feature = "kernelet")]
+fn page_walk_user(
+    pt: &PageTable<UserPtConfig>,
+    va: Vaddr,
+    write: bool,
+) -> Result<(Paddr, usize), usize> {
+    if va >= MAX_USERSPACE_VADDR {
+        return Err(0);
+    }
+
+    let mut pt_addr = paddr_to_vaddr(pt.root_paddr());
+    for cur_level in (1..=UserPtConfig::NR_LEVELS).rev() {
+        let offset = pte_index::<UserPtConfig>(va, cur_level);
+        // SAFETY: Caller holds `DisabledPreemptGuard` (RCU read-side critical section),
+        // keeping `pt` and all reachable page table nodes alive; `offset < 512`.
+        let cur_pte = unsafe {
+            load_pte(
+                (pt_addr as *mut PageTableEntry).add(offset),
+                Ordering::Acquire,
+            )
+        };
+        match cur_pte.to_repr(cur_level) {
+            PteScalar::Absent => return Err(0),
+            PteScalar::PageTable(next_pt_addr, _) => {
+                pt_addr = paddr_to_vaddr(next_pt_addr);
+            }
+            PteScalar::Mapped(frame_paddr, prop) => {
+                if !prop.flags.contains(PageFlags::R) {
+                    return Err(0);
+                }
+                if write && !prop.flags.contains(PageFlags::W) {
+                    return Err(PageFaultErrorCode::PRESENT.bits());
+                }
+                let page_sz = page_size::<UserPtConfig>(cur_level);
+                let in_page_off = va & (page_sz - 1);
+                return Ok((frame_paddr + in_page_off, page_sz - in_page_off));
+            }
+        }
+    }
+    Err(0)
+}
+
+#[cfg(feature = "kernelet")]
+fn copy_user_rcu(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let dst_addr = dst as usize;
+    let src_addr = src as usize;
+    if dst_addr >= MAX_USERSPACE_VADDR && src_addr >= MAX_USERSPACE_VADDR {
+        if dst_addr >= KERNEL_BASE_VADDR && src_addr >= KERNEL_BASE_VADDR {
+            // SAFETY: Both pointers are valid kernel memory for `len` bytes.
+            unsafe { copy_opaque(dst, src, len) };
+            return len;
+        }
+        return 0;
+    }
+
+    let _preempt_guard = disable_preempt();
+    let pt = VmSpace::current_activated_page_table(&_preempt_guard);
+    let mut copied = 0;
+
+    while copied < len {
+        let rem = len - copied;
+        let cur_dst = dst.wrapping_add(copied);
+        let cur_src = src.wrapping_add(copied);
+        let cur_dst_va = cur_dst as usize;
+        let cur_src_va = cur_src as usize;
+
+        let (dst_kptr, dst_avail) = if cur_dst_va < MAX_USERSPACE_VADDR {
+            let Some(pt) = pt else {
+                publish_image_copy_fault(cur_dst_va, true, 0);
+                return copied;
+            };
+            match page_walk_user(pt, cur_dst_va, true) {
+                Ok((paddr, avail)) => (paddr_to_vaddr(paddr) as *mut u8, avail),
+                Err(present) => {
+                    publish_image_copy_fault(cur_dst_va, true, present);
+                    return copied;
+                }
+            }
+        } else if cur_dst_va >= KERNEL_BASE_VADDR {
+            (cur_dst, rem)
+        } else {
+            return copied;
+        };
+
+        let (src_kptr, src_avail) = if cur_src_va < MAX_USERSPACE_VADDR {
+            let Some(pt) = pt else {
+                publish_image_copy_fault(cur_src_va, false, 0);
+                return copied;
+            };
+            match page_walk_user(pt, cur_src_va, false) {
+                Ok((paddr, avail)) => (paddr_to_vaddr(paddr) as *const u8, avail),
+                Err(present) => {
+                    publish_image_copy_fault(cur_src_va, false, present);
+                    return copied;
+                }
+            }
+        } else if cur_src_va >= KERNEL_BASE_VADDR {
+            (cur_src, rem)
+        } else {
+            return copied;
+        };
+
+        let chunk = rem.min(dst_avail).min(src_avail);
+        // SAFETY: Both pointers are valid direct-map or kernel addresses for `chunk`
+        // bytes, and any mapped user frames remain pinned through `_preempt_guard`.
+        unsafe { copy_opaque(dst_kptr, src_kptr, chunk) };
+        copied += chunk;
+    }
+
+    copied
+}
+
+#[cfg(feature = "kernelet")]
+fn memset_user_rcu(dst: *mut u8, value: u8, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let dst_addr = dst as usize;
+    if dst_addr >= MAX_USERSPACE_VADDR {
+        if dst_addr >= KERNEL_BASE_VADDR {
+            // SAFETY: `dst` is valid kernel memory for `len` bytes.
+            unsafe { fill_opaque(dst, value, len) };
+            return len;
+        }
+        return 0;
+    }
+
+    let _preempt_guard = disable_preempt();
+    let pt = VmSpace::current_activated_page_table(&_preempt_guard);
+    let mut filled = 0;
+
+    while filled < len {
+        let rem = len - filled;
+        let cur_dst = dst.wrapping_add(filled);
+        let va = cur_dst as usize;
+        if va >= MAX_USERSPACE_VADDR {
+            return filled;
+        }
+        let Some(pt) = pt else {
+            publish_image_copy_fault(va, true, 0);
+            return filled;
+        };
+        let (paddr, avail) = match page_walk_user(pt, va, true) {
+            Ok(res) => res,
+            Err(present) => {
+                publish_image_copy_fault(va, true, present);
+                return filled;
+            }
+        };
+        let chunk = rem.min(avail);
+        // SAFETY: `paddr_to_vaddr(paddr)` is valid direct-map memory for `chunk`
+        // bytes, and the frame remains pinned through `_preempt_guard`.
+        unsafe { fill_opaque(paddr_to_vaddr(paddr) as *mut u8, value, chunk) };
+        filled += chunk;
+    }
+
+    filled
+}
+
+#[cfg(feature = "kernelet")]
+pub(super) fn atomic_load_user_rcu(ptr: *const u32) -> u64 {
+    let va = ptr as usize;
+    if !va.is_multiple_of(align_of::<u32>()) {
+        if va < MAX_USERSPACE_VADDR {
+            publish_image_copy_fault(va, false, 0);
+        }
+        return !0u64;
+    }
+    if va >= MAX_USERSPACE_VADDR {
+        if va >= KERNEL_BASE_VADDR {
+            // SAFETY: `ptr` is valid aligned kernel memory for `u32`.
+            return unsafe { AtomicU32::from_ptr(ptr.cast_mut()).load(Ordering::Relaxed) } as u64;
+        }
+        return !0u64;
+    }
+
+    let _preempt_guard = disable_preempt();
+    let Some(pt) = VmSpace::current_activated_page_table(&_preempt_guard) else {
+        publish_image_copy_fault(va, false, 0);
+        return !0u64;
+    };
+    match page_walk_user(pt, va, false) {
+        Ok((paddr, avail)) if avail >= size_of::<u32>() => {
+            let kptr = paddr_to_vaddr(paddr) as *mut u32;
+            // SAFETY: `kptr` points to an aligned, mapped `u32` in the direct map,
+            // pinned for the duration of `_preempt_guard`.
+            unsafe { AtomicU32::from_ptr(kptr).load(Ordering::Relaxed) as u64 }
+        }
+        Ok(_) => {
+            publish_image_copy_fault(va, false, 0);
+            !0u64
+        }
+        Err(present) => {
+            publish_image_copy_fault(va, false, present);
+            !0u64
+        }
+    }
+}
+
+#[cfg(feature = "kernelet")]
+pub(super) fn atomic_cmpxchg_user_rcu(ptr: *mut u32, old_val: u32, new_val: u32) -> u64 {
+    let va = ptr as usize;
+    if !va.is_multiple_of(align_of::<u32>()) {
+        if va < MAX_USERSPACE_VADDR {
+            publish_image_copy_fault(va, true, 0);
+        }
+        return !0u64;
+    }
+    if va >= MAX_USERSPACE_VADDR {
+        if va >= KERNEL_BASE_VADDR {
+            // SAFETY: `ptr` is valid aligned kernel memory for `u32`.
+            let atomic = unsafe { AtomicU32::from_ptr(ptr) };
+            return match atomic.compare_exchange(
+                old_val,
+                new_val,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(v) | Err(v) => v as u64,
+            };
+        }
+        return !0u64;
+    }
+
+    let _preempt_guard = disable_preempt();
+    let Some(pt) = VmSpace::current_activated_page_table(&_preempt_guard) else {
+        publish_image_copy_fault(va, true, 0);
+        return !0u64;
+    };
+    match page_walk_user(pt, va, true) {
+        Ok((paddr, avail)) if avail >= size_of::<u32>() => {
+            let kptr = paddr_to_vaddr(paddr) as *mut u32;
+            // SAFETY: `kptr` points to an aligned, writable `u32` in the direct map,
+            // pinned for the duration of `_preempt_guard`.
+            let atomic = unsafe { AtomicU32::from_ptr(kptr) };
+            match atomic.compare_exchange(old_val, new_val, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(v) | Err(v) => v as u64,
+            }
+        }
+        Ok(_) => {
+            publish_image_copy_fault(va, true, 0);
+            !0u64
+        }
+        Err(present) => {
+            publish_image_copy_fault(va, true, present);
+            !0u64
+        }
+    }
+}
 
 /// Copies `len` bytes from `src` to `dst`.
 ///
@@ -166,15 +479,22 @@ unsafe impl Memcpy<Infallible> for Infallible {
     }
 }
 
-// SAFETY: Delegates to `__memcpy_fallible`,
-// which handles page faults when copying from fallible to infallible memory.
+// SAFETY: Delegates to `copy_user_rcu` under `kernelet` or `__memcpy_fallible`,
+// which handle page faults when copying from fallible to infallible memory.
 unsafe impl Memcpy<Fallible> for Infallible {
     type Result = usize;
 
     unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) -> usize {
-        // SAFETY: The safety is upheld by the caller.
-        let failed_bytes = unsafe { __memcpy_fallible(dst, src, len) };
-        len - failed_bytes
+        #[cfg(feature = "kernelet")]
+        {
+            copy_user_rcu(dst, src, len)
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            // SAFETY: The safety is upheld by the caller.
+            let failed_bytes = unsafe { __memcpy_fallible(dst, src, len) };
+            len - failed_bytes
+        }
     }
 }
 
@@ -189,27 +509,41 @@ unsafe impl Memcpy<Io> for Infallible {
     }
 }
 
-// SAFETY: Delegates to `__memcpy_fallible`,
-// which handles page faults when copying from infallible to fallible memory.
+// SAFETY: Delegates to `copy_user_rcu` under `kernelet` or `__memcpy_fallible`,
+// which handle page faults when copying from infallible to fallible memory.
 unsafe impl Memcpy<Infallible> for Fallible {
     type Result = usize;
 
     unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) -> usize {
-        // SAFETY: The safety is upheld by the caller.
-        let failed_bytes = unsafe { __memcpy_fallible(dst, src, len) };
-        len - failed_bytes
+        #[cfg(feature = "kernelet")]
+        {
+            copy_user_rcu(dst, src, len)
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            // SAFETY: The safety is upheld by the caller.
+            let failed_bytes = unsafe { __memcpy_fallible(dst, src, len) };
+            len - failed_bytes
+        }
     }
 }
 
-// SAFETY: Delegates to `__memcpy_fallible`,
-// which handles page faults when copying between fallible memory regions.
+// SAFETY: Delegates to `copy_user_rcu` under `kernelet` or `__memcpy_fallible`,
+// which handle page faults when copying between fallible memory regions.
 unsafe impl Memcpy<Fallible> for Fallible {
     type Result = usize;
 
     unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) -> usize {
-        // SAFETY: The safety is upheld by the caller.
-        let failed_bytes = unsafe { __memcpy_fallible(dst, src, len) };
-        len - failed_bytes
+        #[cfg(feature = "kernelet")]
+        {
+            copy_user_rcu(dst, src, len)
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            // SAFETY: The safety is upheld by the caller.
+            let failed_bytes = unsafe { __memcpy_fallible(dst, src, len) };
+            len - failed_bytes
+        }
     }
 }
 
@@ -257,15 +591,22 @@ unsafe impl Memset for Infallible {
     }
 }
 
-// SAFETY: Delegates to `__memset_fallible`,
-// which handles page faults when filling fallible memory.
+// SAFETY: Delegates to `memset_user_rcu` under `kernelet` or `__memset_fallible`,
+// which handle page faults when filling fallible memory.
 unsafe impl Memset for Fallible {
     type Result = usize;
 
     unsafe fn memset(dst: *mut u8, value: u8, len: usize) -> usize {
-        // SAFETY: The safety is upheld by the caller.
-        let failed_bytes = unsafe { __memset_fallible(dst, value, len) };
-        len - failed_bytes
+        #[cfg(feature = "kernelet")]
+        {
+            memset_user_rcu(dst, value, len)
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            // SAFETY: The safety is upheld by the caller.
+            let failed_bytes = unsafe { __memset_fallible(dst, value, len) };
+            len - failed_bytes
+        }
     }
 }
 

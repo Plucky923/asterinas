@@ -188,6 +188,7 @@ impl PosixThreadBuilder {
             .unwrap_or_else(|| Arc::new(ThreadFsInfo::new(ns_proxy.mnt_ns().new_path_resolver())));
 
         Ok(Arc::new_cyclic(|weak_task| {
+            let process_arc = process.upgrade();
             let posix_thread = {
                 let prof_clock = ProfClock::new();
                 let virtual_timer_manager = TimerManager::new(prof_clock.user_clock().clone());
@@ -226,6 +227,7 @@ impl PosixThreadBuilder {
             ));
 
             let thread_local = ThreadLocal::new(
+                process_arc,
                 set_child_tid,
                 clear_child_tid,
                 vmar,

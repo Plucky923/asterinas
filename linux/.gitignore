@@ -1,0 +1,11 @@
+/bench/build/
+/endovisor/.*.cmd
+/endovisor/*.o
+/endovisor/*.ko
+/endovisor/*.mod
+/endovisor/*.mod.c
+/endovisor/Module.symvers
+/endovisor/modules.order
+/runner/.tmp/
+/runner/run-kernelet
+/runner/run-poc

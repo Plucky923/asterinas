@@ -333,7 +333,12 @@ fn set_cpu_context(
     }
 
     // Reset the user register context.
-    *user_context = UserContext::default();
+    #[cfg(target_arch = "x86_64")]
+    user_context.reset();
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        *user_context = UserContext::default();
+    }
 
     // Set the new instruction pointer to the ELF entry point.
     user_context.set_instruction_pointer(elf_load_info.entry_point as _);

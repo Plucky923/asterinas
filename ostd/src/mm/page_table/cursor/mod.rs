@@ -225,6 +225,7 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
             match cur_entry.to_ref() {
                 PteStateRef::PageTable(pt) => {
                     if find_unmap_subtree
+                        && C::CAN_PRUNE_SUBTREE
                         && cur_entry_fits_range
                         && (C::TOP_LEVEL_CAN_UNMAP || self.level != C::NR_LEVELS)
                     {
@@ -622,6 +623,34 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
         self.0.move_forward();
 
         Some(protected_va)
+    }
+
+    /// Applies `op` to the next mapped slot within `len` bytes and returns its VA range,
+    /// physical address, and before/after properties.
+    ///
+    /// # Safety
+    ///
+    /// The protected range and the resulting properties must preserve kernel memory safety.
+    /// `op` must not change the reserved `AVAIL1` privileged flag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds the remaining cursor range or is not page-aligned.
+    #[cfg(feature = "kernelet")]
+    pub(in crate::mm) unsafe fn protect_next_tracked(
+        &mut self,
+        len: usize,
+        op: &mut impl FnMut(&mut PageProperty),
+    ) -> Option<(Range<Vaddr>, crate::mm::Paddr, PageProperty, PageProperty)> {
+        self.0.find_next_impl(len, false, true)?;
+
+        let (paddr, old_prop, new_prop) = self.0.cur_entry().protect_tracked(op)?;
+
+        let protected_va = self.0.cur_va_range();
+
+        self.0.move_forward();
+
+        Some((protected_va, paddr, old_prop, new_prop))
     }
 
     fn replace_cur_entry(&mut self, new_child: PteState<C>) -> Option<PageTableFrag<C>> {

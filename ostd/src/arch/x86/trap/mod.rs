@@ -141,12 +141,7 @@ pub(crate) unsafe fn init_on_cpu() {
     unsafe { syscall::init_on_cpu() };
 }
 
-// Use the service ABI object itself: the Host entry stubs save and restore
-// the image task's register file without a private context or conversion.
-#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
-pub(super) use crate::kernelet::abi::KletUserContext as RawUserContext;
-
-#[cfg(not(any(feature = "kernelet", feature = "kernelet-host")))]
+#[cfg(not(feature = "kernelet"))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct RawUserContext {
@@ -157,12 +152,14 @@ pub(super) struct RawUserContext {
 }
 
 // Both native assembly entry paths access exactly this twenty-word prefix.
-crate::const_assert!(core::mem::offset_of!(RawUserContext, general) == 0);
-crate::const_assert!(core::mem::offset_of!(RawUserContext, rflags) == 17 * size_of::<usize>());
-crate::const_assert!(core::mem::offset_of!(RawUserContext, trap_num) == 18 * size_of::<usize>());
-crate::const_assert!(core::mem::offset_of!(RawUserContext, error_code) == 19 * size_of::<usize>());
-#[cfg(not(any(feature = "kernelet", feature = "kernelet-host")))]
-crate::const_assert!(size_of::<RawUserContext>() == 20 * size_of::<usize>());
+#[cfg(not(feature = "kernelet"))]
+const _: () = {
+    crate::const_assert!(core::mem::offset_of!(RawUserContext, general) == 0);
+    crate::const_assert!(core::mem::offset_of!(RawUserContext, rflags) == 17 * size_of::<usize>());
+    crate::const_assert!(core::mem::offset_of!(RawUserContext, trap_num) == 18 * size_of::<usize>());
+    crate::const_assert!(core::mem::offset_of!(RawUserContext, error_code) == 19 * size_of::<usize>());
+    crate::const_assert!(size_of::<RawUserContext>() == 20 * size_of::<usize>());
+};
 
 /// Handle traps (only from kernel).
 // SAFETY: The name does not collide with other symbols.
@@ -184,17 +181,6 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
     // during exception handling is consistent with the state before the trap.
     let was_irq_enabled =
         f.rflags as u64 & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits() > 0;
-
-    #[cfg(feature = "kernelet-host")]
-    if f.trap_num == 14 && crate::kernelet::host_run::recover_host_copy_fault(f) {
-        return;
-    }
-
-    #[cfg(feature = "kernelet-host")]
-    if crate::kernelet::host_run::contain_image_exception(f) {
-        crate::kernelet::host_run::finish_image_trap(f);
-        return;
-    }
 
     let cpu_exception = CpuException::new(f.trap_num, f.error_code);
     match cpu_exception {
@@ -229,29 +215,9 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
             );
         }
     }
-    #[cfg(feature = "kernelet-host")]
-    crate::kernelet::host_run::finish_image_trap(f);
-}
-
-/// Applies the native Host policy to a machine event taken in user mode.
-///
-/// The caller has classified this as a machine event, rather than a user
-/// fault or trap, and keeps physical IRQs masked through the handoff.
-#[cfg(feature = "kernelet-host")]
-pub(in crate::arch) fn handle_user_machine_exception(frame: &mut TrapFrame) {
-    debug_assert!(!crate::arch::irq::is_local_enabled());
-    // SAFETY: The user gate supplied the complete Host-built trap frame.
-    // Only machine events reach this wrapper, so the injected user-page-
-    // fault handler is not called. Native fatal policy remains authoritative.
-    unsafe { trap_handler(frame) };
 }
 
 /// User-space code segment selector value.
 pub const USER_CS_VALUE: usize = gdt::USER_CS.0 as usize;
 /// User-space stack segment selector value.
 pub const USER_SS_VALUE: usize = gdt::USER_SS.0 as usize;
-
-#[cfg(feature = "kernelet-host")]
-pub(crate) const KERNEL_CS_VALUE: usize = gdt::KERNEL_CS.0 as usize;
-#[cfg(feature = "kernelet-host")]
-pub(crate) const KERNEL_SS_VALUE: usize = gdt::KERNEL_SS.0 as usize;

@@ -44,13 +44,6 @@ pub(crate) fn send_ipi(hw_cpu_id: HwCpuId, guard: &dyn PinCurrentCpu) -> Result<
     )
 }
 
-/// Sends a real IPI to the current CPU without reading its APIC ID.
-#[cfg(feature = "kernelet-host")]
-pub(crate) fn send_self_ipi(guard: &dyn PinCurrentCpu) -> Result<()> {
-    // The destination field is ignored when using the self shorthand.
-    send_to(ApicId::from(0), DestinationShorthand::MySelf, guard)
-}
-
 fn send_to(
     destination: ApicId,
     shorthand: DestinationShorthand,

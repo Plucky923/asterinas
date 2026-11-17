@@ -33,6 +33,7 @@ pub(super) fn sys_getrusage(
                 rusage_t {
                     ru_utime: process.prof_clock().user_clock().read_time().into(),
                     ru_stime: process.prof_clock().kernel_clock().read_time().into(),
+                    ru_minflt: process.minor_faults(),
                     ..Default::default()
                 }
             }
@@ -41,14 +42,17 @@ pub(super) fn sys_getrusage(
                 rusage_t {
                     ru_utime: posix_thread.prof_clock().user_clock().read_time().into(),
                     ru_stime: posix_thread.prof_clock().kernel_clock().read_time().into(),
+                    ru_minflt: ctx.process.minor_faults(),
                     ..Default::default()
                 }
             }
             RusageTarget::Children => {
-                let (user_time, kernel_time) = ctx.process.reaped_children_stats().lock().get();
+                let stats = ctx.process.reaped_children_stats().lock();
+                let (user_time, kernel_time) = stats.get();
                 rusage_t {
                     ru_utime: user_time.into(),
                     ru_stime: kernel_time.into(),
+                    ru_minflt: stats.minflt(),
                     ..Default::default()
                 }
             }

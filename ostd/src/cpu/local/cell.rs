@@ -81,12 +81,6 @@ macro_rules! cpu_local_cell {
 pub struct CpuLocalCell<T: 'static>(UnsafeCell<T>);
 
 impl<T: 'static> CpuLocalCell<T> {
-    /// Returns this static cell's offset from the architecture CPU-local base.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn static_offset(&'static self) -> usize {
-        self as *const _ as usize - __cpu_local_start as *const () as usize
-    }
-
     /// Initializes a CPU-local object.
     ///
     /// Please do not call this function directly. Instead, use the
@@ -119,7 +113,11 @@ impl<T: 'static> CpuLocalCell<T> {
     ///   enforced, since the interrupts may come asynchronously.
     pub fn as_mut_ptr(&'static self) -> *mut T {
         super::is_used::debug_set_true();
+        self.as_mut_ptr_with_base(arch::cpu::local::get_base() as usize)
+    }
 
+    /// Computes a raw address using an already selected CPU-local replica.
+    pub(crate) fn as_mut_ptr_with_base(&'static self, local_base: usize) -> *mut T {
         let offset = {
             let bsp_va = self as *const _ as usize;
             let bsp_base = __cpu_local_start as *const () as usize;
@@ -129,13 +127,19 @@ impl<T: 'static> CpuLocalCell<T> {
             bsp_va - bsp_base
         };
 
-        let local_base = arch::cpu::local::get_base() as usize;
         let local_va = local_base + offset;
 
         // A sanity check about the alignment.
         debug_assert_eq!(local_va % align_of::<T>(), 0);
 
         local_va as *mut T
+    }
+
+    /// Returns this cell's byte offset within the `.cpu_local` section.
+    #[cfg(feature = "kernelet")]
+    #[inline(always)]
+    pub(crate) fn offset(&'static self) -> usize {
+        self as *const _ as usize - __cpu_local_start as *const () as usize
     }
 }
 

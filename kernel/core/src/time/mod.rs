@@ -13,8 +13,6 @@ use crate::prelude::*;
 pub(crate) mod clocks;
 mod core;
 pub(crate) mod cpu_time_stats;
-#[cfg(feature = "kernelet-host")]
-mod kernelet;
 mod softirq;
 mod system_time;
 pub(crate) mod timerfd;
@@ -46,8 +44,6 @@ pub(crate) fn read_monotonic_time() -> Duration {
 pub(super) fn init() {
     system_time::init();
     clocks::init();
-    #[cfg(feature = "kernelet-host")]
-    kernelet::init();
     softirq::init();
     cpu_time_stats::init();
 }

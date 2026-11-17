@@ -48,9 +48,10 @@ use core::{marker::PhantomData, mem::MaybeUninit};
 use ostd_pod::Pod;
 
 use self::copy::{memcpy, memset};
+#[cfg(not(feature = "kernelet"))]
+use crate::arch::mm::{__atomic_cmpxchg_fallible, __atomic_load_fallible};
 use crate::{
     Error,
-    arch::mm::{__atomic_cmpxchg_fallible, __atomic_load_fallible},
     mm::kspace::{KERNEL_BASE_VADDR, KERNEL_END_VADDR},
     prelude::*,
 };
@@ -1131,7 +1132,7 @@ impl PodAtomic for u32 {
         #[cfg(not(feature = "kernelet"))]
         let result = unsafe { __atomic_load_fallible(ptr) };
         #[cfg(feature = "kernelet")]
-        let result = retry_image_atomic(|| unsafe { __atomic_load_fallible(ptr) })?;
+        let result = retry_image_atomic(|| copy::atomic_load_user_rcu(ptr))?;
         #[cfg(not(feature = "kernelet"))]
         if result == !0 {
             return Err(Error::PageFault);
@@ -1144,8 +1145,7 @@ impl PodAtomic for u32 {
         #[cfg(not(feature = "kernelet"))]
         let result = unsafe { __atomic_cmpxchg_fallible(ptr, old_val, new_val) };
         #[cfg(feature = "kernelet")]
-        let result =
-            retry_image_atomic(|| unsafe { __atomic_cmpxchg_fallible(ptr, old_val, new_val) })?;
+        let result = retry_image_atomic(|| copy::atomic_cmpxchg_user_rcu(ptr, old_val, new_val))?;
         #[cfg(not(feature = "kernelet"))]
         if result == !0 {
             return Err(Error::PageFault);

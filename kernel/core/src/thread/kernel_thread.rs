@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#[cfg(feature = "kernelet-host")]
-use core::num::NonZeroU16;
-
 use ostd::{
     cpu::CpuSet,
     mm::VmSpace,
@@ -21,12 +18,10 @@ pub(super) struct KernelThread {
     address_space: AddressSpace,
 }
 
-/// A process mapping owner or carrier restoration state, never both.
+/// A process mapping owner or empty address space.
 enum AddressSpace {
     None,
     Process(Arc<Vmar>),
-    #[cfg(feature = "kernelet-host")]
-    Carrier(Arc<VmSpace>),
 }
 
 impl KernelThread {
@@ -34,7 +29,7 @@ impl KernelThread {
     pub(super) fn vmar(&self) -> Option<&Arc<Vmar>> {
         match &self.address_space {
             AddressSpace::Process(vmar) => Some(vmar),
-            _ => None,
+            AddressSpace::None => None,
         }
     }
 
@@ -43,8 +38,6 @@ impl KernelThread {
         match &self.address_space {
             AddressSpace::None => None,
             AddressSpace::Process(vmar) => Some(vmar.vm_space()),
-            #[cfg(feature = "kernelet-host")]
-            AddressSpace::Carrier(space) => Some(space),
         }
     }
 }
@@ -72,8 +65,6 @@ pub(crate) struct ThreadOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
     cpu_affinity: CpuSet,
     sched_policy: SchedPolicy,
-    #[cfg(feature = "kernelet-host")]
-    fair_weight_divisor: NonZeroU16,
     address_space: AddressSpace,
 }
 
@@ -89,8 +80,6 @@ impl ThreadOptions {
             func: Some(Box::new(func)),
             cpu_affinity,
             sched_policy,
-            #[cfg(feature = "kernelet-host")]
-            fair_weight_divisor: NonZeroU16::MIN,
             address_space: AddressSpace::None,
         }
     }
@@ -116,26 +105,9 @@ impl ThreadOptions {
     /// The `Arc` keeps the VMAR object alive, but does not prevent its mappings from being cleared
     /// after the last [`VmarHandle`](crate::vm::vmar::VmarHandle) is dropped. A caller that needs
     /// the mappings to outlive their userspace owner must hold a separate owner-memory lease.
-    #[cfg_attr(all(not(ktest), not(feature = "kernelet-host")), expect(dead_code))]
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(crate) fn vmar(mut self, vmar: Arc<Vmar>) -> Self {
         self.address_space = AddressSpace::Process(vmar);
-        self
-    }
-
-    /// Associates a carrier's page-table restoration state with this thread.
-    ///
-    /// This does not supply a Host process VMAR for resolving page faults.
-    /// Activation still validates the registered root through `VmSpace`.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn carrier_vm_space(mut self, vm_space: Arc<VmSpace>) -> Self {
-        self.address_space = AddressSpace::Carrier(vm_space);
-        self
-    }
-
-    /// Divides this Host carrier thread scheduling weight.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn fair_weight_divisor(mut self, divisor: NonZeroU16) -> Self {
-        self.fair_weight_divisor = divisor;
         self
     }
 }
@@ -159,16 +131,6 @@ impl ThreadOptions {
                 let sched_policy = self.sched_policy;
                 let thread =
                     Thread::new(weak_task.clone(), kernel_thread, cpu_affinity, sched_policy);
-                #[cfg(feature = "kernelet-host")]
-                let thread = {
-                    let mut thread = thread;
-                    if self.fair_weight_divisor != NonZeroU16::MIN {
-                        thread.sched_attr = thread
-                            .sched_attr
-                            .with_fair_weight_divisor(self.fair_weight_divisor);
-                    }
-                    thread
-                };
                 Arc::new(thread)
             };
 
@@ -295,51 +257,6 @@ mod tests {
 
         worker.join();
         assert_eq!(result.lock().take().unwrap(), expected);
-    }
-
-    #[cfg(feature = "kernelet-host")]
-    #[ktest]
-    fn carrier_vm_space_is_restored_without_process_vmar() {
-        super::super::init();
-
-        let space = Arc::new(VmSpace::new());
-        let worker_space = space.clone();
-        let completed = Arc::new(Mutex::new(false));
-        let worker_completed = completed.clone();
-        let test_cpu = CpuId::current_racy();
-        let worker = ThreadOptions::new(move || {
-            let current = Thread::current().unwrap();
-            let kernel_thread = current.as_kernel_thread().unwrap();
-            assert!(kernel_thread.vmar().is_none());
-            assert!(Arc::ptr_eq(
-                kernel_thread.vm_space().unwrap(),
-                &worker_space
-            ));
-
-            // A different association forces a real root switch before resuming.
-            let switcher = ThreadOptions::new(|| {})
-                .cpu_affinity(test_cpu.into())
-                .carrier_vm_space(Arc::new(VmSpace::new()))
-                .spawn();
-            switcher.join();
-
-            const UNMAPPED_ADDR: usize = PAGE_SIZE * 16;
-            let mut reader = worker_space.reader(UNMAPPED_ADDR, 1).unwrap();
-            let mut output = [0u8; 1];
-            let mut writer = VmWriter::from(output.as_mut_slice()).to_fallible();
-            // The root was restored, but no Host process VMAR may resolve this fault.
-            assert_eq!(
-                reader.read_fallible(&mut writer),
-                Err((Error::PageFault, 0))
-            );
-            *worker_completed.lock() = true;
-        })
-        .cpu_affinity(test_cpu.into())
-        .carrier_vm_space(space)
-        .spawn();
-
-        worker.join();
-        assert!(*completed.lock());
     }
 
     #[cfg(not(feature = "kernelet"))]

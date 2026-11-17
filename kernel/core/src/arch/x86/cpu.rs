@@ -44,15 +44,23 @@ impl LinuxAbi for UserContext {
         self.set_rax(ret);
     }
 
+    #[inline(always)]
     fn syscall_args(&self) -> [usize; 6] {
-        [
-            self.rdi(),
-            self.rsi(),
-            self.rdx(),
-            self.r10(),
-            self.r8(),
-            self.r9(),
-        ]
+        #[cfg(feature = "kernelet")]
+        {
+            UserContext::read_syscall_args(self)
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            [
+                self.rdi(),
+                self.rsi(),
+                self.rdx(),
+                self.r10(),
+                self.r8(),
+                self.r9(),
+            ]
+        }
     }
 }
 
@@ -120,8 +128,11 @@ macro_rules! copy_gp_regs {
 
 impl SigContext {
     pub(crate) fn copy_user_regs_to(&self, dst: &mut UserContext) {
-        let gp_regs = dst.general_regs_mut();
-        copy_gp_regs!(self, gp_regs);
+        {
+            #[cfg_attr(not(feature = "kernelet"), expect(unused_mut))]
+            let mut gp_regs = dst.general_regs_mut();
+            copy_gp_regs!(self, gp_regs);
+        }
         dst.set_rflags(
             (dst.rflags() & !SIGRETURN_RFLAGS_MASK) | (self.rflags & SIGRETURN_RFLAGS_MASK),
         );

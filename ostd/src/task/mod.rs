@@ -2,13 +2,7 @@
 
 //! Tasks are the unit of code execution.
 
-#[cfg(any(
-    feature = "kernelet-host",
-    feature = "kernelet",
-    kernelet_rq1,
-    kernelet_rq1_diagnostics,
-    ktest
-))]
+#[cfg(feature = "kernelet")]
 pub(crate) mod accounting;
 pub mod atomic_mode;
 #[cfg_attr(feature = "kernelet", path = "kernelet_stack.rs")]
@@ -19,8 +13,6 @@ mod processor;
 pub mod scheduler;
 mod utils;
 
-#[cfg(feature = "kernelet-host")]
-use core::sync::atomic::AtomicUsize;
 use core::{
     any::Any,
     borrow::Borrow,
@@ -32,22 +24,22 @@ use core::{
 #[cfg(feature = "kernelet")]
 use core::{
     cell::RefCell,
-    sync::atomic::{AtomicU32, AtomicU64},
+    sync::atomic::{AtomicPtr, AtomicU32},
 };
 
 use kernel_stack::KernelStack;
+#[cfg(feature = "kernelet")]
+pub(crate) use processor::after_switching_to;
 use processor::current_task;
 use spin::Once;
 use utils::ForceSync;
 
-#[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
-pub use self::accounting::CpuTimeMeasurement;
 pub use self::{
     preempt::{DisabledPreemptGuard, disable_preempt, halt_cpu},
     scheduler::info::{AtomicCpuId, TaskScheduleInfo},
 };
-#[cfg(feature = "kernelet-host")]
-use crate::kernelet::account::AdoptedTask;
+#[cfg(feature = "kernelet")]
+use crate::Error;
 use crate::{
     arch::task::TaskContext,
     irq::{DisabledLocalIrqGuard, InterruptLevel},
@@ -73,26 +65,26 @@ pub fn inject_post_schedule_handler(handler: fn()) {
     POST_SCHEDULE_HANDLER.call_once(|| handler);
 }
 
+/// Size of the `LinuxPtRegs` save area reserved at the top of each user Task's
+/// kernel stack (168 bytes rounded up to 16-byte stack alignment).
+#[cfg(feature = "kernelet")]
+pub(crate) const PT_REGS_SAVE_AREA_BYTES: usize =
+    size_of::<crate::arch::cpu::context::LinuxPtRegs>().next_multiple_of(16);
+
 /// Ends the current Task using the normal return-path cleanup.
 ///
 /// This never returns. The caller must release any owned resources on its
 /// stack before calling it, because the stack will be discarded after switching.
 pub(crate) fn exit_current_task() -> ! {
     #[cfg(feature = "kernelet")]
-    crate::mm::VmSpace::deactivate();
-
-    #[cfg(ktest)]
     {
-        let current_task = Task::current().expect("task exit requires a current Task");
-        let _ = current_task.accounting.detach(None);
-    }
-    #[cfg(feature = "kernelet-host")]
-    {
-        let current = Task::current().expect("task exit requires a current Task");
-        if let Some(adopted) = current.adopted_kernelet().take() {
-            drop(adopted);
+        crate::mm::VmSpace::deactivate();
+        let _irq_guard = crate::irq::disable_local();
+        if let Some(current) = Task::current() {
+            current.exiting.store(true, Ordering::Release);
         }
     }
+
     scheduler::exit_current();
 }
 
@@ -136,14 +128,13 @@ pub(crate) fn adopt_boot_task() {
         switched_to_cpu: AtomicBool::new(true),
         scheduling_in_progress: AtomicBool::new(false),
         virq_deferral_depth: AtomicU32::new(0),
-        completed_virq_batches: AtomicU64::new(0),
         active_vm_space: ForceSync::new(RefCell::new(None)),
+        is_user: false,
+        exiting: AtomicBool::new(false),
+        active_pt_regs: AtomicPtr::new(core::ptr::null_mut()),
         schedule_info: TaskScheduleInfo {
             cpu: AtomicCpuId::default(),
         },
-        accounting: accounting::TaskAccounting::new(),
-        #[cfg(kernelet_rq1_diagnostics)]
-        rq1_fpu_counters: crate::kernelet::fpu_profile::Counters::new(),
     });
     processor::adopt_current_boot_task(task);
 }
@@ -184,42 +175,27 @@ pub struct Task {
     #[cfg(feature = "kernelet")]
     virq_deferral_depth: AtomicU32,
 
-    /// Counts nonempty virtual-interrupt batches completed on this Task.
-    ///
-    /// This is Guest-local progress state, never shared with the Host. The
-    /// upcall advances it before its epilogue can switch Tasks. A pending
-    /// IRQ-on window can therefore finish after one batch, even if producers
-    /// leave more pending events. Only this Task accesses its counter.
-    #[cfg(feature = "kernelet")]
-    completed_virq_batches: AtomicU64,
-
     /// Retains the user space last activated by this Guest Task.
     #[cfg(feature = "kernelet")]
     active_vm_space: ForceSync<RefCell<Option<Arc<crate::mm::VmSpace>>>>,
 
+    /// Whether this Task executes user mode via `UserEventHandler`.
+    #[cfg(feature = "kernelet")]
+    is_user: bool,
+
+    /// Set once the Task enters `exit_current_task` so preemption cannot
+    /// re-establish `PT_REGS_OWNER` on it before exit completes.
+    #[cfg(feature = "kernelet")]
+    exiting: AtomicBool,
+
+    /// Live Host `pt_regs` pointer on the vCPU currently hosting this user Task.
+    #[cfg(feature = "kernelet")]
+    active_pt_regs: AtomicPtr<crate::arch::cpu::context::LinuxPtRegs>,
+
     schedule_info: TaskScheduleInfo,
-    #[cfg(feature = "kernelet-host")]
-    carrier_context: AtomicUsize,
-    #[cfg(feature = "kernelet-host")]
-    // Only CurrentTask methods in task context access this worker's ownership.
-    adopted_kernelet: ForceSync<Cell<Option<AdoptedTask>>>,
-    #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
-    accounting: accounting::TaskAccounting,
-    #[cfg(kernelet_rq1_diagnostics)]
-    rq1_fpu_counters:
-        crate::kernelet::fpu_profile::Counters<{ crate::kernelet::fpu_profile::EVENT_COUNT }>,
 }
 
 impl Task {
-    /// Diagnostic events owned by this Task; absent from ordinary builds.
-    #[cfg(kernelet_rq1_diagnostics)]
-    pub fn rq1_fpu_counters(
-        &self,
-    ) -> &crate::kernelet::fpu_profile::Counters<{ crate::kernelet::fpu_profile::EVENT_COUNT }>
-    {
-        &self.rq1_fpu_counters
-    }
-
     /// Settles a batch captured while this Task owned its vCPU's execution.
     /// IRQs must be off, and an outgoing Task must still be switched_to_cpu.
     #[cfg(feature = "kernelet")]
@@ -243,42 +219,6 @@ impl Task {
         }
     }
 
-    /// Attaches an account to this currently executing native Task.
-    #[cfg(ktest)]
-    pub(crate) fn attach_cpu_account(
-        &self,
-        account: Arc<dyn accounting::CpuTimeAccount>,
-    ) -> Result<()> {
-        if !Task::current().is_some_and(|task| core::ptr::eq(&*task, self)) {
-            return Err(crate::Error::InvalidArgs);
-        }
-        self.accounting.attach(account)
-    }
-
-    #[cfg(ktest)]
-    pub(crate) fn detach_cpu_account(&self, owner: usize) -> Result<()> {
-        debug_assert!(Task::current().is_some_and(|task| core::ptr::eq(&*task, self)));
-        self.accounting.detach(Some(owner))
-    }
-
-    /// Installs the calling Task's pinned carrier context, or clears it with zero.
-    ///
-    /// # Safety
-    /// The nonzero address must remain a live carrier context until this Task
-    /// clears it. The caller must hold physical IRQs disabled and own this Task.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) unsafe fn set_carrier_context(&self, address: usize) {
-        self.carrier_context.store(address, Ordering::Release);
-        // SAFETY: The caller supplies the Task-owned lifetime and IRQ exclusion.
-        unsafe {
-            if address == 0 {
-                crate::kernelet::host_run::clear_carrier_context();
-            } else {
-                crate::kernelet::host_run::restore_carrier_context(address);
-            }
-        };
-    }
-
     /// Gets the current task.
     ///
     /// It returns `None` in Native bootstrap or before Guest boot adopts its Task.
@@ -289,6 +229,16 @@ impl Task {
         Some(unsafe { CurrentTask::new(current_task) })
     }
 
+    /// Gets the current Task through an IRQ-pinned CPU-local access.
+    #[cfg(feature = "kernelet")]
+    pub(crate) fn current_with(
+        access: &crate::arch::cpu::local::CpuLocalAccess<'_>,
+    ) -> Option<CurrentTask> {
+        let current_task = processor::current_task_with(access)?;
+        // SAFETY: The borrowed IRQ guard pins the Task pointer during this lookup.
+        Some(unsafe { CurrentTask::new(current_task) })
+    }
+
     pub(super) fn ctx(&self) -> &SyncUnsafeCell<TaskContext> {
         &self.ctx
     }
@@ -296,6 +246,46 @@ impl Task {
     #[cfg(feature = "kernelet")]
     pub(super) fn is_boot_task(&self) -> bool {
         self.kstack.is_boot()
+    }
+
+    #[cfg(feature = "kernelet")]
+    pub(crate) fn is_user(&self) -> bool {
+        self.is_user
+    }
+
+    #[cfg(feature = "kernelet")]
+    pub(super) fn is_exiting(&self) -> bool {
+        self.exiting.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "kernelet")]
+    pub(super) fn event_rsp(&self) -> usize {
+        debug_assert!(self.is_user);
+        self.kstack.end_vaddr() - PT_REGS_SAVE_AREA_BYTES
+    }
+
+    #[cfg(feature = "kernelet")]
+    pub(super) fn pt_regs_save_area(&self) -> *mut crate::arch::cpu::context::LinuxPtRegs {
+        self.event_rsp() as *mut crate::arch::cpu::context::LinuxPtRegs
+    }
+
+    #[cfg(feature = "kernelet")]
+    pub(crate) fn active_pt_regs(&self) -> &AtomicPtr<crate::arch::cpu::context::LinuxPtRegs> {
+        &self.active_pt_regs
+    }
+
+    /// Returns the CPU-local section byte offset of `CURRENT_TASK_PTR`.
+    #[cfg(feature = "kernelet")]
+    #[inline(always)]
+    pub(crate) fn current_task_ptr_offset() -> usize {
+        processor::current_task_ptr_offset()
+    }
+
+    /// Returns the CPU-local section byte offset of `PREEMPT_INFO`.
+    #[cfg(feature = "kernelet")]
+    #[inline(always)]
+    pub(crate) fn preempt_info_offset() -> usize {
+        preempt::cpu_local::preempt_info_offset()
     }
 
     /// Returns whether we need to yield execution to another task.
@@ -440,20 +430,21 @@ impl Drop for VirtualIrqDeferral {
 
 /// Options to create or spawn a new task.
 pub struct TaskOptions {
-    func: Option<Box<dyn FnOnce() + Send>>,
+    entry: TaskEntry,
     data: Option<Box<dyn Any + Send + Sync>>,
     local_data: Option<Box<dyn Any + Send>>,
+}
+
+enum TaskEntry {
+    Kernel(Box<dyn FnOnce() + Send>),
+    #[cfg(feature = "kernelet")]
+    User(crate::arch::cpu::context::UserContext),
 }
 
 /// A fallibly reserved Task stack, owned until task construction or Drop.
 ///
 /// Reserve this before entering an infallible cyclic-owner constructor.
 pub struct PreparedTaskStack(KernelStack);
-
-#[cfg(feature = "kernelet-host")]
-pub(crate) const fn native_stack_reservation_bytes() -> usize {
-    kernel_stack::RESERVATION_BYTES
-}
 
 impl TaskOptions {
     /// Creates a set of options for a task.
@@ -462,18 +453,29 @@ impl TaskOptions {
         F: FnOnce() + Send + 'static,
     {
         Self {
-            func: Some(Box::new(func)),
+            entry: TaskEntry::Kernel(Box::new(func)),
             data: None,
             local_data: None,
         }
     }
 
-    /// Sets the function that represents the entry point of the task.
+    /// Creates a set of options for a kernelet user-mode task handled via
+    /// [`crate::user::UserEventHandler`].
+    #[cfg(feature = "kernelet")]
+    pub fn new_user(user_ctx: crate::arch::cpu::context::UserContext) -> Self {
+        Self {
+            entry: TaskEntry::User(user_ctx),
+            data: None,
+            local_data: None,
+        }
+    }
+
+    /// Replaces the task's entry point with a kernel function.
     pub fn func<F>(mut self, func: F) -> Self
     where
         F: Fn() + Send + 'static,
     {
-        self.func = Some(Box::new(func));
+        self.entry = TaskEntry::Kernel(Box::new(func));
         self
     }
 
@@ -496,8 +498,10 @@ impl TaskOptions {
     }
 
     /// Builds a new task without running it immediately.
+    /// Returns [`Error::InvalidArgs`] if user task data does not match the linked handler.
     pub fn build(self) -> Result<Task> {
-        Ok(self.build_with_stack(Self::prepare_stack()?))
+        self.validate()?;
+        Ok(self.build_validated(Self::prepare_stack()?))
     }
 
     /// Reserves the stack before publishing cyclic Task/Thread ownership.
@@ -506,7 +510,26 @@ impl TaskOptions {
     }
 
     /// Builds a dormant task using an already reserved stack.
-    pub fn build_with_stack(self, stack: PreparedTaskStack) -> Task {
+    /// Returns [`Error::InvalidArgs`] if user task data does not match the linked handler.
+    pub fn build_with_stack(self, stack: PreparedTaskStack) -> Result<Task> {
+        self.validate()?;
+        Ok(self.build_validated(stack))
+    }
+
+    fn validate(&self) -> Result<()> {
+        #[cfg(feature = "kernelet")]
+        if matches!(self.entry, TaskEntry::User(_))
+            && (self.data.as_ref().map(|data| (**data).type_id())
+                != Some(crate::user::user_event_handler_data_type_id())
+                || self.local_data.as_ref().map(|data| (**data).type_id())
+                    != Some(crate::user::user_event_handler_local_data_type_id()))
+        {
+            return Err(Error::InvalidArgs);
+        }
+        Ok(())
+    }
+
+    fn build_validated(self, stack: PreparedTaskStack) -> Task {
         // All tasks will enter this function. It is meant to execute the `task_fn` in `Task`.
         //
         // We provide an assembly wrapper for this function as the end of call stack so we
@@ -520,7 +543,14 @@ impl TaskOptions {
         unsafe extern "C" fn kernel_task_entry() -> ! {
             // SAFETY: The new task is switched on a CPU for the first time, `after_switching_to`
             // hasn't been called yet.
-            unsafe { processor::after_switching_to() };
+            #[cfg(feature = "kernelet")]
+            unsafe {
+                after_switching_to()
+            };
+            #[cfg(not(feature = "kernelet"))]
+            unsafe {
+                processor::after_switching_to()
+            };
 
             let current_task = Task::current()
                 .expect("no current task, it should have current task in kernel task entry");
@@ -544,31 +574,34 @@ impl TaskOptions {
 
         let kstack = stack.0;
 
+        #[cfg(feature = "kernelet")]
+        let is_user = matches!(self.entry, TaskEntry::User(_));
         let mut ctx = TaskContext::new();
-        ctx.set_instruction_pointer(
-            crate::arch::task::kernel_task_entry_wrapper as *const () as usize,
-        );
-        // We should reserve space for the return address in the stack, otherwise
-        // we will write across the page boundary due to the implementation of
-        // the context switch.
-        //
-        // According to the System V AMD64 ABI, the stack pointer should be aligned
-        // to at least 16 bytes. A larger alignment is needed if larger arguments
-        // are passed to the function, which is not the case for the
-        // `kernel_task_entry` function because it does not have any arguments. So
-        // we only need to align the stack pointer to 16 bytes.
-        ctx.set_stack_pointer(kstack.end_vaddr() - 16);
+        let func = match self.entry {
+            TaskEntry::Kernel(func) => {
+                ctx.set_instruction_pointer(
+                    crate::arch::task::kernel_task_entry_wrapper as *const () as usize,
+                );
+                // Reserve the return address and maintain the ABI's 16-byte alignment.
+                ctx.set_stack_pointer(kstack.end_vaddr() - 16);
+                Some(func)
+            }
+            #[cfg(feature = "kernelet")]
+            TaskEntry::User(user_ctx) => {
+                let event_rsp = kstack.end_vaddr() - PT_REGS_SAVE_AREA_BYTES;
+                let save_area = event_rsp as *mut crate::arch::cpu::context::LinuxPtRegs;
+                // SAFETY: This reserved area belongs to the dormant task's stack.
+                unsafe { save_area.write(user_ctx.into_sanitized_pt_regs()) };
+                ctx.set_instruction_pointer(
+                    crate::arch::task::first_user_task_entry_wrapper as *const () as usize,
+                );
+                ctx.set_stack_pointer(event_rsp - 16);
+                None
+            }
+        };
 
-        let new_task = Task {
-            #[cfg(feature = "kernelet-host")]
-            carrier_context: AtomicUsize::new(0),
-            #[cfg(feature = "kernelet-host")]
-            adopted_kernelet: ForceSync::new(Cell::new(None)),
-            #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
-            accounting: accounting::TaskAccounting::new(),
-            #[cfg(kernelet_rq1_diagnostics)]
-            rq1_fpu_counters: crate::kernelet::fpu_profile::Counters::new(),
-            func: ForceSync::new(Cell::new(self.func)),
+        Task {
+            func: ForceSync::new(Cell::new(func)),
             data: self.data.unwrap_or_else(|| Box::new(())),
             local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),
             ctx: SyncUnsafeCell::new(ctx),
@@ -578,15 +611,17 @@ impl TaskOptions {
             #[cfg(feature = "kernelet")]
             virq_deferral_depth: AtomicU32::new(0),
             #[cfg(feature = "kernelet")]
-            completed_virq_batches: AtomicU64::new(0),
-            #[cfg(feature = "kernelet")]
             active_vm_space: ForceSync::new(RefCell::new(None)),
+            #[cfg(feature = "kernelet")]
+            is_user,
+            #[cfg(feature = "kernelet")]
+            exiting: AtomicBool::new(false),
+            #[cfg(feature = "kernelet")]
+            active_pt_regs: AtomicPtr::new(core::ptr::null_mut()),
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },
-        };
-
-        new_task
+        }
     }
 
     /// Builds a new task and runs it immediately.
@@ -613,45 +648,6 @@ impl !Send for CurrentTask {}
 impl !Sync for CurrentTask {}
 
 impl CurrentTask {
-    #[cfg(feature = "kernelet-host")]
-    #[inline]
-    fn adopted_kernelet(&self) -> &Cell<Option<AdoptedTask>> {
-        assert!(InterruptLevel::current().is_task_context());
-
-        // SAFETY: CurrentTask cannot be sent to another Task, and the scheduler
-        // runs a Task on only one CPU at a time. Only these methods and this
-        // Task's exit cleanup access the cell; IRQ handlers are excluded above.
-        unsafe { self.adopted_kernelet.get() }
-    }
-
-    /// Retains an instance on this Host worker without CPU accounting.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn adopt_kernelet(&self, owner: AdoptedTask) -> Result<()> {
-        let adopted = self.adopted_kernelet();
-        if let Some(previous) = adopted.replace(Some(owner)) {
-            // Restore the live owner before refunding the rejected reservation.
-            drop(adopted.replace(Some(previous)));
-            return Err(crate::Error::InvalidArgs);
-        }
-        Ok(())
-    }
-
-    /// Releases this Host worker's matching instance reference.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn disown_kernelet(&self, owner: usize) -> Result<()> {
-        let adopted = self.adopted_kernelet();
-        let Some(previous) = adopted.take() else {
-            return Err(crate::Error::AccessDenied);
-        };
-        if previous.owner() != owner {
-            adopted.set(Some(previous));
-            return Err(crate::Error::AccessDenied);
-        }
-        // The cell is empty before Drop can wake the instance reaper.
-        drop(previous);
-        Ok(())
-    }
-
     /// Settles this Task's physical tick samples before publishing an exit.
     ///
     /// Only explicit-owner accounting callbacks run. No global timer callback
@@ -665,36 +661,6 @@ impl CurrentTask {
         self.account_sampled_ticks(batch);
     }
 
-    /// Returns this Task's local virtual-interrupt progress epoch.
-    #[cfg(feature = "kernelet")]
-    pub(crate) fn completed_virq_batches(&self) -> u64 {
-        self.completed_virq_batches.load(Ordering::Relaxed)
-    }
-
-    /// Records a nonempty batch after its callbacks and before its epilogue.
-    ///
-    /// The original Task owns this continuation across any context switch;
-    /// another Task cannot advance this counter on its behalf. Relaxed order
-    /// suffices because the same Task reads and updates its own progress.
-    #[cfg(feature = "kernelet")]
-    pub(crate) fn complete_virq_batch(&self) {
-        self.completed_virq_batches.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cfg(feature = "kernelet")]
-    pub(crate) fn active_vm_space_matches(
-        &self,
-        space: &Arc<crate::mm::VmSpace>,
-        _irq_guard: &DisabledLocalIrqGuard,
-    ) -> bool {
-        // SAFETY: Only the current Task accesses this cache. Masking virtual
-        // IRQs excludes Guest upcalls, and a Task executes on only one CPU.
-        unsafe { self.active_vm_space.get() }
-            .borrow()
-            .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(active, space))
-    }
-
     #[cfg(feature = "kernelet")]
     pub(crate) fn replace_active_vm_space(
         &self,
@@ -706,18 +672,38 @@ impl CurrentTask {
         unsafe { self.active_vm_space.get() }.replace(space)
     }
 
-    /// Begins measuring execution accounted by this Task's scheduler,
-    /// excluding time spent asleep or running other Tasks.
-    #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
-    pub fn measure_cpu_time(&self) -> CpuTimeMeasurement {
-        CpuTimeMeasurement::start(self.cloned())
-    }
-
     /// # Safety
     ///
     /// The caller must ensure that `task` is the current task.
     unsafe fn new(task: NonNull<Task>) -> Self {
         Self(task)
+    }
+
+    /// Wraps an already-validated current-task pointer without cloning.
+    ///
+    /// # Safety
+    ///
+    /// `task` must be the current task executing on this CPU.
+    #[cfg(feature = "kernelet")]
+    #[inline(always)]
+    pub(crate) unsafe fn from_raw(task: NonNull<Task>) -> Self {
+        Self(task)
+    }
+
+    /// Returns the local data of the current task without rechecking interrupt level.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be executing in task context on this `CurrentTask`.
+    #[cfg(feature = "kernelet")]
+    #[inline(always)]
+    pub(crate) unsafe fn local_data_unchecked(&self) -> &(dyn Any + Send) {
+        debug_assert!(InterruptLevel::current().is_task_context());
+
+        let local_data = &self.local_data;
+
+        // SAFETY: Caller guarantees task context, so `local_data` is exclusive to this task.
+        &**unsafe { local_data.get() }
     }
 
     /// Returns the local data of the current task.

@@ -11,8 +11,5 @@ aster-util.workspace = true
 bitvec.workspace = true
 ostd.workspace = true
 
-[features]
-kernelet-host = []
-
 [lints]
 workspace = true

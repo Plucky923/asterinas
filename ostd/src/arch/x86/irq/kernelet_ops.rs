@@ -4,71 +4,48 @@
 
 use core::sync::atomic::Ordering;
 
-use crate::kernelet::{
-    abi::{STATE, STOP_PANIC},
-    entry,
-};
+use crate::kernelet::entry;
 
 pub(crate) fn enable_local() {
-    set_local_mask(false);
+    let pending: u64;
+    // SAFETY: Unmasking and the pending read share one protected lookup.
+    // The memory-clobbering asm implements the original Release store and
+    // Acquire load with x86's ordinary scalar instructions.
+    unsafe {
+        crate::arch::cpu::local::record_asm!(
+            "mov dword ptr [{record_base} + {irq_offset}], 0",
+            "mov {pending}, qword ptr [{record_base} + {pending_offset}]";
+            pending = out(reg) pending,
+            irq_offset = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, irq_off),
+            pending_offset = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, pending),
+            options(nostack),
+        );
+    }
     // A local wake can request preemption without publishing a pending IRQ.
     // When neither action is needed, avoid all Task/context gate lookups.
-    if entry::vcpu_record().pending.load(Ordering::Acquire) == 0
-        && !crate::task::scheduler::should_preempt()
-    {
+    if pending == 0 && !crate::task::scheduler::should_preempt() {
         return;
     }
+    finish_enable_local_slow();
+}
+
+/// Slow continuation after unmasking virtual IRQs when `pending != 0` or a
+/// scheduler preemption may be due.
+#[cold]
+#[inline(never)]
+pub(crate) fn finish_enable_local_slow() {
     if !can_receive_virtual_interrupts() {
         // Bootstrap must finish installing its idle Task. A scheduling
         // transition or upcall epilogue must finish before another upcall.
         return;
     }
     crate::task::scheduler::might_preempt();
-    if entry::vcpu_record().pending.load(Ordering::Acquire) == 0 {
+    if entry::vcpu_record().pending.load(Ordering::Acquire) == 0
+        || entry::copy_fault_record().pending.load(Ordering::Acquire) != 0
+    {
         return;
     }
-    // Only the pending slow path reads Task-local progress. This borrowed
-    // current Task remains this continuation's owner if an upcall migrates it.
-    let Some(task) = crate::task::Task::current() else {
-        return;
-    };
-    let completed = task.completed_virq_batches();
-    let mut kicked_vcpu = None;
-    #[cfg(kernelet_getpid_profile)]
-    let mut window_started = false;
-    #[cfg(kernelet_getpid_profile)]
-    let mut _window_span = None;
-    while task.completed_virq_batches() == completed {
-        // One completed batch is enough even if producers keep pending
-        // nonzero. An upcall can migrate this Task: reload every CPU gate.
-        if entry::vcpu_record().pending.load(Ordering::Acquire) == 0
-            || !can_receive_virtual_interrupts()
-            || entry::copy_fault_record().pending.load(Ordering::Acquire) != 0
-        {
-            // A user-copy fault must be consumed by its recovery path before
-            // the Host can redirect another virtual interrupt.
-            return;
-        }
-        #[cfg(kernelet_getpid_profile)]
-        if !window_started {
-            use crate::kernelet::getpid_profile as profile;
-            window_started = true;
-            profile::event(profile::event_id::VIRQ_WINDOW);
-            _window_span = profile::span(profile::stage::GUEST_VIRQ_WINDOW);
-        }
-        let vcpu = entry::vcpu_record().vcpu;
-        if kicked_vcpu != Some(vcpu) {
-            // Request one physical doorbell through the existing service.
-            // Its common STI; RET enables physical IRQ delivery only after
-            // returning to Guest code; the trap-return hook is the consumer.
-            // If this Task resumed on another vCPU, kick that carrier once.
-            kicked_vcpu = Some(vcpu);
-            let result = (entry::services().vcpu_kick)(vcpu);
-            assert_eq!(result, 0, "failed to kick a pending virtual interrupt");
-        } else {
-            core::hint::spin_loop();
-        }
-    }
+    let _ = entry::deliver_pending();
 }
 
 #[inline]
@@ -82,6 +59,101 @@ fn can_receive_virtual_interrupts() -> bool {
 
 pub(crate) fn disable_local() {
     set_local_mask(true);
+}
+
+/// Saves the current mask and disables virtual IRQs in one protected access.
+pub(crate) fn disable_local_save() -> bool {
+    let mask: u32;
+    // SAFETY: The mask read and conditional Release store cannot be separated
+    // by an image upcall. Native carrier preemption preserves the selected vCPU.
+    unsafe {
+        crate::arch::cpu::local::record_asm!(
+            "mov {mask:e}, dword ptr [{record_base} + {irq_offset}]",
+            "test {mask:e}, {mask:e}",
+            "jnz 4f",
+            "mov dword ptr [{record_base} + {irq_offset}], 1",
+            "4:";
+            mask = out(reg) mask,
+            irq_offset = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, irq_off),
+            options(nostack),
+        );
+    }
+    mask == 0
+}
+
+/// Disables virtual IRQs and reads `(was_enabled, guards)` in one
+/// nonredirectable `.text.kernelet_cpu_access` sequence.
+pub(crate) fn disable_local_save_with_guards() -> (bool, u32) {
+    let mask: u32;
+    let guards: u32;
+    // SAFETY: Reading `irq_off`, reading `guards`, and masking `irq_off = 1`
+    // cannot be separated by an image upcall.
+    unsafe {
+        crate::arch::cpu::local::record_asm!(
+            "mov {mask:e}, dword ptr [{record_base} + {irq_offset}]",
+            "mov {guards:e}, dword ptr [{record_base} + {guards_offset}]",
+            "mov dword ptr [{record_base} + {irq_offset}], 1";
+            mask = out(reg) mask,
+            guards = out(reg) guards,
+            irq_offset = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, irq_off),
+            guards_offset = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, guards),
+            options(nostack),
+        );
+    }
+    (mask == 0, guards)
+}
+
+/// Fast user-return exit check: reads `PREEMPT_INFO` and, when no preemption
+/// is needed (`preempt_info != 0`), masks virtual IRQs and reads `(was_enabled, guards)`
+/// in a single `.text.kernelet_cpu_access` sequence.
+#[inline(always)]
+pub(crate) fn try_disable_with_guards_if_no_preempt(
+    preempt_info_off: usize,
+) -> Option<(bool, u32)> {
+    let mut preempt = preempt_info_off;
+    let mask: u32;
+    let guards: usize;
+    // SAFETY: Checking `PREEMPT_INFO != 0`, reading `irq_off`/`guards`, and
+    // writing `irq_off = 1` execute together inside `.text.kernelet_cpu_access`.
+    unsafe {
+        core::arch::asm!(
+            "jmp 2f",
+            ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
+            "2:",
+            "lea {vrec}, [rip + {fast_cpu}]",
+            "mov {slot}, qword ptr [{vrec} + {slot_gs_off}]",
+            "movzx {slot:e}, word ptr gs:[{slot} + 2]",
+            "mov {guards}, qword ptr [{vrec} + {slot} * 8 + {local_bases_off}]",
+            "mov {preempt:e}, dword ptr [{guards} + {preempt}]",
+            "test {preempt:e}, {preempt:e}",
+            "jz 4f",
+            "mov {vrec}, qword ptr [{vrec} + {slot} * 8 + {record_ptrs_off}]",
+            "mov {mask:e}, dword ptr [{vrec} + {irq_off}]",
+            "mov {guards:e}, dword ptr [{vrec} + {guards_off}]",
+            "mov dword ptr [{vrec} + {irq_off}], 1",
+            "4:",
+            "jmp 3f",
+            ".popsection",
+            "3:",
+            vrec = out(reg) _,
+            slot = out(reg) _,
+            preempt = inout(reg) preempt,
+            mask = out(reg) mask,
+            guards = out(reg) guards,
+            fast_cpu = sym entry::KERNELET_FAST_CPU,
+            slot_gs_off = const core::mem::offset_of!(entry::FastCpuTable, slot_gs_offset),
+            local_bases_off = const core::mem::offset_of!(entry::FastCpuTable, local_bases),
+            record_ptrs_off = const core::mem::offset_of!(entry::FastCpuTable, record_ptrs),
+            irq_off = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, irq_off),
+            guards_off = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, guards),
+            options(nostack),
+        );
+    }
+    if preempt as u32 != 0 {
+        Some((mask == 0, guards as u32))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn is_local_enabled() -> bool {
@@ -111,15 +183,4 @@ fn set_local_mask(disabled: bool) {
             options(nostack),
         );
     }
-}
-
-pub(crate) fn disable_local_and_halt() -> ! {
-    disable_local();
-    const MESSAGE: &[u8] = b"virtual CPU halted";
-    (entry::services().stop)(
-        STOP_PANIC,
-        STATE as u32,
-        MESSAGE.as_ptr(),
-        MESSAGE.len() as u32,
-    )
 }

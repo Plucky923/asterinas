@@ -416,7 +416,7 @@ pub struct CommonArgs {
     pub strip_elf: bool,
     #[arg(
         long,
-        help = "Build and embed a kernelet image alongside the host kernel",
+        help = "Build and audit a standalone kernelet image",
         global = true
     )]
     pub kernelet: bool,

@@ -38,11 +38,7 @@ pub(in crate::net) fn init() {
         // to ensure the loopback interface index is ahead of virtio.
         ifaces.push(new_loopback());
 
-        #[cfg(feature = "kernelet")]
-        let shared = new_shared();
-        #[cfg(not(feature = "kernelet"))]
-        let shared = None;
-        if let Some(iface_virtio) = shared.or_else(new_virtio) {
+        if let Some(iface_virtio) = new_virtio() {
             ifaces.push(iface_virtio);
         }
 
@@ -51,17 +47,8 @@ pub(in crate::net) fn init() {
 
     if let Some(iface_virtio) = virtio_iface() {
         let callback = || iface_virtio.poll();
-        #[cfg(feature = "kernelet")]
-        let device_name =
-            if aster_network::get_device(crate::net::device::shared::DEVICE_NAME).is_some() {
-                crate::net::device::shared::DEVICE_NAME
-            } else {
-                VIRTIO_DEVICE_NAME
-            };
-        #[cfg(not(feature = "kernelet"))]
-        let device_name = VIRTIO_DEVICE_NAME;
-        aster_network::register_recv_callback(device_name, callback);
-        aster_network::register_send_callback(device_name, callback);
+        aster_network::register_recv_callback(VIRTIO_DEVICE_NAME, callback);
+        aster_network::register_send_callback(VIRTIO_DEVICE_NAME, callback);
     }
 
     poll_ifaces();
@@ -126,36 +113,12 @@ fn new_virtio() -> Option<Arc<Iface>> {
     new_ether::<aster_virtio::device::network::device::NetworkDevice>(VIRTIO_DEVICE_NAME)
 }
 
-#[cfg(feature = "kernelet")]
-fn new_shared() -> Option<Arc<Iface>> {
-    use crate::net::device::shared::{DEVICE_NAME, SharedNetworkDevice};
-
-    if !SharedNetworkDevice::init()
-        .expect("startup-selected shared Ethernet device must initialize")
-    {
-        return None;
-    }
-    new_ether::<SharedNetworkDevice>(DEVICE_NAME)
-}
-
 fn new_ether<D: AnyNetworkDevice>(device_name: &str) -> Option<Arc<Iface>> {
     use aster_bigtcp::{
         iface::EtherIface,
         wire::{Ipv4Address, Ipv4Cidr},
     };
 
-    // Benchmark Hosts use .16 so images can address Host port mappings.
-    // The explicit network flag also supports builds without timing probes.
-    // Images and unconfigured Hosts keep the normal .15 address.
-    #[cfg(all(
-        any(kernelet_rq1, kernelet_bench_host_network),
-        not(feature = "kernelet")
-    ))]
-    const VIRTIO_ADDRESS: Ipv4Address = Ipv4Address::new(10, 0, 2, 16);
-    #[cfg(not(all(
-        any(kernelet_rq1, kernelet_bench_host_network),
-        not(feature = "kernelet")
-    )))]
     const VIRTIO_ADDRESS: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
     const VIRTIO_ADDRESS_PREFIX_LEN: u8 = 24; // mask: 255.255.255.0
     const VIRTIO_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);

@@ -8,9 +8,11 @@ use core::{
 };
 
 use aster_systree::{Error, Result, SysAttrSetBuilder, SysBranchNode, SysObj};
+use aster_util::printer::VmPrinter;
 use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
 use bitflags::bitflags;
 use ostd::{
+    cpu::{CpuSet, all_cpus},
     mm::{VmReader, VmWriter},
     sync::Rcu,
 };
@@ -302,6 +304,19 @@ impl Controller {
             return Err(Error::IsDead);
         };
 
+        if name == "cpuset.cpus.effective" {
+            let effective = self.effective_cpus();
+            let mut printer = VmPrinter::new_skip(writer, offset);
+            self.cpuset
+                .read()
+                .get()
+                .inner
+                .as_ref()
+                .ok_or(Error::IsDead)?
+                .write_cpu_list(&mut printer, &effective)?;
+            return Ok(printer.bytes_written());
+        }
+
         controller.read_attr_at(name, offset, writer)
     }
 
@@ -519,6 +534,42 @@ impl Controller {
         let guard = self.pids.read();
         let sub = guard.get();
         sub.uncharge_hierarchy();
+    }
+
+    /// Returns the effective `cpuset.cpus` mask intersected with all ancestors.
+    pub(crate) fn effective_cpus(&self) -> CpuSet {
+        let mut effective = CpuSet::new_full();
+        let guard = self.cpuset.read();
+        let mut current = Some(guard.get().clone());
+        while let Some(sub) = current {
+            if let Some(inner) = sub.inner.as_ref() {
+                let configured = inner.configured_cpus();
+                effective = cpuset::intersect_cpu_sets(&effective, &configured);
+            }
+            current = sub.parent.clone();
+        }
+        effective
+    }
+
+    /// Records an attempted out-of-cpuset affinity change.
+    pub(crate) fn record_cpuset_violation(&self) {
+        let guard = self.cpuset.read();
+        if let Some(inner) = guard.get().inner.as_ref() {
+            inner.record_violation();
+        }
+    }
+
+    /// Clamps `requested` against `effective_cpus()`, returning `(clamped, had_violation)`
+    /// or `None` when the intersection is empty.
+    pub(crate) fn clamp_cpu_set(&self, requested: &CpuSet) -> Option<(CpuSet, bool)> {
+        let effective = self.effective_cpus();
+        let clamped = cpuset::intersect_cpu_sets(requested, &effective);
+        let had_violation = all_cpus().any(|cpu| requested.contains(cpu) && !effective.contains(cpu));
+        if clamped.is_empty() {
+            None
+        } else {
+            Some((clamped, had_violation))
+        }
     }
 }
 

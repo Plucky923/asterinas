@@ -8,16 +8,16 @@
 //! the page table cursor, providing efficient, powerful concurrent accesses
 //! to the page table.
 
-#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
-use core::sync::atomic::AtomicBool;
 use core::{ops::Range, sync::atomic::Ordering};
 
 use super::{AnyUFrameMeta, PagingLevel, page_table::PageTableConfig};
 #[cfg(not(feature = "kernelet"))]
+use crate::arch::mm::current_page_table_paddr;
+#[cfg(not(feature = "kernelet"))]
 use crate::mm::kspace::KERNEL_PAGE_TABLE;
 use crate::{
     Error,
-    arch::mm::{PageTableEntry, PagingConsts, current_page_table_paddr},
+    arch::mm::{PageTableEntry, PagingConsts},
     cpu::{AtomicCpuSet, CpuSet, PinCurrentCpu},
     cpu_local_cell,
     io::IoMem,
@@ -55,7 +55,7 @@ use crate::{
 ///
 /// If the kernel otherwise decides not to ensure that the running task's `VmSpace` is always
 /// activated, the kernel must deal with race conditions when calling methods that require the
-/// `VmSpace` to be activated, e.g., [`UserMode::execute`], [`VmSpace::reader`],
+/// `VmSpace` to be activated, e.g., user-mode execution, [`VmSpace::reader`],
 /// [`VmSpace::writer`]. Otherwise, the behavior is unspecified, though it's guaranteed _not_ to
 /// compromise the kernel's memory safety.
 ///
@@ -69,330 +69,96 @@ use crate::{
 /// handle page faults generated from user space.
 ///
 /// [`inject_post_schedule_handler`]: crate::task::inject_post_schedule_handler
-/// [`UserMode::execute`]: crate::user::UserMode::execute
 #[derive(Debug)]
 pub struct VmSpace {
-    #[cfg(feature = "kernelet-host")]
-    pt: Option<PageTable<UserPtConfig>>,
-    #[cfg(not(feature = "kernelet-host"))]
-    pt: PageTable<UserPtConfig>,
-    #[cfg(feature = "kernelet-host")]
-    activation: Option<RootActivation>,
+    #[cfg(feature = "kernelet")]
+    resources: RcuDrop<VmResources>,
+    #[cfg(not(feature = "kernelet"))]
+    resources: VmResources,
     cpus: AtomicCpuSet,
+}
+
+// Page tables and I/O mappings remain owned until both RCU domains are clear.
+#[derive(Debug)]
+struct VmResources {
+    pt: PageTable<UserPtConfig>,
     iomems: SpinLock<Vec<IoMem>>,
     #[cfg(feature = "kernelet")]
-    registered: AtomicBool,
-}
-
-#[cfg(feature = "kernelet-host")]
-#[derive(Debug)]
-struct RootActivation {
-    root: SpinLock<Option<Arc<RegisteredPageTable>>, crate::sync::LocalIrqDisabled>,
-    restore: AtomicBool,
-}
-
-/// A validated root. No Host page-table walker may inspect its tenant frames.
-#[cfg(feature = "kernelet-host")]
-#[derive(Debug)]
-pub(crate) struct RegisteredPageTable {
-    paddr: Paddr,
-    state: SpinLock<RegisteredRootState, crate::sync::LocalIrqDisabled>,
-    #[cfg(ktest)]
-    last_direct_activation_from: core::sync::atomic::AtomicUsize,
-    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-    diagnostic_id: Option<u64>,
-}
-
-/// One root generation and its active physical CPU snapshot.
-#[cfg(feature = "kernelet-host")]
-pub(crate) struct RootShootdown {
-    pub(crate) active: CpuSet,
-    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-    pub(crate) root_id: Option<u64>,
-    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-    pub(crate) generation: u64,
-}
-
-#[cfg(feature = "kernelet-host")]
-#[derive(Debug)]
-struct RegisteredRootState {
-    valid: bool,
-    active: CpuSet,
-    generation: u64,
-    seen_generation: Vec<u64>,
-}
-
-#[cfg(feature = "kernelet-host")]
-impl RegisteredPageTable {
-    /// The caller must retain the validated root's grant until invalidation.
-    pub(crate) fn new(paddr: Paddr) -> Option<Arc<Self>> {
-        let mut seen_generation = Vec::new();
-        seen_generation
-            .try_reserve_exact(crate::cpu::num_cpus())
-            .ok()?;
-        seen_generation.resize(crate::cpu::num_cpus(), 0);
-        Some(Arc::new(Self {
-            paddr,
-            #[cfg(ktest)]
-            last_direct_activation_from: core::sync::atomic::AtomicUsize::new(0),
-            #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-            diagnostic_id: crate::kernelet::tlb_profile::next_root_id(),
-            state: SpinLock::new(RegisteredRootState {
-                valid: true,
-                active: CpuSet::new_empty(),
-                generation: 0,
-                seen_generation,
-            }),
-        }))
-    }
-
-    fn reserve(&self, cpu: crate::cpu::CpuId) -> bool {
-        let mut state = self.state.lock();
-        if !state.valid {
-            return false;
-        }
-        let generation = state.generation;
-        if state.seen_generation[u32::from(cpu) as usize] != generation {
-            #[cfg(all(kernelet_getpid_profile, target_arch = "x86_64"))]
-            crate::kernelet::getpid_profile::event(
-                crate::kernelet::getpid_profile::event_id::ROOT_GENERATION_FLUSH,
-            );
-            crate::arch::mm::tlb_flush_all_excluding_global();
-        }
-        state.seen_generation[u32::from(cpu) as usize] = generation;
-        state.active.add(cpu);
-        true
-    }
-
-    fn activate(&self, cpu: crate::cpu::CpuId) -> bool {
-        let mut state = self.state.lock();
-        if !state.valid {
-            return false;
-        }
-        // Holding this lock through CR3 excludes a missed shootdown snapshot.
-        // Every restoration flushes non-global entries, including generations
-        // published while this CPU was absent from the active set.
-        // SAFETY: The registry validated the shared kernel half and retains
-        // the grant until this token is invalidated with no active CPUs.
-        unsafe { crate::arch::mm::activate_page_table(self.paddr) };
-        #[cfg(all(kernelet_getpid_profile, target_arch = "x86_64"))]
-        crate::kernelet::getpid_profile::event(
-            crate::kernelet::getpid_profile::event_id::CR3_WRITE,
-        );
-        let generation = state.generation;
-        state.seen_generation[u32::from(cpu) as usize] = generation;
-        state.active.add(cpu);
-        true
-    }
-
-    fn leave(&self, cpu: crate::cpu::CpuId) {
-        self.state.lock().active.remove(cpu);
-    }
-
-    pub(crate) fn is_active(&self) -> bool {
-        !self.state.lock().active.is_empty()
-    }
-
-    #[cfg(ktest)]
-    pub(crate) fn is_active_on(&self, cpu: crate::cpu::CpuId) -> bool {
-        self.state.lock().active.contains(cpu)
-    }
-
-    #[cfg(ktest)]
-    pub(crate) fn last_direct_activation_from(&self) -> Paddr {
-        self.last_direct_activation_from.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn begin_shootdown(&self) -> Option<RootShootdown> {
-        let mut state = self.state.lock();
-        state.generation = state.generation.checked_add(1)?;
-        Some(RootShootdown {
-            active: state.active.clone(),
-            #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-            root_id: self.diagnostic_id,
-            #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
-            generation: state.generation,
-        })
-    }
-
-    pub(crate) fn invalidate(&self) {
-        let mut state = self.state.lock();
-        assert!(
-            state.active.is_empty(),
-            "retiring an active registered root"
-        );
-        state.valid = false;
-    }
+    linux_pgd_paddr: Paddr,
 }
 
 #[cfg(feature = "kernelet")]
-impl Drop for VmSpace {
+impl Drop for VmResources {
     fn drop(&mut self) {
-        if self.registered.load(Ordering::Acquire) {
-            let result = (crate::kernelet::entry::services().pt_root_unregister)(
-                self.page_table().unwrap().root_paddr() as u64,
-            );
-            assert_eq!(
-                result, 0,
-                "Host refused to unregister a user page-table root"
-            );
-        }
+        // Kernelet RCU callbacks run in sleepable task context. The Host must
+        // finish its readers before Rust releases the lower-level page tables.
+        let result =
+            (crate::kernelet::entry::services().pt_root_unregister)(self.linux_pgd_paddr as u64);
+        assert_eq!(
+            result, 0,
+            "Host refused to unregister a user page-table root"
+        );
     }
 }
 
 impl VmSpace {
     /// Creates a new VM address space.
     pub fn new() -> Self {
-        Self {
-            #[cfg(feature = "kernelet-host")]
-            pt: Some(KERNEL_PAGE_TABLE.get().unwrap().create_user_page_table()),
-            #[cfg(not(any(feature = "kernelet", feature = "kernelet-host")))]
-            pt: KERNEL_PAGE_TABLE.get().unwrap().create_user_page_table(),
-            #[cfg(feature = "kernelet")]
-            pt: PageTable::new_kernelet_user_page_table(),
-            #[cfg(feature = "kernelet-host")]
-            activation: None,
-            cpus: AtomicCpuSet::new(CpuSet::new_empty()),
-            iomems: SpinLock::new(Vec::new()),
-            #[cfg(feature = "kernelet")]
-            registered: AtomicBool::new(false),
-        }
-    }
-
-    fn page_table(&self) -> Result<&PageTable<UserPtConfig>> {
-        #[cfg(feature = "kernelet-host")]
+        #[cfg(feature = "kernelet")]
         {
-            self.pt.as_ref().ok_or(Error::AccessDenied)
-        }
-        #[cfg(not(feature = "kernelet-host"))]
-        {
-            Ok(&self.pt)
-        }
-    }
-
-    /// Creates a carrier address space that can only activate validated roots.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn new_activation_only() -> Self {
-        Self {
-            pt: None,
-            activation: Some(RootActivation {
-                root: SpinLock::new(None),
-                restore: AtomicBool::new(false),
-            }),
-            cpus: AtomicCpuSet::new(CpuSet::new_empty()),
-            iomems: SpinLock::new(Vec::new()),
-        }
-    }
-
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn set_registered_root(&self, root: Option<Arc<RegisteredPageTable>>) {
-        let activation = self.activation.as_ref().unwrap();
-        debug_assert!(self.cpus.load(Ordering::Relaxed).is_empty());
-        *activation.root.lock() = root;
-    }
-
-    /// Commits a carrier's new root before releasing its old active reservation.
-    ///
-    /// The caller retains the registry lock and the roots' grants throughout
-    /// this synchronous operation. Its IRQ guard excludes native scheduling
-    /// until the carrier's desired-root identity has also been updated.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn activate_registered_root(
-        self: &Arc<Self>,
-        root: Arc<RegisteredPageTable>,
-        irq_guard: &crate::irq::DisabledLocalIrqGuard,
-    ) -> bool {
-        let Some(activation) = self.activation.as_ref() else {
-            return false;
-        };
-        let current = ACTIVATED_VM_SPACE.load();
-        if !current.is_null() && current != Arc::as_ptr(self) {
-            // Carrier entry and pause must release any native address space.
-            // Reject an unexpected owner without changing its root or references.
-            return false;
-        }
-        let cpu = irq_guard.current_cpu();
-        let was_active = current == Arc::as_ptr(self);
-        let mut selected = activation.root.lock();
-        // Keep the old token and active CPU bit until the new CR3 is installed.
-        // activate() serializes validation, CR3 and the new active bit against
-        // shootdown. Failure leaves all old hardware and software state intact.
-        #[cfg(ktest)]
-        let from = current_page_table_paddr();
-        if !root.activate(cpu) {
-            return false;
-        }
-        #[cfg(ktest)]
-        root.last_direct_activation_from
-            .store(from, Ordering::Relaxed);
-        let previous = selected.replace(root);
-        self.record_activation(cpu);
-        activation.restore.store(true, Ordering::Release);
-        if was_active {
-            if let Some(previous) = previous {
-                // Re-selecting the same token must retain its new reservation.
-                if !Arc::ptr_eq(&previous, selected.as_ref().unwrap()) {
-                    previous.leave(cpu);
-                }
+            let boot = crate::kernelet::entry::boot_args();
+            let pgd = (crate::kernelet::entry::services().pt_root_register)(0);
+            if pgd <= 0 {
+                crate::kernelet::entry::stop_panic(format_args!(
+                    "Host refused to allocate a Linux user page-table root: {pgd}"
+                ));
+            }
+            let linux_pgd_paddr = pgd as Paddr;
+            let pt = PageTable::new_kernelet_user_page_table();
+            if boot.pt_mode == 0 {
+                pt.set_linux_pgd_paddr(linux_pgd_paddr);
+            }
+            Self {
+                resources: RcuDrop::new(VmResources {
+                    pt,
+                    iomems: SpinLock::new(Vec::new()),
+                    linux_pgd_paddr,
+                }),
+                cpus: AtomicCpuSet::new(CpuSet::new_empty()),
             }
         }
-        true
+        #[cfg(not(feature = "kernelet"))]
+        Self {
+            resources: VmResources {
+                pt: KERNEL_PAGE_TABLE.get().unwrap().create_user_page_table(),
+                iomems: SpinLock::new(Vec::new()),
+            },
+            cpus: AtomicCpuSet::new(CpuSet::new_empty()),
+        }
     }
 
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn set_root_restore(&self, restore: bool) {
-        self.activation
-            .as_ref()
-            .unwrap()
-            .restore
-            .store(restore, Ordering::Release);
+    #[cfg(feature = "kernelet")]
+    pub(crate) fn linux_pgd_paddr(&self) -> Paddr {
+        self.resources.linux_pgd_paddr
     }
 
-    /// Reserves the root and its CPU reference before the fixed CR3 commit.
-    ///
-    /// The caller's physical IRQ guard pins this CPU throughout preparation.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn prepare_registered_root(
-        self: &Arc<Self>,
-        expected_root: Paddr,
-        irq_guard: &crate::irq::DisabledLocalIrqGuard,
-    ) -> bool {
-        debug_assert!(!crate::arch::irq::is_local_enabled());
-        let cpu = irq_guard.current_cpu();
-        let activation = self.activation.as_ref().unwrap();
-        if ACTIVATED_VM_SPACE.load() == Arc::as_ptr(self)
-            && activation.restore.load(Ordering::Acquire)
-            && self.cpus.contains(cpu, Ordering::Relaxed)
-            && expected_root != 0
-        {
-            // A CPU reference is published only after a valid root is reserved,
-            // and cleared before leaving its active set. Root replacement and
-            // invalidation require that set to be empty. With IRQs masked, this
-            // reservation remains valid until the caller's fixed CR3 commit,
-            // including when that commit has not installed the root yet.
-            // A concurrent shootdown still waits for the actual IPI; this path
-            // must not update the root's observed generation.
-            #[cfg(all(kernelet_getpid_profile, target_arch = "x86_64"))]
-            crate::kernelet::getpid_profile::event(
-                crate::kernelet::getpid_profile::event_id::ROOT_FAST,
-            );
-            return true;
+    #[cfg(feature = "kernelet")]
+    pub(crate) fn current_activated_page_table<'a>(
+        _guard: &'a DisabledPreemptGuard,
+    ) -> Option<&'a PageTable<UserPtConfig>> {
+        let ptr = ACTIVATED_VM_SPACE.load();
+        if ptr.is_null() {
+            return None;
         }
-        #[cfg(all(kernelet_getpid_profile, target_arch = "x86_64"))]
-        crate::kernelet::getpid_profile::event(
-            crate::kernelet::getpid_profile::event_id::ROOT_SLOW,
-        );
-        Self::deactivate();
-        let root = activation.root.lock();
-        let Some(root) = root.as_ref() else {
-            return true;
-        };
-        if !root.reserve(cpu) {
-            return false;
-        }
-        self.record_activation(cpu);
-        activation.restore.store(true, Ordering::Release);
-        true
+        // SAFETY: `ACTIVATED_VM_SPACE` owns an `Arc` reference to that `VmSpace`
+        // until this CPU switches spaces or deactivates, which cannot happen
+        // while `_guard` disables preemption.
+        let vmspace = unsafe { &*ptr };
+        Some(vmspace.page_table())
+    }
+
+    fn page_table(&self) -> &PageTable<UserPtConfig> {
+        &self.resources.pt
     }
 
     /// Installs the kernel root and releases this CPU's active-space reference.
@@ -400,10 +166,7 @@ impl VmSpace {
         let irq_guard = crate::irq::disable_local();
         #[cfg(not(feature = "kernelet"))]
         {
-            KERNEL_PAGE_TABLE.get().unwrap().activate(
-                #[cfg(feature = "kernelet-host")]
-                &irq_guard,
-            );
+            KERNEL_PAGE_TABLE.get().unwrap().activate();
         }
         #[cfg(feature = "kernelet")]
         {
@@ -419,12 +182,6 @@ impl VmSpace {
             // SAFETY: The CPU cell owns exactly one reference from `into_raw`.
             let last = unsafe { Arc::from_raw(last_ptr) };
             last.cpus.remove(irq_guard.current_cpu(), Ordering::Relaxed);
-            #[cfg(feature = "kernelet-host")]
-            if let Some(activation) = last.activation.as_ref() {
-                if let Some(root) = activation.root.lock().as_ref() {
-                    root.leave(irq_guard.current_cpu());
-                }
-            }
         }
         #[cfg(feature = "kernelet")]
         if let Some(task) = crate::task::Task::current() {
@@ -432,11 +189,6 @@ impl VmSpace {
             // root and this CPU released its active-space reference.
             drop(task.replace_active_vm_space(None, &irq_guard));
         }
-    }
-
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn kernel_root_paddr() -> Paddr {
-        KERNEL_PAGE_TABLE.get().unwrap().root_paddr()
     }
 
     fn record_activation(self: &Arc<Self>, cpu: crate::cpu::CpuId) {
@@ -450,12 +202,6 @@ impl VmSpace {
             // SAFETY: Replacing the CPU cell transfers its unique raw reference.
             let last = unsafe { Arc::from_raw(last_ptr) };
             last.cpus.remove(cpu, Ordering::Relaxed);
-            #[cfg(feature = "kernelet-host")]
-            if let Some(activation) = last.activation.as_ref() {
-                if let Some(root) = activation.root.lock().as_ref() {
-                    root.leave(cpu);
-                }
-            }
         }
     }
 
@@ -472,7 +218,7 @@ impl VmSpace {
         guard: &'a G,
         va: &Range<Vaddr>,
     ) -> Result<Cursor<'a>> {
-        Ok(Cursor(self.page_table()?.cursor(guard, va)?))
+        Ok(Cursor(self.page_table().cursor(guard, va)?))
     }
 
     /// Gets an mutable cursor in the virtual address range.
@@ -491,7 +237,7 @@ impl VmSpace {
         va: &Range<Vaddr>,
     ) -> Result<CursorMut<'a>> {
         Ok(CursorMut {
-            pt_cursor: self.page_table()?.cursor_mut(guard, va)?,
+            pt_cursor: self.page_table().cursor_mut(guard, va)?,
             #[cfg(not(feature = "kernelet"))]
             flusher: TlbFlusher::new(&self.cpus, disable_preempt()),
             #[cfg(feature = "kernelet")]
@@ -503,101 +249,38 @@ impl VmSpace {
     /// Activates the page table on the current CPU.
     pub fn activate(self: &Arc<Self>) {
         #[cfg(feature = "kernelet")]
-        let _irq_guard = crate::irq::disable_local();
-        let preempt_guard = disable_preempt();
-        let cpu = preempt_guard.current_cpu();
-
-        #[cfg(feature = "kernelet-host")]
-        if let Some(activation) = self.activation.as_ref() {
-            let _irq_guard = crate::irq::disable_local();
-            if !activation.restore.load(Ordering::Acquire) {
-                Self::deactivate();
-                return;
-            }
-            let root = activation.root.lock().clone();
-            let Some(root) = root else {
-                Self::deactivate();
-                return;
-            };
-            // Transfer any ordinary native root reference to the permanent
-            // kernel root before borrowing CR3 for a tenant page table.
-            Self::deactivate();
-            if !root.activate(cpu) {
-                Self::deactivate();
-                return;
-            }
-            self.record_activation(cpu);
-            return;
-        }
-
-        let last_ptr = ACTIVATED_VM_SPACE.load();
-
-        #[cfg(feature = "kernelet")]
-        let current_task = crate::task::Task::current();
-        #[cfg(feature = "kernelet")]
-        let cached = current_task.as_ref().map_or_else(
-            // Bootstrap execution has no Task-owned cache yet.
-            || last_ptr == Arc::as_ptr(self),
-            |task| task.active_vm_space_matches(self, &_irq_guard),
-        );
-        #[cfg(not(feature = "kernelet"))]
-        let cached = last_ptr == Arc::as_ptr(self);
-
-        // Image Tasks can borrow another root while their Task-owned cache
-        // remains unchanged. Host carrier boundaries release the native
-        // VmSpace before borrowing CR3, so native cache hits need no CR3 read.
-        #[cfg(feature = "kernelet")]
-        let already_active =
-            cached && current_page_table_paddr() == self.page_table().unwrap().root_paddr();
-        #[cfg(not(feature = "kernelet"))]
-        let already_active = cached;
-        if already_active {
-            #[cfg(feature = "kernelet")]
-            self.record_activation(cpu);
-            return;
-        }
-
-        // Native cache hits only need CPU pinning. Protect an actual root
-        // change and its active-space publication with physical IRQs masked.
-        #[cfg(feature = "kernelet-host")]
-        let _irq_guard = crate::irq::disable_local();
-
-        #[cfg(feature = "kernelet")]
         {
-            let root = self.register_kernelet_root();
-            let status = (crate::kernelet::entry::services().pt_activate)(root);
+            let _irq_guard = crate::irq::disable_local();
+            let preempt_guard = disable_preempt();
+            let cpu = preempt_guard.current_cpu();
+
+            if ACTIVATED_VM_SPACE.load() == Arc::as_ptr(self) {
+                return;
+            }
+
+            let status =
+                (crate::kernelet::entry::services().pt_activate)(self.linux_pgd_paddr() as u64);
             assert_eq!(status, 0, "Host refused to activate a user page-table root");
+            self.record_activation(cpu);
+            if let Some(task) = crate::task::Task::current() {
+                drop(task.replace_active_vm_space(Some(self.clone()), &_irq_guard));
+            }
+            return;
         }
 
         #[cfg(not(feature = "kernelet"))]
-        self.page_table().unwrap().activate(
-            #[cfg(feature = "kernelet-host")]
-            &_irq_guard,
-        );
-        self.record_activation(cpu);
-        #[cfg(feature = "kernelet")]
-        if let Some(task) = current_task {
-            drop(task.replace_active_vm_space(Some(self.clone()), &_irq_guard));
-        }
-    }
+        {
+            let preempt_guard = disable_preempt();
+            let cpu = preempt_guard.current_cpu();
 
-    /// Registers this root before activation or an image-side shootdown.
-    #[cfg(feature = "kernelet")]
-    pub(super) fn register_kernelet_root(&self) -> u64 {
-        let root = self.page_table().unwrap().root_paddr() as u64;
-        if !self.registered.load(Ordering::Acquire) {
-            // Host registration is idempotent. Concurrent first activations
-            // and flushes may both register, but neither may publish completion
-            // or use the root before its registration has returned.
-            let status = (crate::kernelet::entry::services().pt_root_register)(root);
-            if status != 0 {
-                crate::kernelet::entry::stop_panic(format_args!(
-                    "Host refused to register a user page-table root: {status}"
-                ));
+            let last_ptr = ACTIVATED_VM_SPACE.load();
+            if last_ptr == Arc::as_ptr(self) {
+                return;
             }
-            self.registered.store(true, Ordering::Release);
+
+            self.page_table().activate();
+            self.record_activation(cpu);
         }
-        root
     }
 
     /// Creates a reader to read data from the user space of the current task.
@@ -608,9 +291,11 @@ impl VmSpace {
     /// Users must ensure that no other page table is activated in the current task during the
     /// lifetime of the created `VmReader`. This guarantees that the `VmReader` can operate correctly.
     pub fn reader(&self, vaddr: Vaddr, len: usize) -> Result<VmReader<'_, Fallible>> {
-        if current_page_table_paddr() != self.page_table()?.root_paddr()
-            || !super::is_in_user_space(vaddr, len)
-        {
+        #[cfg(feature = "kernelet")]
+        let is_active = ACTIVATED_VM_SPACE.load() == core::ptr::from_ref(self);
+        #[cfg(not(feature = "kernelet"))]
+        let is_active = current_page_table_paddr() == self.page_table().root_paddr();
+        if !is_active || !super::is_in_user_space(vaddr, len) {
             return Err(Error::AccessDenied);
         }
 
@@ -626,9 +311,11 @@ impl VmSpace {
     /// Users must ensure that no other page table is activated in the current task during the
     /// lifetime of the created `VmWriter`. This guarantees that the `VmWriter` can operate correctly.
     pub fn writer(&self, vaddr: Vaddr, len: usize) -> Result<VmWriter<'_, Fallible>> {
-        if current_page_table_paddr() != self.page_table()?.root_paddr()
-            || !super::is_in_user_space(vaddr, len)
-        {
+        #[cfg(feature = "kernelet")]
+        let is_active = ACTIVATED_VM_SPACE.load() == core::ptr::from_ref(self);
+        #[cfg(not(feature = "kernelet"))]
+        let is_active = current_page_table_paddr() == self.page_table().root_paddr();
+        if !is_active || !super::is_in_user_space(vaddr, len) {
             return Err(Error::AccessDenied);
         }
 
@@ -656,9 +343,11 @@ impl VmSpace {
         vaddr: Vaddr,
         len: usize,
     ) -> Result<(VmReader<'_, Fallible>, VmWriter<'_, Fallible>)> {
-        if current_page_table_paddr() != self.page_table()?.root_paddr()
-            || !super::is_in_user_space(vaddr, len)
-        {
+        #[cfg(feature = "kernelet")]
+        let is_active = ACTIVATED_VM_SPACE.load() == core::ptr::from_ref(self);
+        #[cfg(not(feature = "kernelet"))]
+        let is_active = current_page_table_paddr() == self.page_table().root_paddr();
+        if !is_active || !super::is_in_user_space(vaddr, len) {
             return Err(Error::AccessDenied);
         }
 
@@ -688,7 +377,7 @@ impl VmSpace {
     /// It is a private method for internal use only. Please refer to
     /// [`CursorMut::find_iomem_by_paddr`] for more details.
     fn find_iomem_by_paddr(&self, paddr: Paddr) -> Option<(IoMem, usize)> {
-        let iomems = self.iomems.lock();
+        let iomems = self.resources.iomems.lock();
         for iomem in iomems.iter() {
             let start = iomem.paddr();
             let end = start + iomem.size();
@@ -818,10 +507,24 @@ impl<'a> CursorMut<'a> {
     ///  - the current virtual address is already mapped;
     ///  - the current virtual address is outside the cursor's range.
     pub fn map(&mut self, frame: UFrame, prop: PageProperty) {
+        #[cfg(feature = "kernelet")]
+        let (va, paddr) = (self.virt_addr(), frame.paddr());
         let item = VmItem::new_tracked(frame, prop);
 
         // SAFETY: It is safe to map untyped memory into the userspace.
         unsafe { self.pt_cursor.map(item) };
+
+        #[cfg(feature = "kernelet")]
+        if crate::kernelet::entry::boot_args().pt_mode == 1 && prop.flags.contains(PageFlags::R) {
+            let res = (crate::kernelet::entry::services().buffer)(
+                crate::kernelet::abi::OP_VM_MAP,
+                self.vmspace.linux_pgd_paddr() as u64,
+                va as u64,
+                paddr as u64,
+                page_flags_to_klet_prot(prop.flags),
+            );
+            assert_eq!(res.status, 0, "Host refused OP_VM_MAP: {}", res.status);
+        }
     }
 
     /// Maps a range of [`IoMem`] into the current slot.
@@ -864,12 +567,41 @@ impl<'a> CursorMut<'a> {
             io_mem_paddr + len + offset
         };
 
+        #[cfg(feature = "kernelet")]
+        assert!(
+            !io_mem.is_virtual(),
+            "virtual device IoMem cannot be mapped directly into a user VmSpace"
+        );
+
         for current_paddr in (paddr_begin..paddr_end).step_by(PAGE_SIZE) {
+            #[cfg(feature = "kernelet")]
+            assert!(
+                crate::kernelet::image_grant::has_meta(current_paddr),
+                "kernelet VmSpace cannot map ungranted physical address {current_paddr:#x}"
+            );
+            #[cfg(feature = "kernelet")]
+            let va = self.virt_addr();
             // SAFETY: It is safe to map I/O memory into the userspace.
             unsafe {
                 self.pt_cursor
                     .map(VmItem::new_untracked_io(current_paddr, prop))
             };
+            #[cfg(feature = "kernelet")]
+            if crate::kernelet::entry::boot_args().pt_mode == 1 && prop.flags.contains(PageFlags::R)
+            {
+                let res = (crate::kernelet::entry::services().buffer)(
+                    crate::kernelet::abi::OP_VM_MAP,
+                    self.vmspace.linux_pgd_paddr() as u64,
+                    va as u64,
+                    current_paddr as u64,
+                    page_flags_to_klet_prot(prop.flags),
+                );
+                assert_eq!(
+                    res.status, 0,
+                    "Host refused OP_VM_MAP (iomem): {}",
+                    res.status
+                );
+            }
         }
 
         fn io_mem_contains(parent: &IoMem, child: &IoMem) -> bool {
@@ -878,7 +610,7 @@ impl<'a> CursorMut<'a> {
 
         // If the `iomems` list in `VmSpace` does not contain the current I/O
         // memory, push it to maintain the correct reference count.
-        let mut iomems = self.vmspace.iomems.lock();
+        let mut iomems = self.vmspace.resources.iomems.lock();
         if !iomems.iter().any(|iomem| io_mem_contains(iomem, &io_mem)) {
             iomems.retain(|iomem| !io_mem_contains(&io_mem, iomem));
             iomems.push(io_mem);
@@ -920,8 +652,12 @@ impl<'a> CursorMut<'a> {
     ///  - the length is longer than the remaining range of the cursor;
     ///  - the length is not page-aligned.
     pub fn unmap(&mut self, len: usize) -> usize {
+        #[cfg(feature = "kernelet")]
+        let start_va = self.virt_addr();
         let end_va = self.virt_addr() + len;
         let mut num_unmapped: usize = 0;
+        #[cfg(feature = "kernelet")]
+        let mut unmapped_any = false;
         loop {
             // SAFETY:
             // 1. It is safe to unmap memory in the userspace.
@@ -930,6 +666,10 @@ impl<'a> CursorMut<'a> {
             else {
                 break; // No more mappings in the range.
             };
+            #[cfg(feature = "kernelet")]
+            {
+                unmapped_any = true;
+            }
 
             match frag {
                 PageTableFrag::Mapped { va, item, .. } => {
@@ -982,6 +722,24 @@ impl<'a> CursorMut<'a> {
             }
         }
 
+        #[cfg(feature = "kernelet")]
+        if crate::kernelet::entry::boot_args().pt_mode == 1 {
+            if unmapped_any {
+                let res = (crate::kernelet::entry::services().buffer)(
+                    crate::kernelet::abi::OP_VM_UNMAP,
+                    self.vmspace.linux_pgd_paddr() as u64,
+                    start_va as u64,
+                    len as u64,
+                    0,
+                );
+                assert_eq!(res.status, 0, "Host refused OP_VM_UNMAP: {}", res.status);
+            }
+            // `zap_vma_ptes` already flushed the TLB; retire unmapped frames
+            // after an RCU grace period without a redundant shootdown.
+            self.flusher.retire_without_shootdown();
+            return num_unmapped;
+        }
+
         self.flusher.dispatch_tlb_flush();
 
         num_unmapped
@@ -1014,6 +772,52 @@ impl<'a> CursorMut<'a> {
         len: usize,
         mut op: impl FnMut(&mut PageFlags, &mut CachePolicy),
     ) -> Option<Range<Vaddr>> {
+        #[cfg(feature = "kernelet")]
+        if crate::kernelet::entry::boot_args().pt_mode == 1 {
+            // SAFETY: It is safe to set `PageFlags` and `CachePolicy` of memory
+            // in the userspace.
+            let (va_range, paddr, old_prop, new_prop) = unsafe {
+                self.pt_cursor.protect_next_tracked(len, &mut |prop| {
+                    op(&mut prop.flags, &mut prop.cache);
+                })
+            }?;
+            let old_r = old_prop.flags.contains(PageFlags::R);
+            let new_r = new_prop.flags.contains(PageFlags::R);
+            let old_prot = page_flags_to_klet_prot(old_prop.flags);
+            let new_prot = page_flags_to_klet_prot(new_prop.flags);
+            let root = self.vmspace.linux_pgd_paddr() as u64;
+            let buf = crate::kernelet::entry::services().buffer;
+            if old_r && !new_r {
+                let res = buf(
+                    crate::kernelet::abi::OP_VM_UNMAP,
+                    root,
+                    va_range.start as u64,
+                    va_range.len() as u64,
+                    0,
+                );
+                assert_eq!(res.status, 0, "Host refused OP_VM_UNMAP: {}", res.status);
+            } else if !old_r && new_r {
+                let res = buf(
+                    crate::kernelet::abi::OP_VM_MAP,
+                    root,
+                    va_range.start as u64,
+                    paddr as u64,
+                    new_prot,
+                );
+                assert_eq!(res.status, 0, "Host refused OP_VM_MAP: {}", res.status);
+            } else if new_r && old_prot != new_prot {
+                let res = buf(
+                    crate::kernelet::abi::OP_VM_PROTECT,
+                    root,
+                    va_range.start as u64,
+                    new_prot,
+                    0,
+                );
+                assert_eq!(res.status, 0, "Host refused OP_VM_PROTECT: {}", res.status);
+            }
+            return Some(va_range);
+        }
+
         // SAFETY: It is safe to set `PageFlags` and `CachePolicy` of memory
         // in the userspace.
         unsafe {
@@ -1022,6 +826,22 @@ impl<'a> CursorMut<'a> {
             })
         }
     }
+}
+
+#[cfg(feature = "kernelet")]
+fn page_flags_to_klet_prot(flags: PageFlags) -> u64 {
+    use crate::kernelet::abi::{KLET_PROT_EXEC, KLET_PROT_READ, KLET_PROT_WRITE};
+    let mut prot = 0u64;
+    if flags.contains(PageFlags::R) {
+        prot |= KLET_PROT_READ;
+    }
+    if flags.contains(PageFlags::W) {
+        prot |= KLET_PROT_WRITE;
+    }
+    if flags.contains(PageFlags::X) {
+        prot |= KLET_PROT_EXEC;
+    }
+    prot
 }
 
 cpu_local_cell! {
@@ -1048,8 +868,8 @@ mod native_activation_test {
     fn native_roots_release_cpu_references_after_switch_and_deactivate() {
         let first = Arc::new(VmSpace::new());
         let second = Arc::new(VmSpace::new());
-        let first_table = first.page_table().unwrap();
-        let second_table = second.page_table().unwrap();
+        let first_table = first.page_table();
+        let second_table = second.page_table();
         let _guard = disable_preempt();
         VmSpace::deactivate();
         let first_refs = first_table.root_reference_count();
@@ -1071,377 +891,6 @@ mod native_activation_test {
             assert_eq!(Arc::strong_count(&first), 1);
             assert_eq!(Arc::strong_count(&second), 1);
         }
-    }
-}
-
-#[cfg(all(ktest, feature = "kernelet-host"))]
-mod activation_test {
-    use core::sync::atomic::Ordering;
-
-    use super::{RegisteredPageTable, RootShootdown, VmSpace, get_activated_vm_space};
-    use crate::{
-        arch::mm::current_page_table_paddr,
-        cpu::PinCurrentCpu,
-        mm::PAGE_SIZE,
-        prelude::*,
-        sync::{LocalIrqDisabled, SpinLock},
-        task::disable_preempt,
-    };
-
-    #[ktest]
-    fn direct_root_switch_preserves_reservations_and_failure_state() {
-        let owners = [Arc::new(VmSpace::new()), Arc::new(VmSpace::new())];
-        let first = RegisteredPageTable::new(owners[0].page_table().unwrap().root_paddr()).unwrap();
-        let second =
-            RegisteredPageTable::new(owners[1].page_table().unwrap().root_paddr()).unwrap();
-        let retired_owner = Arc::new(VmSpace::new());
-        let retired =
-            RegisteredPageTable::new(retired_owner.page_table().unwrap().root_paddr()).unwrap();
-        retired.invalidate();
-        let carrier = Arc::new(VmSpace::new_activation_only());
-        let _pin = disable_preempt();
-        let guard = crate::irq::disable_local();
-        let cpu = guard.current_cpu();
-        VmSpace::deactivate();
-        let host_root = current_page_table_paddr();
-        let references = Arc::strong_count(&carrier);
-        assert!(carrier.activate_registered_root(first.clone(), &guard));
-        assert_eq!(first.last_direct_activation_from(), host_root);
-        assert_eq!(current_page_table_paddr(), first.paddr);
-        assert!(first.is_active_on(cpu));
-        assert_eq!(Arc::strong_count(&carrier), references + 1);
-
-        // A shootdown published while B is absent must be observed by the
-        // single direct CR3 commit, without first switching to HostRoot.
-        let generation = second.begin_shootdown().unwrap();
-        assert!(generation.active.is_empty());
-        assert!(carrier.activate_registered_root(second.clone(), &guard));
-        assert_eq!(second.last_direct_activation_from(), first.paddr);
-        assert_eq!(current_page_table_paddr(), second.paddr);
-        assert!(!first.is_active_on(cpu));
-        assert!(second.is_active_on(cpu));
-        assert_eq!(get_activated_vm_space(), Arc::as_ptr(&carrier));
-        assert_eq!(Arc::strong_count(&carrier), references + 1);
-        {
-            let state = second.state.lock();
-            assert_eq!(
-                state.seen_generation[u32::from(cpu) as usize],
-                state.generation
-            );
-        }
-        assert_eq!(Arc::strong_count(&first), 1);
-        assert_eq!(Arc::strong_count(&second), 2);
-
-        // Same-token activation must not clear the newly installed active bit.
-        assert!(carrier.activate_registered_root(second.clone(), &guard));
-        assert_eq!(second.last_direct_activation_from(), second.paddr);
-        assert!(second.is_active_on(cpu));
-        assert_eq!(Arc::strong_count(&carrier), references + 1);
-        assert!(!carrier.activate_registered_root(retired, &guard));
-        assert_eq!(current_page_table_paddr(), second.paddr);
-        assert!(second.is_active_on(cpu));
-        assert_eq!(Arc::strong_count(&carrier), references + 1);
-        assert!(Arc::ptr_eq(
-            carrier
-                .activation
-                .as_ref()
-                .unwrap()
-                .root
-                .lock()
-                .as_ref()
-                .unwrap(),
-            &second,
-        ));
-        VmSpace::deactivate();
-        assert_eq!(current_page_table_paddr(), host_root);
-        assert!(!second.is_active_on(cpu));
-        assert_eq!(Arc::strong_count(&carrier), references);
-        carrier.set_registered_root(None);
-        first.invalidate();
-        second.invalidate();
-    }
-
-    static REMOTE_ROOT: SpinLock<Option<Arc<RegisteredPageTable>>, LocalIrqDisabled> =
-        SpinLock::new(None);
-    static REMOTE_SHOOTDOWN: SpinLock<Option<RootShootdown>, LocalIrqDisabled> =
-        SpinLock::new(None);
-    static REMOTE_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
-
-    fn publish_remote_shootdown() {
-        let root = REMOTE_ROOT.lock().as_ref().unwrap().clone();
-        let shootdown = root.begin_shootdown().unwrap();
-        REMOTE_CPU.store(
-            u32::from(crate::cpu::CpuId::current_racy()),
-            Ordering::Relaxed,
-        );
-        *REMOTE_SHOOTDOWN.lock() = Some(shootdown);
-    }
-
-    #[ktest]
-    fn direct_root_switch_serializes_with_remote_shootdown_publication() {
-        let pin = disable_preempt();
-        let cpu = pin.current_cpu();
-        let Some(remote) = crate::cpu::all_cpus().find(|other| *other != cpu) else {
-            crate::early_println!("[skipped: remote root switch requires two CPUs]");
-            return;
-        };
-        let owners = [Arc::new(VmSpace::new()), Arc::new(VmSpace::new())];
-        let roots = [
-            RegisteredPageTable::new(owners[0].page_table().unwrap().root_paddr()).unwrap(),
-            RegisteredPageTable::new(owners[1].page_table().unwrap().root_paddr()).unwrap(),
-        ];
-        let carrier = Arc::new(VmSpace::new_activation_only());
-        {
-            let guard = crate::irq::disable_local();
-            VmSpace::deactivate();
-            assert!(carrier.activate_registered_root(roots[0].clone(), &guard));
-        }
-        for iteration in 0..32 {
-            let next = &roots[(iteration + 1) % 2];
-            let old = &roots[iteration % 2];
-            *REMOTE_ROOT.lock() = Some(next.clone());
-            let pending =
-                crate::smp::inter_processor_call(&remote.into(), publish_remote_shootdown);
-            {
-                let guard = crate::irq::disable_local();
-                assert!(carrier.activate_registered_root(next.clone(), &guard));
-                assert_eq!(next.last_direct_activation_from(), old.paddr);
-                assert_eq!(current_page_table_paddr(), next.paddr);
-                assert!(!old.is_active_on(cpu));
-                assert!(next.is_active_on(cpu));
-            }
-            pending.wait();
-            assert_eq!(REMOTE_CPU.load(Ordering::Relaxed), u32::from(remote));
-            let shootdown = REMOTE_SHOOTDOWN.lock().take().unwrap();
-            {
-                let state = next.state.lock();
-                if !shootdown.active.contains(cpu) {
-                    // Publication preceded activation: the CR3 write must
-                    // already have observed that generation.
-                    assert_eq!(
-                        state.seen_generation[u32::from(cpu) as usize],
-                        state.generation
-                    );
-                }
-            }
-            // If publication followed activation, the snapshot contains this
-            // CPU and a real flush/ack is required before old frames retire.
-            crate::mm::tlb::dispatch_tlb_flush_on_cpus(
-                &shootdown.active,
-                crate::mm::tlb::TlbFlushOp::for_all(),
-                #[cfg(kernelet_rq1_diagnostics)]
-                None,
-            )
-            .wait();
-            assert!(next.is_active_on(cpu));
-        }
-        VmSpace::deactivate();
-        carrier.set_registered_root(None);
-        *REMOTE_ROOT.lock() = None;
-        assert!(REMOTE_SHOOTDOWN.lock().is_none());
-        for root in roots {
-            assert!(!root.is_active());
-            root.invalidate();
-        }
-    }
-
-    #[ktest]
-    fn native_reactivation_after_kernel_boundary_releases_cpu_references() {
-        let space = Arc::new(VmSpace::new());
-        let table = space.page_table().unwrap();
-        let _guard = disable_preempt();
-        VmSpace::deactivate();
-        let references = table.root_reference_count();
-        for _ in 0..3 {
-            space.activate();
-            assert_eq!(table.root_reference_count(), references + 1);
-            {
-                let _irq_guard = crate::irq::disable_local();
-                // The carrier boundary installs the permanent root and clears
-                // the software identity before any fixed stub borrows CR3.
-                VmSpace::deactivate();
-                assert!(get_activated_vm_space().is_null());
-                assert_eq!(Arc::strong_count(&space), 1);
-                assert_eq!(table.root_reference_count(), references);
-                assert_eq!(current_page_table_paddr(), VmSpace::kernel_root_paddr());
-                space.activate();
-                assert_eq!(current_page_table_paddr(), table.root_paddr());
-                assert_eq!(table.root_reference_count(), references + 1);
-            }
-            VmSpace::deactivate();
-            assert_eq!(table.root_reference_count(), references);
-        }
-    }
-
-    #[ktest]
-    fn native_activation_does_not_drop_a_borrowed_tenant_root() {
-        let owner = Arc::new(VmSpace::new());
-        let owner_table = owner.page_table().unwrap();
-        let root = RegisteredPageTable::new(owner_table.root_paddr()).unwrap();
-        let carrier = Arc::new(VmSpace::new_activation_only());
-        carrier.set_registered_root(Some(root.clone()));
-        let native = Arc::new(VmSpace::new());
-        let _guard = disable_preempt();
-        let _irq_guard = crate::irq::disable_local();
-        let references = owner_table.root_reference_count();
-        assert!(carrier.prepare_registered_root(root.paddr, &_irq_guard));
-        carrier.activate();
-        assert_eq!(owner_table.root_reference_count(), references);
-
-        native.activate();
-        assert_eq!(owner_table.root_reference_count(), references);
-        assert!(!root.is_active());
-        VmSpace::deactivate();
-        assert_eq!(owner_table.root_reference_count(), references);
-        carrier.set_registered_root(None);
-        root.invalidate();
-    }
-
-    #[ktest]
-    fn registered_root_restores_and_releases_cpu_reference() {
-        let owner = Arc::new(VmSpace::new());
-        let root = owner.page_table().unwrap().root_paddr();
-        let table = RegisteredPageTable::new(root).unwrap();
-        let carrier = Arc::new(VmSpace::new_activation_only());
-        carrier.set_registered_root(Some(table.clone()));
-        let guard = disable_preempt();
-        let cpu = guard.current_cpu();
-        let _irq_guard = crate::irq::disable_local();
-        VmSpace::deactivate();
-        let host_root = current_page_table_paddr();
-        let references = Arc::strong_count(&carrier);
-
-        assert!(carrier.prepare_registered_root(root, &_irq_guard));
-        assert_eq!(current_page_table_paddr(), host_root);
-        assert!(table.is_active_on(cpu));
-        assert_eq!(Arc::strong_count(&carrier), references + 1);
-        assert!(table.begin_shootdown().unwrap().active.contains(cpu));
-        // Preparing again before the fixed CR3 commit retains the reservation
-        // without acknowledging a shootdown that has not dispatched its IPI.
-        let reserved_generation = table.state.lock().seen_generation[u32::from(cpu) as usize];
-        assert!(carrier.prepare_registered_root(root, &_irq_guard));
-        assert_eq!(current_page_table_paddr(), host_root);
-        assert_eq!(Arc::strong_count(&carrier), references + 1);
-        assert!(table.is_active_on(cpu));
-        {
-            let state = table.state.lock();
-            assert_eq!(
-                state.seen_generation[u32::from(cpu) as usize],
-                reserved_generation
-            );
-            assert_ne!(reserved_generation, state.generation);
-        }
-
-        carrier.activate();
-        assert_eq!(current_page_table_paddr(), root);
-        assert_eq!(get_activated_vm_space(), Arc::as_ptr(&carrier));
-        assert_eq!(Arc::strong_count(&carrier), references + 1);
-
-        assert!(carrier.prepare_registered_root(root, &_irq_guard));
-        assert_eq!(current_page_table_paddr(), root);
-
-        // Repeated preparation must retain the tenant root and CPU reference,
-        // including when a shootdown published a new generation meanwhile.
-        let installed_generation = table.state.lock().seen_generation[u32::from(cpu) as usize];
-        assert!(table.begin_shootdown().unwrap().active.contains(cpu));
-        assert!(carrier.prepare_registered_root(root, &_irq_guard));
-        {
-            let state = table.state.lock();
-            assert_eq!(
-                state.seen_generation[u32::from(cpu) as usize],
-                installed_generation
-            );
-            assert_ne!(installed_generation, state.generation);
-        }
-        assert_eq!(current_page_table_paddr(), root);
-        assert!(table.is_active_on(cpu));
-        assert_eq!(get_activated_vm_space(), Arc::as_ptr(&carrier));
-        assert_eq!(Arc::strong_count(&carrier), references + 1);
-        // Execute the real flush callback and wait for its acknowledgement.
-        // The active reservation must survive both dispatch and preparation;
-        // only a fresh reservation records a newly observed generation.
-        let shootdown = table.begin_shootdown().unwrap();
-        assert!(shootdown.active.contains(cpu));
-        // The outer preemption guard retains this CPU; waiting for remote
-        // acknowledgements requires restoring physical IRQ delivery.
-        drop(_irq_guard);
-        crate::mm::tlb::dispatch_tlb_flush_on_cpus(
-            &shootdown.active,
-            crate::mm::tlb::TlbFlushOp::for_all(),
-            #[cfg(kernelet_rq1_diagnostics)]
-            None,
-        )
-        .wait();
-        let _irq_guard = crate::irq::disable_local();
-        assert!(carrier.prepare_registered_root(root, &_irq_guard));
-        assert_eq!(current_page_table_paddr(), root);
-        assert!(table.is_active_on(cpu));
-        {
-            let state = table.state.lock();
-            assert_eq!(
-                state.seen_generation[u32::from(cpu) as usize],
-                installed_generation
-            );
-            assert_ne!(installed_generation, state.generation);
-        }
-        VmSpace::deactivate();
-        assert_eq!(current_page_table_paddr(), host_root);
-        assert!(!table.is_active_on(cpu));
-        assert!(get_activated_vm_space().is_null());
-        assert_eq!(Arc::strong_count(&carrier), references);
-
-        // The active CPU's generation publication above did not dispatch an
-        // IPI. After leaving, a new reservation must observe that generation
-        // before the fixed entry installs the root again.
-        assert!(carrier.prepare_registered_root(root, &_irq_guard));
-        assert_eq!(current_page_table_paddr(), host_root);
-        assert!(table.is_active_on(cpu));
-        assert_eq!(get_activated_vm_space(), Arc::as_ptr(&carrier));
-        assert_eq!(Arc::strong_count(&carrier), references + 1);
-        {
-            let state = table.state.lock();
-            assert_eq!(
-                state.seen_generation[u32::from(cpu) as usize],
-                state.generation
-            );
-        }
-        VmSpace::deactivate();
-        assert_eq!(current_page_table_paddr(), host_root);
-        assert!(!table.is_active_on(cpu));
-        assert!(get_activated_vm_space().is_null());
-        assert_eq!(Arc::strong_count(&carrier), references);
-        carrier.set_registered_root(None);
-        table.invalidate();
-    }
-
-    #[ktest]
-    fn activation_only_space_rejects_walks_and_retired_roots() {
-        let owner = Arc::new(VmSpace::new());
-        let table = RegisteredPageTable::new(owner.page_table().unwrap().root_paddr()).unwrap();
-        let carrier = Arc::new(VmSpace::new_activation_only());
-        carrier.set_registered_root(Some(table.clone()));
-        let guard = disable_preempt();
-        assert!(carrier.cursor(&guard, &(0..PAGE_SIZE)).is_err());
-        assert!(carrier.cursor_mut(&guard, &(0..PAGE_SIZE)).is_err());
-        assert!(carrier.reader(0, 1).is_err());
-        assert!(carrier.writer(0, 1).is_err());
-
-        let _irq_guard = crate::irq::disable_local();
-        VmSpace::deactivate();
-        let host_root = current_page_table_paddr();
-        table.invalidate();
-        // SAFETY: The native owner retains this page table and its Host kernel
-        // mappings. Matching its hardware address must not revive the retired
-        // registration token or establish a carrier CPU reference.
-        unsafe { crate::arch::mm::activate_page_table(table.paddr) };
-        assert!(!carrier.prepare_registered_root(table.paddr, &_irq_guard));
-        assert_eq!(current_page_table_paddr(), host_root);
-        assert!(get_activated_vm_space().is_null());
-        carrier.set_root_restore(true);
-        carrier.activate();
-        assert_eq!(current_page_table_paddr(), host_root);
-        assert!(get_activated_vm_space().is_null());
-        carrier.set_registered_root(None);
     }
 }
 
@@ -1548,6 +997,8 @@ pub(crate) struct UserPtConfig {}
 // `ItemRef` types.
 unsafe impl PageTableConfig for UserPtConfig {
     const TOP_LEVEL_INDEX_RANGE: Range<usize> = 0..256;
+    #[cfg(feature = "kernelet")]
+    const CAN_PRUNE_SUBTREE: bool = false;
 
     type E = PageTableEntry;
     type C = PagingConsts;

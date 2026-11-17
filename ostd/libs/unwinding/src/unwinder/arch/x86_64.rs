@@ -9,28 +9,28 @@ use super::maybe_cfi;
 // user-state hooks and Host carrier save/restore, not to kernel unwinding.
 // Keep the Context layout and initialize its otherwise-unused slots so that
 // cloning or inspecting an unwind context never reads uninitialized slots.
-#[cfg(feature = "kernelet-no-fp-control")]
+#[cfg(feature = "kernelet")]
 macro_rules! save_fp_control {
     () => {
         "mov qword ptr [rsp + 0x88], 0; mov qword ptr [rsp + 0x90], 0"
     };
 }
 
-#[cfg(not(feature = "kernelet-no-fp-control"))]
+#[cfg(not(feature = "kernelet"))]
 macro_rules! save_fp_control {
     () => {
         "stmxcsr [rsp + 0x88]; fnstcw [rsp + 0x90]"
     };
 }
 
-#[cfg(feature = "kernelet-no-fp-control")]
+#[cfg(feature = "kernelet")]
 macro_rules! restore_fp_control {
     () => {
         ""
     };
 }
 
-#[cfg(not(feature = "kernelet-no-fp-control"))]
+#[cfg(not(feature = "kernelet"))]
 macro_rules! restore_fp_control {
     () => {
         "ldmxcsr [rdi + 0x88]; fldcw [rdi + 0x90]"

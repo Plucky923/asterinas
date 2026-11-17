@@ -210,8 +210,6 @@ pub(crate) fn enable_local_and_halt() {
 }
 
 pub(crate) fn call_timer_callback_functions(_: &TrapFrame) {
-    #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
-    crate::task::scheduler::runtime_ticks();
     let irq_guard = irq::disable_local();
 
     if irq_guard.current_cpu() == CpuId::bsp() {

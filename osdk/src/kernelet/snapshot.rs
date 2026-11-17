@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Private build inputs shared by both halves of a paired build.
+//! Frozen source inputs for the standalone kernelet build and its audit.
 //!
 //! This protects builds against concurrent edits to the user's checkout and
 //! Cargo source cache. It is not a sandbox for hostile build scripts or tools.
@@ -119,7 +119,9 @@ impl BuildSnapshot {
                     directory.display()
                 ))
             })?;
-            copy_tree(directory, &home.join(relative), directory)?;
+            if !relative.starts_with("git") {
+                copy_tree(directory, &home.join(relative), directory)?;
+            }
             if relative.starts_with("registry/src") {
                 let registry = relative.components().nth(2).unwrap().as_os_str();
                 let archive = format!("{}.crate", directory.file_name().unwrap().to_string_lossy());
@@ -179,7 +181,7 @@ impl BuildSnapshot {
                         .map_err(io::Error::other)?;
                 if config.get("source").is_some() || config.get("patch").is_some() {
                     return Err(io::Error::other(
-                        "paired builds require source/patch settings in workspace manifests, not Cargo-home config",
+                        "kernelet builds require source/patch settings in workspace manifests, not Cargo-home config",
                     ));
                 }
                 fs::write(
@@ -248,7 +250,7 @@ fn metadata(
     let output = command.output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
-            "resolve paired build inputs: {}",
+            "resolve kernelet build inputs: {}",
             String::from_utf8_lossy(&output.stderr)
         )));
     }
@@ -266,6 +268,17 @@ fn copy_workspace(
     cache: &Path,
     build_output: Option<&Path>,
 ) -> io::Result<()> {
+    // If `source` itself lives inside a gitignored directory (such as a test
+    // temporary directory under `target/`), `git ls-files --exclude-standard`
+    // would skip every file in `source`. Fall back to `copy_tree` in that case.
+    let ignored_root = Command::new("git")
+        .current_dir(source)
+        .args(["check-ignore", "-q", "."])
+        .status()
+        .is_ok_and(|status| status.success());
+    if ignored_root {
+        return copy_tree(source, destination, source);
+    }
     let git = Command::new("git")
         .current_dir(source)
         .args([
@@ -349,7 +362,9 @@ fn copy_tree(source: &Path, destination: &Path, boundary: &Path) -> io::Result<(
         }
     } else if metadata.is_file() {
         fs::create_dir_all(destination.parent().unwrap())?;
-        fs::copy(source, destination)?;
+        if fs::symlink_metadata(destination).is_err() {
+            fs::copy(source, destination)?;
+        }
     } else {
         return Err(io::Error::other(
             "source input is not a regular file or directory",
@@ -405,7 +420,7 @@ fn source_fingerprint(root: &Path) -> io::Result<String> {
 fn verify_sources(root: &Path) -> io::Result<()> {
     if fs::read_to_string(root.join("frozen-source.sha256"))? != source_fingerprint(root)? {
         return Err(io::Error::other(
-            "frozen paired build sources changed; refusing cached inputs",
+            "frozen kernelet build sources changed; refusing cached inputs",
         ));
     }
     Ok(())
@@ -491,7 +506,7 @@ mod tests {
             Path::new(&output),
             None,
             &[],
-            &["kernelet".into(), "kernelet-host".into()],
+            &["kernelet".into()],
             true,
         )
         .unwrap();
@@ -510,11 +525,11 @@ mod tests {
         if core.join("Cargo.toml").is_file() {
             validate_dependencies(&snapshot.cargo_home(), &core, &[], false, &[], None).unwrap();
         }
-        println!("frozen paired inputs: {}", snapshot.root.display());
+        println!("frozen kernelet inputs: {}", snapshot.root.display());
     }
 
     #[test]
-    fn paired_inputs_include_dirty_and_external_path_dependencies() {
+    fn frozen_inputs_include_dirty_and_external_path_dependencies() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let dependency = temp.path().join("outside");
@@ -683,7 +698,7 @@ pub(super) fn validate_dependencies(
         .canonicalize()?;
         if !manifest.starts_with(&root) && !manifest.starts_with(&base) {
             return Err(io::Error::other(format!(
-                "paired dependency escapes frozen inputs: {}",
+                "kernelet dependency escapes frozen inputs: {}",
                 manifest.display()
             )));
         }

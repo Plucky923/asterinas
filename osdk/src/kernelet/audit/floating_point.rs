@@ -56,6 +56,7 @@ const GS_BASE_FUNCTIONS: &[&str] = &[
     "<aster_core::process::posix_thread::cpu_sync::CpuSync<ostd::arch::cpu::context::GsBase>>::before_user_exec",
     "<aster_core::process::posix_thread::thread_local::SuppUserContext>::before_user_exec",
     "<aster_core::context::Context as ostd::user::UserModeHooks>::pre_user_run",
+    "<aster_core::thread::Thread as ostd::user::kernelet_events::UserEventHandler>::pre_user_run",
 ];
 const XSAVE_FUNCTION: &str = "core::core_arch::x86_64::xsave::_xsave64";
 const XRSTOR_FUNCTION: &str = "core::core_arch::x86_64::xsave::_xrstor64";
@@ -150,12 +151,26 @@ pub(super) fn audit_with_decoder(
     if !output.contains("file format elf64-x86-64") {
         return Err("decoder did not recognize an x86-64 ELF".into());
     }
+    let table_bytes = file_bytes(bytes, table.offset, table.size)?;
+    let cpu_access_start = u64::from_le_bytes(
+        table_bytes
+            [abi::entry_table::CPU_ACCESS_START_OFFSET..abi::entry_table::CPU_ACCESS_START_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let cpu_access_end = u64::from_le_bytes(
+        table_bytes
+            [abi::entry_table::CPU_ACCESS_END_OFFSET..abi::entry_table::CPU_ACCESS_END_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
     let functions = allowed_functions(&output, text_index, text, symbols)?;
     check_instructions(
         &output,
         text.addr,
         file_bytes(bytes, text.offset, text.size)?,
         &functions,
+        cpu_access_start..cpu_access_end,
         false,
     )?;
     // These ranges, together with the fixed metadata and decoded .text, cover
@@ -189,7 +204,7 @@ pub(super) fn audit_with_decoder(
             ],
             file.path().as_os_str(),
         )?;
-        check_instructions(&output, start, padding, &[], true)?;
+        check_instructions(&output, start, padding, &[], 0..0, true)?;
     }
     Ok(())
 }
@@ -284,6 +299,20 @@ fn changes_host_control(instruction: &Instruction<'_>) -> bool {
             | "int"
             | "into"
             | "swapgs"
+            | "wrgsbase"
+            | "wrpkru"
+            | "in"
+            | "ins"
+            | "insb"
+            | "insw"
+            | "insl"
+            | "insd"
+            | "out"
+            | "outs"
+            | "outsb"
+            | "outsw"
+            | "outsl"
+            | "outsd"
             | "rsm"
             | "lgdt"
             | "lidt"
@@ -528,11 +557,80 @@ fn touches_fp(instruction: &Instruction<'_>, registers: &Regex) -> bool {
         || mnemonic.starts_with("tile")
 }
 
+fn check_cpu_access_forward_progress(
+    instruction: &Instruction<'_>,
+    operands: &str,
+    cpu_access: &core::ops::Range<u64>,
+) -> Result<(), String> {
+    if cpu_access.is_empty() {
+        return Ok(());
+    }
+    let insn_end = end(instruction.address, instruction.bytes.len() as u64)?;
+    let starts_in = cpu_access.contains(&instruction.address);
+    let overlaps = instruction.address < cpu_access.end && insn_end > cpu_access.start;
+    if !overlaps {
+        return Ok(());
+    }
+    if !starts_in || insn_end > cpu_access.end {
+        return Err(format!(
+            "instruction at {:#x} straddles .text.kernelet_cpu_access boundary",
+            instruction.address
+        ));
+    }
+    let mnemonic = instruction.mnemonic;
+    if matches!(
+        mnemonic,
+        "call"
+            | "callq"
+            | "lcall"
+            | "lcallq"
+            | "ret"
+            | "retq"
+            | "lret"
+            | "lretq"
+            | "loop"
+            | "loope"
+            | "loopz"
+            | "loopne"
+            | "loopnz"
+            | "jrcxz"
+            | "jecxz"
+            | "jcxz"
+    ) {
+        return Err(format!(
+            "forbidden control-flow {mnemonic} in nonredirectable .text.kernelet_cpu_access at {:#x}",
+            instruction.address
+        ));
+    }
+    if mnemonic.starts_with('j') {
+        let Some(target) = operands
+            .split_whitespace()
+            .next()
+            .map(|tok| tok.strip_prefix("0x").unwrap_or(tok))
+            .filter(|tok| !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|tok| u64::from_str_radix(tok, 16).ok())
+        else {
+            return Err(format!(
+                "forbidden indirect branch {mnemonic} in .text.kernelet_cpu_access at {:#x}",
+                instruction.address
+            ));
+        };
+        if cpu_access.contains(&target) && target <= instruction.address {
+            return Err(format!(
+                "forbidden backward branch {mnemonic} to {target:#x} in .text.kernelet_cpu_access at {:#x}",
+                instruction.address
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_instructions(
     output: &str,
     start: u64,
     bytes: &[u8],
     functions: &[Function],
+    cpu_access: core::ops::Range<u64>,
     padding: bool,
 ) -> Result<(), String> {
     let registers = Regex::new(r"%(?:st\b|mm[0-7]\b|[xyz]mm[0-9]+\b|k[0-7]\b|tmm[0-7]\b)").unwrap();
@@ -572,6 +670,7 @@ fn check_instructions(
             .next()
             .unwrap_or_default()
             .trim();
+        check_cpu_access_forward_progress(&instruction, operands, &cpu_access)?;
         let host_control = changes_host_control(&instruction);
         if !host_control && !touches_fp(&instruction, &registers) {
             continue;
@@ -803,7 +902,54 @@ mod tests {
             size: symbol_size,
         }];
         let functions = allowed_functions(&output, TEXT_INDEX, &text, &symbols)?;
-        check_instructions(&output, START, code, &functions, false)
+        check_instructions(&output, START, code, &functions, 0..0, false)
+    }
+
+    #[test]
+    fn wrgsbase_and_pio_instructions_are_forbidden() {
+        for code in [
+            &[0xf3, 0x48, 0x0f, 0xae, 0xd8][..], // WRGSBASE %rax
+            &[0x0f, 0x01, 0xef][..],             // WRPKRU
+            &[0xe4, 0x60][..],                   // IN $0x60, %al
+            &[0xe6, 0x64][..],                   // OUT %al, $0x64
+            &[0xec][..],                         // IN (%dx), %al
+            &[0xee][..],                         // OUT %al, (%dx)
+        ] {
+            let error = audit_function("ordinary::code", code, code.len() as u64).unwrap_err();
+            assert!(error.contains("forbidden"), "{error}");
+        }
+    }
+
+    #[test]
+    fn cpu_access_rejects_backward_branches_and_calls_while_allowing_forward_exits() {
+        const START: u64 = 0x2000;
+        let decode_check = |code: &[u8], range: core::ops::Range<u64>| -> Result<(), String> {
+            let mut file = NamedTempFile::new().unwrap();
+            file.write_all(code).unwrap();
+            let decoded = run_objdump(
+                OsStr::new("objdump"),
+                &[
+                    "-D",
+                    "-z",
+                    "-w",
+                    "--insn-width=16",
+                    "-b",
+                    "binary",
+                    "-m",
+                    "i386:x86-64",
+                    "--adjust-vma=8192",
+                ],
+                file.path().as_os_str(),
+            )?;
+            check_instructions(&decoded, START, code, &[], range, false)
+        };
+        // Forward conditional jump inside range + unconditional jump exiting range: allowed.
+        let ok_code = [0x85, 0xc0, 0x74, 0x02, 0x89, 0xc0, 0xeb, 0xfe];
+        assert_eq!(decode_check(&ok_code, START..START + 6), Ok(()));
+        // Self-loop (`jmp .` = `eb fe`) inside `.text.kernelet_cpu_access`: rejected.
+        assert!(decode_check(&[0xeb, 0xfe], START..START + 2).is_err());
+        // Direct `call` inside `.text.kernelet_cpu_access`: rejected.
+        assert!(decode_check(&[0xe8, 0x00, 0x00, 0x00, 0x00], START..START + 5).is_err());
     }
 
     #[test]

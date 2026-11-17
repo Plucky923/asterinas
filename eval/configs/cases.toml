@@ -1,0 +1,796 @@
+# Declarative Syscall & MM benchmark registry for `poc/eval/`.
+# Single source of truth for case commands, CPU pinning, tmpfiles, copy_files, parsers, and fail-closed invariants.
+
+[defaults]
+grant_mb = 512
+vcpus = 2
+rounds = 5
+seed = 20261116
+timeout_sec = 120
+
+# ---------------------------------------------------------------------------
+# Step 0: Fairness & baseline noise self-checks
+# ---------------------------------------------------------------------------
+
+[cases."selfcheck.vdso"]
+group = "selfcheck"
+suite = "selfcheck"
+binary = "/bin/vdso_selfcheck"
+args = ["--iters", "100000"]
+cpus = [0]
+parser = "vdso_selfcheck"
+unit = "syscalls"
+higher_is_better = false
+
+[cases."selfcheck.vdso".invariants]
+max_vdso_syscalls = 0
+forbid_migration = true
+forbid_thp = true
+
+[cases."selfcheck.noop"]
+group = "selfcheck"
+suite = "selfcheck"
+binary = "/bin/true"
+args = []
+cpus = [0]
+parser = "noop_rc"
+unit = "rc"
+higher_is_better = false
+
+[cases."selfcheck.noop".invariants]
+forbid_migration = true
+forbid_thp = true
+
+# ---------------------------------------------------------------------------
+# Syscall microbenchmarks (LMbench 3 + will-it-scale)
+# ---------------------------------------------------------------------------
+
+[cases."sys.lm.null"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_syscall"
+args = ["-P", "1", "null"]
+cpus = [0]
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.null".invariants]
+max_fpu_saves = 0
+max_non_sysret = 0
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.read"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_syscall"
+args = ["-P", "1", "read"]
+cpus = [0]
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.read".invariants]
+max_timing_faults = 0
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.write"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_syscall"
+args = ["-P", "1", "write"]
+cpus = [0]
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.write".invariants]
+max_timing_faults = 0
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.fstat"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_syscall"
+args = ["-P", "1", "fstat", "/tmp/lm_stat_file"]
+cpus = [0]
+tmpfiles = [{ path = "/tmp/lm_stat_file", size_mb = 1 }]
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.fstat".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.stat"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_syscall"
+args = ["-P", "1", "stat", "/tmp/lm_stat_file"]
+cpus = [0]
+tmpfiles = [{ path = "/tmp/lm_stat_file", size_mb = 1 }]
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.stat".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.open"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_syscall"
+args = ["-P", "1", "open", "/tmp/lm_stat_file"]
+cpus = [0]
+tmpfiles = [{ path = "/tmp/lm_stat_file", size_mb = 1 }]
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.open".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.pipe"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_pipe"
+args = ["-P", "1"]
+cpus = [0, 1]
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.pipe".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.select"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_select"
+args = ["-P", "1", "file"]
+cpus = [0]
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.select".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.fork"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_proc"
+args = ["-P", "1", "fork"]
+cpus = [0, 1]
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.fork".invariants]
+require_vm_balance = true
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.exec"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_proc"
+args = ["-P", "1", "exec"]
+cpus = [0, 1]
+copy_files = [{ src = "/benchmark/bin/lmbench/hello", dst = "/tmp/hello" }]
+verify_exec = "/tmp/hello"
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.exec".invariants]
+require_vm_balance = true
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.lm.shell"]
+group = "syscall"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_proc"
+args = ["-P", "1", "shell"]
+cpus = [0, 1]
+copy_files = [{ src = "/benchmark/bin/lmbench/hello", dst = "/tmp/hello" }]
+verify_exec = "/tmp/hello"
+parser = "lmbench_latency"
+unit = "us/op"
+higher_is_better = false
+
+[cases."sys.lm.shell".invariants]
+require_vm_balance = true
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.wis.getppid.p1"]
+group = "syscall"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/getppid1_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."sys.wis.getppid.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.wis.getppid.p2"]
+group = "syscall"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/getppid1_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."sys.wis.getppid.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.wis.open.p1"]
+group = "syscall"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/open1_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."sys.wis.open.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.wis.open.p2"]
+group = "syscall"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/open1_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."sys.wis.open.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.wis.dup.p1"]
+group = "syscall"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/dup1_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."sys.wis.dup.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.wis.dup.p2"]
+group = "syscall"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/dup1_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."sys.wis.dup.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.wis.pipe.p1"]
+group = "syscall"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/pipe1_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."sys.wis.pipe.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."sys.wis.pipe.p2"]
+group = "syscall"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/pipe1_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."sys.wis.pipe.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+# ---------------------------------------------------------------------------
+# MM (page fault, VMA/VMAR, protection, bandwidth, stress-ng) benchmarks
+# ---------------------------------------------------------------------------
+
+[cases."mm.wis.pf_anon.p1"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/page_fault1_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.pf_anon.p1".invariants]
+min_minor_faults = 32768
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.pf_anon.p2"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/page_fault1_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.pf_anon.p2".invariants]
+min_minor_faults = 65536
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.pf_file.p1"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/page_fault2_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.pf_file.p1".invariants]
+min_minor_faults = 32768
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.pf_file.p2"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/page_fault2_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.pf_file.p2".invariants]
+min_minor_faults = 65536
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.pf_shared.p1"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/page_fault3_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.pf_shared.p1".invariants]
+min_minor_faults = 32768
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.pf_shared.p2"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/page_fault3_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.pf_shared.p2".invariants]
+min_minor_faults = 65536
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.mmap1.p1"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/mmap1_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.mmap1.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.mmap1.p2"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/mmap1_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.mmap1.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.mmap2.p1"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/mmap2_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.mmap2.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.mmap2.p2"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/mmap2_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.mmap2.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.brk1.p1"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/brk1_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.brk1.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.brk1.p2"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/brk1_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.brk1.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.malloc1.p1"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/malloc1_processes"
+args = ["-t", "1", "-s", "5"]
+cpus = [0]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.malloc1.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.wis.malloc1.p2"]
+group = "mm"
+suite = "will-it-scale"
+binary = "/benchmark/bin/will-it-scale/malloc1_processes"
+args = ["-t", "2", "-s", "5"]
+cpus = [0, 1]
+parser = "will_it_scale_ops"
+unit = "ops/s"
+higher_is_better = true
+
+[cases."mm.wis.malloc1.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.lm.mmap"]
+group = "mm"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_mmap"
+args = ["64m", "/tmp/lm_mmap_64m"]
+cpus = [0]
+tmpfiles = [{ path = "/tmp/lm_mmap_64m", size_mb = 64 }]
+parser = "lmbench_latency"
+unit = "us"
+higher_is_better = false
+
+[cases."mm.lm.mmap".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.lm.mmap_bw"]
+group = "mm"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/bw_mmap_rd"
+args = ["64m", "mmap_only", "/tmp/lm_mmap_64m"]
+cpus = [0]
+tmpfiles = [{ path = "/tmp/lm_mmap_64m", size_mb = 64 }]
+parser = "lmbench_bandwidth"
+unit = "MB/s"
+higher_is_better = true
+
+[cases."mm.lm.mmap_bw".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.lm.pf_lat"]
+group = "mm"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_pagefault"
+args = ["-P", "1", "/tmp/lm_pf_64m"]
+cpus = [0]
+tmpfiles = [{ path = "/tmp/lm_pf_64m", size_mb = 64 }]
+parser = "lmbench_latency"
+unit = "us/fault"
+higher_is_better = false
+
+[cases."mm.lm.pf_lat".invariants]
+min_minor_faults = 1024
+timing_stage_index = 1
+min_timing_stage_faults = 1024
+forbid_migration = true
+forbid_thp = true
+
+# `lat_sig prot` maps a 4096-byte PROT_READ MAP_SHARED page, writes to trigger
+# SIGSEGV, and catches the signal in a sigaction handler (it does not call mprotect).
+[cases."mm.lm.prot"]
+group = "mm"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/lat_sig"
+args = ["-P", "1", "prot", "/tmp/lm_prot_64m"]
+cpus = [0]
+tmpfiles = [{ path = "/tmp/lm_prot_64m", size_mb = 64 }]
+parser = "lmbench_latency"
+unit = "us/fault"
+higher_is_better = false
+
+[cases."mm.lm.prot".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.lm.bw_mem.rd"]
+group = "mm"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/bw_mem"
+args = ["-P", "1", "64m", "rd"]
+cpus = [0]
+parser = "lmbench_bandwidth"
+unit = "MB/s"
+higher_is_better = true
+
+[cases."mm.lm.bw_mem.rd".invariants]
+max_timing_faults = 0
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.lm.bw_mem.wr"]
+group = "mm"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/bw_mem"
+args = ["-P", "1", "64m", "wr"]
+cpus = [0]
+parser = "lmbench_bandwidth"
+unit = "MB/s"
+higher_is_better = true
+
+[cases."mm.lm.bw_mem.wr".invariants]
+max_timing_faults = 0
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.lm.bw_mem.rdwr"]
+group = "mm"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/bw_mem"
+args = ["-P", "1", "64m", "rdwr"]
+cpus = [0]
+parser = "lmbench_bandwidth"
+unit = "MB/s"
+higher_is_better = true
+
+[cases."mm.lm.bw_mem.rdwr".invariants]
+max_timing_faults = 0
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.lm.bw_mem.fcp"]
+group = "mm"
+suite = "lmbench"
+binary = "/benchmark/bin/lmbench/bw_mem"
+args = ["-P", "1", "64m", "fcp"]
+cpus = [0]
+parser = "lmbench_bandwidth"
+unit = "MB/s"
+higher_is_better = true
+
+[cases."mm.lm.bw_mem.fcp".invariants]
+max_timing_faults = 0
+forbid_migration = true
+forbid_thp = true
+
+# ---------------------------------------------------------------------------
+# stress-ng VM / fork / mprotect throughput (1-core and 2-core)
+# Note: stress-ng 0.18.06 has no pre-fork large MAP_PRIVATE + post-fork write
+# COW stressor (`--mmapfork` maps MAP_SHARED after fork; `--fork-vm` only calls
+# madvise), so these cases measure fork, mprotect, and 64 MiB private-anon VM
+# fault/write throughput without mislabeling them as COW.
+# ---------------------------------------------------------------------------
+
+[cases."mm.stress.fork.p1"]
+group = "stress"
+suite = "stress-ng"
+binary = "/benchmark/bin/stress-ng"
+args = ["--fork", "1", "--timeout", "5s", "--metrics-brief"]
+cpus = [0]
+parser = "stress_ng_bogo_ops"
+unit = "bogo ops/s"
+higher_is_better = true
+
+[cases."mm.stress.fork.p1".invariants]
+require_vm_balance = true
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.stress.fork.p2"]
+group = "stress"
+suite = "stress-ng"
+binary = "/benchmark/bin/stress-ng"
+args = ["--fork", "2", "--timeout", "5s", "--metrics-brief"]
+cpus = [0, 1]
+parser = "stress_ng_bogo_ops"
+unit = "bogo ops/s"
+higher_is_better = true
+
+[cases."mm.stress.fork.p2".invariants]
+require_vm_balance = true
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.stress.vm.p1"]
+group = "stress"
+suite = "stress-ng"
+binary = "/benchmark/bin/stress-ng"
+args = ["--vm", "1", "--vm-bytes", "64M", "--timeout", "5s", "--metrics-brief"]
+cpus = [0]
+parser = "stress_ng_bogo_ops"
+unit = "bogo ops/s"
+higher_is_better = true
+
+[cases."mm.stress.vm.p1".invariants]
+min_minor_faults = 16384
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.stress.vm.p2"]
+group = "stress"
+suite = "stress-ng"
+binary = "/benchmark/bin/stress-ng"
+args = ["--vm", "2", "--vm-bytes", "128M", "--timeout", "5s", "--metrics-brief"]
+cpus = [0, 1]
+parser = "stress_ng_bogo_ops"
+unit = "bogo ops/s"
+higher_is_better = true
+
+[cases."mm.stress.vm.p2".invariants]
+min_minor_faults = 32768
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.stress.mprotect.p1"]
+group = "stress"
+suite = "stress-ng"
+binary = "/benchmark/bin/stress-ng"
+args = ["--mprotect", "1", "--timeout", "5s", "--metrics-brief"]
+cpus = [0]
+parser = "stress_ng_bogo_ops"
+unit = "bogo ops/s"
+higher_is_better = true
+
+[cases."mm.stress.mprotect.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.stress.mprotect.p2"]
+group = "stress"
+suite = "stress-ng"
+binary = "/benchmark/bin/stress-ng"
+args = ["--mprotect", "2", "--timeout", "5s", "--metrics-brief"]
+cpus = [0, 1]
+parser = "stress_ng_bogo_ops"
+unit = "bogo ops/s"
+higher_is_better = true
+
+[cases."mm.stress.mprotect.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.stress.mmap_mprotect.p1"]
+group = "stress"
+suite = "stress-ng"
+binary = "/benchmark/bin/stress-ng"
+args = ["--mmap", "1", "--mmap-bytes", "64M", "--mmap-mprotect", "--timeout", "5s", "--metrics-brief"]
+cpus = [0]
+parser = "stress_ng_bogo_ops"
+unit = "bogo ops/s"
+higher_is_better = true
+
+[cases."mm.stress.mmap_mprotect.p1".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.stress.mmap_mprotect.p2"]
+group = "stress"
+suite = "stress-ng"
+binary = "/benchmark/bin/stress-ng"
+args = ["--mmap", "2", "--mmap-bytes", "128M", "--mmap-mprotect", "--timeout", "5s", "--metrics-brief"]
+cpus = [0, 1]
+parser = "stress_ng_bogo_ops"
+unit = "bogo ops/s"
+higher_is_better = true
+
+[cases."mm.stress.mmap_mprotect.p2".invariants]
+forbid_migration = true
+forbid_thp = true
+
+[cases."mm.sng.cow"]
+group = "stress"
+suite = "stress-ng"
+binary = "/benchmark/bin/stress-ng"
+args = ["--cow", "1", "--timeout", "5s", "--metrics-brief"]
+cpus = [0]
+parser = "stress_ng_bogo_ops"
+unit = "bogo ops/s"
+higher_is_better = true
+auto_skip_reason = "COVERAGE GAP: stress-ng 0.18.06 has no --cow stressor (pre-fork large MAP_PRIVATE + post-fork child write); R2 forbids custom benchmark code"
+
+[cases."mm.sng.cow".invariants]
+forbid_migration = true
+forbid_thp = true

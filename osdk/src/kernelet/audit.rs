@@ -111,8 +111,11 @@ pub fn audit_kernelet_image(
         entry_table.virq_entry(),
         entry_table.yield_entry(),
         entry_table.exit_entry(),
+        entry_table.user_event_entry(),
         entry_table.stub_range_start(),
         entry_table.stub_range_end(),
+        entry_table.cpu_access_start(),
+        entry_table.cpu_access_end(),
     ) {
         violations.push(err);
     }
@@ -154,6 +157,7 @@ fn check_10_indirect_targets(
         ("virtual interrupt entry".to_string(), table.virq_entry()),
         ("carrier yield entry".to_string(), table.yield_entry()),
         ("carrier exit entry".to_string(), table.exit_entry()),
+        ("user event entry".to_string(), table.user_event_entry()),
     ];
     let relocated = relocations.iter().filter_map(|relocation| {
         if relocation.rtype != elf::R_X86_64_RELATIVE {
@@ -283,6 +287,10 @@ impl<'a> EntryTableBytes<'a> {
 
     fn ex_table_end(&self) -> u64 {
         self.field(abi::entry_table::EX_TABLE_END_OFFSET)
+    }
+
+    fn user_event_entry(&self) -> u64 {
+        self.field(abi::entry_table::USER_EVENT_ENTRY_OFFSET)
     }
 }
 
@@ -506,6 +514,7 @@ fn check_4_entry_table(
         ("virq_entry", table.virq_entry()),
         ("yield_entry", table.yield_entry()),
         ("exit_entry", table.exit_entry()),
+        ("user_event_entry", table.user_event_entry()),
     ] {
         if entry
             .checked_add(1)

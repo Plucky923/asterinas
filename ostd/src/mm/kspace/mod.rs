@@ -140,6 +140,20 @@ pub(crate) fn paddr_to_vaddr(pa: Paddr) -> usize {
     }
 }
 
+/// Convert linear-mapped virtual address to physical address, only available inside `ostd`
+pub(crate) fn vaddr_to_paddr(va: Vaddr) -> Paddr {
+    #[cfg(feature = "kernelet")]
+    {
+        let base = crate::kernelet::entry::boot_args().linear_map_base as usize;
+        return va - base;
+    }
+    #[cfg(not(feature = "kernelet"))]
+    {
+        debug_assert!(LINEAR_MAPPING_VADDR_RANGE.contains(&va));
+        va - LINEAR_MAPPING_BASE_VADDR
+    }
+}
+
 /// The kernel page table instance.
 ///
 /// It manages the kernel mapping of all address spaces by sharing the kernel part. And it

@@ -179,9 +179,15 @@ impl VtConsole {
     pub(in vt) fn send(&self, buf: &[u8]) {
         let mut backend = self.backend.lock();
         match &mut *backend {
-            VtConsoleBackend::Framebuffer(c) => c.send(buf),
+            VtConsoleBackend::Framebuffer(c) => {
+                c.send(buf);
+                return;
+            }
             VtConsoleBackend::None => {}
         }
+        drop(backend);
+        #[cfg(feature = "kernelet")]
+        ostd::early_print!("{}", String::from_utf8_lossy(buf));
     }
 
     /// Sets the console font.

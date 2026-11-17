@@ -82,4 +82,6 @@ unsafe extern "C" {
         vcpu_record: *const crate::kernelet::abi::VcpuRecord,
     );
     pub(crate) unsafe fn kernel_task_entry_wrapper();
+    #[cfg(feature = "kernelet")]
+    pub(crate) unsafe fn first_user_task_entry_wrapper();
 }

@@ -108,9 +108,6 @@ pub(in crate::arch) fn get_or_init(_guard: &dyn PinCurrentCpu) -> &(dyn Apic + '
 }
 
 pub(in crate::arch) trait Apic: ApicTimer {
-    /// Snapshots fixed-delivery vectors accepted but not acknowledged.
-    #[cfg(feature = "kernelet-host")]
-    fn in_service(&self) -> [u32; 8];
     fn id(&self) -> u32;
 
     fn version(&self) -> u32;
@@ -274,7 +271,7 @@ impl From<u32> for ApicId {
 #[repr(u64)]
 pub(in crate::arch) enum DestinationShorthand {
     NoShorthand = 0b00,
-    #[cfg_attr(not(feature = "kernelet-host"), expect(dead_code))]
+    #[expect(dead_code)]
     MySelf = 0b01,
     AllIncludingSelf = 0b10,
     AllExcludingSelf = 0b11,

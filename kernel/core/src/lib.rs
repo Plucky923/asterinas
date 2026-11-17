@@ -45,8 +45,6 @@ pub mod context;
 mod cpu;
 pub mod device;
 mod driver;
-#[cfg(feature = "kernelet-host")]
-mod endovisor;
 pub mod error;
 pub mod events;
 pub mod fs;

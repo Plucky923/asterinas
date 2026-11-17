@@ -73,6 +73,35 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         unsafe { self.node.write_pte(self.idx, self.pte) };
     }
 
+    /// Operates on the mapping properties of the entry and returns the physical address,
+    /// old properties, and updated properties when the entry is mapped.
+    #[cfg(feature = "kernelet")]
+    pub(in crate::mm) fn protect_tracked(
+        &mut self,
+        op: &mut impl FnMut(&mut PageProperty),
+    ) -> Option<(crate::mm::Paddr, PageProperty, PageProperty)> {
+        let level = self.node.level();
+        let PteScalar::Mapped(pa, prop) = self.pte.to_repr(level) else {
+            return None;
+        };
+
+        let mut new_prop = prop;
+        op(&mut new_prop);
+
+        if prop != new_prop {
+            self.pte = C::E::from_repr(&PteScalar::Mapped(pa, new_prop), level);
+
+            // SAFETY:
+            //  1. The index is within the bounds.
+            //  2. We replace the PTE with a new one, which differs only in
+            //     `PageProperty`, so it's in `C` and at the correct paging level.
+            //  3. The child is still owned by the page table node.
+            unsafe { self.node.write_pte(self.idx, self.pte) };
+        }
+
+        Some((pa, prop, new_prop))
+    }
+
     /// Replaces the entry with a new child.
     ///
     /// The old child is returned.

@@ -152,6 +152,15 @@ impl WaitStatus {
         }
     }
 
+    pub(crate) fn minor_faults(&self) -> u64 {
+        match self.source() {
+            WaitStatusSource::Process(process) => process
+                .minor_faults()
+                .saturating_add(process.reaped_children_stats().lock().minflt()),
+            WaitStatusSource::Thread(_) => 0,
+        }
+    }
+
     fn source(&self) -> WaitStatusSource<'_> {
         match self {
             WaitStatus::Zombie(process)
@@ -366,10 +375,17 @@ fn reap_zombie_child(
     let mut child_group_mut = child_process.process_group.lock();
     child_process.clear_old_group_and_session(&mut child_group_mut, &mut pid_table);
 
-    let (mut user_time, mut kernel_time) = child_process.reaped_children_stats().lock().get();
+    let (mut user_time, mut kernel_time, child_minflt) = {
+        let stats = child_process.reaped_children_stats().lock();
+        let (ut, kt) = stats.get();
+        (ut, kt, stats.minflt())
+    };
     user_time += child_process.prof_clock().user_clock().read_time();
     kernel_time += child_process.prof_clock().kernel_clock().read_time();
-    reaped_children_stats.lock().add(user_time, kernel_time);
+    let total_minflt = child_process.minor_faults().saturating_add(child_minflt);
+    reaped_children_stats
+        .lock()
+        .add(user_time, kernel_time, total_minflt);
 
     child_process.status().exit_code()
 }

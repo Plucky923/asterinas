@@ -189,15 +189,23 @@ pub use unwinding::panic::catch_unwind;
 
 /// Catches an unwind and reports each caught kernelet panic to its Host.
 #[cfg(feature = "kernelet")]
+#[inline]
 pub fn catch_unwind<R, F: FnOnce() -> R>(
     f: F,
 ) -> Result<R, alloc::boxed::Box<dyn core::any::Any + Send>> {
     let result = unwinding::panic::catch_unwind(f);
     if result.is_err() {
-        let message = stashed_message();
-        let _ = crate::kernelet::entry::report_oops(message.as_str());
+        report_caught_panic();
     }
     result
+}
+
+#[cfg(feature = "kernelet")]
+#[cold]
+#[inline(never)]
+fn report_caught_panic() {
+    let message = stashed_message();
+    let _ = crate::kernelet::entry::report_oops(message.as_str());
 }
 
 /// Prints the stack trace of the current thread to the console.

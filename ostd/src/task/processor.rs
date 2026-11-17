@@ -37,6 +37,19 @@ pub(super) fn current_task() -> Option<NonNull<Task>> {
 }
 
 #[cfg(feature = "kernelet")]
+#[inline(always)]
+pub(super) fn current_task_ptr_offset() -> usize {
+    CURRENT_TASK_PTR.offset()
+}
+
+#[cfg(feature = "kernelet")]
+pub(super) fn current_task_with(
+    access: &crate::arch::cpu::local::CpuLocalAccess<'_>,
+) -> Option<NonNull<Task>> {
+    NonNull::new(access.load(&CURRENT_TASK_PTR).cast_mut())
+}
+
+#[cfg(feature = "kernelet")]
 pub(super) fn adopt_current_boot_task(task: Arc<Task>) {
     assert!(!crate::arch::irq::is_local_enabled());
     assert!(CURRENT_TASK_PTR.load().is_null());
@@ -78,28 +91,6 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
     }
 
     before_switching_to(&next_task, &irq_guard);
-    #[cfg(any(
-        feature = "kernelet-host",
-        feature = "kernelet",
-        kernelet_rq1,
-        kernelet_rq1_diagnostics,
-        ktest
-    ))]
-    if let Some(current) = Task::current() {
-        #[cfg(kernelet_rq1_diagnostics)]
-        crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::TaskSwitchOut);
-        #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
-        let _ = current.accounting.sample(false);
-        // Carrier state belongs to the native execution continuation.
-        #[cfg(feature = "kernelet-host")]
-        {
-            let address = current.carrier_context.load(Ordering::Acquire);
-            if address != 0 {
-                // SAFETY: IRQs are masked and the outgoing Task retains its context.
-                unsafe { crate::kernelet::host_run::pause_carrier_context(address) };
-            }
-        }
-    }
 
     // `before_switching_to` guarantees that from now on, and while the next task is running on the
     // CPU, its context can be used exclusively.
@@ -137,12 +128,6 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
         // Until `after_switching_to`, the task's context is alive and can be exclusively used.
         current_task.ctx.get()
     } else {
-        #[cfg(all(kernelet_getpid_profile, target_arch = "x86_64"))]
-        crate::kernelet::getpid_profile::event(if cfg!(feature = "kernelet") {
-            crate::kernelet::getpid_profile::event_id::GUEST_SWITCH
-        } else {
-            crate::kernelet::getpid_profile::event_id::NATIVE_SWITCH
-        });
         // SAFETY:
         // 1. We have exclusive access to the next context (see above).
         // 2. The next context is valid (because it is either correctly initialized or written by a
@@ -164,12 +149,6 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
         unreachable!("`first_context_switch` should never return");
     };
 
-    #[cfg(all(kernelet_getpid_profile, target_arch = "x86_64"))]
-    crate::kernelet::getpid_profile::event(if cfg!(feature = "kernelet") {
-        crate::kernelet::getpid_profile::event_id::GUEST_SWITCH
-    } else {
-        crate::kernelet::getpid_profile::event_id::NATIVE_SWITCH
-    });
     // SAFETY:
     // 1. We have exclusive access to both the current context and the next context (see above).
     // 2. The next context is valid (because it is either correctly initialized or written by a
@@ -216,7 +195,7 @@ fn before_switching_to(next_task: &Task, irq_guard: &DisabledLocalIrqGuard) {
 /// # Safety
 ///
 /// This function must be called only once after switching to a task.
-pub(super) unsafe fn after_switching_to() {
+pub(crate) unsafe fn after_switching_to() {
     #[cfg(feature = "kernelet")]
     {
         let boot_stack = BOOT_STACK_TO_RELEASE.load();
@@ -229,27 +208,50 @@ pub(super) unsafe fn after_switching_to() {
             assert_eq!(result, 0, "Host refused to retire a bootstrap stack");
         }
     }
-    #[cfg(any(
-        feature = "kernelet-host",
-        feature = "kernelet",
-        kernelet_rq1,
-        kernelet_rq1_diagnostics,
-        ktest
-    ))]
-    if let Some(current) = Task::current() {
-        #[cfg(feature = "kernelet-host")]
-        {
-            let address = current.carrier_context.load(Ordering::Acquire);
-            if address != 0 {
-                // SAFETY: IRQs are masked and the incoming Task retains its context.
-                unsafe { crate::kernelet::host_run::restore_carrier_context(address) };
+    let prev = PREVIOUS_TASK_PTR.load();
+    #[cfg(feature = "kernelet")]
+    {
+        let urec = crate::kernelet::entry::user_event_record();
+        let pt_regs_ptr =
+            urec.pt_regs.load(Ordering::Acquire) as *mut crate::arch::cpu::context::LinuxPtRegs;
+        if !prev.is_null() {
+            // SAFETY: `prev` is alive and still owns `switched_to_cpu == true` on
+            // this vCPU until released below, so saving its live `pt_regs` frame
+            // into its stack save area before cross-vCPU migration is race-free.
+            let prev_ref = unsafe { &*prev };
+            if prev_ref.is_user() && !prev_ref.is_exiting() {
+                assert!(
+                    !pt_regs_ptr.is_null(),
+                    "user task switched out without Host pt_regs pointer"
+                );
+                let saved = unsafe { pt_regs_ptr.read() };
+                let save_area = prev_ref.pt_regs_save_area();
+                unsafe { save_area.write(saved) };
+                prev_ref.active_pt_regs().store(save_area, Ordering::Release);
             }
         }
-        #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
-        current.accounting.resume();
+        if let Some(current) = Task::current()
+            && current.is_user()
+            && !current.is_exiting()
+        {
+            urec.event_rsp
+                .store(current.event_rsp() as u64, Ordering::Release);
+            urec.event_stack_limit
+                .store(current.kstack.lower_bound() as u64, Ordering::Release);
+            assert!(
+                !pt_regs_ptr.is_null(),
+                "user task switched in without Host pt_regs pointer"
+            );
+            // SAFETY: `current` exclusively owns its stack save area (`switched_to_cpu`
+            // was acquired in `before_switching_to`), and `pt_regs_ptr` is this vCPU's frame.
+            let incoming = unsafe { current.pt_regs_save_area().read() };
+            unsafe { pt_regs_ptr.write(incoming) };
+            current
+                .active_pt_regs()
+                .store(pt_regs_ptr, Ordering::Relaxed);
+        }
     }
     // Release the previous task.
-    let prev = PREVIOUS_TASK_PTR.load();
     let prev = if !prev.is_null() {
         PREVIOUS_TASK_PTR.store(core::ptr::null());
 

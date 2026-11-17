@@ -38,24 +38,7 @@ use crate::{BLOCK_SIZE, SECTOR_SIZE, impl_block_device::general_complete_fn, pre
 pub struct Bio {
     metadata: Arc<BioMetadata>,
     complete_fn: Option<BioCompleteFn>,
-    segments: BioSegments,
-}
-
-#[derive(Debug)]
-enum BioSegments {
-    Multiple(Vec<BioSegment>),
-    #[cfg(feature = "kernelet-host")]
-    Single(BioSegment),
-}
-
-impl BioSegments {
-    fn as_slice(&self) -> &[BioSegment] {
-        match self {
-            Self::Multiple(segments) => segments,
-            #[cfg(feature = "kernelet-host")]
-            Self::Single(segment) => core::slice::from_ref(segment),
-        }
-    }
+    segments: Vec<BioSegment>,
 }
 
 /// The completion function type for BIO operations.
@@ -77,35 +60,7 @@ impl Bio {
         segments: Vec<BioSegment>,
         complete_fn: Option<BioCompleteFn>,
     ) -> Self {
-        Self::with_segments(
-            type_,
-            start_sid,
-            BioSegments::Multiple(segments),
-            complete_fn,
-        )
-    }
-
-    /// Constructs a BIO with one inline segment, without allocating a segment vector.
-    ///
-    /// Submission retains the segment until device completion, as with [`Self::new`].
-    #[cfg(feature = "kernelet-host")]
-    pub fn new_single(
-        type_: BioType,
-        start_sid: Sid,
-        segment: BioSegment,
-        complete_fn: Option<BioCompleteFn>,
-    ) -> Self {
-        Self::with_segments(type_, start_sid, BioSegments::Single(segment), complete_fn)
-    }
-
-    fn with_segments(
-        type_: BioType,
-        start_sid: Sid,
-        segments: BioSegments,
-        complete_fn: Option<BioCompleteFn>,
-    ) -> Self {
         let nsectors = segments
-            .as_slice()
             .iter()
             .map(|segment| segment.nsectors().to_raw())
             .sum();
@@ -135,7 +90,7 @@ impl Bio {
 
     /// Returns the slice to the memory segments currently owned by this handle.
     pub fn segments(&self) -> &[BioSegment] {
-        self.segments.as_slice()
+        &self.segments
     }
 
     /// Returns the status.
@@ -242,7 +197,7 @@ pub struct SubmittedBio {
     metadata: Arc<BioMetadata>,
     sid_offset: u64,
     complete_fn: Option<BioCompleteFn>,
-    segments: BioSegments,
+    segments: Vec<BioSegment>,
 }
 
 impl SubmittedBio {
@@ -268,7 +223,7 @@ impl SubmittedBio {
 
     /// Returns the slice to the memory segments.
     pub fn segments(&self) -> &[BioSegment] {
-        self.segments.as_slice()
+        &self.segments
     }
 
     /// Returns the status.
@@ -418,33 +373,8 @@ pub struct BioSegment {
 struct BioSegmentInner {
     /// Internal DMA slice.
     // TODO: The direction is currently `FromAndToDevice`. Implement compile-time checking.
-    storage: BioSegmentStorage,
+    storage: Slice<BioBuffer>,
     direction: BioDirection,
-}
-
-#[derive(Debug)]
-enum BioSegmentStorage {
-    Active(Slice<BioBuffer>),
-    #[cfg(feature = "kernelet-host")]
-    Cached,
-}
-
-impl From<Slice<BioBuffer>> for BioSegmentStorage {
-    fn from(storage: Slice<BioBuffer>) -> Self {
-        Self::Active(storage)
-    }
-}
-
-impl Deref for BioSegmentStorage {
-    type Target = Slice<BioBuffer>;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Active(storage) => storage,
-            #[cfg(feature = "kernelet-host")]
-            Self::Cached => unreachable!("only active BIO segments expose storage"),
-        }
-    }
 }
 
 /// The direction of a bio request.
@@ -457,117 +387,32 @@ pub enum BioDirection {
 }
 
 /// The owning DMA storage of a BIO segment.
-///
-/// Shared backing is confined to BIO views; general DMA buffers retain their
-/// native representation, including network and VirtIO filesystem buffers.
 #[derive(Debug)]
-pub struct BioBuffer(BioBufferInner);
-
-#[derive(Debug)]
-enum BioBufferInner {
-    Owned(DmaBuffer<FromAndToDevice>),
-    #[cfg(feature = "kernelet-host")]
-    Shared(Arc<DmaBuffer<FromAndToDevice>>),
-    #[cfg(feature = "kernelet-host")]
-    Imported(Arc<ostd::kernelet::shared_buffer::BackendBuffer>),
-    #[cfg(feature = "kernelet-host")]
-    Lent(LentStorage),
-}
-
-#[cfg(feature = "kernelet-host")]
-struct LentStorage {
-    // Drop the pin before refunding the retained device's metadata budget.
-    lease: ostd::kernelet::guest_dma::GuestDmaLease,
-    _owner: Arc<dyn Send + Sync>,
-}
-
-/// Reusable metadata for a borrowed BIO segment, without a retained DMA lease.
-///
-/// A cache can be rebound only with a newly checked lease.
-/// It exposes no DMA
-/// address or CPU access and cannot be submitted as a BIO segment.
-#[cfg(feature = "kernelet-host")]
-pub struct GuestBioSegmentCache {
-    inner: Arc<BioSegmentInner>,
-    _owner: Arc<dyn Send + Sync>,
-}
-
-#[cfg(feature = "kernelet-host")]
-impl Debug for GuestBioSegmentCache {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        self.inner.fmt(formatter)
-    }
-}
-
-#[cfg(feature = "kernelet-host")]
-impl GuestBioSegmentCache {
-    /// Binds this metadata to a newly acquired DMA lease.
-    pub fn bind(
-        mut self,
-        lease: ostd::kernelet::guest_dma::GuestDmaLease,
-        owner: Arc<dyn Send + Sync>,
-    ) -> Result<BioSegment, Error> {
-        let inner = BioSegment::guest_dma_inner(lease, owner)?;
-        *Arc::get_mut(&mut self.inner).expect("cached segment must be uniquely owned") = inner;
-        Ok(BioSegment { inner: self.inner })
-    }
-}
-
-#[cfg(feature = "kernelet-host")]
-impl Debug for LentStorage {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        self.lease.fmt(formatter)
-    }
-}
+pub struct BioBuffer(DmaBuffer<FromAndToDevice>);
 
 impl BioBuffer {
-    fn new<const SHARED: bool>(buffer: DmaBuffer<FromAndToDevice>) -> Self {
-        #[cfg(feature = "kernelet-host")]
-        if SHARED {
-            return Self(BioBufferInner::Shared(Arc::new(buffer)));
-        }
-        Self(BioBufferInner::Owned(buffer))
+    fn new(buffer: DmaBuffer<FromAndToDevice>) -> Self {
+        Self(buffer)
     }
 }
 
-// Preserve the native public backing interface. Imported grants in Host
-// builds deliberately expose only the restricted BIO accessors below.
-#[cfg(not(feature = "kernelet-host"))]
 impl Deref for BioBuffer {
     type Target = DmaBuffer<FromAndToDevice>;
 
     fn deref(&self) -> &Self::Target {
-        match &self.0 {
-            BioBufferInner::Owned(buffer) => buffer,
-        }
+        &self.0
     }
 }
 
 impl HasSize for BioBuffer {
     fn size(&self) -> usize {
-        match &self.0 {
-            BioBufferInner::Owned(buffer) => buffer.size(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Shared(buffer) => buffer.size(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Imported(buffer) => buffer.size(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Lent(buffer) => buffer.lease.size(),
-        }
+        self.0.size()
     }
 }
 
 impl HasDaddr for BioBuffer {
     fn daddr(&self) -> Daddr {
-        match &self.0 {
-            BioBufferInner::Owned(buffer) => buffer.daddr(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Shared(buffer) => buffer.daddr(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Imported(buffer) => buffer.daddr(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Lent(buffer) => buffer.lease.daddr(),
-        }
+        self.0.daddr()
     }
 }
 
@@ -575,149 +420,27 @@ impl HasVmReaderWriter for BioBuffer {
     type Types = VmReaderWriterResult;
 
     fn reader(&self) -> Result<VmReader<'_, Infallible>, Error> {
-        match &self.0 {
-            BioBufferInner::Owned(buffer) => buffer.reader(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Shared(buffer) => buffer.reader(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Imported(buffer) => buffer.reader(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Lent(_) => Err(Error::AccessDenied),
-        }
+        self.0.reader()
     }
 
     fn writer(&self) -> Result<VmWriter<'_, Infallible>, Error> {
-        match &self.0 {
-            BioBufferInner::Owned(buffer) => buffer.writer(),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Shared(buffer) => buffer.writer(),
-            // A shared DMA hold cannot create an exclusive CPU writer.
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Imported(_) => Err(Error::AccessDenied),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Lent(_) => Err(Error::AccessDenied),
-        }
+        self.0.writer()
     }
 }
 
 impl BioBuffer {
     /// Synchronizes this BIO view after device access.
     pub fn sync_from_device(&self, range: Range<usize>) -> Result<(), Error> {
-        match &self.0 {
-            BioBufferInner::Owned(buffer) => buffer.sync_from_device(range),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Shared(buffer) => buffer.sync_from_device(range),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Imported(buffer) => buffer.sync_from_device(range),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Lent(buffer) => buffer.lease.sync_from_device(range),
-        }
+        self.0.sync_from_device(range)
     }
 
     /// Synchronizes this BIO view before device access.
     pub fn sync_to_device(&self, range: Range<usize>) -> Result<(), Error> {
-        match &self.0 {
-            BioBufferInner::Owned(buffer) => buffer.sync_to_device(range),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Shared(buffer) => buffer.sync_to_device(range),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Imported(buffer) => buffer.sync_to_device(range),
-            #[cfg(feature = "kernelet-host")]
-            BioBufferInner::Lent(buffer) => buffer.lease.sync_to_device(range),
-        }
+        self.0.sync_to_device(range)
     }
 }
 
 impl BioSegment {
-    /// Borrows registered Image DMA storage without copying or exposing CPU access.
-    /// Every segment clone retains the lease through its last asynchronous use.
-    #[cfg(feature = "kernelet-host")]
-    pub fn from_guest_dma(
-        buffer: ostd::kernelet::guest_dma::GuestDmaLease,
-        owner: Arc<dyn Send + Sync>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            inner: Arc::new(Self::guest_dma_inner(buffer, owner)?),
-        })
-    }
-
-    #[cfg(feature = "kernelet-host")]
-    fn guest_dma_inner(
-        buffer: ostd::kernelet::guest_dma::GuestDmaLease,
-        owner: Arc<dyn Send + Sync>,
-    ) -> Result<BioSegmentInner, Error> {
-        use ostd::kernelet::guest_dma::DeviceAccess;
-
-        let len = buffer.size();
-        if len == 0 || !is_sector_aligned(len) {
-            return Err(Error::InvalidArgs);
-        }
-        let direction = match buffer.access() {
-            DeviceAccess::Read => BioDirection::ToDevice,
-            DeviceAccess::Write => BioDirection::FromDevice,
-        };
-        Ok(BioSegmentInner {
-            storage: Slice::new(
-                BioBuffer(BioBufferInner::Lent(LentStorage {
-                    lease: buffer,
-                    _owner: owner,
-                })),
-                0..len,
-            )
-            .into(),
-            direction,
-        })
-    }
-
-    /// Releases a uniquely owned borrowed segment's lease and retains its metadata.
-    ///
-    /// Returns the original segment if another view still owns it or its backing
-    /// is not borrowed. Callers must finish all device access before recycling.
-    #[cfg(feature = "kernelet-host")]
-    pub fn try_recycle_guest_dma(mut self) -> Result<GuestBioSegmentCache, Self> {
-        let Some(inner) = Arc::get_mut(&mut self.inner) else {
-            return Err(self);
-        };
-        if !matches!(inner.storage.mem_obj().0, BioBufferInner::Lent(_)) {
-            return Err(self);
-        }
-        let BioSegmentStorage::Active(storage) =
-            core::mem::replace(&mut inner.storage, BioSegmentStorage::Cached)
-        else {
-            unreachable!("a borrowed segment must have active storage");
-        };
-        let (BioBuffer(BioBufferInner::Lent(storage)), _) = storage.into_parts() else {
-            unreachable!("only borrowed backing can be recycled");
-        };
-        drop(storage.lease);
-        Ok(GuestBioSegmentCache {
-            inner: self.inner,
-            _owner: storage._owner,
-        })
-    }
-
-    /// Imports an accepted shared-buffer operation without copying payload.
-    /// Each cloned segment retains the operation until its last use ends.
-    #[cfg(feature = "kernelet-host")]
-    pub fn from_shared_buffer(
-        buffer: Arc<ostd::kernelet::shared_buffer::BackendBuffer>,
-    ) -> Result<Self, Error> {
-        let request = buffer.request();
-        if request.len == 0 || !is_sector_aligned(request.len) {
-            return Err(Error::InvalidArgs);
-        }
-        Ok(Self {
-            inner: Arc::new(BioSegmentInner {
-                storage: Slice::new(BioBuffer(BioBufferInner::Imported(buffer)), 0..request.len)
-                    .into(),
-                direction: if request.device_writes {
-                    BioDirection::FromDevice
-                } else {
-                    BioDirection::ToDevice
-                },
-            }),
-        })
-    }
     /// Allocates a new `BioSegment` with the wanted blocks count and
     /// the bio direction.
     pub fn alloc(nblocks: usize, direction: BioDirection) -> Self {
@@ -726,55 +449,11 @@ impl BioSegment {
 
     /// Allocates a block-aligned segment, returning allocation failures.
     pub fn try_alloc(nblocks: usize, direction: BioDirection) -> Result<Self, Error> {
-        Self::try_alloc_with_ownership::<false>(nblocks, direction)
-    }
-
-    /// Allocates a buffer whose partial views retain its DMA owner.
-    #[cfg(feature = "kernelet-host")]
-    pub fn try_alloc_shared(nblocks: usize, direction: BioDirection) -> Result<Self, Error> {
-        Self::try_alloc_with_ownership::<true>(nblocks, direction)
-    }
-
-    fn try_alloc_with_ownership<const SHARED: bool>(
-        nblocks: usize,
-        direction: BioDirection,
-    ) -> Result<Self, Error> {
         let len = nblocks.checked_mul(BLOCK_SIZE).ok_or(Error::Overflow)?;
         if len == 0 {
             return Err(Error::InvalidArgs);
         }
-        Self::try_alloc_inner::<SHARED>(nblocks, 0, len, direction)
-    }
-
-    /// Returns a sector-aligned view that shares this segment's DMA memory.
-    ///
-    /// Partial views require an owner allocated with `try_alloc_shared`.
-    #[cfg(feature = "kernelet-host")]
-    pub fn slice(&self, range: Range<usize>) -> Result<Self, Error> {
-        if range.start >= range.end
-            || range.end > self.nbytes()
-            || !is_sector_aligned(range.start)
-            || !is_sector_aligned(range.end)
-        {
-            return Err(Error::InvalidArgs);
-        }
-        if range == (0..self.nbytes()) {
-            return Ok(self.clone());
-        }
-        let BioBufferInner::Shared(owner) = &self.inner.storage.mem_obj().0 else {
-            return Err(Error::InvalidArgs);
-        };
-        let offset = self.inner.storage.offset().start;
-        Ok(Self {
-            inner: Arc::new(BioSegmentInner {
-                storage: Slice::new(
-                    BioBuffer(BioBufferInner::Shared(owner.clone())),
-                    offset + range.start..offset + range.end,
-                )
-                .into(),
-                direction: self.inner.direction,
-            }),
-        })
+        Self::try_alloc_inner(nblocks, 0, len, direction)
     }
 
     /// The inner function that do the real segment allocation.
@@ -794,10 +473,10 @@ impl BioSegment {
         len: usize,
         direction: BioDirection,
     ) -> Self {
-        Self::try_alloc_inner::<false>(nblocks, offset_within_first_block, len, direction).unwrap()
+        Self::try_alloc_inner(nblocks, offset_within_first_block, len, direction).unwrap()
     }
 
-    fn try_alloc_inner<const SHARED: bool>(
+    fn try_alloc_inner(
         nblocks: usize,
         offset_within_first_block: usize,
         len: usize,
@@ -812,22 +491,20 @@ impl BioSegment {
         );
 
         // The target segment is whether from the pool or newly-allocated
-        let bio_segment_inner = match target_pool(direction)
-            .and_then(|pool| pool.alloc::<SHARED>(nblocks, offset, len))
-        {
-            Some(segment) => segment,
-            None => {
-                let dma_stream = DmaStream::alloc_uninit(nblocks, false)?;
-                BioSegmentInner {
-                    storage: Slice::new(
-                        BioBuffer::new::<SHARED>(DmaBuffer::Direct(dma_stream)),
-                        offset..offset + len,
-                    )
-                    .into(),
-                    direction,
+        let bio_segment_inner =
+            match target_pool(direction).and_then(|pool| pool.alloc(nblocks, offset, len)) {
+                Some(segment) => segment,
+                None => {
+                    let dma_stream = DmaStream::alloc_uninit(nblocks, false)?;
+                    BioSegmentInner {
+                        storage: Slice::new(
+                            BioBuffer::new(DmaBuffer::Direct(dma_stream)),
+                            offset..offset + len,
+                        ),
+                        direction,
+                    }
                 }
-            }
-        };
+            };
 
         Ok(Self {
             inner: Arc::new(bio_segment_inner),
@@ -840,11 +517,7 @@ impl BioSegment {
         let dma_stream = DmaStream::map(segment, false).unwrap();
         Self {
             inner: Arc::new(BioSegmentInner {
-                storage: Slice::new(
-                    BioBuffer::new::<false>(DmaBuffer::Direct(dma_stream)),
-                    0..len,
-                )
-                .into(),
+                storage: Slice::new(BioBuffer::new(DmaBuffer::Direct(dma_stream)), 0..len),
                 direction,
             }),
         }
@@ -936,7 +609,7 @@ impl BioSegmentPool {
     ///
     /// If the `offset_within_first_block` exceeds the block size, or the `len`
     /// exceeds the total length, this method will panic.
-    fn alloc<const SHARED: bool>(
+    fn alloc(
         &self,
         nblocks: usize,
         offset_within_first_block: usize,
@@ -950,10 +623,9 @@ impl BioSegmentPool {
         let arena = self.arena_pool.alloc(nblocks)?;
         Some(BioSegmentInner {
             storage: Slice::new(
-                BioBuffer::new::<SHARED>(DmaBuffer::Arena(arena)),
+                BioBuffer::new(DmaBuffer::Arena(arena)),
                 offset_within_first_block..offset_within_first_block + len,
-            )
-            .into(),
+            ),
             direction: self.direction,
         })
     }
@@ -983,94 +655,4 @@ fn target_pool(direction: BioDirection) -> Option<&'static Arc<BioSegmentPool>> 
 /// Checks if the given offset is aligned to sector.
 pub(crate) fn is_sector_aligned(offset: usize) -> bool {
     offset.is_multiple_of(SECTOR_SIZE)
-}
-
-#[cfg(all(feature = "kernelet-host", ktest))]
-mod test {
-    use ostd::prelude::*;
-
-    use super::*;
-
-    #[ktest]
-    fn ordinary_bio_keeps_full_views_and_rejects_partial_views() {
-        let segment = BioSegment::try_alloc(1, BioDirection::ToDevice).unwrap();
-        let full = segment.slice(0..segment.nbytes()).unwrap();
-        assert!(matches!(
-            segment.slice(0..SECTOR_SIZE),
-            Err(Error::InvalidArgs)
-        ));
-        drop(segment);
-        let data = [0xa5u8; SECTOR_SIZE];
-        assert_eq!(
-            full.writer()
-                .unwrap()
-                .write(&mut VmReader::from(data.as_slice())),
-            data.len()
-        );
-        let mut output = [0; SECTOR_SIZE];
-        assert_eq!(
-            full.dma_slice()
-                .reader()
-                .unwrap()
-                .read(&mut VmWriter::from(output.as_mut_slice())),
-            data.len()
-        );
-        assert_eq!(output, data);
-    }
-
-    #[ktest]
-    fn bio_views_keep_arena_pages_until_last_view_is_dropped() {
-        // Use a private, full arena so another BIO cannot obscure early slot reuse.
-        let pool = BioSegmentPool {
-            arena_pool: DmaArenaPool::new(2).unwrap(),
-            direction: BioDirection::ToDevice,
-        };
-        let segment = BioSegment {
-            inner: Arc::new(
-                pool.alloc::<true>(2, SECTOR_SIZE, 2 * BLOCK_SIZE - SECTOR_SIZE)
-                    .unwrap(),
-            ),
-        };
-        let allocation_daddr = segment.dma_slice().daddr() - SECTOR_SIZE;
-        let parent = Bio::new(BioType::Write, Sid::from_offset(0), vec![segment], None);
-        let view = parent.segments()[0]
-            .slice(SECTOR_SIZE..3 * SECTOR_SIZE)
-            .unwrap();
-        let nested_view = view.slice(SECTOR_SIZE..2 * SECTOR_SIZE).unwrap();
-        assert_eq!(view.dma_slice().daddr(), allocation_daddr + 2 * SECTOR_SIZE);
-        assert_eq!(
-            nested_view.dma_slice().daddr(),
-            allocation_daddr + 3 * SECTOR_SIZE
-        );
-        assert_eq!(nested_view.nbytes(), SECTOR_SIZE);
-
-        let data = [0xa5u8; SECTOR_SIZE];
-        assert_eq!(
-            nested_view
-                .writer()
-                .unwrap()
-                .write(&mut VmReader::from(data.as_slice())),
-            data.len()
-        );
-        drop(parent);
-        assert!(pool.arena_pool.alloc(1).is_none());
-
-        // This is the actual DMA buffer, rather than a separately allocated test copy.
-        let mut read_back = [0u8; SECTOR_SIZE];
-        assert_eq!(
-            nested_view
-                .dma_slice()
-                .reader()
-                .unwrap()
-                .read(&mut VmWriter::from(read_back.as_mut_slice())),
-            data.len()
-        );
-        assert_eq!(read_back, data);
-
-        drop(view);
-        assert!(pool.arena_pool.alloc(1).is_none());
-        drop(nested_view);
-        let reused = pool.arena_pool.alloc(2).unwrap();
-        assert_eq!(reused.daddr(), allocation_daddr);
-    }
 }

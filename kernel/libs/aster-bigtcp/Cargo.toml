@@ -19,8 +19,5 @@ spin.workspace = true
 takeable.workspace = true
 zerocopy.workspace = true
 
-[features]
-kernelet = ["ostd/kernelet"]
-
 [lints]
 workspace = true

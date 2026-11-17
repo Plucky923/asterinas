@@ -9,7 +9,12 @@ use ostd::{
 };
 
 use super::SyscallReturn;
-use crate::{prelude::*, process::pid_table, thread::Tid};
+use crate::{
+    fs::cgroupfs::CgroupSysNode,
+    prelude::*,
+    process::{pid_table, posix_thread::AsPosixThread},
+    thread::Tid,
+};
 
 pub(super) fn sys_sched_getaffinity(
     tid: Tid,
@@ -42,20 +47,47 @@ pub(super) fn sys_sched_setaffinity(
 ) -> Result<SyscallReturn> {
     let user_cpu_set = read_cpu_set_from(ctx.user_space(), cpuset_size, cpu_set_ptr)?;
 
-    match tid {
-        0 => ctx
-            .thread
-            .atomic_cpu_affinity()
-            .store(&user_cpu_set, Ordering::Relaxed),
+    let owned_thread;
+    let target_thread: &crate::thread::Thread = match tid {
+        0 => ctx.thread,
         _ => match pid_table::pid_table_mut().get_thread(tid) {
             Some(thread) => {
-                thread
-                    .atomic_cpu_affinity()
-                    .store(&user_cpu_set, Ordering::Relaxed);
+                owned_thread = thread;
+                &owned_thread
             }
             None => return_errno_with_message!(Errno::ESRCH, "the target thread does not exist"),
         },
-    }
+    };
+
+    let target_process = target_thread
+        .as_posix_thread()
+        .map(|pt| pt.process())
+        .unwrap_or_else(|| ctx.process.clone());
+
+    let effective_set = if let Some(cgroup) = target_process.cgroup().get() {
+        let controller = cgroup.controller();
+        match controller.clamp_cpu_set(&user_cpu_set) {
+            Some((clamped, had_violation)) => {
+                if had_violation {
+                    controller.record_cpuset_violation();
+                }
+                clamped
+            }
+            None => {
+                controller.record_cpuset_violation();
+                return_errno_with_message!(
+                    Errno::EINVAL,
+                    "requested CPU affinity has no overlap with cgroup cpuset"
+                );
+            }
+        }
+    } else {
+        user_cpu_set
+    };
+
+    target_thread
+        .atomic_cpu_affinity()
+        .store(&effective_set, Ordering::Relaxed);
 
     Ok(SyscallReturn::Return(0))
 }

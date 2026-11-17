@@ -136,11 +136,6 @@ SECTIONS
         __sensitive_io_ports_end = .;
     } : rodata
 
-    # Fixed-size, read-only cells are filled after the final Host link.
-    .kernelet_service_budgets : AT(ADDR(.kernelet_service_budgets) - KERNEL_VMA) {
-        KEEP(*(.rodata.kernelet_service_budgets))
-    } : rodata
-
     .rodata                 : AT(ADDR(.rodata) - KERNEL_VMA) {
         *(.rodata .rodata.*)
     } : rodata

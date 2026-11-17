@@ -39,9 +39,6 @@ const DEFAULT_STACK_SIZE_IN_PAGES: u32 = 128;
 
 const KERNEL_STACK_SIZE: usize = STACK_SIZE_IN_PAGES as usize * PAGE_SIZE;
 
-#[cfg(feature = "kernelet-host")]
-pub(super) const RESERVATION_BYTES: usize = KERNEL_STACK_SIZE + 4 * PAGE_SIZE;
-
 #[derive(Debug)]
 pub(crate) struct KernelStack {
     kvirt_area: KVirtArea,

@@ -28,6 +28,8 @@
 mod entry;
 mod pte_state;
 
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::AtomicUsize;
 use core::{
     cell::SyncUnsafeCell,
     marker::PhantomData,
@@ -61,17 +63,16 @@ use crate::{
 /// [`PageTableGuard`].
 pub(crate) type PageTableNode<C> = Frame<PageTablePageMeta<C>>;
 
-#[cfg(feature = "kernelet-host")]
-crate::cpu_local_cell! {
-    // Owns the native root's forgotten Frame reference. A registered tenant
-    // root may temporarily borrow CR3 without Host frame metadata, so the
-    // hardware register alone cannot identify this reference's owner.
-    static MANAGED_ROOT_PADDR: crate::mm::Paddr = 0;
-}
-
 impl<C: PageTableConfig> PageTableNode<C> {
     pub(super) fn level(&self) -> PagingLevel {
         self.meta().level
+    }
+
+    #[cfg(feature = "kernelet")]
+    pub(super) fn set_linux_pgd_paddr(&self, pgd_paddr: crate::mm::Paddr) {
+        self.meta()
+            .linux_pgd_paddr
+            .store(pgd_paddr, Ordering::Release);
     }
 
     /// Allocates a new empty page table node.
@@ -105,38 +106,19 @@ impl<C: PageTableConfig> PageTableNode<C> {
     /// # Panics
     ///
     /// Only top-level page tables can be activated using this function.
-    pub(super) unsafe fn activate(
-        &self,
-        #[cfg(feature = "kernelet-host")] _irq_guard: &crate::irq::DisabledLocalIrqGuard,
-    ) {
+    pub(super) unsafe fn activate(&self) {
         use crate::arch::mm::{activate_page_table, current_page_table_paddr};
 
-        // Host callers retain their IRQ guard through the root and VmSpace
-        // updates, so the native root reference needs no nested IRQ guard.
         assert_eq!(self.level(), C::NR_LEVELS);
 
-        #[cfg(feature = "kernelet-host")]
-        let last_activated_paddr = MANAGED_ROOT_PADDR.load();
-        #[cfg(feature = "kernelet-host")]
-        assert_ne!(last_activated_paddr, 0, "native root was not initialized");
-        #[cfg(not(feature = "kernelet-host"))]
         let last_activated_paddr = current_page_table_paddr();
         if last_activated_paddr == self.paddr() {
-            // Returning from a borrowed tenant root needs a CR3 write but
-            // already owns exactly one native CPU reference.
-            #[cfg(feature = "kernelet-host")]
-            if current_page_table_paddr() != self.paddr() {
-                // SAFETY: The safety is upheld by the caller.
-                unsafe { activate_page_table(self.paddr()) };
-            }
             return;
         }
 
         let paddr = self.clone().into_raw();
         // SAFETY: The safety is upheld by the caller.
         unsafe { activate_page_table(paddr) };
-        #[cfg(feature = "kernelet-host")]
-        MANAGED_ROOT_PADDR.store(paddr);
 
         // Restore and drop the last activated page table.
         // SAFETY: The physical address is valid and points to a forgotten page table node.
@@ -153,8 +135,6 @@ impl<C: PageTableConfig> PageTableNode<C> {
         let paddr = self.clone().into_raw();
         // SAFETY: The safety is upheld by the caller.
         unsafe { activate_page_table(paddr) };
-        #[cfg(feature = "kernelet-host")]
-        MANAGED_ROOT_PADDR.store(paddr);
     }
 }
 
@@ -177,6 +157,8 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            #[cfg(feature = "kernelet")]
+            crate::kernelet::entry::on_spin();
             core::hint::spin_loop();
         }
 
@@ -265,11 +247,53 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     ///     after this method.
     pub(super) unsafe fn write_pte(&mut self, idx: usize, pte: C::E) {
         debug_assert!(idx < nr_subpage_per_huge::<C>());
+        #[cfg(feature = "kernelet")]
+        if self.level() < C::NR_LEVELS || C::TOP_LEVEL_INDEX_RANGE.contains(&idx) {
+            if let PteScalar::PageTable(child_paddr, _) = pte.to_repr(self.level()) {
+                assert!(
+                    crate::kernelet::image_grant::has_meta(child_paddr),
+                    "child page table outside kernelet grant: {child_paddr:#x}"
+                );
+            }
+        }
         let ptr = paddr_to_vaddr(self.paddr()) as *mut C::E;
         // SAFETY:
         // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
         // - All page table entries are aligned and accessed with atomic operations only.
-        unsafe { store_pte(ptr.add(idx), pte, Ordering::Release) }
+        unsafe { store_pte(ptr.add(idx), pte, Ordering::Release) };
+
+        #[cfg(feature = "kernelet")]
+        {
+            let pgd_pa = self.meta().linux_pgd_paddr.load(Ordering::Relaxed);
+            if pgd_pa != 0
+                && self.level() == C::NR_LEVELS
+                && C::TOP_LEVEL_INDEX_RANGE.contains(&idx)
+            {
+                let boot = crate::kernelet::entry::boot_args();
+                let raw = pte.as_usize();
+                let pti = boot.pti_enabled != 0;
+                let nx = boot.nx_supported != 0;
+                if pti {
+                    let user_pgd_ptr = (paddr_to_vaddr(pgd_pa | crate::mm::PAGE_SIZE)
+                        as *mut usize)
+                        .wrapping_add(idx);
+                    // Clear `_PAGE_NX` (bit 63) in the PTI user-mode PGD.
+                    let user_raw = raw & !(1usize << 63);
+                    // SAFETY: `pgd_pa | PAGE_SIZE` is the Linux PTI user PGD page in linear map,
+                    // and `idx < 256`.
+                    unsafe { AtomicUsize::from_ptr(user_pgd_ptr) }
+                        .store(user_raw, Ordering::Release);
+                }
+                let kern_pgd_ptr = (paddr_to_vaddr(pgd_pa) as *mut usize).wrapping_add(idx);
+                let kern_raw = if raw != 0 && nx && pti {
+                    raw | (1usize << 63)
+                } else {
+                    raw
+                };
+                // SAFETY: `pgd_pa` is the Linux kernel PGD page in linear map, and `idx < 256`.
+                unsafe { AtomicUsize::from_ptr(kern_pgd_ptr) }.store(kern_raw, Ordering::Release);
+            }
+        }
     }
 
     /// Gets the mutable reference to the number of valid PTEs in the node.
@@ -310,6 +334,9 @@ pub(crate) struct PageTablePageMeta<C: PageTableConfig> {
     level: PagingLevel,
     /// The lock for the page table page.
     lock: AtomicU8,
+    /// Physical address of the mirrored Linux `mm->pgd` when `pt_mode == 0` on a user root.
+    #[cfg(feature = "kernelet")]
+    linux_pgd_paddr: AtomicUsize,
     _phantom: PhantomData<C>,
 }
 
@@ -320,6 +347,8 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
             stray: SyncUnsafeCell::new(false),
             level,
             lock: AtomicU8::new(0),
+            #[cfg(feature = "kernelet")]
+            linux_pgd_paddr: AtomicUsize::new(0),
             _phantom: PhantomData,
         }
     }

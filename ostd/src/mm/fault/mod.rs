@@ -56,6 +56,23 @@ pub(crate) fn clear_image_copy_fault() {
         .store(0, Ordering::Release);
 }
 
+/// Publishes a software-walked user-copy page fault for `retry_image_access` /
+/// `retry_image_atomic` to resolve through the kernel page-fault handler.
+#[cfg(feature = "kernelet")]
+pub(crate) fn publish_image_copy_fault(addr: Vaddr, write: bool, present: usize) {
+    let error = PageFaultErrorCode::USER.bits()
+        | if write {
+            PageFaultErrorCode::WRITE.bits()
+        } else {
+            0
+        }
+        | present;
+    let record = crate::kernelet::entry::copy_fault_record();
+    record.addr.store(addr as u64, Ordering::Relaxed);
+    record.error.store(error as u64, Ordering::Relaxed);
+    record.pending.store(1, Ordering::Release);
+}
+
 /// Takes the hardware fault published by the Host's validated image fixup.
 /// Keep the pending marker set until both fields are in local values, so a
 /// physical IRQ cannot deliver an upcall that overwrites them mid-read.
@@ -132,16 +149,4 @@ pub(crate) fn handle_user_page_fault(
     } else {
         panic!("Cannot handle user page fault; trapframe: {:#x?}", f);
     }
-}
-
-/// Applies an exception-table fixup after the caller has authenticated a
-/// scoped kernel read fault.
-/// This does not change the normal page-fault policy.
-#[cfg(all(target_arch = "x86_64", feature = "kernelet-host"))]
-pub(crate) fn recover_kernel_copy_fault(frame: &mut TrapFrame) -> bool {
-    let Some(recovery) = ExTable::find_recovery_inst_addr(frame.instruction_pointer()) else {
-        return false;
-    };
-    frame.set_instruction_pointer(recovery);
-    true
 }

@@ -68,13 +68,17 @@ pub fn __main_epilogue() -> ! {
 
 /// Initializes the boot information supplied by a kernelet Host.
 #[cfg(feature = "kernelet")]
-pub(crate) fn init_kernelet(cmdline: &'static str, memory_regions: Vec<MemoryRegion>) {
+pub(crate) fn init_kernelet(
+    cmdline: &'static str,
+    initramfs: Option<&'static [u8]>,
+    memory_regions: Vec<MemoryRegion>,
+) {
     // The image has already imported its grants and can use the heap. Native
     // early boot and its fixed-capacity firmware map do not run on this path.
     INFO.call_once(|| BootInfo {
         bootloader_name: "kernelet".to_string(),
         kernel_cmdline: cmdline.to_string(),
-        initramfs: None,
+        initramfs,
         framebuffer_arg: None,
         memory_regions,
     });

@@ -1,11 +1,9 @@
 use alloc::boxed::Box;
-use core::any::Any;
-use core::mem::MaybeUninit;
+use core::{any::Any, mem::MaybeUninit};
 
-use crate::abi::*;
 #[cfg(feature = "panic-handler")]
 pub use crate::panic_handler::*;
-use crate::panicking::Exception;
+use crate::{abi::*, panicking::Exception};
 
 static CANARY: u8 = 0;
 
@@ -63,7 +61,9 @@ pub fn begin_panic(payload: Box<dyn Any + Send>) -> UnwindReasonCode {
     crate::panicking::begin_panic(RustPanic(payload, DropGuard))
 }
 
+#[cfg_attr(feature = "kernelet", inline(always))]
 pub fn catch_unwind<R, F: FnOnce() -> R>(f: F) -> Result<R, Box<dyn Any + Send>> {
+    #[cfg_attr(feature = "kernelet", inline(never))]
     #[cold]
     fn process_panic(p: Option<RustPanic>) -> Box<dyn Any + Send> {
         match p {

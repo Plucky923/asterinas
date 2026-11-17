@@ -1,0 +1,121 @@
+# Performance-baseline x86_64 kernel config for `poc/eval/`.
+# Applied on top of `make ARCH=x86_64 tinyconfig` via merge_config.sh + olddefconfig.
+# Eliminates size optimization (-Os), stack zeroing, debug sleep checks, schedstats,
+# and always-on THP that distort Linux vs Asterinas/Kernelet comparisons.
+
+# --- architecture and CPU -----------------------------------------------
+CONFIG_64BIT=y
+CONFIG_SMP=y
+CONFIG_NR_CPUS=8
+# CONFIG_IA32_EMULATION is not set
+# CONFIG_X86_X32_ABI is not set
+# CONFIG_X86_VSYSCALL_EMULATION is not set
+# CONFIG_X86_UMIP is not set
+CONFIG_RELOCATABLE=y
+CONFIG_RANDOMIZE_BASE=y
+
+# --- compiler optimization and stack hygiene ----------------------------
+CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
+# CONFIG_CC_OPTIMIZE_FOR_SIZE is not set
+CONFIG_INIT_STACK_NONE=y
+# CONFIG_INIT_STACK_ALL_ZERO is not set
+
+# --- paravirt / KVM guest -----------------------------------------------
+CONFIG_HYPERVISOR_GUEST=y
+CONFIG_PARAVIRT=y
+CONFIG_KVM_GUEST=y
+
+# --- firmware and buses: ACPI + PCI for clean QEMU poweroff -------------
+CONFIG_PCI=y
+CONFIG_ACPI=y
+
+# --- console ------------------------------------------------------------
+CONFIG_PRINTK=y
+CONFIG_TTY=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_EARLY_PRINTK=y
+
+# --- initramfs ----------------------------------------------------------
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+
+# --- binary formats -----------------------------------------------------
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+
+# --- filesystems --------------------------------------------------------
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_SHMEM=y
+CONFIG_TMPFS=y
+CONFIG_ANON_INODES=y
+CONFIG_EPOLL=y
+CONFIG_EVENTFD=y
+CONFIG_SIGNALFD=y
+CONFIG_TIMERFD=y
+
+# --- loadable modules ---------------------------------------------------
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+# CONFIG_MODVERSIONS is not set
+# CONFIG_MODULE_SIG is not set
+# CONFIG_MODULE_SIG_ALL is not set
+# CONFIG_MODULE_COMPRESS is not set
+# CONFIG_TRIM_UNUSED_KSYMS is not set
+
+# --- symbols & host profiling support -----------------------------------
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_PERF_EVENTS=y
+
+# --- process, IPC, timekeeping & kernelet hooks -------------------------
+CONFIG_MULTIUSER=y
+CONFIG_FUTEX=y
+CONFIG_POSIX_TIMERS=y
+CONFIG_HIGH_RES_TIMERS=y
+CONFIG_SYSVIPC=y
+CONFIG_POSIX_MQUEUE=y
+CONFIG_ADVISE_SYSCALLS=y
+CONFIG_MEMBARRIER=y
+CONFIG_NET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+CONFIG_RSEQ=y
+CONFIG_KERNELET=y
+
+# --- preemption model ---------------------------------------------------
+# CONFIG_PREEMPT_NONE is not set
+# CONFIG_PREEMPT_VOLUNTARY is not set
+CONFIG_PREEMPT=y
+CONFIG_PREEMPT_DYNAMIC=y
+
+# --- cgroups ------------------------------------------------------------
+CONFIG_CGROUPS=y
+CONFIG_MEMCG=y
+CONFIG_CPUSETS=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_FAIR_GROUP_SCHED=y
+
+# --- debugging hygiene (no hot-path locks/sleep/schedstats overhead) ----
+CONFIG_BUG=y
+CONFIG_DEBUG_BUGVERBOSE=y
+# CONFIG_DEBUG_ATOMIC_SLEEP is not set
+# CONFIG_SCHEDSTATS is not set
+# CONFIG_SCHED_INFO is not set
+# CONFIG_DEBUG_INFO_BTF is not set
+CONFIG_DEBUG_INFO_NONE=y
+# CONFIG_PANIC_ON_OOPS is not set
+
+# --- memory accounting (expose vmstat counters; THP disabled at boot) ---
+CONFIG_VM_EVENT_COUNTERS=y
+CONFIG_TRANSPARENT_HUGEPAGE=y
+CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y
+# CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS is not set
+
+# --- mitigations off for unmitigated baseline ---------------------------
+# CONFIG_CPU_MITIGATIONS is not set

@@ -2,22 +2,12 @@
 
 //! Virtual Dynamic Shared Object (vDSO) mappings.
 //!
-//! The Host initializes a Linux vDSO from its machine clocksource. Images leave
-//! the vDSO absent and use clock syscalls with local TSC conversion.
+//! Both native Asterinas and Kernelet images populate a per-instance `VdsoData`
+//! VMO page calibrated from the active TSC clock parameters so user-space
+//! `clock_gettime` and `gettimeofday` execute in Ring 3 without syscalls.
 
-#[cfg(not(feature = "kernelet"))]
 pub(crate) use host::{init_in_first_kthread, vdso_vmo};
 use ostd::{const_assert, mm::PAGE_SIZE};
-
-// The prebuilt vDSO expects Host-managed vvar data, which Images do not publish.
-// Images leave it absent so every clock read uses the existing syscall path.
-#[cfg(feature = "kernelet")]
-pub(super) fn init_in_first_kthread() {}
-
-#[cfg(feature = "kernelet")]
-pub(crate) fn vdso_vmo() -> Option<alloc::sync::Arc<crate::vm::page_cache::Vmo>> {
-    None
-}
 
 /// The offset from the vDSO base to the `__vdso_rt_sigreturn` function.
 ///
@@ -30,12 +20,11 @@ pub(crate) const __VDSO_RT_SIGRETURN_OFFSET: usize = cfg_select! {
     target_arch = "aarch64" => 0x538,
 };
 
-#[cfg(not(feature = "kernelet"))]
 mod host {
     use alloc::sync::Arc;
     use core::{mem::ManuallyDrop, time::Duration};
 
-    use aster_time::{Instant, read_monotonic_time};
+    use aster_time::Instant;
     use aster_util::coeff::Coeff;
     use ostd::{
         const_assert,
@@ -55,12 +44,14 @@ mod host {
         },
         vm::page_cache::{Vmo, VmoMapMode, VmoOptions},
     };
+    #[cfg(not(feature = "kernelet"))]
+    use crate::time::read_monotonic_time;
 
     const CLOCK_TAI: usize = 11;
     const VDSO_BASES: usize = CLOCK_TAI + 1;
     const DEFAULT_CLOCK_MODE: VdsoClockMode = VdsoClockMode::Tsc;
 
-    static START_SECS_COUNT: Once<u64> = Once::new();
+    static START_DURATION: Once<Duration> = Once::new();
     static VDSO: Once<Arc<Vdso>> = Once::new();
 
     #[derive(Clone, Copy, Debug)]
@@ -158,14 +149,29 @@ mod host {
 
         /// Initializes vDSO data based on the default clock source.
         fn init(&mut self) {
-            let clocksource = aster_time::default_clocksource();
-            let coeff = clocksource.coeff();
-            self.set_clock_mode(DEFAULT_CLOCK_MODE);
-            self.set_coeff(coeff);
+            #[cfg(not(feature = "kernelet"))]
+            {
+                let clocksource = aster_time::default_clocksource();
+                let coeff = clocksource.coeff();
+                self.set_clock_mode(DEFAULT_CLOCK_MODE);
+                self.set_coeff(coeff);
 
-            let (last_instant, last_cycles) = clocksource.last_record();
-            self.update_high_res_instant(last_instant, last_cycles);
-            self.update_coarse_res_instant(last_instant);
+                let (last_instant, last_cycles) = clocksource.last_record();
+                self.update_high_res_instant(last_instant, last_cycles);
+                self.update_coarse_res_instant(last_instant);
+            }
+            #[cfg(feature = "kernelet")]
+            {
+                let boot = ostd::kernelet::entry::boot_args();
+                let coeff = Coeff::new(1_000_000_000, boot.tsc_freq_hz, 10 * boot.tsc_freq_hz);
+                self.set_clock_mode(DEFAULT_CLOCK_MODE);
+                self.set_coeff(&coeff);
+
+                let (nanos, last_cycles) = ostd::kernelet::entry::clock_snapshot();
+                let last_instant = Instant::from(Duration::from_nanos(nanos));
+                self.update_high_res_instant(last_instant, last_cycles);
+                self.update_coarse_res_instant(last_instant);
+            }
         }
 
         fn set_clock_mode(&mut self, mode: VdsoClockMode) {
@@ -184,29 +190,35 @@ mod host {
 
         fn update_high_res_instant(&mut self, instant: Instant, instant_cycles: u64) {
             self.last_cycles = instant_cycles;
+            let start_dur = *START_DURATION.get().unwrap();
+            let real_instant =
+                Instant::from(start_dur) + Duration::new(instant.secs(), instant.nanos());
             for clock_id in HIGH_RES_CLOCK_IDS {
-                let secs = if clock_id == ClockId::CLOCK_REALTIME {
-                    instant.secs() + START_SECS_COUNT.get().unwrap()
+                let ts = if clock_id == ClockId::CLOCK_REALTIME {
+                    real_instant
                 } else {
-                    instant.secs()
+                    instant
                 };
 
                 self.update_clock_instant(
                     clock_id as usize,
-                    secs,
-                    (instant.nanos() as u64) << self.shift as u64,
+                    ts.secs(),
+                    (ts.nanos() as u64) << self.shift as u64,
                 );
             }
         }
 
         fn update_coarse_res_instant(&mut self, instant: Instant) {
+            let start_dur = *START_DURATION.get().unwrap();
+            let real_instant =
+                Instant::from(start_dur) + Duration::new(instant.secs(), instant.nanos());
             for clock_id in COARSE_RES_CLOCK_IDS {
-                let secs = if clock_id == ClockId::CLOCK_REALTIME_COARSE {
-                    instant.secs() + START_SECS_COUNT.get().unwrap()
+                let ts = if clock_id == ClockId::CLOCK_REALTIME_COARSE {
+                    real_instant
                 } else {
-                    instant.secs()
+                    instant
                 };
-                self.update_clock_instant(clock_id as usize, secs, instant.nanos() as u64);
+                self.update_clock_instant(clock_id as usize, ts.secs(), ts.nanos() as u64);
             }
         }
     }
@@ -362,16 +374,28 @@ mod host {
     }
 
     /// Updates instants with respect to high-resolution clocks in vDSO data.
+    #[cfg(not(feature = "kernelet"))]
     fn update_vdso_high_res_instant(instant: Instant, instant_cycles: u64) {
         VDSO.get()
             .unwrap()
             .update_high_res_instant(instant, instant_cycles);
     }
 
-    /// Updates instants with respect to coarse-resolution clocks in vDSO data.
+    /// Updates instants with respect to coarse-resolution (and kernelet high-res) clocks in vDSO data.
     fn update_vdso_coarse_res_instant(_guard: TimerGuard) {
-        let instant = Instant::from(read_monotonic_time());
-        VDSO.get().unwrap().update_coarse_res_instant(instant);
+        #[cfg(feature = "kernelet")]
+        {
+            let (nanos, cycles) = ostd::kernelet::entry::clock_snapshot();
+            let instant = Instant::from(Duration::from_nanos(nanos));
+            let vdso = VDSO.get().unwrap();
+            vdso.update_high_res_instant(instant, cycles);
+            vdso.update_coarse_res_instant(instant);
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            let instant = Instant::from(read_monotonic_time());
+            VDSO.get().unwrap().update_coarse_res_instant(instant);
+        }
     }
 
     /// Initializes the time duration from 1970-01-01 00:00:00 to the start time.
@@ -381,7 +405,7 @@ mod host {
             .unwrap()
             .duration_since(&SystemTime::UNIX_EPOCH)
             .unwrap();
-        START_SECS_COUNT.call_once(|| time_duration.as_secs());
+        START_DURATION.call_once(|| time_duration);
     }
 
     /// Initializes the vDSO singleton.
@@ -394,6 +418,7 @@ mod host {
         init_start_secs_count();
         init_vdso();
 
+        #[cfg(not(feature = "kernelet"))]
         aster_time::VDSO_DATA_HIGH_RES_UPDATE_FN.call_once(|| update_vdso_high_res_instant);
 
         // Coarse resolution clock IDs directly read the instant stored in vDSO data without

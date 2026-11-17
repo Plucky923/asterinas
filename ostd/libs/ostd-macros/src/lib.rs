@@ -7,6 +7,25 @@ use quote::quote;
 use rand::{Rng, distr::Alphanumeric};
 use syn::{Expr, Ident, ItemFn, parse_macro_input};
 
+mod user_event;
+
+/// Binds the kernelet's user-event handler at link time.
+///
+/// Apply this attribute to the non-generic `UserEventHandler` implementation.
+/// It exports the handler's data and local-data type IDs and four callback symbols for OSTD.
+/// Exactly one implementation may be marked in an image; a missing or duplicate
+/// implementation fails to link instead of requiring runtime registration.
+///
+/// OSTD checks the user task's data and local-data types during construction, then borrows the
+/// handler and local data for each callback. The generated unsafe bridges belong to OSTD's
+/// implementation; the kernel's trait implementation remains safe Rust.
+#[proc_macro_attribute]
+pub fn user_event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
+    user_event::expand(attr.into(), item.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
 /// A macro attribute to mark the kernel entry point.
 ///
 /// # Bootstrap Context

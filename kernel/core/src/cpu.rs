@@ -11,6 +11,6 @@ pub(crate) trait LinuxAbi {
     /// Sets the return value of the system call.
     fn set_syscall_ret(&mut self, ret: usize);
 
-    /// Gets the arguments of the system call.
-    fn syscall_args(&self) -> [usize; 6];
+    /// Reads the first `N` syscall arguments, where `N` is at most six.
+    fn syscall_args<const N: usize>(&self) -> [usize; N];
 }

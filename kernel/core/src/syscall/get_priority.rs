@@ -56,7 +56,7 @@ pub(super) fn get_processes(prio_target: PriorityTarget) -> Result<Vec<Arc<Proce
             let processes: Vec<Arc<Process>> = pid_table::pid_table_mut()
                 .iter_processes()
                 .filter(|process| {
-                    let main_thread = process.main_thread();
+                    let main_thread = process.main_thread().unwrap();
                     let posix_thread = main_thread.as_posix_thread().unwrap();
                     uid == posix_thread.credentials().ruid()
                 })

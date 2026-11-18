@@ -2,7 +2,10 @@
 
 //! Ptrace implementation for POSIX threads.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    ops::ControlFlow,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(target_arch = "x86_64")]
 use ostd::arch::cpu::context::{FsBase, GsBase, OwnedUserContext};
@@ -102,16 +105,20 @@ impl PosixThread {
 
     /// Stops this thread at a syscall-stop if requested by the tracer.
     ///
-    /// Returns a [`PtraceStopResult`] indicating why this ptrace-stop ended.
+    /// Breaks if `SIGKILL` interrupts the stop.
+    /// The continuation value reports whether a stop occurred and registers may have changed.
+    #[inline]
     pub(crate) fn ptrace_may_stop_on_syscall(
         &self,
         ctx: &Context,
         user_ctx: &mut UserContext,
-    ) -> PtraceStopResult {
-        if let Some(status) = self.tracee_status.get() {
+    ) -> ControlFlow<(), bool> {
+        if let Some(status) = self.tracee_status.get()
+            && status.is_tracing_syscall.load(Ordering::Acquire)
+        {
             status.ptrace_may_stop_on_syscall(ctx, user_ctx)
         } else {
-            PtraceStopResult::NotTraced(None)
+            ControlFlow::Continue(false)
         }
     }
 
@@ -197,7 +204,7 @@ impl PosixThread {
     /// Returns `ESRCH` if this thread is not ptrace-stopped.
     pub(crate) fn ptrace_peek_data(&self, addr: usize) -> Result<usize> {
         let status = self.get_tracee_status()?;
-        status.peek_data(self.weak_process(), addr)
+        status.peek_data(self.process_ref(), addr)
     }
 
     /// Writes one word to the tracee's memory.
@@ -207,7 +214,7 @@ impl PosixThread {
     /// Returns `ESRCH` if this thread is not ptrace-stopped.
     pub(crate) fn ptrace_poke_data(&self, addr: usize, value: usize) -> Result<()> {
         let status = self.get_tracee_status()?;
-        status.poke_data(self.weak_process(), addr, value)
+        status.poke_data(self.process_ref(), addr, value)
     }
 
     /// Sets ptrace options for this thread.
@@ -342,6 +349,8 @@ impl PosixThread {
 
 pub(super) struct TraceeStatus {
     is_stopped: AtomicBool,
+    // Writes hold `state`; `resume` publishes this before waking the tracee.
+    is_tracing_syscall: AtomicBool,
     state: Mutex<TraceeState>,
 }
 
@@ -349,6 +358,7 @@ impl TraceeStatus {
     pub(super) fn new() -> Self {
         Self {
             is_stopped: AtomicBool::new(false),
+            is_tracing_syscall: AtomicBool::new(false),
             state: Mutex::new(TraceeState::new()),
         }
     }
@@ -381,7 +391,7 @@ impl TraceeStatus {
                 arch_ptrace::disable_single_step(user_context);
             }
         }
-        state.is_tracing_syscall = false;
+        self.is_tracing_syscall.store(false, Ordering::Release);
         detach_callback(&state);
         self.is_stopped.store(false, Ordering::Relaxed);
     }
@@ -445,26 +455,32 @@ impl TraceeStatus {
         );
     }
 
+    #[cold]
+    #[inline(never)]
     fn ptrace_may_stop_on_syscall(
         &self,
         ctx: &Context,
         user_ctx: &mut UserContext,
-    ) -> PtraceStopResult {
+    ) -> ControlFlow<(), bool> {
         let state = self.state.lock();
 
-        let Some(tracer) = state.tracer() else {
-            return PtraceStopResult::NotTraced(None);
-        };
-        if !state.is_tracing_syscall {
-            return PtraceStopResult::NotTraced(None);
+        // Detach or another resume may have changed the initial fast-path result.
+        if !self.is_tracing_syscall.load(Ordering::Relaxed) {
+            return ControlFlow::Continue(false);
         }
+        let Some(tracer) = state.tracer() else {
+            return ControlFlow::Continue(false);
+        };
 
         let siginfo = util::syscall_stop_siginfo(&state.options, ctx);
         let signal = Box::new(RawSignal::new(siginfo));
         let signal = DequeuedSignal::FromThread(signal);
         let wait_status = PtraceWaitStatus::from_syscall(&state.options);
 
-        self.do_ptrace_stop(state, tracer, signal, wait_status, None, ctx, user_ctx)
+        match self.do_ptrace_stop(state, tracer, signal, wait_status, None, ctx, user_ctx) {
+            PtraceStopResult::Interrupted => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(true),
+        }
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -523,7 +539,7 @@ impl TraceeStatus {
                 state.gs_base = None;
                 state.clear_orig_syscall_ret();
             }
-            state.is_tracing_syscall = false;
+            self.is_tracing_syscall.store(false, Ordering::Release);
             self.is_stopped.store(false, Ordering::Relaxed);
             return PtraceStopResult::Interrupted;
         };
@@ -610,7 +626,10 @@ impl TraceeStatus {
             }
         }
 
-        state.is_tracing_syscall = matches!(request, PtraceContRequest::Syscall(_));
+        self.is_tracing_syscall.store(
+            matches!(request, PtraceContRequest::Syscall(_)),
+            Ordering::Release,
+        );
 
         self.is_stopped.store(false, Ordering::Relaxed);
 
@@ -694,12 +713,11 @@ impl TraceeStatus {
         Ok(())
     }
 
-    fn peek_data(&self, process: &Weak<Process>, addr: usize) -> Result<usize> {
+    fn peek_data(&self, process: &Process, addr: usize) -> Result<usize> {
         // Hold the lock first to avoid race conditions.
         let state = self.state.lock();
         self.check_ptrace_stopped(&state)?;
 
-        let process = process.upgrade().unwrap();
         let vmar_guard = process.lock_vmar();
         let Some(vmar) = vmar_guard.as_ref() else {
             return_errno_with_message!(Errno::EIO, "the process has exited");
@@ -713,12 +731,11 @@ impl TraceeStatus {
         }
     }
 
-    fn poke_data(&self, process: &Weak<Process>, addr: usize, value: usize) -> Result<()> {
+    fn poke_data(&self, process: &Process, addr: usize, value: usize) -> Result<()> {
         // Hold the lock first to avoid race conditions.
         let state = self.state.lock();
         self.check_ptrace_stopped(&state)?;
 
-        let process = process.upgrade().unwrap();
         let vmar_guard = process.lock_vmar();
         let Some(vmar) = vmar_guard.as_ref() else {
             return_errno_with_message!(Errno::EIO, "the process has exited");
@@ -766,8 +783,6 @@ struct TraceeState {
     event: Option<PtraceEvent>,
     /// The configured ptrace options.
     options: PtraceOptions,
-    /// Whether the tracee should stop at the next syscall enter or exit.
-    is_tracing_syscall: bool,
     /// The user register context of the tracee at the time of ptrace-stop.
     #[cfg(target_arch = "x86_64")]
     user_context: Option<OwnedUserContext>,
@@ -790,7 +805,6 @@ impl TraceeState {
             signal: StopDeliverySignal::default(),
             event: None,
             options: PtraceOptions::empty(),
-            is_tracing_syscall: false,
             #[cfg(target_arch = "x86_64")]
             user_context: None,
             #[cfg(target_arch = "x86_64")]

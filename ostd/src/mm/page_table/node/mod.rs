@@ -263,12 +263,9 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         unsafe { store_pte(ptr.add(idx), pte, Ordering::Release) };
 
         #[cfg(feature = "kernelet")]
-        {
+        if self.level() == C::NR_LEVELS && C::TOP_LEVEL_INDEX_RANGE.contains(&idx) {
             let pgd_pa = self.meta().linux_pgd_paddr.load(Ordering::Relaxed);
-            if pgd_pa != 0
-                && self.level() == C::NR_LEVELS
-                && C::TOP_LEVEL_INDEX_RANGE.contains(&idx)
-            {
+            if pgd_pa != 0 {
                 let boot = crate::kernelet::entry::boot_args();
                 let raw = pte.as_usize();
                 let pti = boot.pti_enabled != 0;

@@ -12,7 +12,7 @@ mod user_event;
 /// Binds the kernelet's user-event handler at link time.
 ///
 /// Apply this attribute to the non-generic `UserEventHandler` implementation.
-/// It exports the handler's data and local-data type IDs and four callback symbols for OSTD.
+/// It exports the handler's data and local-data type IDs and six callback symbols for OSTD.
 /// Exactly one implementation may be marked in an image; a missing or duplicate
 /// implementation fails to link instead of requiring runtime registration.
 ///

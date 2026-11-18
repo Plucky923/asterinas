@@ -63,7 +63,7 @@ use crate::{
         page_table::{PageTable, PteScalar, PteTrait, load_pte, pte_index},
         vm_space::{UserPtConfig, VmSpace},
     },
-    task::disable_preempt,
+    task::{DisabledPreemptGuard, disable_preempt},
 };
 
 #[cfg(feature = "kernelet")]
@@ -104,51 +104,78 @@ unsafe fn fill_opaque(dst: *mut u8, value: u8, len: usize) {
     }
 }
 
-/// Walks the user page table locklessly under preemption disabled.
-///
-/// On success, returns the resolved byte physical address and the remaining bytes
-/// contiguous within that page. On missing or insufficient permission, returns
-/// `Err(present_bit_if_mapped)`.
+/// Reuses a leaf table while walking one protected user-memory access.
 #[cfg(feature = "kernelet")]
-fn page_walk_user(
-    pt: &PageTable<UserPtConfig>,
-    va: Vaddr,
-    write: bool,
-) -> Result<(Paddr, usize), usize> {
-    if va >= MAX_USERSPACE_VADDR {
-        return Err(0);
-    }
+struct UserPageWalker<'a> {
+    pt: &'a PageTable<UserPtConfig>,
+    leaf_table: Option<(Vaddr, Vaddr)>,
+    _guard: &'a DisabledPreemptGuard,
+}
 
-    let mut pt_addr = paddr_to_vaddr(pt.root_paddr());
-    for cur_level in (1..=UserPtConfig::NR_LEVELS).rev() {
-        let offset = pte_index::<UserPtConfig>(va, cur_level);
-        // SAFETY: Caller holds `DisabledPreemptGuard` (RCU read-side critical section),
-        // keeping `pt` and all reachable page table nodes alive; `offset < 512`.
-        let cur_pte = unsafe {
-            load_pte(
-                (pt_addr as *mut PageTableEntry).add(offset),
-                Ordering::Acquire,
-            )
-        };
-        match cur_pte.to_repr(cur_level) {
-            PteScalar::Absent => return Err(0),
-            PteScalar::PageTable(next_pt_addr, _) => {
-                pt_addr = paddr_to_vaddr(next_pt_addr);
-            }
-            PteScalar::Mapped(frame_paddr, prop) => {
-                if !prop.flags.contains(PageFlags::R) {
-                    return Err(0);
-                }
-                if write && !prop.flags.contains(PageFlags::W) {
-                    return Err(PageFaultErrorCode::PRESENT.bits());
-                }
-                let page_sz = page_size::<UserPtConfig>(cur_level);
-                let in_page_off = va & (page_sz - 1);
-                return Ok((frame_paddr + in_page_off, page_sz - in_page_off));
-            }
+#[cfg(feature = "kernelet")]
+const _: () = assert!(!<UserPtConfig as crate::mm::page_table::PageTableConfig>::CAN_PRUNE_SUBTREE);
+
+#[cfg(feature = "kernelet")]
+impl<'a> UserPageWalker<'a> {
+    fn new(pt: &'a PageTable<UserPtConfig>, guard: &'a DisabledPreemptGuard) -> Self {
+        Self {
+            pt,
+            leaf_table: None,
+            _guard: guard,
         }
     }
-    Err(0)
+
+    fn walk(&mut self, va: Vaddr, write: bool) -> Result<(Paddr, usize), usize> {
+        if va >= MAX_USERSPACE_VADDR {
+            return Err(0);
+        }
+
+        let leaf_base = va & !(page_size::<UserPtConfig>(2) - 1);
+        let (mut pt_addr, first_level) = match self.leaf_table {
+            Some((base, table)) if base == leaf_base => (table, 1),
+            _ => (
+                paddr_to_vaddr(self.pt.root_paddr()),
+                UserPtConfig::NR_LEVELS,
+            ),
+        };
+
+        for cur_level in (1..=first_level).rev() {
+            let offset = pte_index::<UserPtConfig>(va, cur_level);
+            // SAFETY: `pt` and `_guard` keep the root and its nodes alive.
+            // A user subtree stays attached: `take_next` cannot prune it,
+            // and `map` requires an absent entry instead of replacing a table.
+            // Allocation and huge-page splitting only add tables; protection
+            // only modifies mapped entries. Each leaf PTE is still reread,
+            // including its current permissions.
+            let cur_pte = unsafe {
+                load_pte(
+                    (pt_addr as *mut PageTableEntry).add(offset),
+                    Ordering::Acquire,
+                )
+            };
+            match cur_pte.to_repr(cur_level) {
+                PteScalar::Absent => return Err(0),
+                PteScalar::PageTable(next_pt_addr, _) => {
+                    pt_addr = paddr_to_vaddr(next_pt_addr);
+                    if cur_level == 2 {
+                        self.leaf_table = Some((leaf_base, pt_addr));
+                    }
+                }
+                PteScalar::Mapped(frame_paddr, prop) => {
+                    if !prop.flags.contains(PageFlags::R) {
+                        return Err(0);
+                    }
+                    if write && !prop.flags.contains(PageFlags::W) {
+                        return Err(PageFaultErrorCode::PRESENT.bits());
+                    }
+                    let page_sz = page_size::<UserPtConfig>(cur_level);
+                    let in_page_off = va & (page_sz - 1);
+                    return Ok((frame_paddr + in_page_off, page_sz - in_page_off));
+                }
+            }
+        }
+        Err(0)
+    }
 }
 
 #[cfg(feature = "kernelet")]
@@ -170,6 +197,8 @@ fn copy_user_rcu(dst: *mut u8, src: *const u8, len: usize) -> usize {
 
     let _preempt_guard = disable_preempt();
     let pt = VmSpace::current_activated_page_table(&_preempt_guard);
+    let mut dst_walk = pt.map(|pt| UserPageWalker::new(pt, &_preempt_guard));
+    let mut src_walk = pt.map(|pt| UserPageWalker::new(pt, &_preempt_guard));
     let mut copied = 0;
 
     while copied < len {
@@ -180,11 +209,11 @@ fn copy_user_rcu(dst: *mut u8, src: *const u8, len: usize) -> usize {
         let cur_src_va = cur_src as usize;
 
         let (dst_kptr, dst_avail) = if cur_dst_va < MAX_USERSPACE_VADDR {
-            let Some(pt) = pt else {
+            let Some(walk) = dst_walk.as_mut() else {
                 publish_image_copy_fault(cur_dst_va, true, 0);
                 return copied;
             };
-            match page_walk_user(pt, cur_dst_va, true) {
+            match walk.walk(cur_dst_va, true) {
                 Ok((paddr, avail)) => (paddr_to_vaddr(paddr) as *mut u8, avail),
                 Err(present) => {
                     publish_image_copy_fault(cur_dst_va, true, present);
@@ -198,11 +227,11 @@ fn copy_user_rcu(dst: *mut u8, src: *const u8, len: usize) -> usize {
         };
 
         let (src_kptr, src_avail) = if cur_src_va < MAX_USERSPACE_VADDR {
-            let Some(pt) = pt else {
+            let Some(walk) = src_walk.as_mut() else {
                 publish_image_copy_fault(cur_src_va, false, 0);
                 return copied;
             };
-            match page_walk_user(pt, cur_src_va, false) {
+            match walk.walk(cur_src_va, false) {
                 Ok((paddr, avail)) => (paddr_to_vaddr(paddr) as *const u8, avail),
                 Err(present) => {
                     publish_image_copy_fault(cur_src_va, false, present);
@@ -243,6 +272,7 @@ fn memset_user_rcu(dst: *mut u8, value: u8, len: usize) -> usize {
 
     let _preempt_guard = disable_preempt();
     let pt = VmSpace::current_activated_page_table(&_preempt_guard);
+    let mut walk = pt.map(|pt| UserPageWalker::new(pt, &_preempt_guard));
     let mut filled = 0;
 
     while filled < len {
@@ -252,11 +282,11 @@ fn memset_user_rcu(dst: *mut u8, value: u8, len: usize) -> usize {
         if va >= MAX_USERSPACE_VADDR {
             return filled;
         }
-        let Some(pt) = pt else {
+        let Some(walk) = walk.as_mut() else {
             publish_image_copy_fault(va, true, 0);
             return filled;
         };
-        let (paddr, avail) = match page_walk_user(pt, va, true) {
+        let (paddr, avail) = match walk.walk(va, true) {
             Ok(res) => res,
             Err(present) => {
                 publish_image_copy_fault(va, true, present);
@@ -295,7 +325,7 @@ pub(super) fn atomic_load_user_rcu(ptr: *const u32) -> u64 {
         publish_image_copy_fault(va, false, 0);
         return !0u64;
     };
-    match page_walk_user(pt, va, false) {
+    match UserPageWalker::new(pt, &_preempt_guard).walk(va, false) {
         Ok((paddr, avail)) if avail >= size_of::<u32>() => {
             let kptr = paddr_to_vaddr(paddr) as *mut u32;
             // SAFETY: `kptr` points to an aligned, mapped `u32` in the direct map,
@@ -343,7 +373,7 @@ pub(super) fn atomic_cmpxchg_user_rcu(ptr: *mut u32, old_val: u32, new_val: u32)
         publish_image_copy_fault(va, true, 0);
         return !0u64;
     };
-    match page_walk_user(pt, va, true) {
+    match UserPageWalker::new(pt, &_preempt_guard).walk(va, true) {
         Ok((paddr, avail)) if avail >= size_of::<u32>() => {
             let kptr = paddr_to_vaddr(paddr) as *mut u32;
             // SAFETY: `kptr` points to an aligned, writable `u32` in the direct map,

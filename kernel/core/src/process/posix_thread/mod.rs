@@ -49,7 +49,7 @@ pub(crate) use thread_local::{AsThreadLocal, FileTableRefMut, ThreadLocal};
 
 pub struct PosixThread {
     // Immutable part
-    process: Weak<Process>,
+    process: Arc<Process>,
     task: Weak<Task>,
 
     // Mutable part
@@ -110,10 +110,10 @@ pub struct PosixThread {
 
 impl PosixThread {
     pub(crate) fn process(&self) -> Arc<Process> {
-        self.process.upgrade().unwrap()
+        self.process.clone()
     }
 
-    pub(crate) fn weak_process(&self) -> &Weak<Process> {
+    pub(crate) fn process_ref(&self) -> &Arc<Process> {
         &self.process
     }
 
@@ -124,7 +124,7 @@ impl PosixThread {
 
     /// Sets the thread as the main thread by changing its thread ID.
     pub(super) fn set_main(&self, pid: Pid) {
-        debug_assert_eq!(pid, self.process.upgrade().unwrap().pid());
+        debug_assert_eq!(pid, self.process.pid());
         debug_assert_ne!(pid, self.tid.load(Ordering::Relaxed));
 
         self.tid.store(pid, Ordering::Relaxed);

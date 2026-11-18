@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-// Exercise register arguments, ptrace, exceptions, blocking, and process retirement.
+// Exercise register arguments, ptrace, exceptions, migration, and process retirement.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -140,6 +141,39 @@ static void check_blocking_and_retirement(void)
 	printf("RESULT blocking_and_retirement 1 bool\n");
 }
 
+static void check_affinity_migration(void)
+{
+	cpu_set_t original;
+	REQUIRE(sched_getaffinity(0, sizeof(original), &original) == 0);
+	int cpus[2], count = 0;
+	for (int cpu = 0; cpu < CPU_SETSIZE && count < 2; cpu++) {
+		if (CPU_ISSET(cpu, &original))
+			cpus[count++] = cpu;
+	}
+	if (count < 2) {
+		printf("SKIP affinity_migration: fewer than two allowed CPUs\n");
+		return;
+	}
+
+	pid_t pid = getpid();
+	for (int iteration = 0; iteration < 128; iteration++) {
+		unsigned int target = cpus[iteration % 2], actual;
+		cpu_set_t selected;
+		CPU_ZERO(&selected);
+		CPU_SET(target, &selected);
+		REQUIRE(sched_setaffinity(0, sizeof(selected), &selected) == 0);
+		// Blocking makes wakeup placement apply the new affinity. The syscall
+		// continuation must then return through the destination vCPU's record.
+		struct timespec delay = { .tv_nsec = 1000000 };
+		REQUIRE(nanosleep(&delay, NULL) == 0);
+		REQUIRE(syscall(SYS_getcpu, &actual, NULL, NULL) == 0);
+		REQUIRE(actual == target);
+		REQUIRE(syscall(SYS_getpid) == pid);
+	}
+	REQUIRE(sched_setaffinity(0, sizeof(original), &original) == 0);
+	printf("RESULT affinity_migration 1 bool\n");
+}
+
 int main(int argc, char **argv)
 {
 	if (argc == 2 && strcmp(argv[1], "--exec-child") == 0)
@@ -153,6 +187,7 @@ int main(int argc, char **argv)
 	check_exception(2, SIGSEGV);
 	printf("RESULT user_exceptions 1 bool\n");
 	check_blocking_and_retirement();
+	check_affinity_migration();
 	pid_t child = fork();
 	REQUIRE(child >= 0);
 	if (child == 0) {

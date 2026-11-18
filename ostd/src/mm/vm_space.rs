@@ -8,6 +8,8 @@
 //! the page table cursor, providing efficient, powerful concurrent accesses
 //! to the page table.
 
+#[cfg(feature = "kernelet")]
+use core::mem::ManuallyDrop;
 use core::{ops::Range, sync::atomic::Ordering};
 
 use super::{AnyUFrameMeta, PagingLevel, page_table::PageTableConfig};
@@ -653,6 +655,11 @@ impl<'a> CursorMut<'a> {
     ///  - the length is not page-aligned.
     pub fn unmap(&mut self, len: usize) -> usize {
         #[cfg(feature = "kernelet")]
+        if crate::kernelet::entry::boot_args().pt_mode == 0 {
+            return self.unmap_direct(len);
+        }
+
+        #[cfg(feature = "kernelet")]
         let start_va = self.virt_addr();
         let end_va = self.virt_addr() + len;
         let mut num_unmapped: usize = 0;
@@ -742,6 +749,82 @@ impl<'a> CursorMut<'a> {
 
         self.flusher.dispatch_tlb_flush();
 
+        num_unmapped
+    }
+
+    #[cfg(feature = "kernelet")]
+    fn unmap_direct(&mut self, len: usize) -> usize {
+        const BATCH_FRAMES: usize = 256;
+
+        let end_va = self.virt_addr() + len;
+        let mut num_unmapped = 0;
+        // Keep ownership without an automatic drop until the Host has flushed.
+        let mut frames = ManuallyDrop::new([const { None }; BATCH_FRAMES]);
+        let mut used = 0;
+
+        loop {
+            // SAFETY: User mappings are cleared before their retained frames
+            // are released, after both the Host flush and the Image grace period.
+            let Some(frag) = (unsafe { self.pt_cursor.take_next(end_va - self.virt_addr()) })
+            else {
+                break;
+            };
+
+            let frame = match frag {
+                PageTableFrag::Mapped { va, item, .. } => {
+                    // SAFETY: The batch retains ownership until the flush, and
+                    // `RcuDrop` then keeps it until all readers have finished.
+                    let (item, panic_guard) = unsafe { RcuDrop::into_inner(item) };
+                    self.flusher.issue_tlb_flush(TlbFlushOp::for_single(va));
+                    let frame = match item.mapped_item {
+                        MappedItem::TrackedFrame(frame) => {
+                            num_unmapped += 1;
+                            Some(Frame::from_unsized(frame))
+                        }
+                        MappedItem::UntrackedIoMem { .. } => None,
+                    };
+                    panic_guard.forget();
+                    frame
+                }
+                PageTableFrag::StrayPageTable {
+                    pt,
+                    va,
+                    len,
+                    num_frames,
+                } => {
+                    num_unmapped += num_frames;
+                    self.flusher
+                        .issue_tlb_flush(TlbFlushOp::for_range(va..va + len));
+                    // SAFETY: The same batch retains this subtree through both
+                    // the Host flush and the Image grace period.
+                    let (pt, panic_guard) = unsafe { RcuDrop::into_inner(pt) };
+                    let frame = Frame::from_unsized(pt);
+                    panic_guard.forget();
+                    Some(frame)
+                }
+            };
+
+            if let Some(frame) = frame {
+                frames[used] = Some(frame);
+                used += 1;
+            }
+            if used == BATCH_FRAMES {
+                self.flusher.dispatch_tlb_flush();
+                // SAFETY: All translations for this batch are invalidated, so
+                // ownership can pass to the deferred Image RCU callback.
+                let retired = unsafe { ManuallyDrop::take(&mut frames) };
+                frames = ManuallyDrop::new([const { None }; BATCH_FRAMES]);
+                used = 0;
+                drop(RcuDrop::new(retired));
+            }
+        }
+
+        self.flusher.dispatch_tlb_flush();
+        if used != 0 {
+            // SAFETY: The final batch completed the same synchronous Host flush.
+            let retired = unsafe { ManuallyDrop::take(&mut frames) };
+            drop(RcuDrop::new(retired));
+        }
         num_unmapped
     }
 

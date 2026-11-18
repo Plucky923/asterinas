@@ -157,27 +157,13 @@ mod kernelet_events {
 
     use crate::{
         arch::cpu::{
-            context::{CpuException, LinuxPtRegs, UserContext},
+            context::{CpuException, UserContext},
             local::CpuLocalAccess,
         },
         irq::DisabledLocalIrqGuard,
-        kernelet::{
-            abi::{USER_EVENT_EXCEPTION, USER_EVENT_KERNEL_EVENT, USER_EVENT_SYSCALL},
-            entry,
-        },
+        kernelet::{abi::VcpuRecord, entry},
         task::{CurrentTask, Task},
     };
-
-    /// Reason why control returned from user mode to [`user_event_entry`].
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum UserEvent {
-        /// A system call issued by user space.
-        Syscall,
-        /// A CPU exception triggered by user space.
-        Exception,
-        /// A pending kernel event or reschedule notice.
-        KernelEvent,
-    }
 
     /// Kernel callbacks invoked by OSTD's non-returning user-mode event loop.
     ///
@@ -198,13 +184,30 @@ mod kernelet_events {
             user_ctx: &mut UserContext,
         ) -> bool;
 
-        /// Handles a user-mode return event.
+        /// Handles a system call from user mode.
         /// Returns `true` if the task should exit instead of resuming user mode.
-        fn handle(
+        fn handle_syscall(
             &self,
             local: &Self::LocalData,
             task: &CurrentTask,
-            event: UserEvent,
+            user_ctx: &mut UserContext,
+        ) -> bool;
+
+        /// Handles a user-mode exception.
+        /// Returns `true` if the task should exit instead of resuming user mode.
+        fn handle_exception(
+            &self,
+            local: &Self::LocalData,
+            task: &CurrentTask,
+            user_ctx: &mut UserContext,
+        ) -> bool;
+
+        /// Handles pending kernel work for this user task.
+        /// Returns `true` if the task should exit instead of resuming user mode.
+        fn handle_kernel_event(
+            &self,
+            local: &Self::LocalData,
+            task: &CurrentTask,
             user_ctx: &mut UserContext,
         ) -> bool;
 
@@ -228,11 +231,22 @@ mod kernelet_events {
             task: &CurrentTask,
             user_ctx: &mut UserContext,
         ) -> bool;
-        fn __ostd_user_handle(
+        fn __ostd_user_handle_syscall(
             data: *const (),
             local: *const (),
             task: &CurrentTask,
-            event: UserEvent,
+            user_ctx: &mut UserContext,
+        ) -> bool;
+        fn __ostd_user_handle_exception(
+            data: *const (),
+            local: *const (),
+            task: &CurrentTask,
+            user_ctx: &mut UserContext,
+        ) -> bool;
+        fn __ostd_user_handle_kernel_event(
+            data: *const (),
+            local: *const (),
+            task: &CurrentTask,
             user_ctx: &mut UserContext,
         ) -> bool;
         fn __ostd_user_has_kernel_event(
@@ -259,20 +273,8 @@ mod kernelet_events {
 
     #[cold]
     #[inline(never)]
-    fn panic_active_preempt_guard(guards: u32) -> ! {
-        panic!("returning to user mode with active preemption guard (guards={guards})");
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn invalid_user_event(raw_event: u64) -> ! {
-        panic!("invalid user_event_entry event: {raw_event}");
-    }
-
-    #[cold]
-    #[inline(never)]
     fn missing_current_task() -> ! {
-        panic!("user_event_entry requires a current Task");
+        panic!("entering a user event requires a current Task");
     }
 
     #[inline(always)]
@@ -282,32 +284,30 @@ mod kernelet_events {
         current_task: &CurrentTask,
         user_ctx: &mut UserContext,
     ) -> ! {
-        let (guard, guards) = DisabledLocalIrqGuard::disable_for_user_return();
-        if guards != 0 {
-            panic_active_preempt_guard(guards);
-        }
+        let guard = DisabledLocalIrqGuard::disable_for_user_return(current_task);
         user_ctx.sync_to_frame(current_task.active_pt_regs());
         // SAFETY: `handler_data` points to `current_task.data()` (`Arc<H>`) and
         // `handler_local` points to `current_task.local_data()` (`H::LocalData`).
         unsafe { __ostd_user_pre_user_run(handler_data, handler_local, &guard) };
-        core::mem::forget(guard);
         (entry::services().user_run)(core::ptr::null_mut());
         unreachable!("user_run should not return under kernelet PR #3");
     }
 
-    /// Fuses vCPU lookup, `CURRENT_TASK_PTR` load, virtual IRQ unmask (`vrec.irq_off = 0`),
+    /// Fuses vCPU selection, `CURRENT_TASK_PTR` load, virtual IRQ unmask (`vrec.irq_off = 0`),
     /// and `(vrec.pending, PREEMPT_INFO)` read into one `.text.kernelet_cpu_access`
-    /// block for the `raw_event != USER_EVENT_EXCEPTION` fast path.
+    /// block for syscall and kernel event entry.
     ///
     /// # Safety
     ///
-    /// Must only be called on `user_event_entry` entry while `vrec.irq_off == 1`.
+    /// The Host must have entered a current user task with `vrec.irq_off == 1`.
+    /// A non-null `record` must identify its pinned shared vCPU record.
+    /// A null pointer selects the legacy GS lookup.
     #[inline(always)]
-    unsafe fn fast_enter_user_event() -> (CurrentTask, u64, u32) {
+    unsafe fn fast_enter_user_event(record: *const VcpuRecord) -> (CurrentTask, u64, u32) {
         let mut current_task_ptr = Task::current_task_ptr_offset();
         let mut preempt_info = Task::preempt_info_offset();
         let pending: u64;
-        // SAFETY: `vrec.irq_off == 1` on entry, and the entire table lookup,
+        // SAFETY: `vrec.irq_off == 1` on entry, and the entire record selection,
         // IRQ unmask and state check stay inside one
         // nonredirectable `.text.kernelet_cpu_access` block.
         unsafe {
@@ -315,11 +315,17 @@ mod kernelet_events {
                 "jmp 2f",
                 ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
                 "2:",
+                "test {vrec}, {vrec}",
+                "jnz 4f",
                 "lea {vrec}, [rip + {fast_cpu}]",
                 "mov {slot}, qword ptr [{vrec} + {slot_gs_off}]",
                 "movzx {slot:e}, word ptr gs:[{slot} + 2]",
                 "mov {local_base}, qword ptr [{vrec} + {slot} * 8 + {local_bases_off}]",
                 "mov {vrec}, qword ptr [{vrec} + {slot} * 8 + {record_ptrs_off}]",
+                "jmp 5f",
+                "4:",
+                "mov {local_base}, qword ptr [{vrec} + {local_base_off}]",
+                "5:",
                 "mov {task}, qword ptr [{local_base} + {task}]",
                 "mov dword ptr [{vrec} + {vrec_irq_off}], 0",
                 "mov {pending}, qword ptr [{vrec} + {vrec_pending_off}]",
@@ -327,7 +333,7 @@ mod kernelet_events {
                 "jmp 3f",
                 ".popsection",
                 "3:",
-                vrec = out(reg) _,
+                vrec = inout(reg) record => _,
                 slot = out(reg) _,
                 local_base = out(reg) _,
                 pending = out(reg) pending,
@@ -337,6 +343,7 @@ mod kernelet_events {
                 slot_gs_off = const core::mem::offset_of!(entry::FastCpuTable, slot_gs_offset),
                 local_bases_off = const core::mem::offset_of!(entry::FastCpuTable, local_bases),
                 record_ptrs_off = const core::mem::offset_of!(entry::FastCpuTable, record_ptrs),
+                local_base_off = const core::mem::offset_of!(VcpuRecord, cpu_local_base),
                 vrec_irq_off = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, irq_off),
                 vrec_pending_off = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, pending),
                 options(nostack),
@@ -350,28 +357,34 @@ mod kernelet_events {
         (current_task, pending, preempt_info as u32)
     }
 
+    /// Handles a user-mode exception reported by the Host.
+    ///
+    /// # Safety
+    ///
+    /// The Host must call this on `urec.event_rsp` with virtual interrupts masked,
+    /// a valid current user task's `urec.pt_regs`, and the captured exception in `urec`.
     #[cold]
-    #[inline(never)]
-    unsafe fn user_exception_entry() -> ! {
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn user_exception_entry() -> ! {
         let (current_task, handler_data, handler_local, mut user_ctx) = {
             // SAFETY: The Host's user-event entry contract masks virtual IRQs.
             let irq_guard = unsafe { DisabledLocalIrqGuard::from_disabled() };
             let access = CpuLocalAccess::new(&irq_guard);
             let urec = entry::user_event_record_for(access.record());
-            let pt_regs_ptr = urec.pt_regs.load(Ordering::Acquire) as *mut LinuxPtRegs;
-            debug_assert!(!pt_regs_ptr.is_null());
             let trap_num = urec.trap_num.load(Ordering::Acquire) as usize;
             let error_code = urec.error_code.load(Ordering::Acquire) as usize;
             let fault_addr = urec.fault_addr.load(Ordering::Acquire) as usize;
             let exception = CpuException::from_raw(trap_num, error_code, fault_addr)
-                .expect("user_event_entry exception without a valid trap number");
+                .expect("user exception entry requires a valid trap number");
             let current_task =
-                Task::current_with(&access).expect("user_event_entry requires a current Task");
+                Task::current_with(&access).expect("user exception entry requires a current Task");
             debug_assert!(current_task.is_user());
-            debug_assert_eq!(
-                current_task.active_pt_regs().load(Ordering::Relaxed),
-                pt_regs_ptr
-            );
+            #[cfg(debug_assertions)]
+            {
+                let active_pt_regs = current_task.active_pt_regs().load(Ordering::Relaxed);
+                debug_assert!(!active_pt_regs.is_null());
+                debug_assert_eq!(active_pt_regs as u64, urec.pt_regs.load(Ordering::Acquire));
+            }
             let handler_data = core::ptr::from_ref(current_task.data().as_ref()).cast::<()>();
             // SAFETY: `user_exception_entry` executes in task context on `current_task`.
             let handler_local =
@@ -385,13 +398,7 @@ mod kernelet_events {
         crate::arch::irq::enable_local();
         // SAFETY: `handler_data` and `handler_local` match the linked handler's types.
         if unsafe {
-            __ostd_user_handle(
-                handler_data,
-                handler_local,
-                &current_task,
-                UserEvent::Exception,
-                &mut user_ctx,
-            )
+            __ostd_user_handle_exception(handler_data, handler_local, &current_task, &mut user_ctx)
         } {
             crate::task::exit_current_task();
         }
@@ -438,60 +445,78 @@ mod kernelet_events {
         enter_user_mode(handler_data, handler_local, &current_task, &mut user_ctx);
     }
 
-    /// Re-entry point called by the Host when a user task leaves user mode.
+    /// Handles a system call from user mode.
     ///
     /// # Safety
     ///
     /// The Host must call this on `urec.event_rsp` with virtual interrupts
-    /// masked (`vrec.irq_off == 1`), `urec.pt_regs` valid for the active user
-    /// task, and `raw_event` equal to one of `USER_EVENT_*`.
+    /// masked (`vrec.irq_off == 1`) and the current user task's `urec.pt_regs`
+    /// containing the system call number and arguments.
+    /// `record` must identify its shared vCPU record or be null for a legacy Host.
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn user_event_entry(raw_event: u64) -> ! {
-        if raw_event == USER_EVENT_EXCEPTION {
-            // SAFETY: Same entry contract as `user_event_entry`, with virtual IRQs still masked.
-            unsafe { user_exception_entry() };
+    pub unsafe extern "C" fn user_syscall_entry(record: *const VcpuRecord) -> ! {
+        // SAFETY: The Host supplied the active task's event state. Its data types were checked
+        // during construction, and the callback accesses them only while the task is current.
+        unsafe {
+            handle_user_event(record, |data, local, task, user_ctx| {
+                __ostd_user_handle_syscall(data, local, task, user_ctx)
+            })
         }
-        let event = match raw_event {
-            USER_EVENT_SYSCALL => UserEvent::Syscall,
-            USER_EVENT_KERNEL_EVENT => UserEvent::KernelEvent,
-            _ => invalid_user_event(raw_event),
-        };
-        // SAFETY: The Host's user-event entry contract masks virtual IRQs.
-        let (current_task, pending, preempt_info) = unsafe { fast_enter_user_event() };
+    }
+
+    /// Handles pending kernel work on a user task.
+    ///
+    /// # Safety
+    ///
+    /// The Host must call this on `urec.event_rsp` with virtual interrupts masked
+    /// (`vrec.irq_off == 1`) and `urec.pt_regs` valid for the current user task.
+    /// `record` must identify its shared vCPU record or be null for a legacy Host.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn user_kernel_event_entry(record: *const VcpuRecord) -> ! {
+        // SAFETY: The Host supplied the active task's event state. Both callbacks use the
+        // same task data and local data validated during construction.
+        unsafe {
+            handle_user_event(record, |data, local, task, user_ctx| {
+                __ostd_user_has_kernel_event(data, local, task)
+                    && __ostd_user_handle_kernel_event(data, local, task, user_ctx)
+            })
+        }
+    }
+
+    /// Prepares the active task for its syscall or kernel event callback.
+    ///
+    /// # Safety
+    ///
+    /// The Host must have entered the active user task on its event stack with virtual
+    /// interrupts masked and its `pt_regs` frame installed.
+    /// `record` must identify its shared vCPU record or be null for a legacy Host.
+    #[inline(always)]
+    unsafe fn handle_user_event(
+        record: *const VcpuRecord,
+        handle: impl FnOnce(*const (), *const (), &CurrentTask, &mut UserContext) -> bool,
+    ) -> ! {
+        // SAFETY: The entry contract establishes the current task and masks virtual IRQs.
+        let (current_task, pending, preempt_info) = unsafe { fast_enter_user_event(record) };
         if pending != 0 || preempt_info == 0 {
             crate::arch::irq::finish_enable_local_slow();
         }
         let handler_data = core::ptr::from_ref(current_task.data().as_ref()).cast::<()>();
-        // SAFETY: `user_event_entry` runs in task context on `current_task`.
+        // SAFETY: This entry runs in task context on `current_task`.
         let handler_local =
             core::ptr::from_ref(unsafe { current_task.local_data_unchecked() }).cast::<()>();
         // SAFETY: `current_task.active_pt_regs()` holds this vCPU's live carrier
         // `pt_regs`, updated across any task switch by `after_switching_to`.
         let mut user_ctx = unsafe { UserContext::from_frame(current_task.active_pt_regs(), None) };
 
-        // SAFETY: `handler_data` and `handler_local` match the linked handler's types.
-        if event != UserEvent::KernelEvent
-            || unsafe { __ostd_user_has_kernel_event(handler_data, handler_local, &current_task) }
-        {
-            // SAFETY: Same as above.
-            if unsafe {
-                __ostd_user_handle(
-                    handler_data,
-                    handler_local,
-                    &current_task,
-                    event,
-                    &mut user_ctx,
-                )
-            } {
-                crate::task::exit_current_task();
-            }
+        if handle(handler_data, handler_local, &current_task, &mut user_ctx) {
+            crate::task::exit_current_task();
         }
         enter_user_mode(handler_data, handler_local, &current_task, &mut user_ctx);
     }
 }
 
 #[cfg(feature = "kernelet")]
-pub use kernelet_events::{UserEvent, UserEventHandler};
+pub use kernelet_events::UserEventHandler;
 #[cfg(feature = "kernelet")]
 pub(crate) use kernelet_events::{
     user_event_handler_data_type_id, user_event_handler_local_data_type_id,

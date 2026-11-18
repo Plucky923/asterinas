@@ -73,8 +73,12 @@ pub struct EntryTable {
     pub cpu_access_start_offset: u64,
     /// Image-relative exclusive end of the CPU-local access sequences.
     pub cpu_access_end_offset: u64,
-    /// Image-relative entry for user-mode returns (syscalls, exceptions, kernel events).
-    pub user_event_entry_offset: u64,
+    /// Image-relative entry for a system call from user mode.
+    pub user_syscall_entry_offset: u64,
+    /// Image-relative entry for a user-mode exception.
+    pub user_exception_entry_offset: u64,
+    /// Image-relative entry for pending kernel work on a user task.
+    pub user_kernel_event_entry_offset: u64,
 }
 
 /// Bootstrap version of the read-only boot page shared by the Host and image.
@@ -362,11 +366,11 @@ pub struct UserEventRecord {
     pub event_rsp: AtomicU64,
     /// Current user task's kernel stack lower bound.
     pub event_stack_limit: AtomicU64,
-    /// Returned trap number for `UserEvent::Exception`.
+    /// Trap number for a user-mode exception.
     pub trap_num: AtomicU64,
-    /// Returned trap error code for `UserEvent::Exception`.
+    /// Trap error code for a user-mode exception.
     pub error_code: AtomicU64,
-    /// Fault address (`CR2` on `#PF`) for `UserEvent::Exception`.
+    /// Fault address (`CR2` on `#PF`) for a user-mode exception.
     pub fault_addr: AtomicU64,
     /// Reserved and always zero.
     pub _pad: [u64; 2],
@@ -498,13 +502,6 @@ pub const USER_RETURN_EXCEPTION: i32 = 1;
 /// A physical interrupt or virtual work requires image-side processing.
 pub const USER_RETURN_PENDING: i32 = 2;
 
-/// User event code passed to `user_event_entry` for a system call.
-pub const USER_EVENT_SYSCALL: u64 = 0;
-/// User event code passed to `user_event_entry` for a CPU exception.
-pub const USER_EVENT_EXCEPTION: u64 = 1;
-/// User event code passed to `user_event_entry` for a pending kernel event.
-pub const USER_EVENT_KERNEL_EVENT: u64 = 2;
-
 /// The requested resource is not owned by this kernelet.
 pub const NOT_OWNED: i64 = 2;
 /// An argument or pointer is invalid.
@@ -538,7 +535,7 @@ const _: () = {
     assert!(offset_of!(CpuSlot, vcpu) == 2);
     assert!(offset_of!(CpuSlot, generation) == 4);
     assert!(offset_of!(CpuSlot, _reserved) == 8);
-    assert!(size_of::<EntryTable>() == 144);
+    assert!(size_of::<EntryTable>() == 160);
     assert!(offset_of!(EntryTable, source_hash) == 40);
     assert!(offset_of!(EntryTable, ex_table_start_offset) == 72);
     assert!(offset_of!(EntryTable, yield_entry_offset) == 88);
@@ -547,7 +544,9 @@ const _: () = {
     assert!(offset_of!(EntryTable, stub_range_end_offset) == 112);
     assert!(offset_of!(EntryTable, cpu_access_start_offset) == 120);
     assert!(offset_of!(EntryTable, cpu_access_end_offset) == 128);
-    assert!(offset_of!(EntryTable, user_event_entry_offset) == 136);
+    assert!(offset_of!(EntryTable, user_syscall_entry_offset) == 136);
+    assert!(offset_of!(EntryTable, user_exception_entry_offset) == 144);
+    assert!(offset_of!(EntryTable, user_kernel_event_entry_offset) == 152);
     assert!(size_of::<BootArgs>() == 2352);
     assert!(size_of::<DeviceEntry>() == 24);
     assert!(size_of::<RunDesc>() == 16);

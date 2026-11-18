@@ -111,7 +111,7 @@ pub fn audit_kernelet_image(
         entry_table.virq_entry(),
         entry_table.yield_entry(),
         entry_table.exit_entry(),
-        entry_table.user_event_entry(),
+        entry_table.user_entries(),
         entry_table.stub_range_start(),
         entry_table.stub_range_end(),
         entry_table.cpu_access_start(),
@@ -152,13 +152,15 @@ fn check_10_indirect_targets(
         }
     };
     let fixed = [
-        ("image entry".to_string(), entry),
-        ("secondary vCPU entry".to_string(), table.vcpu_entry()),
-        ("virtual interrupt entry".to_string(), table.virq_entry()),
-        ("carrier yield entry".to_string(), table.yield_entry()),
-        ("carrier exit entry".to_string(), table.exit_entry()),
-        ("user event entry".to_string(), table.user_event_entry()),
-    ];
+        ("image entry", entry),
+        ("secondary vCPU entry", table.vcpu_entry()),
+        ("virtual interrupt entry", table.virq_entry()),
+        ("carrier yield entry", table.yield_entry()),
+        ("carrier exit entry", table.exit_entry()),
+    ]
+    .into_iter()
+    .chain(table.user_entries())
+    .map(|(name, target)| (name.to_string(), target));
     let relocated = relocations.iter().filter_map(|relocation| {
         if relocation.rtype != elf::R_X86_64_RELATIVE {
             return None;
@@ -174,7 +176,7 @@ fn check_10_indirect_targets(
                 )
             })
     });
-    for (name, target) in fixed.into_iter().chain(relocated) {
+    for (name, target) in fixed.chain(relocated) {
         if !loads
             .text
             .covers_vaddr_range(target, target.saturating_add(ENDBR64.len() as u64))
@@ -289,8 +291,22 @@ impl<'a> EntryTableBytes<'a> {
         self.field(abi::entry_table::EX_TABLE_END_OFFSET)
     }
 
-    fn user_event_entry(&self) -> u64 {
-        self.field(abi::entry_table::USER_EVENT_ENTRY_OFFSET)
+    fn user_entries(&self) -> [(&'static str, u64); 3] {
+        [
+            (
+                "user_syscall_entry",
+                abi::entry_table::USER_SYSCALL_ENTRY_OFFSET,
+            ),
+            (
+                "user_exception_entry",
+                abi::entry_table::USER_EXCEPTION_ENTRY_OFFSET,
+            ),
+            (
+                "user_kernel_event_entry",
+                abi::entry_table::USER_KERNEL_EVENT_ENTRY_OFFSET,
+            ),
+        ]
+        .map(|(name, offset)| (name, self.field(offset)))
     }
 }
 
@@ -514,8 +530,10 @@ fn check_4_entry_table(
         ("virq_entry", table.virq_entry()),
         ("yield_entry", table.yield_entry()),
         ("exit_entry", table.exit_entry()),
-        ("user_event_entry", table.user_event_entry()),
-    ] {
+    ]
+    .into_iter()
+    .chain(table.user_entries())
+    {
         if entry
             .checked_add(1)
             .is_none_or(|end| !loads.text.covers_vaddr_range(entry, end))

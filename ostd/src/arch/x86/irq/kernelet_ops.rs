@@ -81,79 +81,83 @@ pub(crate) fn disable_local_save() -> bool {
     mask == 0
 }
 
-/// Disables virtual IRQs and reads `(was_enabled, guards)` in one
+/// Disables virtual IRQs and reads the guard count in one
 /// nonredirectable `.text.kernelet_cpu_access` sequence.
-pub(crate) fn disable_local_save_with_guards() -> (bool, u32) {
-    let mask: u32;
+fn disable_local_with_guards() -> u32 {
     let guards: u32;
-    // SAFETY: Reading `irq_off`, reading `guards`, and masking `irq_off = 1`
-    // cannot be separated by an image upcall.
+    // SAFETY: Reading `guards` and masking `irq_off = 1` cannot be separated
+    // by an image upcall.
     unsafe {
         crate::arch::cpu::local::record_asm!(
-            "mov {mask:e}, dword ptr [{record_base} + {irq_offset}]",
             "mov {guards:e}, dword ptr [{record_base} + {guards_offset}]",
             "mov dword ptr [{record_base} + {irq_offset}], 1";
-            mask = out(reg) mask,
             guards = out(reg) guards,
             irq_offset = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, irq_off),
             guards_offset = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, guards),
             options(nostack),
         );
     }
-    (mask == 0, guards)
+    guards
 }
 
-/// Fast user-return exit check: reads `PREEMPT_INFO` and, when no preemption
-/// is needed (`preempt_info != 0`), masks virtual IRQs and reads `(was_enabled, guards)`
-/// in a single `.text.kernelet_cpu_access` sequence.
+// A nonnegative result is the vCPU's guard count.
+const PREEMPTION_PENDING: i64 = -1;
+
+/// Masks virtual IRQs after handling any pending preemption and checks for open guards.
 #[inline(always)]
-pub(crate) fn try_disable_with_guards_if_no_preempt(
-    preempt_info_off: usize,
-) -> Option<(bool, u32)> {
-    let mut preempt = preempt_info_off;
-    let mask: u32;
-    let guards: usize;
-    // SAFETY: Checking `PREEMPT_INFO != 0`, reading `irq_off`/`guards`, and
-    // writing `irq_off = 1` execute together inside `.text.kernelet_cpu_access`.
+pub(crate) fn disable_local_for_user_return(current_task: &crate::task::CurrentTask) {
+    let status: i64;
+    // SAFETY: Every switch-in refreshes the current task's record pointer
+    // before it resumes. Loading that pointer, checking `PREEMPT_INFO`, and
+    // masking IRQs execute together inside `.text.kernelet_cpu_access`, so
+    // migration cannot leave a stale pointer between the load and its uses.
+    // Host preemption preserves the vCPU and its pinned shared record.
     unsafe {
         core::arch::asm!(
             "jmp 2f",
             ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
             "2:",
-            "lea {vrec}, [rip + {fast_cpu}]",
-            "mov {slot}, qword ptr [{vrec} + {slot_gs_off}]",
-            "movzx {slot:e}, word ptr gs:[{slot} + 2]",
-            "mov {guards}, qword ptr [{vrec} + {slot} * 8 + {local_bases_off}]",
-            "mov {preempt:e}, dword ptr [{guards} + {preempt}]",
-            "test {preempt:e}, {preempt:e}",
+            "mov {vrec}, qword ptr [{record_ptr}]",
+            "mov {status}, qword ptr [{vrec} + {local_base_off}]",
+            "cmp dword ptr [{status} + {preempt_info_off}], 0",
             "jz 4f",
-            "mov {vrec}, qword ptr [{vrec} + {slot} * 8 + {record_ptrs_off}]",
-            "mov {mask:e}, dword ptr [{vrec} + {irq_off}]",
-            "mov {guards:e}, dword ptr [{vrec} + {guards_off}]",
+            "mov {status:e}, dword ptr [{vrec} + {guards_off}]",
             "mov dword ptr [{vrec} + {irq_off}], 1",
+            "jmp 3f",
             "4:",
+            "mov {status}, {preemption_pending}",
             "jmp 3f",
             ".popsection",
             "3:",
+            record_ptr = in(reg) current_task.active_vcpu_record_ptr(),
             vrec = out(reg) _,
-            slot = out(reg) _,
-            preempt = inout(reg) preempt,
-            mask = out(reg) mask,
-            guards = out(reg) guards,
-            fast_cpu = sym entry::KERNELET_FAST_CPU,
-            slot_gs_off = const core::mem::offset_of!(entry::FastCpuTable, slot_gs_offset),
-            local_bases_off = const core::mem::offset_of!(entry::FastCpuTable, local_bases),
-            record_ptrs_off = const core::mem::offset_of!(entry::FastCpuTable, record_ptrs),
+            status = out(reg) status,
+            preempt_info_off = in(reg) crate::task::Task::preempt_info_offset(),
+            preemption_pending = const PREEMPTION_PENDING,
+            local_base_off = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, cpu_local_base),
             irq_off = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, irq_off),
             guards_off = const core::mem::offset_of!(crate::kernelet::abi::VcpuRecord, guards),
             options(nostack),
         );
     }
-    if preempt as u32 != 0 {
-        Some((mask == 0, guards as u32))
-    } else {
-        None
+    if status != 0 {
+        finish_disable_for_user_return(status);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn finish_disable_for_user_return(status: i64) {
+    let guards = if status == PREEMPTION_PENDING {
+        crate::task::scheduler::might_preempt();
+        disable_local_with_guards()
+    } else {
+        status as u32
+    };
+    assert_eq!(
+        guards, 0,
+        "returning to user mode with active preemption guard (guards={guards})"
+    );
 }
 
 pub(crate) fn is_local_enabled() -> bool {

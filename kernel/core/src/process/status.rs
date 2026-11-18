@@ -2,7 +2,7 @@
 
 //! The process status.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use ostd::sync::SpinLock;
 
@@ -12,23 +12,30 @@ use crate::process::{WaitOptions, signal::sig_num::SigNum};
 /// The status of a process.
 ///
 /// This maintains:
-/// 1. Whether the process is a zombie (i.e., all its threads have exited);
+/// 1. Whether the process is running, a zombie, or has been reaped;
 /// 2. Whether the process is the vfork child, which shares the user-space virtual memory
 ///    with its parent process;
 /// 3. The exit code of the process;
 /// 4. Whether the process is stopped by a signal.
 #[derive(Debug)]
 pub(crate) struct ProcessStatus {
-    is_zombie: AtomicBool,
+    exit_state: AtomicU8,
     is_vfork_child: AtomicBool,
     exit_code: AtomicU32,
     stop_status: StopStatus,
 }
 
+#[repr(u8)]
+enum ExitState {
+    Running,
+    Zombie,
+    Reaped,
+}
+
 impl Default for ProcessStatus {
     fn default() -> Self {
         Self {
-            is_zombie: AtomicBool::new(false),
+            exit_state: AtomicU8::new(ExitState::Running as u8),
             is_vfork_child: AtomicBool::new(false),
             exit_code: AtomicU32::new(0),
             stop_status: StopStatus::new(),
@@ -37,10 +44,10 @@ impl Default for ProcessStatus {
 }
 
 impl ProcessStatus {
-    /// Returns whether the process is a zombie process.
+    /// Returns whether all threads of the process have exited.
     pub(crate) fn is_zombie(&self) -> bool {
         // Use the `Acquire` memory order to make the exit code visible.
-        self.is_zombie.load(Ordering::Acquire)
+        self.exit_state.load(Ordering::Acquire) != ExitState::Running as u8
     }
 
     /// Sets the process to be a zombie process.
@@ -50,7 +57,23 @@ impl ProcessStatus {
     /// after it.
     pub(super) fn set_zombie(&self) {
         // Use the `Release` memory order to make the exit code visible.
-        self.is_zombie.store(true, Ordering::Release);
+        self.exit_state
+            .store(ExitState::Zombie as u8, Ordering::Release);
+    }
+
+    /// Returns whether the parent has reaped the zombie process.
+    pub(crate) fn is_reaped(&self) -> bool {
+        self.exit_state.load(Ordering::Acquire) == ExitState::Reaped as u8
+    }
+
+    /// Marks the process reaped after detaching its PID and main task.
+    pub(super) fn set_reaped(&self) {
+        debug_assert_eq!(
+            self.exit_state.load(Ordering::Relaxed),
+            ExitState::Zombie as u8
+        );
+        self.exit_state
+            .store(ExitState::Reaped as u8, Ordering::Release);
     }
 }
 

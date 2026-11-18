@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::ops::ControlFlow;
+
 #[cfg(feature = "kernelet")]
 use ostd::{
     arch::cpu::context::UserContext,
@@ -7,7 +9,7 @@ use ostd::{
     mm::VmIo,
     sync::Waiter,
     task::{CurrentTask, PreparedTaskStack, Task, TaskOptions},
-    user::{UserContextApi, UserEvent, UserEventHandler},
+    user::{UserContextApi, UserEventHandler},
 };
 #[cfg(not(feature = "kernelet"))]
 use ostd::{
@@ -27,7 +29,7 @@ use crate::{
     cpu::LinuxAbi,
     prelude::*,
     process::{
-        posix_thread::{AsPosixThread, FIRST_POSIX_TID, ThreadLocal, ptrace::PtraceStopResult},
+        posix_thread::{AsPosixThread, FIRST_POSIX_TID, ThreadLocal},
         signal::{HandlePendingSignal, PauseReason, handle_pending_signal},
     },
     syscall::handle_syscall,
@@ -55,9 +57,8 @@ pub(crate) fn create_new_user_task(
 #[inline(never)]
 fn exit_current_after_oops(thread: &Thread, local: &ThreadLocal, task: &CurrentTask) {
     let posix_thread = thread.as_posix_thread().unwrap();
-    let process = posix_thread.process();
     let ctx = Context {
-        process: &process,
+        process: posix_thread.process_ref(),
         thread_local: local,
         posix_thread,
         thread,
@@ -88,8 +89,6 @@ impl UserEventHandler for Thread {
     fn init(&self, local: &ThreadLocal, task: &CurrentTask, user_ctx: &mut UserContext) -> bool {
         let result = oops::catch_panics_as_oops(|| {
             let current_posix_thread = self.as_posix_thread().unwrap();
-            let process_ref = local.process().borrow();
-            let current_process = process_ref.as_ref().unwrap();
 
             debug!(
                 "task entry: rip = {:#x}, rsp = {:#x}, rax = {:#x}",
@@ -107,7 +106,7 @@ impl UserEventHandler for Thread {
             }
 
             let ctx = Context {
-                process: current_process,
+                process: current_posix_thread.process_ref(),
                 thread_local: local,
                 posix_thread: current_posix_thread,
                 thread: self,
@@ -122,85 +121,70 @@ impl UserEventHandler for Thread {
         if result.is_err() {
             exit_current_after_oops(self, local, task);
         }
-        if self.is_exited() {
-            let _ = local.process().borrow_mut().take();
-            true
-        } else {
-            false
-        }
+        self.is_exited()
     }
 
-    fn handle(
+    fn handle_syscall(
         &self,
         local: &ThreadLocal,
         task: &CurrentTask,
-        event: UserEvent,
         user_ctx: &mut UserContext,
     ) -> bool {
-        let result = oops::catch_panics_as_oops(|| {
-            let current_posix_thread = self.as_posix_thread().unwrap();
-            let process_ref = local.process().borrow();
-            let current_process = process_ref.as_ref().unwrap();
+        self.handle_user_event(local, task, user_ctx, |ctx, user_ctx| {
+            let syscall_number = user_ctx.syscall_num();
+            #[cfg(target_arch = "x86_64")]
+            let orig_syscall_ret = syscall_number;
+            #[cfg(not(target_arch = "x86_64"))]
+            let orig_syscall_ret = user_ctx.syscall_ret();
+            ctx.thread_local
+                .set_orig_syscall_ret(Some(orig_syscall_ret));
 
-            let ctx = Context {
-                process: current_process,
-                thread_local: local,
-                posix_thread: current_posix_thread,
-                thread: self,
-                task,
-            };
+            if let ControlFlow::Continue(did_stop) =
+                ctx.posix_thread.ptrace_may_stop_on_syscall(ctx, user_ctx)
+            {
+                let syscall_number = if did_stop {
+                    user_ctx.syscall_num()
+                } else {
+                    syscall_number
+                };
+                handle_syscall(syscall_number, ctx, user_ctx);
 
-            match event {
-                UserEvent::Exception => {
-                    let exception = user_ctx.take_exception().unwrap();
-                    ctx.thread_local.set_orig_syscall_ret(None);
-                    handle_exception(&ctx, user_ctx, exception);
-                }
-                UserEvent::Syscall => {
-                    ctx.thread_local
-                        .set_orig_syscall_ret(Some(user_ctx.syscall_ret()));
-
-                    let res = ctx.posix_thread.ptrace_may_stop_on_syscall(&ctx, user_ctx);
-                    if !matches!(res, PtraceStopResult::Interrupted) {
-                        handle_syscall(&ctx, user_ctx);
-
-                        ctx.posix_thread.ptrace_may_stop_on_syscall(&ctx, user_ctx);
-                    }
-                }
-                UserEvent::KernelEvent => {
-                    ctx.thread_local.set_orig_syscall_ret(None);
-                }
+                let _ = ctx.posix_thread.ptrace_may_stop_on_syscall(ctx, user_ctx);
             }
+        })
+    }
 
-            if self.is_exited() {
-                return;
-            }
+    fn handle_exception(
+        &self,
+        local: &ThreadLocal,
+        task: &CurrentTask,
+        user_ctx: &mut UserContext,
+    ) -> bool {
+        self.handle_user_event(local, task, user_ctx, |ctx, user_ctx| {
+            let exception = user_ctx.take_exception().unwrap();
+            ctx.thread_local.set_orig_syscall_ret(None);
+            handle_exception(ctx, user_ctx, exception);
+        })
+    }
 
-            handle_pending_signal(user_ctx, &ctx);
-
-            if ctx.process.is_stopped() {
-                wait_while_stopped(self, &ctx, user_ctx);
-            }
-        });
-        if result.is_err() {
-            exit_current_after_oops(self, local, task);
-        }
-        if self.is_exited() {
-            let _ = local.process().borrow_mut().take();
-            true
-        } else {
-            false
-        }
+    fn handle_kernel_event(
+        &self,
+        local: &ThreadLocal,
+        task: &CurrentTask,
+        user_ctx: &mut UserContext,
+    ) -> bool {
+        self.handle_user_event(local, task, user_ctx, |ctx, _| {
+            ctx.thread_local.set_orig_syscall_ret(None);
+        })
     }
 
     fn has_kernel_event(&self, local: &ThreadLocal, task: &CurrentTask) -> bool {
-        let current_posix_thread = self.as_posix_thread().unwrap();
-        let process_ref = local.process().borrow();
-        let Some(current_process) = process_ref.as_ref() else {
+        if self.is_exited() {
             return false;
-        };
+        }
+        let current_posix_thread = self.as_posix_thread().unwrap();
         let ctx = Context {
-            process: current_process,
+            process: current_posix_thread.process_ref(),
             thread_local: local,
             posix_thread: current_posix_thread,
             thread: self,
@@ -211,6 +195,51 @@ impl UserEventHandler for Thread {
 
     fn pre_user_run(&self, local: &ThreadLocal, guard: &DisabledLocalIrqGuard) {
         local.supp_user_context().before_user_exec(guard);
+    }
+}
+
+#[cfg(feature = "kernelet")]
+impl Thread {
+    #[inline(always)]
+    fn handle_user_event(
+        &self,
+        local: &ThreadLocal,
+        task: &CurrentTask,
+        user_ctx: &mut UserContext,
+        handle: impl FnOnce(&Context<'_>, &mut UserContext),
+    ) -> bool {
+        let result = oops::catch_panics_as_oops(|| {
+            let current_posix_thread = self.as_posix_thread().unwrap();
+            let ctx = Context {
+                process: current_posix_thread.process_ref(),
+                thread_local: local,
+                posix_thread: current_posix_thread,
+                thread: self,
+                task,
+            };
+
+            handle(&ctx, user_ctx);
+            if self.is_exited() {
+                return true;
+            }
+
+            let had_signal_work = handle_pending_signal(user_ctx, &ctx);
+
+            if ctx.process.is_stopped() {
+                wait_while_stopped(self, &ctx, user_ctx);
+                return self.is_exited();
+            }
+
+            // Only the running thread can complete its own exit.
+            had_signal_work && self.is_exited()
+        });
+        match &result {
+            Ok(has_exited) => *has_exited,
+            Err(_) => {
+                exit_current_after_oops(self, local, task);
+                self.is_exited()
+            }
+        }
     }
 }
 
@@ -227,7 +256,6 @@ pub(crate) fn create_new_user_task(
         let current_thread = current_task.as_thread().unwrap();
         let current_posix_thread = current_thread.as_posix_thread().unwrap();
         let current_thread_local = current_task.as_thread_local().unwrap();
-        let current_process = current_posix_thread.process();
         let (stop_waiter, _) = Waiter::new_pair();
 
         let mut user_mode = UserMode::new(user_ctx);
@@ -249,7 +277,7 @@ pub(crate) fn create_new_user_task(
         }
 
         let ctx = Context {
-            process: &current_process,
+            process: current_posix_thread.process_ref(),
             thread_local: current_thread_local,
             posix_thread: current_posix_thread,
             thread: current_thread.as_ref(),
@@ -274,14 +302,25 @@ pub(crate) fn create_new_user_task(
                     handle_exception(&ctx, user_ctx, exception)
                 }
                 ReturnReason::UserSyscall => {
+                    let syscall_number = user_ctx.syscall_num();
+                    #[cfg(target_arch = "x86_64")]
+                    let orig_syscall_ret = syscall_number;
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let orig_syscall_ret = user_ctx.syscall_ret();
                     ctx.thread_local
-                        .set_orig_syscall_ret(Some(user_ctx.syscall_ret()));
+                        .set_orig_syscall_ret(Some(orig_syscall_ret));
 
-                    let res = ctx.posix_thread.ptrace_may_stop_on_syscall(&ctx, user_ctx);
-                    if !matches!(res, PtraceStopResult::Interrupted) {
-                        handle_syscall(&ctx, user_ctx);
+                    if let ControlFlow::Continue(did_stop) =
+                        ctx.posix_thread.ptrace_may_stop_on_syscall(&ctx, user_ctx)
+                    {
+                        let syscall_number = if did_stop {
+                            user_ctx.syscall_num()
+                        } else {
+                            syscall_number
+                        };
+                        handle_syscall(syscall_number, &ctx, user_ctx);
 
-                        ctx.posix_thread.ptrace_may_stop_on_syscall(&ctx, user_ctx);
+                        let _ = ctx.posix_thread.ptrace_may_stop_on_syscall(&ctx, user_ctx);
                     }
                 }
                 ReturnReason::KernelEvent => {

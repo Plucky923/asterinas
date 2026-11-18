@@ -68,7 +68,7 @@ fn exit_internal(
     let current_thread = current_task.as_thread().unwrap();
     let posix_thread = current_thread.as_posix_thread().unwrap();
     let thread_local = current_task.as_thread_local().unwrap();
-    let posix_process = posix_thread.process();
+    let posix_process = posix_thread.process_ref();
 
     let is_last_thread = {
         let mut tasks = posix_process.tasks().lock();
@@ -126,11 +126,8 @@ fn exit_internal(
     drop_after!(thread_local.vmar().borrow_mut().take());
     drop_after!(thread_local.borrow_file_table_mut().remove());
     drop_after!(thread_local.borrow_ns_proxy_mut().remove());
-    #[cfg(not(feature = "kernelet"))]
-    drop_after!(thread_local.process().borrow_mut().take());
-
     if is_last_thread {
-        exit_process(&posix_process);
+        exit_process(posix_process);
     }
 }
 

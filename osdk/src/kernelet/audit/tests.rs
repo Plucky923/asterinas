@@ -26,6 +26,23 @@ const DYN_SIZE: usize = 16;
 // produces them.
 const ENTRY_TABLE_VADDR: u64 = 0x1000;
 const TEXT_VADDR: u64 = 0x2000;
+const USER_ENTRIES: [(&str, usize, u64); 3] = [
+    (
+        "user_syscall_entry",
+        abi::entry_table::USER_SYSCALL_ENTRY_OFFSET,
+        TEXT_VADDR + 0x40,
+    ),
+    (
+        "user_exception_entry",
+        abi::entry_table::USER_EXCEPTION_ENTRY_OFFSET,
+        TEXT_VADDR + 0x60,
+    ),
+    (
+        "user_kernel_event_entry",
+        abi::entry_table::USER_KERNEL_EVENT_ENTRY_OFFSET,
+        TEXT_VADDR + 0xa0,
+    ),
+];
 const RETURNING_STUB_SIZE: usize = VIRQ_BEFORE_CALL.len() + 4 + VIRQ_AFTER_CALL.len();
 const EXIT_STUB_SIZE: usize = EXIT_BEFORE_LOAD.len() + 4 + EXIT_AFTER_LOAD.len();
 const STUB_RANGE_START: u64 = TEXT_VADDR + 0x100;
@@ -207,7 +224,9 @@ fn fixture() -> Vec<u8> {
         abi::entry_table::EX_TABLE_END_OFFSET,
         EX_TABLE_VADDR + EX_TABLE_ITEM_SIZE,
     );
-    write_entry_table_field(abi::entry_table::USER_EVENT_ENTRY_OFFSET, TEXT_VADDR + 0x20);
+    for (_, offset, address) in USER_ENTRIES {
+        write_entry_table_field(offset, address);
+    }
     let hash_base = ENTRY_TABLE_FILE_OFFSET + abi::entry_table::SOURCE_HASH_OFFSET;
     bytes[hash_base..hash_base + 32].copy_from_slice(&SOURCE_HASH);
 
@@ -246,9 +265,13 @@ fn fixture() -> Vec<u8> {
     // ---- The code --------------------------------------------------------------
     bytes[TEXT_VADDR as usize..TEXT_VADDR as usize + 0x600].fill(0x90);
     // Compiler-generated fixed entries retain the indirect-branch marker.
-    for offset in [0, 0x20] {
-        bytes[TEXT_VADDR as usize + offset..TEXT_VADDR as usize + offset + 4]
-            .copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]); // ENDBR64
+    let user_entries = USER_ENTRIES.map(|(_, _, address)| address);
+    for address in [TEXT_VADDR, TEXT_VADDR + 0x20]
+        .into_iter()
+        .chain(user_entries)
+    {
+        let start = address as usize;
+        bytes[start..start + 4].copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]); // ENDBR64
     }
     for stub in [TEXT_VADDR as usize + 0x100, TEXT_VADDR as usize + 0x300] {
         bytes[stub..stub + VIRQ_BEFORE_CALL.len()].copy_from_slice(VIRQ_BEFORE_CALL);
@@ -311,7 +334,10 @@ fn fixture() -> Vec<u8> {
             0,
         ),
         ("__bss", 0x10, 10, BSS_VADDR, 0),
-    ] {
+    ]
+    .into_iter()
+    .chain(USER_ENTRIES.map(|(name, _, address)| (name, 0x12, 2, address, 4)))
+    {
         let mut symbol = vec![0u8; SYM_SIZE];
         symbol[0..4].copy_from_slice(&(strtab.offset_of(name) as u32).to_le_bytes());
         symbol[4] = info;
@@ -522,6 +548,9 @@ fn build_string_table() -> StringTable {
         "__ex_table_end",
         "__bss",
     ] {
+        strtab.push(name);
+    }
+    for (name, _, _) in USER_ENTRIES {
         strtab.push(name);
     }
     strtab
@@ -902,31 +931,51 @@ fn non_executable_yield_target_fails() {
 
 #[test]
 fn non_executable_user_event_target_fails() {
+    for (name, offset, _) in USER_ENTRIES {
+        let bytes = image_with(&[Mutation {
+            offset: ENTRY_TABLE_FILE_OFFSET + offset,
+            bytes: DATA_VADDR.to_le_bytes().to_vec(),
+        }]);
+        let violations = audit(&bytes).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("audit item 4") && v.contains(name)),
+            "expected a non-executable {name} violation, got: {violations:#?}"
+        );
+    }
+}
+
+#[test]
+fn user_event_entry_without_endbr_fails() {
+    for (name, offset, _) in USER_ENTRIES {
+        let bytes = image_with(&[Mutation {
+            offset: ENTRY_TABLE_FILE_OFFSET + offset,
+            bytes: (TEXT_VADDR + 0x80).to_le_bytes().to_vec(),
+        }]);
+        let violations = audit(&bytes).unwrap_err();
+        assert!(
+            violations.iter().any(|v| v.contains("audit item 10")
+                && v.contains(name)
+                && v.contains("lacks ENDBR64")),
+            "expected a {name} ENDBR64 violation, got: {violations:#?}"
+        );
+    }
+}
+
+#[test]
+fn user_event_entry_must_match_its_symbol() {
+    let [(name, offset, _), (_, _, other_address), _] = USER_ENTRIES;
     let bytes = image_with(&[Mutation {
-        offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::USER_EVENT_ENTRY_OFFSET,
-        bytes: DATA_VADDR.to_le_bytes().to_vec(),
+        offset: ENTRY_TABLE_FILE_OFFSET + offset,
+        bytes: other_address.to_le_bytes().to_vec(),
     }]);
     let violations = audit(&bytes).unwrap_err();
     assert!(
         violations
             .iter()
-            .any(|v| v.contains("audit item 4") && v.contains("user_event_entry")),
-        "expected a non-executable user_event_entry violation, got: {violations:#?}"
-    );
-}
-
-#[test]
-fn user_event_entry_without_endbr_fails() {
-    let bytes = image_with(&[Mutation {
-        offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::USER_EVENT_ENTRY_OFFSET,
-        bytes: (TEXT_VADDR + 0x80).to_le_bytes().to_vec(),
-    }]);
-    let violations = audit(&bytes).unwrap_err();
-    assert!(
-        violations.iter().any(|v| v.contains("audit item 10")
-            && v.contains("user event entry")
-            && v.contains("lacks ENDBR64")),
-        "expected a user_event_entry ENDBR64 violation, got: {violations:#?}"
+            .any(|v| v.contains("audit item 11") && v.contains(name)),
+        "expected a {name} symbol mismatch, got: {violations:#?}"
     );
 }
 

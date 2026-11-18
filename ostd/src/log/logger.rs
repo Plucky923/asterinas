@@ -151,13 +151,14 @@ impl<'a> Record<'a> {
 // -- Maximum log level --
 
 /// Compile-time maximum log level.
-// TODO: Add cargo features (e.g., `log_max_level_info`) to
-// set `STATIC_MAX_LEVEL` at compile time
-// so that log calls above the chosen level are eliminated entirely.
-// The same feature should activate the corresponding `log` crate feature
-// (e.g., `log/max_level_info`)
-// so that both OSTD macros and third-party `log::info!()` calls are filtered uniformly.
-pub const STATIC_MAX_LEVEL: LevelFilter = LevelFilter::Debug;
+///
+/// Debug logging is compiled out when debug assertions are disabled.
+// Keep this consistent with the `log` dependency's `release_max_level_info` feature.
+pub const STATIC_MAX_LEVEL: LevelFilter = if cfg!(debug_assertions) {
+    LevelFilter::Debug
+} else {
+    LevelFilter::Info
+};
 
 /// Run-time maximum log level.
 static DYNAMIC_MAX_LEVEL: AtomicU8 = {

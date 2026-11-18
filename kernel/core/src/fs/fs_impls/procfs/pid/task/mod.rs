@@ -99,7 +99,10 @@ impl TidDirOps {
 
     pub(super) fn thread_and_process(&self) -> Option<(Arc<Thread>, Arc<Process>)> {
         let thread = self.thread()?;
-        let process = thread.as_posix_thread().unwrap().weak_process().upgrade()?;
+        let process = thread.as_posix_thread().unwrap().process();
+        if process.status().is_reaped() {
+            return None;
+        }
 
         Some((thread, process))
     }

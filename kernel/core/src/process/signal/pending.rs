@@ -129,15 +129,18 @@ impl HandlePendingSignal for PosixThread {
 }
 
 fn has_pending_signal(posix_thread: &PosixThread, process: &Process) -> bool {
-    // Fast path: No signals are pending.
-    if posix_thread.sig_queues().is_empty() && process.sig_queues().is_empty() {
+    let pending = posix_thread.sig_queues().pending_set() | process.sig_queues().pending_set();
+    if u64::from(pending) == 0 {
+        return false;
+    }
+    let blocked = posix_thread.sig_mask();
+    if !pending.intersects(!blocked) {
         return false;
     }
 
     // Slow path: Some signals are pending.
     let sig_dispositions = process.sig_dispositions().lock();
     let sig_dispositions = sig_dispositions.lock();
-    let blocked = posix_thread.sig_mask();
 
     posix_thread
         .sig_queues()

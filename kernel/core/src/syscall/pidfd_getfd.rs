@@ -35,17 +35,14 @@ pub(super) fn sys_pidfd_getfd(
         .process_opt()
         .ok_or_else(|| Error::with_message(Errno::ESRCH, "the target process has been reaped"))?;
 
-    process
-        .main_thread()
-        .as_posix_thread()
-        .unwrap()
+    let main_thread = process.main_thread()?;
+    let posix_thread = main_thread.as_posix_thread().unwrap();
+    posix_thread
         .check_alien_access_from(ctx.posix_thread, AlienAccessMode::ATTACH_WITH_REAL_CREDS)?;
-
-    let main_thread = process.main_thread();
 
     // Get the file description corresponding to to the file descriptor `targetfd` in the process
     // referred to by the PID file.
-    let target_file_table = main_thread.as_posix_thread().unwrap().file_table();
+    let target_file_table = posix_thread.file_table();
     let target_file = target_file_table
         .lock()
         .as_ref()

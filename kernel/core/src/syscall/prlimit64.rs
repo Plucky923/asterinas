@@ -118,11 +118,8 @@ fn check_rlimit_perm(target_process: &Process, ctx: &Context) -> Result<()> {
         (current_cred.ruid(), current_cred.rgid())
     };
 
-    let target_cred = target_process
-        .main_thread()
-        .as_posix_thread()
-        .unwrap()
-        .credentials();
+    let main_thread = target_process.main_thread()?;
+    let target_cred = main_thread.as_posix_thread().unwrap().credentials();
 
     if current_ruid == target_cred.ruid()
         && current_ruid == target_cred.euid()

@@ -66,11 +66,10 @@ fn update_thread_cpu_time(thread: &Thread, is_kernel_interrupted: bool) {
     let Some(posix_thread) = thread.as_posix_thread() else {
         return;
     };
-    let Some(process) = posix_thread.weak_process().upgrade() else {
-        // FIXME: A POSIX thread should have a process but we can have a
-        // `None` here.
+    let process = posix_thread.process_ref();
+    if process.status().is_reaped() {
         return;
-    };
+    }
 
     let timer_manager = process.timer_manager();
     // Based on whether the timer interrupt occurs in kernel mode or user mode,
@@ -79,11 +78,11 @@ fn update_thread_cpu_time(thread: &Thread, is_kernel_interrupted: bool) {
     if is_kernel_interrupted {
         posix_thread.prof_clock().kernel_clock().add_jiffies(1);
         process.prof_clock().kernel_clock().add_jiffies(1);
-        charge_cpu_time(&process, CpuStatKind::System);
+        charge_cpu_time(process, CpuStatKind::System);
     } else {
         posix_thread.prof_clock().user_clock().add_jiffies(1);
         process.prof_clock().user_clock().add_jiffies(1);
-        charge_cpu_time(&process, CpuStatKind::User);
+        charge_cpu_time(process, CpuStatKind::User);
         timer_manager
             .virtual_timer()
             .timer_manager()
@@ -191,6 +190,18 @@ impl PosixTimerManager {
     /// Gets the profiling timer of the corresponding process.
     pub(crate) fn prof_timer(&self) -> &Arc<Timer> {
         &self.prof_timer
+    }
+
+    /// Disarms all process timers after the last thread exits.
+    pub(in crate::process) fn cancel_all(&self) {
+        for timer in [&self.alarm_timer, &self.virtual_timer, &self.prof_timer] {
+            timer.lock().cancel();
+        }
+
+        let timers = core::mem::take(&mut *self.posix_timers.lock());
+        for timer in timers.into_iter().flatten() {
+            timer.lock().cancel();
+        }
     }
 
     /// Creates a timer based on the profiling CPU clock of the current process.

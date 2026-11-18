@@ -38,17 +38,6 @@ SYM_FUNC_END(jump_linux_stack)
 STACK_FRAME_NON_STANDARD jump_linux_stack
 
 /*
- * void jump_user_run(void *linux_sp, struct carrier *c);
- */
-SYM_FUNC_START(jump_user_run)
-	movq	%rdi, %rsp
-	movq	%rsi, %rdi
-	call	do_user_run_on_linux
-	ud2
-SYM_FUNC_END(jump_user_run)
-STACK_FRAME_NON_STANDARD jump_user_run
-
-/*
  * u64 call_on_linux_stack(void *linux_sp, u64 (*fn)(void *), void *arg);
  *
  * Preserves `%rax` and `%rdx` across epilogue so 16-byte `struct mmio_result`

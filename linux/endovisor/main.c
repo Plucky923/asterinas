@@ -1192,5 +1192,6 @@ module_init(endovisor_init);
 module_exit(endovisor_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(KERNELET_INTERNAL);
 MODULE_AUTHOR("Kernelet contributors");
 MODULE_DESCRIPTION("Asterinas-on-Linux endovisor");

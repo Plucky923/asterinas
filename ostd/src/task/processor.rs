@@ -98,7 +98,15 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
     #[cfg(feature = "kernelet")]
     let next_stack_limit = next_task.kstack.lower_bound();
     #[cfg(feature = "kernelet")]
-    let vcpu_record = crate::kernelet::entry::vcpu_record() as *const _;
+    let vcpu_record = {
+        let record = core::ptr::from_ref(crate::kernelet::entry::vcpu_record());
+        // Execution ownership is exclusive and virtual IRQs are disabled.
+        // Publish the destination before the task resumes, including migration.
+        next_task
+            .active_vcpu_record
+            .store(record.cast_mut(), Ordering::Relaxed);
+        record
+    };
 
     let current_task_ptr = CURRENT_TASK_PTR.load();
     #[cfg(feature = "kernelet")]
@@ -227,7 +235,9 @@ pub(crate) unsafe fn after_switching_to() {
                 let saved = unsafe { pt_regs_ptr.read() };
                 let save_area = prev_ref.pt_regs_save_area();
                 unsafe { save_area.write(saved) };
-                prev_ref.active_pt_regs().store(save_area, Ordering::Release);
+                prev_ref
+                    .active_pt_regs()
+                    .store(save_area, Ordering::Release);
             }
         }
         if let Some(current) = Task::current()

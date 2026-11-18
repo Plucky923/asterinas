@@ -112,6 +112,11 @@ impl<R: UserReg> CpuSync<R> {
         }
     }
 
+    /// Returns whether only the CPU holds the canonical value.
+    pub(super) fn is_on_cpu(&self) -> bool {
+        self.location.get() == CanonicalValueLocation::OnCpu
+    }
+
     /// Gets a copy of the current canonical value.
     ///
     /// This method guarantees that

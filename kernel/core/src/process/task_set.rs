@@ -79,6 +79,12 @@ impl TaskSet {
         self.has_exited_main
     }
 
+    /// Detaches the main task at reap time to release its strong reference to the process.
+    pub(super) fn reap_main(&mut self) -> Arc<Task> {
+        debug_assert!(self.has_exited_main && self.tasks.len() == 1);
+        self.tasks.pop().unwrap()
+    }
+
     /// Removes the main task and makes the remaining task become the main task.
     ///
     /// The method should only be calling when doing execve.

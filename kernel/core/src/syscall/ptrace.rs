@@ -36,7 +36,11 @@ pub(super) fn sys_ptrace(
         PtraceRequest::PTRACE_TRACEME => {
             let current_thread = current_thread!();
             let parent_guard = ctx.process.parent().lock();
-            let parent_main_thread = parent_guard.process().upgrade().unwrap().main_thread();
+            let parent = parent_guard
+                .process()
+                .upgrade()
+                .ok_or(Error::new(Errno::ESRCH))?;
+            let parent_main_thread = parent.main_thread()?;
 
             do_ptrace_attach(&parent_main_thread, current_thread)?;
         }
@@ -148,14 +152,14 @@ pub(super) fn sys_ptrace(
 fn do_ptrace_attach(tracer_thread: &Arc<Thread>, tracee_thread: Arc<Thread>) -> Result<()> {
     let tracer = tracer_thread.as_posix_thread().unwrap();
     let tracee = tracee_thread.as_posix_thread().unwrap();
-    if !Arc::ptr_eq(&tracer.process().main_thread(), tracer_thread) {
+    if !Arc::ptr_eq(&tracer.process_ref().main_thread()?, tracer_thread) {
         return_errno_with_message!(
             Errno::EOPNOTSUPP,
             "using a non-main thread as a tracer is not supported currently"
         );
     }
 
-    if Weak::ptr_eq(tracer.weak_process(), tracee.weak_process()) {
+    if Arc::ptr_eq(tracer.process_ref(), tracee.process_ref()) {
         return_errno_with_message!(
             Errno::EPERM,
             "tracer and tracee must be in different processes"

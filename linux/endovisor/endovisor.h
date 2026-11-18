@@ -28,7 +28,7 @@ struct linux_binprm;
 // ------------------------------------------------------------------
 
 #define ENTRY_TABLE_OFFSET		0x1000UL
-#define ENTRY_TABLE_SIZE		144ULL
+#define ENTRY_TABLE_SIZE		160ULL
 #define EX_TABLE_ENTRY_SIZE		16ULL
 
 struct entry_table {
@@ -46,7 +46,9 @@ struct entry_table {
 	u64 stub_range_end_offset;
 	u64 cpu_access_start_offset;
 	u64 cpu_access_end_offset;
-	u64 user_event_entry_offset;
+	u64 user_syscall_entry_offset;
+	u64 user_exception_entry_offset;
+	u64 user_kernel_event_entry_offset;
 } __packed;
 
 #define KERNEL_HALF_START		256
@@ -167,11 +169,6 @@ struct service_table {
 	struct mmio_result (*buffer)(u32 op, u64 token, u64 arg0,
 					 u64 arg1, u64 arg2);
 };
-
-// `UserEvent` discriminants passed to `user_event_entry(raw_event)`.
-#define USER_EVENT_SYSCALL		0ULL
-#define USER_EVENT_EXCEPTION	1ULL
-#define USER_EVENT_KERNEL_EVENT	2ULL
 
 // ABI negative status codes (returned negated).
 #define ABI_NOT_OWNED		2
@@ -416,7 +413,9 @@ struct sandbox {
 	unsigned long virq_entry;
 	unsigned long yield_entry;
 	unsigned long exit_entry;
-	unsigned long user_event_entry;
+	unsigned long user_syscall_entry;
+	unsigned long user_exception_entry;
+	unsigned long user_kernel_event_entry;
 	unsigned long text_lo;
 	unsigned long text_hi;
 	unsigned long stub_lo;
@@ -600,7 +599,6 @@ static inline bool in_grant(struct sandbox *sandbox, u64 paddr, u64 len)
 void enter_image(unsigned long entry, unsigned long new_rsp,
 		     u64 arg0, u64 arg1);
 void jump_linux_stack(void *linux_sp, void (*fn)(void *), void *arg);
-void jump_user_run(void *linux_sp, struct carrier *c);
 u64 call_on_linux_stack(void *linux_sp, u64 (*fn)(void *), void *arg);
 void return_to_user(struct pt_regs *regs, bool from_syscall);
 void exit_stub(void);

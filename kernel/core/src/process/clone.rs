@@ -450,7 +450,6 @@ fn clone_child_task(
             credentials,
             child_vmar,
         )
-        .process(posix_thread.weak_process().clone())
         .cpu_affinity(ctx.thread.atomic_cpu_affinity().load(Ordering::Relaxed))
         .sig_mask(sig_mask)
         .file_table(child_file_table)
@@ -468,7 +467,7 @@ fn clone_child_task(
         thread_builder = clone_child_cleartid(thread_builder, clone_args.child_tid, clone_flags);
         thread_builder = clone_child_settid(thread_builder, clone_args.child_tid, clone_flags);
 
-        thread_builder.build()?
+        thread_builder.build(Arc::clone(process))?
     };
     // A quota/allocation failure must leave the parent's TID output untouched.
     clone_parent_settid(child_tid, clone_args.parent_tid, clone_flags)?;
@@ -569,7 +568,7 @@ fn clone_child_process(
 
     let child_tid = allocate_posix_tid();
 
-    let child = {
+    let (child, child_task) = {
         let child_vmar_arc = child_vmar.clone_arc();
 
         let mut child_thread_builder = {
@@ -622,13 +621,16 @@ fn clone_child_process(
         )?
     };
 
-    // The child is still private; a failed TID copy drops its complete Task.
+    // Link the task into the process only after the fallible user-memory writes.
+    // Otherwise a failed clone would leave the unpublished process and task in a cycle.
     clone_parent_settid(child_tid, clone_args.parent_tid, clone_flags)?;
     clone_pidfd(ctx, &child, clone_flags, clone_args.pidfd)?;
 
     if let Some(sig) = clone_args.exit_signal {
         child.set_exit_signal(sig);
     };
+
+    child.tasks().lock().insert(child_task).unwrap();
 
     // Sets parent process and group for child process.
     set_parent_and_group(clone_flags, process, &child);
@@ -844,7 +846,7 @@ fn create_child_process(
     sig_dispositions: Arc<Mutex<SigDispositions>>,
     user_ns: Arc<UserNamespace>,
     thread_builder: PosixThreadBuilder,
-) -> Result<Arc<Process>> {
+) -> Result<(Arc<Process>, Arc<Task>)> {
     let child_proc = Process::new(
         pid,
         vmar,
@@ -855,12 +857,9 @@ fn create_child_process(
         user_ns,
     );
 
-    let child_task = thread_builder
-        .process(Arc::downgrade(&child_proc))
-        .build()?;
-    child_proc.tasks().lock().insert(child_task).unwrap();
+    let child_task = thread_builder.build(child_proc.clone())?;
 
-    Ok(child_proc)
+    Ok((child_proc, child_task))
 }
 
 fn set_parent_and_group(clone_flags: CloneFlags, parent: &Arc<Process>, child: &Arc<Process>) {

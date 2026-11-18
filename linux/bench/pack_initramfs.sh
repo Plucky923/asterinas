@@ -26,6 +26,7 @@ pack_guest_cpio() {
     cat > "$list_file" <<EOF
 dir /dev 0755 0 0
 nod /dev/console 0600 0 0 c 5 1
+nod /dev/zero 0666 0 0 c 1 5
 dir /proc 0755 0 0
 dir /tmp 0777 0 0
 file /init $bin 0755 0 0
@@ -36,6 +37,8 @@ EOF
 
 pack_guest_cpio "$OUT_DIR/bench_syscall_fpu" "$OUT_DIR/guest-syscall.cpio"
 pack_guest_cpio "$OUT_DIR/bench_mm" "$OUT_DIR/guest-mm.cpio"
+pack_guest_cpio "$OUT_DIR/bench_review_syscall" "$OUT_DIR/guest-review-syscall.cpio"
+pack_guest_cpio "$OUT_DIR/bench_review_mm" "$OUT_DIR/guest-review-mm.cpio"
 pack_guest_cpio "$OUT_DIR/test_mm_safety" "$OUT_DIR/guest-safety.cpio"
 pack_guest_cpio "$OUT_DIR/test_event_paths" "$OUT_DIR/guest-events.cpio"
 
@@ -52,11 +55,15 @@ dir /guests 0755 0 0
 file /init $OUT_DIR/host_init 0755 0 0
 file /tests/bench_syscall_fpu $OUT_DIR/bench_syscall_fpu 0755 0 0
 file /tests/bench_mm $OUT_DIR/bench_mm 0755 0 0
+file /tests/bench_review_syscall $OUT_DIR/bench_review_syscall 0755 0 0
+file /tests/bench_review_mm $OUT_DIR/bench_review_mm 0755 0 0
 file /tests/test_mm_safety $OUT_DIR/test_mm_safety 0755 0 0
 file /tests/test_event_paths $OUT_DIR/test_event_paths 0755 0 0
 file /tests/test_endovisor $OUT_DIR/test_endovisor 0755 0 0
 file /guests/guest-syscall.cpio $OUT_DIR/guest-syscall.cpio 0644 0 0
 file /guests/guest-mm.cpio $OUT_DIR/guest-mm.cpio 0644 0 0
+file /guests/guest-review-syscall.cpio $OUT_DIR/guest-review-syscall.cpio 0644 0 0
+file /guests/guest-review-mm.cpio $OUT_DIR/guest-review-mm.cpio 0644 0 0
 file /guests/guest-safety.cpio $OUT_DIR/guest-safety.cpio 0644 0 0
 file /guests/guest-events.cpio $OUT_DIR/guest-events.cpio 0644 0 0
 EOF

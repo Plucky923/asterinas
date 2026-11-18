@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use ostd::task::Task;
+
 use super::{
-    ExitCode, Pid, Process,
+    Pid, Process,
     process_filter::ProcessFilter,
     signal::{constants::SIGCHLD, with_sigmask_changed},
 };
 use crate::{
+    events::IoEvents,
     prelude::*,
     process::{
         ReapedChildrenStats, Uid, pid_table,
@@ -118,9 +121,9 @@ fn wait_filter(child_pid: Pid, child: &Arc<Process>, child_filter: &ProcessFilte
 }
 
 pub(crate) enum WaitStatus {
-    Zombie(Arc<Process>),
-    Stop(Arc<Process>, SigNum),
-    Continue(Arc<Process>),
+    Zombie(Arc<Process>, Uid),
+    Stop(Arc<Process>, Uid, SigNum),
+    Continue(Arc<Process>, Uid),
     TraceeExit(Arc<Thread>),
     TraceeStop(Arc<Thread>, PtraceWaitStatus),
 }
@@ -128,33 +131,28 @@ pub(crate) enum WaitStatus {
 impl WaitStatus {
     pub(crate) fn pid(&self) -> Pid {
         match self.source() {
-            WaitStatusSource::Process(process) => process.pid(),
+            WaitStatusSource::Process(process, _) => process.pid(),
             WaitStatusSource::Thread(thread) => thread.tid(),
         }
     }
 
     pub(crate) fn uid(&self) -> Uid {
         match self.source() {
-            WaitStatusSource::Process(process) => process
-                .main_thread()
-                .as_posix_thread()
-                .unwrap()
-                .credentials()
-                .ruid(),
+            WaitStatusSource::Process(_, uid) => uid,
             WaitStatusSource::Thread(thread) => thread.credentials().ruid(),
         }
     }
 
     pub(crate) fn prof_clock(&self) -> &Arc<ProfClock> {
         match self.source() {
-            WaitStatusSource::Process(process) => process.prof_clock(),
+            WaitStatusSource::Process(process, _) => process.prof_clock(),
             WaitStatusSource::Thread(thread) => thread.prof_clock(),
         }
     }
 
     pub(crate) fn minor_faults(&self) -> u64 {
         match self.source() {
-            WaitStatusSource::Process(process) => process
+            WaitStatusSource::Process(process, _) => process
                 .minor_faults()
                 .saturating_add(process.reaped_children_stats().lock().minflt()),
             WaitStatusSource::Thread(_) => 0,
@@ -163,9 +161,9 @@ impl WaitStatus {
 
     fn source(&self) -> WaitStatusSource<'_> {
         match self {
-            WaitStatus::Zombie(process)
-            | WaitStatus::Stop(process, _)
-            | WaitStatus::Continue(process) => WaitStatusSource::Process(process.as_ref()),
+            WaitStatus::Zombie(process, uid)
+            | WaitStatus::Stop(process, uid, _)
+            | WaitStatus::Continue(process, uid) => WaitStatusSource::Process(process, *uid),
             WaitStatus::TraceeExit(thread) | WaitStatus::TraceeStop(thread, _) => {
                 WaitStatusSource::Thread(thread.as_posix_thread().unwrap())
             }
@@ -174,7 +172,7 @@ impl WaitStatus {
 }
 
 enum WaitStatusSource<'a> {
-    Process(&'a Process),
+    Process(&'a Process, Uid),
     Thread(&'a PosixThread),
 }
 
@@ -207,10 +205,11 @@ fn try_wait_tracees(
 
     for thread in tracees.values() {
         let tracee = thread.as_posix_thread().unwrap();
-        let Some(process) = tracee.weak_process().upgrade() else {
+        let process = tracee.process_ref();
+        if process.status().is_reaped() {
             continue;
-        };
-        if !wait_filter(tracee.tid(), &process, child_filter) {
+        }
+        if !wait_filter(tracee.tid(), process, child_filter) {
             continue;
         }
 
@@ -226,7 +225,11 @@ fn try_wait_tracees(
         // Reference: <https://man7.org/linux/man-pages/man2/ptrace.2.html>
         if thread.is_exited() {
             // Lock order: tracer.tracees -> tracee_process.tasks
-            if Arc::ptr_eq(&process.main_thread(), thread) && !process.status().is_zombie() {
+            if process
+                .main_thread()
+                .is_ok_and(|main| Arc::ptr_eq(&main, thread))
+                && !process.status().is_zombie()
+            {
                 // Delay reporting `TraceeExit` for a process's main-thread tracee until the
                 // process becomes zombie.
                 //
@@ -243,7 +246,7 @@ fn try_wait_tracees(
 
             let thread = thread.clone();
             if !wait_options.contains(WaitOptions::WNOWAIT) {
-                cleanup_exited_tracee(&process, &thread, tracees, ctx);
+                cleanup_exited_tracee(&thread, tracees, ctx);
             }
             return WaitResult::Found(WaitStatus::TraceeExit(thread));
         }
@@ -258,12 +261,12 @@ fn try_wait_tracees(
 }
 
 fn cleanup_exited_tracee(
-    process: &Arc<Process>,
     thread: &Arc<Thread>,
     mut tracees: MutexGuard<BTreeMap<Tid, Arc<Thread>>>,
     ctx: &Context,
 ) {
     let tracee = thread.as_posix_thread().unwrap();
+    let process = tracee.process_ref();
     tracees.remove(&tracee.tid());
     tracee.detach_tracer();
     drop(tracees);
@@ -271,7 +274,10 @@ fn cleanup_exited_tracee(
     if !process.status().is_zombie() {
         return;
     }
-    if !Arc::ptr_eq(&process.main_thread(), thread) {
+    if !process
+        .main_thread()
+        .is_ok_and(|main| Arc::ptr_eq(&main, thread))
+    {
         return;
     }
     let tracee_parent = process.parent().lock().process().clone();
@@ -283,11 +289,18 @@ fn cleanup_exited_tracee(
         return;
     }
 
-    reap_zombie_child(
-        process.pid(),
-        ctx.process.children().lock().as_mut().unwrap(),
-        ctx.process.reaped_children_stats(),
-    );
+    let main_task = {
+        let mut children = ctx.process.children().lock();
+        reap_zombie_child(
+            process,
+            children.as_mut().unwrap(),
+            ctx.process.reaped_children_stats(),
+        )
+    };
+    if let Some(main_task) = main_task {
+        process.pidfile_pollee.notify(IoEvents::HUP);
+        drop(main_task);
+    }
 }
 
 /// Checks children for zombie or stopped/continued events.
@@ -312,20 +325,23 @@ fn try_wait_children(
         // We have found at least one child matching `child_filter`.
         fallback_result = WaitResult::MatchedButUnready;
 
-        if child.main_thread().as_posix_thread().unwrap().is_traced() {
+        let main_thread = child.main_thread().unwrap();
+        let posix_thread = main_thread.as_posix_thread().unwrap();
+        if posix_thread.is_traced() {
             continue;
         }
 
         if child.status().is_zombie() {
             let child = child.clone();
+            let uid = posix_thread.credentials().ruid();
             if !wait_options.contains(WaitOptions::WNOWAIT) {
-                reap_zombie_child(
-                    child.pid(),
-                    children_mut,
-                    ctx.process.reaped_children_stats(),
-                );
+                let main_task =
+                    reap_zombie_child(&child, children_mut, ctx.process.reaped_children_stats());
+                drop(children_lock);
+                child.pidfile_pollee.notify(IoEvents::HUP);
+                drop(main_task);
             }
-            return WaitResult::Found(WaitStatus::Zombie(child));
+            return WaitResult::Found(WaitStatus::Zombie(child, uid));
         }
 
         if !wait_options.intersects(WaitOptions::WSTOPPED | WaitOptions::WCONTINUED) {
@@ -334,9 +350,10 @@ fn try_wait_children(
         let Some(stop_wait_status) = child.wait_stopped_or_continued(wait_options) else {
             continue;
         };
+        let uid = posix_thread.credentials().ruid();
         let wait_status = match stop_wait_status {
-            StopWaitStatus::Stopped(sig_num) => WaitStatus::Stop(child.clone(), sig_num),
-            StopWaitStatus::Continue => WaitStatus::Continue(child.clone()),
+            StopWaitStatus::Stopped(sig_num) => WaitStatus::Stop(child.clone(), uid, sig_num),
+            StopWaitStatus::Continue => WaitStatus::Continue(child.clone(), uid),
         };
         return WaitResult::Found(wait_status);
     }
@@ -344,32 +361,33 @@ fn try_wait_children(
     fallback_result
 }
 
-/// Free zombie child with `child_pid`, returns the exit code of child process.
+/// Reaps a zombie and returns its main task for the caller to drop after releasing the locks.
 fn reap_zombie_child(
-    child_pid: Pid,
+    child_process: &Arc<Process>,
     children_lock: &mut BTreeMap<Pid, Arc<Process>>,
     reaped_children_stats: &Mutex<ReapedChildrenStats>,
-) -> ExitCode {
-    let child_process = children_lock.remove(&child_pid).unwrap();
+) -> Option<Arc<Task>> {
+    let child_pid = child_process.pid();
+    // The real parent may reap this tracee after its tracer detaches.
+    if !children_lock
+        .get(&child_pid)
+        .is_some_and(|child| Arc::ptr_eq(child, child_process))
+    {
+        return None;
+    }
+    children_lock.remove(&child_pid);
     assert!(child_process.status().is_zombie());
 
     let mut pid_table = pid_table::pid_table_mut();
 
     // Lock order: children of process -> PID table -> tasks of process
-    debug_assert_eq!(child_process.tasks().lock().as_slice().len(), 1);
-    debug_assert_eq!(
-        child_process.tasks().lock().as_slice()[0]
-            .as_posix_thread()
-            .unwrap()
-            .tid(),
-        child_pid
-    );
+    pid_table.remove_process(child_pid);
+    let main_task = child_process.tasks().lock().reap_main();
+    debug_assert_eq!(main_task.as_posix_thread().unwrap().tid(), child_pid);
+    child_process.status().set_reaped();
 
     // Lock order: children of process -> PID table
     // -> group of process -> group inner -> session inner
-
-    // Remove the process from the global table
-    pid_table.remove_process(child_process.pid());
 
     // Remove the process group and the session from global table, if necessary
     let mut child_group_mut = child_process.process_group.lock();
@@ -387,5 +405,5 @@ fn reap_zombie_child(
         .lock()
         .add(user_time, kernel_time, total_minflt);
 
-    child_process.status().exit_code()
+    Some(main_task)
 }

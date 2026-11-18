@@ -23,14 +23,11 @@ mod remapping;
 pub use chip::{IRQ_CHIP, IrqChip, MappedIrqLine};
 #[cfg(not(feature = "kernelet"))]
 pub(crate) use ipi::{HwCpuId, send_ipi};
-#[cfg(feature = "kernelet")]
-pub(crate) use ops::{
-    disable_local_save, disable_local_save_with_guards, finish_enable_local_slow,
-    try_disable_with_guards_if_no_preempt,
-};
 pub(crate) use ops::{disable_local, enable_local, is_local_enabled};
 #[cfg(not(feature = "kernelet"))]
 pub(crate) use ops::{disable_local_and_halt, enable_local_and_halt};
+#[cfg(feature = "kernelet")]
+pub(crate) use ops::{disable_local_for_user_return, disable_local_save, finish_enable_local_slow};
 pub(crate) use remapping::IrqRemapping;
 
 #[cfg(feature = "kernelet")]

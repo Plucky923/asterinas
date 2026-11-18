@@ -20,6 +20,7 @@ pub(super) fn exit_process(current_process: &Process) {
 
     // Drop fields in `Process`.
     drop_after!(current_process.lock_vmar().set_vmar(None));
+    current_process.timer_manager().cancel_all();
 
     // Move the children to the reaper process and send them signals. The children should see a new
     // parent when they receive the signal.

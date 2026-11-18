@@ -452,6 +452,13 @@ int main(void)
 	} else if (strcmp(mode, "native-mm") == 0) {
 		char *argv[] = { (char *)"/tests/bench_mm", NULL };
 		result = run_argv(argv);
+	} else if (strcmp(mode, "native-review-syscall") == 0) {
+		char *argv[] = { (char *)"/tests/bench_review_syscall", NULL };
+		result = run_argv(argv);
+	} else if (strcmp(mode, "native-review-mm") == 0) {
+		char *argv[] = { (char *)"/tests/bench_review_mm",
+				 (char *)"--native-linux", NULL };
+		result = run_argv(argv);
 	} else if (strcmp(mode, "native-safety") == 0) {
 		char *argv[] = { (char *)"/tests/test_mm_safety", NULL };
 		result = run_argv(argv);
@@ -479,6 +486,12 @@ int main(void)
 			else if (strcmp(mode, "kernelet-events") == 0)
 				snprintf(initramfs_path, sizeof(initramfs_path),
 					 "/guests/guest-events.cpio");
+			else if (strcmp(mode, "kernelet-review-syscall") == 0)
+				snprintf(initramfs_path, sizeof(initramfs_path),
+					 "/guests/guest-review-syscall.cpio");
+			else if (strcmp(mode, "kernelet-review-mm") == 0)
+				snprintf(initramfs_path, sizeof(initramfs_path),
+					 "/guests/guest-review-mm.cpio");
 		}
 		char *argv[20];
 		int idx = 0;

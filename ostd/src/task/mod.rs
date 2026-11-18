@@ -103,9 +103,8 @@ pub(crate) fn adopt_boot_task() {
     assert!(!virq_delivery_deferred());
     assert!(Task::current().is_none());
 
-    let base = crate::kernelet::entry::vcpu_record()
-        .stack_limit
-        .load(Ordering::Acquire) as usize;
+    let vcpu_record = crate::kernelet::entry::vcpu_record();
+    let base = vcpu_record.stack_limit.load(Ordering::Acquire) as usize;
     assert!(base.is_multiple_of(crate::mm::PAGE_SIZE));
     let rsp: usize;
     // SAFETY: Reading RSP does not access memory or change execution state.
@@ -132,6 +131,7 @@ pub(crate) fn adopt_boot_task() {
         is_user: false,
         exiting: AtomicBool::new(false),
         active_pt_regs: AtomicPtr::new(core::ptr::null_mut()),
+        active_vcpu_record: AtomicPtr::new(core::ptr::from_ref(vcpu_record).cast_mut()),
         schedule_info: TaskScheduleInfo {
             cpu: AtomicCpuId::default(),
         },
@@ -191,6 +191,10 @@ pub struct Task {
     /// Live Host `pt_regs` pointer on the vCPU currently hosting this user Task.
     #[cfg(feature = "kernelet")]
     active_pt_regs: AtomicPtr<crate::arch::cpu::context::LinuxPtRegs>,
+
+    /// Host record for the executing vCPU, refreshed before each switch-in.
+    #[cfg(feature = "kernelet")]
+    active_vcpu_record: AtomicPtr<crate::kernelet::abi::VcpuRecord>,
 
     schedule_info: TaskScheduleInfo,
 }
@@ -618,6 +622,8 @@ impl TaskOptions {
             exiting: AtomicBool::new(false),
             #[cfg(feature = "kernelet")]
             active_pt_regs: AtomicPtr::new(core::ptr::null_mut()),
+            #[cfg(feature = "kernelet")]
+            active_vcpu_record: AtomicPtr::new(core::ptr::null_mut()),
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },
@@ -648,6 +654,18 @@ impl !Send for CurrentTask {}
 impl !Sync for CurrentTask {}
 
 impl CurrentTask {
+    /// Returns the location updated before this task resumes on a vCPU.
+    ///
+    /// Load and use the pointer with virtual IRQs disabled or inside one
+    /// `.text.kernelet_cpu_access` sequence, so migration cannot intervene.
+    #[cfg(feature = "kernelet")]
+    #[inline(always)]
+    pub(crate) fn active_vcpu_record_ptr(
+        &self,
+    ) -> *const AtomicPtr<crate::kernelet::abi::VcpuRecord> {
+        core::ptr::from_ref(&self.active_vcpu_record)
+    }
+
     /// Settles this Task's physical tick samples before publishing an exit.
     ///
     /// Only explicit-owner accounting callbacks run. No global timer callback

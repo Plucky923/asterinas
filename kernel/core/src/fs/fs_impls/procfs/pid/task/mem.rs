@@ -45,7 +45,7 @@ impl ProcFileOpsByHandle for MemFileOps {
         let vmar_guard = process.lock_vmar();
 
         process
-            .main_thread()
+            .main_thread()?
             .as_posix_thread()
             .unwrap()
             .check_alien_access_from(

@@ -3,7 +3,7 @@
 //
 // Validates self-contained x86-64 `ET_DYN` kernelet images (`<= 256 MiB`,
 // 3 `PT_LOAD` segments `RX`/`R`/`RW` with 2 MiB-aligned `rodata`/`data`,
-// `SHT_INIT_ARRAY` allowed, 144-byte `EntryTable` at `0x1000`, `ENDBR64` on all
+// `SHT_INIT_ARRAY` allowed, 160-byte `EntryTable` at `0x1000`, `ENDBR64` on all
 // entry targets). Shared `RX`/`RO`/gap pages are allocated once per kind; each
 // sandbox maps those shared pages alongside its own private relocated `RW`
 // segment and per-vCPU `cpu_local` replicas.
@@ -450,7 +450,9 @@ static int image_entry(struct image_kind *kind, const u8 *buf,
 			et->virq_entry_offset,
 			et->yield_entry_offset,
 			et->exit_entry_offset,
-			et->user_event_entry_offset,
+			et->user_syscall_entry_offset,
+			et->user_exception_entry_offset,
+			et->user_kernel_event_entry_offset,
 		};
 
 		targets = check_targets;
@@ -707,7 +709,9 @@ int image_start(struct sandbox *sandbox)
 	sandbox->virq_entry = base + et->virq_entry_offset;
 	sandbox->yield_entry = base + et->yield_entry_offset;
 	sandbox->exit_entry = base + et->exit_entry_offset;
-	sandbox->user_event_entry = base + et->user_event_entry_offset;
+	sandbox->user_syscall_entry = base + et->user_syscall_entry_offset;
+	sandbox->user_exception_entry = base + et->user_exception_entry_offset;
+	sandbox->user_kernel_event_entry = base + et->user_kernel_event_entry_offset;
 	sandbox->text_lo = base + text->offset;
 	sandbox->text_hi = base + text->offset + text->memsz;
 	sandbox->stub_lo = base + et->stub_range_start_offset;

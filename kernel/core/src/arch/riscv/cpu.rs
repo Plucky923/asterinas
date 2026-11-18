@@ -27,15 +27,18 @@ impl LinuxAbi for UserContext {
         self.set_a0(ret)
     }
 
-    fn syscall_args(&self) -> [usize; 6] {
-        [
-            self.a0(),
-            self.a1(),
-            self.a2(),
-            self.a3(),
-            self.a4(),
-            self.a5(),
-        ]
+    #[inline]
+    fn syscall_args<const N: usize>(&self) -> [usize; N] {
+        const { assert!(N <= 6) };
+        core::array::from_fn(|index| match index {
+            0 => self.a0(),
+            1 => self.a1(),
+            2 => self.a2(),
+            3 => self.a3(),
+            4 => self.a4(),
+            5 => self.a5(),
+            _ => unreachable!(),
+        })
     }
 }
 

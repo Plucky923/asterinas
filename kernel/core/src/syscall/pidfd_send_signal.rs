@@ -122,7 +122,7 @@ fn get_target_from_pidfd(
                 process_target(ctx.process.pid())
             }
             PidfdSendSignalFlags::Thread => thread_target(
-                ctx.process.main_thread().as_posix_thread().unwrap().tid(),
+                ctx.process.main_thread()?.as_posix_thread().unwrap().tid(),
                 ctx.process.pid(),
             ),
             PidfdSendSignalFlags::ProcessGroup => group_target(ctx.process.pid()),
@@ -151,7 +151,7 @@ fn get_target_from_pidfd(
                     // FIXME: On Linux, the signal can be sent to any thread.
                     // We currently only support the main thread.
                     thread_target(
-                        process.main_thread().as_posix_thread().unwrap().tid(),
+                        process.main_thread()?.as_posix_thread().unwrap().tid(),
                         process.pid(),
                     )
                 }

@@ -5,7 +5,11 @@
 use alloc::boxed::Box;
 use core::arch::x86_64::{_fxrstor64, _fxsave64, _xrstor64, _xsave64};
 #[cfg(feature = "kernelet")]
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::{
+    cell::UnsafeCell,
+    ptr::NonNull,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
 use bitflags::bitflags;
 use ostd_pod::{FromZeros, IntoBytes};
@@ -104,9 +108,44 @@ impl Default for UserContext {
 
 #[cfg(feature = "kernelet")]
 #[derive(Debug)]
-enum UserContextRepr {
-    Owned(Box<LinuxPtRegs>),
-    Frame(*const AtomicPtr<LinuxPtRegs>),
+struct OwnedPtRegs {
+    slot: AtomicPtr<LinuxPtRegs>,
+    regs: UnsafeCell<LinuxPtRegs>,
+}
+
+#[cfg(feature = "kernelet")]
+#[derive(Debug)]
+struct OwnedPtRegsAllocation(NonNull<OwnedPtRegs>);
+
+#[cfg(feature = "kernelet")]
+impl OwnedPtRegsAllocation {
+    fn new(regs: LinuxPtRegs) -> Self {
+        let allocation = Box::into_raw(Box::new(OwnedPtRegs {
+            slot: AtomicPtr::new(core::ptr::null_mut()),
+            regs: UnsafeCell::new(regs),
+        }));
+        // SAFETY: The allocation is live and has reached its permanent address.
+        // Its registers remain accessible through raw pointers until this owner drops.
+        unsafe {
+            (*allocation)
+                .slot
+                .store((*allocation).regs.get(), Ordering::Relaxed);
+            Self(NonNull::new_unchecked(allocation))
+        }
+    }
+
+    fn slot(&self) -> NonNull<AtomicPtr<LinuxPtRegs>> {
+        // SAFETY: This owner retains the allocation, whose address never changes.
+        unsafe { NonNull::new_unchecked(core::ptr::addr_of_mut!((*self.0.as_ptr()).slot)) }
+    }
+}
+
+#[cfg(feature = "kernelet")]
+impl Drop for OwnedPtRegsAllocation {
+    fn drop(&mut self) {
+        // SAFETY: This private owner uniquely retains the pointer from `Box::into_raw`.
+        unsafe { drop(Box::from_raw(self.0.as_ptr())) };
+    }
 }
 
 /// Userspace CPU context backed either by an owned [`LinuxPtRegs`] or a live
@@ -114,7 +153,10 @@ enum UserContextRepr {
 #[cfg(feature = "kernelet")]
 #[derive(Debug)]
 pub struct UserContext {
-    repr: UserContextRepr,
+    // An owned context uses its allocation's slot; a borrowed context uses
+    // the current task's slot, which must outlive this handle.
+    slot: NonNull<AtomicPtr<LinuxPtRegs>>,
+    owned: Option<OwnedPtRegsAllocation>,
     exception: Option<CpuException>,
 }
 
@@ -129,20 +171,14 @@ impl !Sync for UserContext {}
 #[cfg(feature = "kernelet")]
 impl Clone for UserContext {
     fn clone(&self) -> Self {
-        Self {
-            repr: UserContextRepr::Owned(Box::new(self.read_pt_regs())),
-            exception: self.exception,
-        }
+        Self::new_owned(self.read_pt_regs(), self.exception)
     }
 }
 
 #[cfg(feature = "kernelet")]
 impl Default for UserContext {
     fn default() -> Self {
-        Self {
-            repr: UserContextRepr::Owned(Box::new(LinuxPtRegs::new_initial())),
-            exception: None,
-        }
+        Self::new_owned(LinuxPtRegs::new_initial(), None)
     }
 }
 
@@ -151,8 +187,8 @@ impl Default for UserContext {
 pub struct OwnedUserContext(UserContext);
 
 #[cfg(feature = "kernelet")]
-// SAFETY: Construction always copies registers into the `Owned` representation.
-// The private field has no mutable accessor that can replace its representation.
+// SAFETY: Construction always copies registers into a private owned allocation.
+// No mutable accessor can replace the context or redirect its register slot.
 unsafe impl Send for OwnedUserContext {}
 #[cfg(feature = "kernelet")]
 // SAFETY: Same as `Send`; `OwnedUserContext` holds plain register state only.
@@ -585,36 +621,79 @@ impl Drop for GeneralRegsMut<'_> {
 
 #[cfg(feature = "kernelet")]
 macro_rules! read_pt_reg {
-    ($self:expr, $field:ident) => {
-        match $self.repr {
-            UserContextRepr::Owned(ref regs) => regs.$field as usize,
-            UserContextRepr::Frame(slot) => {
-                // SAFETY: `slot` points to the current task's `active_pt_regs`,
-                // which holds this vCPU's live `pt_regs` while executing in kernel mode.
-                let ptr = unsafe { (*slot).load(Ordering::Relaxed) };
-                unsafe { core::ptr::addr_of!((*ptr).$field).read() as usize }
-            }
-        }
-    };
+    ($self:expr, $field:ident) => {{
+        let values: [usize; 1] = read_frame_args!($self.slot.as_ptr(); $field offset);
+        values[0]
+    }};
 }
 
 #[cfg(feature = "kernelet")]
 macro_rules! write_pt_reg {
-    ($self:expr, $field:ident, $val:expr) => {
-        match $self.repr {
-            UserContextRepr::Owned(ref mut regs) => regs.$field = $val as u64,
-            UserContextRepr::Frame(slot) => {
-                // SAFETY: `slot` points to the current task's `active_pt_regs`,
-                // which holds this vCPU's live `pt_regs` while executing in kernel mode.
-                let ptr = unsafe { (*slot).load(Ordering::Relaxed) };
-                unsafe { core::ptr::addr_of_mut!((*ptr).$field).write($val as u64) }
-            }
+    ($self:expr, $field:ident, $val:expr) => {{
+        // SAFETY: The slot belongs to this owned context or the current task.
+        // The Host cannot redirect this sequence between resolving the frame
+        // and writing the register, so a task switch cannot invalidate it.
+        unsafe {
+            core::arch::asm!(
+                "jmp 2f",
+                ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
+                "2:",
+                "mov {frame}, qword ptr [{slot}]",
+                "mov qword ptr [{frame} + {offset}], {value}",
+                "jmp 3f",
+                ".popsection",
+                "3:",
+                slot = in(reg) $self.slot.as_ptr(),
+                frame = out(reg) _,
+                value = in(reg) $val as usize,
+                offset = const core::mem::offset_of!(LinuxPtRegs, $field),
+                options(nostack, preserves_flags),
+            );
         }
-    };
+    }};
+}
+
+#[cfg(feature = "kernelet")]
+macro_rules! read_frame_args {
+    ($slot:expr; $($field:ident $offset:ident),+) => {{
+        $(let $field: usize;)+
+        // SAFETY: An owned slot and its registers stay in the same allocation.
+        // A task slot is refreshed on every switch-in, and the Host resumes this
+        // protected sequence on the same carrier through the last load.
+        unsafe {
+            core::arch::asm!(
+                "jmp 2f",
+                ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
+                "2:",
+                "mov {frame}, qword ptr [{slot}]",
+                $(concat!("mov {", stringify!($field), "}, qword ptr [{frame} + {",
+                          stringify!($offset), "}]"),)+
+                "jmp 3f",
+                ".popsection",
+                "3:",
+                slot = in(reg) $slot,
+                frame = out(reg) _,
+                $($field = lateout(reg) $field,
+                  $offset = const core::mem::offset_of!(LinuxPtRegs, $field),)+
+                options(nostack, readonly, preserves_flags),
+            );
+        }
+        let args = [$($field),+];
+        core::array::from_fn(|index| args[index])
+    }};
 }
 
 #[cfg(feature = "kernelet")]
 impl UserContext {
+    fn new_owned(regs: LinuxPtRegs, exception: Option<CpuException>) -> Self {
+        let owned = OwnedPtRegsAllocation::new(regs);
+        Self {
+            slot: owned.slot(),
+            owned: Some(owned),
+            exception,
+        }
+    }
+
     /// Constructs a [`UserContext`] borrowing the current user task's active `pt_regs` slot.
     ///
     /// # Safety
@@ -627,32 +706,65 @@ impl UserContext {
         exception: Option<CpuException>,
     ) -> Self {
         Self {
-            repr: UserContextRepr::Frame(core::ptr::from_ref(slot)),
+            slot: NonNull::from(slot),
+            owned: None,
             exception,
         }
     }
 
     pub(crate) fn read_pt_regs(&self) -> LinuxPtRegs {
-        match &self.repr {
-            UserContextRepr::Owned(regs) => **regs,
-            // SAFETY: `slot` holds this vCPU's live `pt_regs` owned by the current task.
-            UserContextRepr::Frame(slot) => unsafe { (**slot).load(Ordering::Relaxed).read() },
+        let mut regs = core::mem::MaybeUninit::<LinuxPtRegs>::uninit();
+        // SAFETY: Both buffers hold a complete `LinuxPtRegs`. The Host cannot
+        // redirect this bounded copy after resolving the source frame.
+        // The x86-64 Rust ABI keeps the direction flag clear.
+        unsafe {
+            core::arch::asm!(
+                "jmp 2f",
+                ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
+                "2:",
+                "mov rsi, qword ptr [{slot}]",
+                "rep movsq",
+                "jmp 3f",
+                ".popsection",
+                "3:",
+                slot = in(reg) self.slot.as_ptr(),
+                out("rsi") _,
+                inout("rdi") regs.as_mut_ptr() => _,
+                inout("rcx") size_of::<LinuxPtRegs>() / size_of::<u64>() => _,
+                options(nostack, preserves_flags),
+            );
+            regs.assume_init()
         }
     }
 
     pub(crate) fn write_pt_regs(&mut self, mut regs: LinuxPtRegs) {
         regs.sanitize();
-        match &mut self.repr {
-            UserContextRepr::Owned(dst) => **dst = regs,
-            // SAFETY: `slot` holds this vCPU's live `pt_regs` owned by the current task.
-            UserContextRepr::Frame(slot) => unsafe { (**slot).load(Ordering::Relaxed).write(regs) },
+        // SAFETY: Both buffers hold a complete `LinuxPtRegs`. The Host cannot
+        // redirect this bounded copy after resolving the destination frame.
+        // The x86-64 Rust ABI keeps the direction flag clear.
+        unsafe {
+            core::arch::asm!(
+                "jmp 2f",
+                ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
+                "2:",
+                "mov rdi, qword ptr [{slot}]",
+                "rep movsq",
+                "jmp 3f",
+                ".popsection",
+                "3:",
+                slot = in(reg) self.slot.as_ptr(),
+                out("rdi") _,
+                inout("rsi") core::ptr::from_ref(&regs) => _,
+                inout("rcx") size_of::<LinuxPtRegs>() / size_of::<u64>() => _,
+                options(nostack, preserves_flags),
+            );
         }
     }
 
     #[inline(always)]
     pub(crate) fn sync_to_frame(&mut self, slot: &AtomicPtr<LinuxPtRegs>) {
-        if let UserContextRepr::Frame(existing) = self.repr {
-            debug_assert_eq!(existing, core::ptr::from_ref(slot));
+        if self.owned.is_none() {
+            debug_assert_eq!(self.slot, NonNull::from(slot));
             return;
         }
         self.sync_owned_to_frame(slot);
@@ -661,53 +773,31 @@ impl UserContext {
     #[cold]
     #[inline(never)]
     fn sync_owned_to_frame(&mut self, slot: &AtomicPtr<LinuxPtRegs>) {
-        if let UserContextRepr::Owned(ref regs) = self.repr {
-            let mut copy = **regs;
-            copy.sanitize();
-            let frame = slot.load(Ordering::Relaxed);
-            debug_assert!(!frame.is_null());
-            // SAFETY: `frame` points to this vCPU's live `pt_regs`.
-            unsafe { frame.write(copy) };
-            self.repr = UserContextRepr::Frame(core::ptr::from_ref(slot));
-        }
+        let mut copy = self.read_pt_regs();
+        copy.sanitize();
+        let frame = slot.load(Ordering::Relaxed);
+        debug_assert!(!frame.is_null());
+        // SAFETY: `frame` points to this vCPU's live `pt_regs`.
+        unsafe { frame.write(copy) };
+        self.slot = NonNull::from(slot);
+        drop(self.owned.take());
     }
 
-    #[cold]
-    #[inline(never)]
-    fn syscall_args_owned(regs: &LinuxPtRegs) -> [usize; 6] {
-        [
-            regs.rdi as usize,
-            regs.rsi as usize,
-            regs.rdx as usize,
-            regs.r10 as usize,
-            regs.r8 as usize,
-            regs.r9 as usize,
-        ]
-    }
-
-    /// Reads the six Linux syscall argument registers (`rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`)
-    /// with a single `active_pt_regs` pointer load.
+    /// Reads only the first `N` Linux syscall argument registers, up to six.
+    /// A frame-backed context resolves the active frame once for all requested registers.
     #[inline(always)]
-    pub fn read_syscall_args(&self) -> [usize; 6] {
-        match &self.repr {
-            UserContextRepr::Frame(slot) => {
-                // SAFETY: `slot` points to the current task's `active_pt_regs`,
-                // which holds this vCPU's live `pt_regs` while executing in kernel mode.
-                let ptr = unsafe { (**slot).load(Ordering::Relaxed) };
-                debug_assert!(!ptr.is_null());
-                // SAFETY: `ptr` is valid and exclusively owned by the current task.
-                unsafe {
-                    [
-                        core::ptr::addr_of!((*ptr).rdi).read() as usize,
-                        core::ptr::addr_of!((*ptr).rsi).read() as usize,
-                        core::ptr::addr_of!((*ptr).rdx).read() as usize,
-                        core::ptr::addr_of!((*ptr).r10).read() as usize,
-                        core::ptr::addr_of!((*ptr).r8).read() as usize,
-                        core::ptr::addr_of!((*ptr).r9).read() as usize,
-                    ]
-                }
-            }
-            UserContextRepr::Owned(regs) => Self::syscall_args_owned(regs),
+    pub fn read_syscall_args<const N: usize>(&self) -> [usize; N] {
+        const { assert!(N <= 6) };
+        let slot = self.slot.as_ptr();
+        match N {
+            0 => [0; N],
+            1 => read_frame_args!(slot; rdi di),
+            2 => read_frame_args!(slot; rdi di, rsi si),
+            3 => read_frame_args!(slot; rdi di, rsi si, rdx dx),
+            4 => read_frame_args!(slot; rdi di, rsi si, rdx dx, r10 arg4),
+            5 => read_frame_args!(slot; rdi di, rsi si, rdx dx, r10 arg4, r8 arg5),
+            6 => read_frame_args!(slot; rdi di, rsi si, rdx dx, r10 arg4, r8 arg5, r9 arg6),
+            _ => unreachable!(),
         }
     }
 

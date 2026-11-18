@@ -45,21 +45,23 @@ impl LinuxAbi for UserContext {
     }
 
     #[inline(always)]
-    fn syscall_args(&self) -> [usize; 6] {
+    fn syscall_args<const N: usize>(&self) -> [usize; N] {
         #[cfg(feature = "kernelet")]
         {
-            UserContext::read_syscall_args(self)
+            self.read_syscall_args::<N>()
         }
         #[cfg(not(feature = "kernelet"))]
         {
-            [
-                self.rdi(),
-                self.rsi(),
-                self.rdx(),
-                self.r10(),
-                self.r8(),
-                self.r9(),
-            ]
+            const { assert!(N <= 6) };
+            core::array::from_fn(|index| match index {
+                0 => self.rdi(),
+                1 => self.rsi(),
+                2 => self.rdx(),
+                3 => self.r10(),
+                4 => self.r8(),
+                5 => self.r9(),
+                _ => unreachable!(),
+            })
         }
     }
 }

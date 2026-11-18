@@ -13,7 +13,7 @@ use crate::{
     fs::{file::file_table::FileTable, thread_info::ThreadFsInfo},
     prelude::*,
     process::{
-        NsProxy, Process, UserNamespace,
+        NsProxy, UserNamespace,
         signal::{SigStack, sig_mask::SigMask},
     },
     vm::vmar::VmarHandle,
@@ -21,7 +21,6 @@ use crate::{
 
 /// Local data for a POSIX thread.
 pub(crate) struct ThreadLocal {
-    process: RefCell<Option<Arc<Process>>>,
     // TID pointers.
     // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
     set_child_tid: Cell<Vaddr>,
@@ -62,7 +61,6 @@ pub(crate) struct ThreadLocal {
 impl ThreadLocal {
     #[expect(clippy::too_many_arguments)]
     pub(super) fn new(
-        process: Option<Arc<Process>>,
         set_child_tid: Vaddr,
         clear_child_tid: Vaddr,
         vmar: VmarHandle,
@@ -73,7 +71,6 @@ impl ThreadLocal {
         ns_proxy: Arc<NsProxy>,
     ) -> Self {
         Self {
-            process: RefCell::new(process),
             set_child_tid: Cell::new(set_child_tid),
             clear_child_tid: Cell::new(clear_child_tid),
             vmar: RefCell::new(Some(vmar)),
@@ -88,10 +85,6 @@ impl ThreadLocal {
             user_ns: RefCell::new(user_ns),
             ns_proxy: RefCell::new(Some(ns_proxy)),
         }
-    }
-
-    pub(crate) fn process(&self) -> &RefCell<Option<Arc<Process>>> {
-        &self.process
     }
 
     pub(crate) fn set_child_tid(&self) -> &Cell<Vaddr> {
@@ -295,6 +288,21 @@ impl SuppUserContext {
     }
 
     pub(crate) fn before_user_exec(&self, guard: &DisabledLocalIrqGuard) {
+        if self.is_on_cpu() {
+            return;
+        }
+        self.before_user_exec_slow(guard);
+    }
+
+    fn is_on_cpu(&self) -> bool {
+        let on_cpu = self.fpu.is_on_cpu();
+        #[cfg(target_arch = "x86_64")]
+        let on_cpu = on_cpu && self.fs_base.is_on_cpu() && self.gs_base.is_on_cpu();
+        on_cpu
+    }
+
+    #[cold]
+    fn before_user_exec_slow(&self, guard: &DisabledLocalIrqGuard) {
         self.fpu.before_user_exec(guard);
         #[cfg(target_arch = "x86_64")]
         {

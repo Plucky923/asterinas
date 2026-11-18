@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     constants::*,
@@ -15,9 +15,8 @@ use crate::{
 };
 
 pub(crate) struct SigQueues {
-    // The number of pending signals.
-    // Useful for quickly determining if any signals are pending without locking `queues`.
-    count: AtomicUsize,
+    // All updates hold `queues` and publish before releasing it or notifying waiters.
+    pending: AtomicU64,
     queues: Mutex<Queues>,
     signalfd_pollee: Pollee,
 }
@@ -25,20 +24,28 @@ pub(crate) struct SigQueues {
 impl SigQueues {
     pub(crate) fn new() -> Self {
         Self {
-            count: AtomicUsize::new(0),
+            pending: AtomicU64::new(0),
             queues: Mutex::new(Queues::new()),
             signalfd_pollee: Pollee::new(),
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.count.load(Ordering::Relaxed) == 0
+    /// Returns a published snapshot of the pending signal kinds.
+    pub(in crate::process) fn pending_set(&self) -> SigSet {
+        self.pending.load(Ordering::Acquire).into()
+    }
+
+    /// Returns whether a pending signal is outside the supplied blocked set.
+    pub(in crate::process) fn has_pending_unblocked(&self, blocked: SigMask) -> bool {
+        self.pending_set().intersects(!blocked)
     }
 
     pub(crate) fn enqueue(&self, signal: Box<dyn Signal>) {
+        let bit = u64::from(SigSet::from(signal.num()));
         let mut queues = self.queues.lock();
         if queues.enqueue(signal) {
-            self.count.fetch_add(1, Ordering::Relaxed);
+            let pending = self.pending.load(Ordering::Relaxed);
+            self.pending.store(pending | bit, Ordering::Release);
             // Avoid holding lock when notifying observers
             drop(queues);
             self.signalfd_pollee.notify(IoEvents::IN);
@@ -46,15 +53,18 @@ impl SigQueues {
     }
 
     pub(crate) fn dequeue(&self, blocked: &SigMask) -> Option<Box<dyn Signal>> {
-        // Fast path for the common case of no pending signals
-        if self.is_empty() {
+        if !self.has_pending_unblocked(*blocked) {
             return None;
         }
 
         let mut queues = self.queues.lock();
         let signal = queues.dequeue(blocked);
-        if signal.is_some() {
-            self.count.fetch_sub(1, Ordering::Relaxed);
+        if let Some(signal) = signal.as_ref()
+            && !queues.has_pending_signal(signal.num())
+        {
+            let bit = u64::from(SigSet::from(signal.num()));
+            let pending = self.pending.load(Ordering::Relaxed);
+            self.pending.store(pending & !bit, Ordering::Release);
         }
         signal
     }
@@ -73,9 +83,15 @@ impl SigQueues {
         blocked: SigMask,
         sig_dispositions: &SigDispositions,
     ) -> bool {
+        if !self.has_pending_unblocked(blocked) {
+            return false;
+        }
         let mut queues = self.queues.lock();
         let (dequeued_signals, has_pending) = queues.has_pending(blocked, sig_dispositions);
-        self.count.fetch_sub(dequeued_signals, Ordering::Relaxed);
+        if dequeued_signals != 0 {
+            self.pending
+                .store(u64::from(queues.sig_pending()), Ordering::Release);
+        }
         has_pending
     }
 

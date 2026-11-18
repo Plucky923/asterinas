@@ -137,7 +137,7 @@ impl PidTable {
         let entry = self.get_or_create_entry(pid);
         let mut entry = entry.lock();
         entry.set_process(process);
-        entry.set_thread(&process.main_thread());
+        entry.set_thread(&process.main_thread().unwrap());
     }
 
     /// Removes a process and its main thread from the table.

@@ -202,123 +202,48 @@ mod wait4;
 mod waitid;
 mod write;
 
-/// This macro is used to define syscall handler.
-/// The first param is the number of parameters,
-/// The second param is the function name of syscall handler,
-/// The third is optional, means the args(if parameter number > 0),
-/// The fourth is optional, means if cpu ctx is required.
+/// Reads the arguments for the selected syscall and invokes its handler.
 macro_rules! syscall_handler {
-    (0, $fn_name: ident, $args: ident, $ctx: expr) => {
-        $fn_name($ctx)
+    (0, $handler:ident, $ctx:ident, $user_ctx:ident $(, $regs:expr)?) => {
+        $handler($ctx $(, $regs)?)
     };
-    (0, $fn_name: ident, $args: ident, $ctx: expr, $user_ctx: expr) => {
-        $fn_name($ctx, $user_ctx)
+    (1, $($call:tt)*) => {
+        $crate::syscall::syscall_handler!(@args 1 [0] $($call)*)
     };
-
-    (1, $fn_name: ident, $args: ident, $ctx: expr) => {
-        $fn_name($args[0] as _, $ctx)
+    (2, $($call:tt)*) => {
+        $crate::syscall::syscall_handler!(@args 2 [0, 1] $($call)*)
     };
-    (1, $fn_name: ident, $args: ident, $ctx: expr, $user_ctx: expr) => {
-        $fn_name($args[0] as _, $ctx, $user_ctx)
+    (3, $($call:tt)*) => {
+        $crate::syscall::syscall_handler!(@args 3 [0, 1, 2] $($call)*)
     };
-
-    (2, $fn_name: ident, $args: ident, $ctx: expr) => {
-        $fn_name($args[0] as _, $args[1] as _, $ctx)
+    (4, $($call:tt)*) => {
+        $crate::syscall::syscall_handler!(@args 4 [0, 1, 2, 3] $($call)*)
     };
-    (2, $fn_name: ident, $args: ident, $ctx: expr, $user_ctx: expr) => {
-        $fn_name($args[0] as _, $args[1] as _, $ctx, $user_ctx)
+    (5, $($call:tt)*) => {
+        $crate::syscall::syscall_handler!(@args 5 [0, 1, 2, 3, 4] $($call)*)
     };
-
-    (3, $fn_name: ident, $args: ident, $ctx: expr) => {
-        $fn_name($args[0] as _, $args[1] as _, $args[2] as _, $ctx)
+    (6, $($call:tt)*) => {
+        $crate::syscall::syscall_handler!(@args 6 [0, 1, 2, 3, 4, 5] $($call)*)
     };
-    (3, $fn_name: ident, $args: ident, $ctx: expr, $user_ctx: expr) => {
-        $fn_name($args[0] as _, $args[1] as _, $args[2] as _, $ctx, $user_ctx)
-    };
-
-    (4, $fn_name: ident, $args: ident, $ctx: expr) => {
-        $fn_name(
-            $args[0] as _,
-            $args[1] as _,
-            $args[2] as _,
-            $args[3] as _,
-            $ctx,
-        )
-    };
-    (4, $fn_name: ident, $args: ident, $ctx: expr, $user_ctx: expr) => {
-        $fn_name(
-            $args[0] as _,
-            $args[1] as _,
-            $args[2] as _,
-            $args[3] as _,
-            $ctx,
-            $user_ctx,
-        )
-    };
-
-    (5, $fn_name: ident, $args: ident, $ctx: expr) => {
-        $fn_name(
-            $args[0] as _,
-            $args[1] as _,
-            $args[2] as _,
-            $args[3] as _,
-            $args[4] as _,
-            $ctx,
-        )
-    };
-    (5, $fn_name: ident, $args: ident, $ctx: expr, $user_ctx: expr) => {
-        $fn_name(
-            $args[0] as _,
-            $args[1] as _,
-            $args[2] as _,
-            $args[3] as _,
-            $args[4] as _,
-            $ctx,
-            $user_ctx,
-        )
-    };
-
-    (6, $fn_name: ident, $args: ident, $ctx: expr) => {
-        $fn_name(
-            $args[0] as _,
-            $args[1] as _,
-            $args[2] as _,
-            $args[3] as _,
-            $args[4] as _,
-            $args[5] as _,
-            $ctx,
-        )
-    };
-    (6, $fn_name: ident, $args: ident, $ctx: expr, $user_ctx: expr) => {
-        $fn_name(
-            $args[0] as _,
-            $args[1] as _,
-            $args[2] as _,
-            $args[3] as _,
-            $args[4] as _,
-            $args[5] as _,
-            $ctx,
-            $user_ctx,
-        )
-    };
+    (@args $count:literal [$($index:literal),+] $handler:ident, $ctx:ident, $user_ctx:ident $(, $regs:expr)?) => {{
+        let args = $crate::cpu::LinuxAbi::syscall_args::<$count>(&*$user_ctx);
+        $handler($(args[$index] as _,)+ $ctx $(, $regs)?)
+    }};
 }
 
 macro_rules! dispatch_fn_inner {
-    ( $args: ident, $ctx: ident, $user_ctx: ident, $handler: ident ( args[ .. $cnt: tt ] ) ) => {
-        $crate::syscall::syscall_handler!($cnt, $handler, $args, $ctx)
+    ($ctx:ident, $user_ctx:ident, $handler:ident(args[..$count:tt])) => {
+        $crate::syscall::syscall_handler!($count, $handler, $ctx, $user_ctx)
     };
-    ( $args: ident, $ctx: ident, $user_ctx: ident, $handler: ident ( args[ .. $cnt: tt ] , &user_ctx ) ) => {
-        $crate::syscall::syscall_handler!($cnt, $handler, $args, $ctx, &$user_ctx)
+    ($ctx:ident, $user_ctx:ident, $handler:ident(args[..$count:tt], &user_ctx)) => {
+        $crate::syscall::syscall_handler!($count, $handler, $ctx, $user_ctx, &*$user_ctx)
     };
-    ( $args: ident, $ctx: ident, $user_ctx: ident, $handler: ident ( args[ .. $cnt: tt ] , &mut user_ctx ) ) => {
-        // `$user_ctx` is already of type `&mut ostd::cpu::UserContext`,
-        // so no need to take `&mut` again
-        $crate::syscall::syscall_handler!($cnt, $handler, $args, $ctx, $user_ctx)
+    ($ctx:ident, $user_ctx:ident, $handler:ident(args[..$count:tt], &mut user_ctx)) => {
+        $crate::syscall::syscall_handler!($count, $handler, $ctx, $user_ctx, $user_ctx)
     };
 }
 
 macro_rules! impl_syscall_nums_and_dispatch_fn {
-    // $args, $user_ctx, and $dispatcher_name are needed since Rust macro is hygienic
     ( $( $name: ident = $num: literal => $handler: ident $args: tt );* $(;)? ) => {
         // First, define the syscall numbers
         $(
@@ -326,25 +251,26 @@ macro_rules! impl_syscall_nums_and_dispatch_fn {
         )*
 
         // Then, define the dispatcher function
-        pub(crate) fn syscall_dispatch(
+        pub(super) fn syscall_dispatch(
             syscall_number: u64,
-            args: [u64; 6],
-            ctx: &crate::context::Context,
+            ctx: &$crate::context::Context,
             user_ctx: &mut ostd::arch::cpu::context::UserContext,
-        ) -> $crate::prelude::Result<$crate::syscall::SyscallReturn> {
+        ) {
             match syscall_number {
                 $(
                     $num => {
                         $crate::syscall::log_syscall_entry!($name);
-                        $crate::syscall::dispatch_fn_inner!(args, ctx, user_ctx, $handler $args)
+                        let result = $crate::syscall::dispatch_fn_inner!(ctx, user_ctx, $handler $args);
+                        $crate::syscall::write_syscall_result(user_ctx, result);
                     }
                 )*
                 _ => {
                     ostd::warn!("Unimplemented syscall number: {}", syscall_number);
-                    $crate::return_errno_with_message!(
+                    let error = $crate::error::Error::with_message(
                         $crate::error::Errno::ENOSYS,
-                        "Syscall was unimplemented"
+                        "Syscall was unimplemented",
                     );
+                    $crate::syscall::write_syscall_error(user_ctx, error);
                 }
             }
         }
@@ -356,52 +282,34 @@ use dispatch_fn_inner;
 use impl_syscall_nums_and_dispatch_fn;
 use syscall_handler;
 
-struct SyscallArgument {
-    syscall_number: u64,
-    args: [u64; 6],
-}
-
 /// Syscall return
 #[derive(Clone, Copy, Debug)]
 enum SyscallReturn {
-    /// return isize, this value will be used to set rax
+    /// Sets the syscall return register to this value.
     Return(isize),
-    /// does not need to set rax
+    /// Keeps the register value supplied by the handler.
     NoReturn,
 }
 
-impl SyscallArgument {
-    fn new_from_context(user_ctx: &UserContext) -> Self {
-        let syscall_number = user_ctx.syscall_num() as u64;
-        let args = user_ctx.syscall_args().map(|x| x as u64);
-        Self {
-            syscall_number,
-            args,
-        }
+pub(crate) fn handle_syscall(syscall_number: usize, ctx: &Context, user_ctx: &mut UserContext) {
+    arch::syscall_dispatch(syscall_number as u64, ctx, user_ctx);
+}
+
+#[inline(always)]
+fn write_syscall_result(user_ctx: &mut UserContext, result: Result<SyscallReturn>) {
+    match result {
+        Ok(SyscallReturn::Return(value)) => user_ctx.set_syscall_ret(value as usize),
+        Ok(SyscallReturn::NoReturn) => {}
+        Err(error) => write_syscall_error(user_ctx, error),
     }
 }
 
-pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
-    let syscall_frame = SyscallArgument::new_from_context(user_ctx);
-    let syscall_return = arch::syscall_dispatch(
-        syscall_frame.syscall_number,
-        syscall_frame.args,
-        ctx,
-        user_ctx,
-    );
-
-    match syscall_return {
-        Ok(return_value) => {
-            if let SyscallReturn::Return(return_value) = return_value {
-                user_ctx.set_syscall_ret(return_value as usize);
-            }
-        }
-        Err(err) => {
-            debug!("syscall return error: {:?}", err);
-            let errno = err.error() as i32;
-            user_ctx.set_syscall_ret((-errno) as usize)
-        }
-    }
+#[cold]
+#[inline(never)]
+fn write_syscall_error(user_ctx: &mut UserContext, error: Error) {
+    debug!("syscall return error: {:?}", error);
+    let errno = error.error() as i32;
+    user_ctx.set_syscall_ret((-errno) as usize);
 }
 
 macro_rules! log_syscall_entry {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{ItemImpl, Result};
 
 pub(super) fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
@@ -37,6 +37,38 @@ pub(super) fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream
         .attrs
         .iter()
         .filter(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"));
+    let context_callbacks = [
+        "init",
+        "handle_syscall",
+        "handle_exception",
+        "handle_kernel_event",
+    ]
+    .into_iter()
+    .map(|name| {
+        let method = format_ident!("{name}");
+        let symbol = format_ident!("__ostd_user_{name}");
+        quote! {
+            #[unsafe(no_mangle)]
+            unsafe extern "Rust" fn #symbol(
+                data: *const (),
+                local: *const (),
+                task: &::ostd::task::CurrentTask,
+                user_ctx: &mut ::ostd::arch::cpu::context::UserContext,
+            ) -> bool {
+                // SAFETY: OSTD checked the task's data and local_data types during construction.
+                // The current task keeps both alive throughout the callback.
+                let handler: &#handler_type = unsafe {
+                    &*data.cast::<alloc::sync::Arc<#handler_type>>()
+                };
+                let local: &<#handler_type as ::ostd::user::UserEventHandler>::LocalData = unsafe {
+                    &*local.cast::<<#handler_type as ::ostd::user::UserEventHandler>::LocalData>()
+                };
+                <#handler_type as ::ostd::user::UserEventHandler>::#method(
+                    handler, local, task, user_ctx,
+                )
+            }
+        }
+    });
 
     Ok(quote! {
         #item
@@ -59,46 +91,7 @@ pub(super) fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream
                 >()
             }
 
-            #[unsafe(no_mangle)]
-            unsafe extern "Rust" fn __ostd_user_init(
-                data: *const (),
-                local: *const (),
-                task: &::ostd::task::CurrentTask,
-                user_ctx: &mut ::ostd::arch::cpu::context::UserContext,
-            ) -> bool {
-                // SAFETY: OSTD checked the task's data and local_data types during construction.
-                // The current task keeps both alive throughout the callback.
-                let handler: &#handler_type = unsafe {
-                    &*data.cast::<alloc::sync::Arc<#handler_type>>()
-                };
-                let local: &<#handler_type as ::ostd::user::UserEventHandler>::LocalData = unsafe {
-                    &*local.cast::<<#handler_type as ::ostd::user::UserEventHandler>::LocalData>()
-                };
-                <#handler_type as ::ostd::user::UserEventHandler>::init(
-                    handler, local, task, user_ctx,
-                )
-            }
-
-            #[unsafe(no_mangle)]
-            unsafe extern "Rust" fn __ostd_user_handle(
-                data: *const (),
-                local: *const (),
-                task: &::ostd::task::CurrentTask,
-                event: ::ostd::user::UserEvent,
-                user_ctx: &mut ::ostd::arch::cpu::context::UserContext,
-            ) -> bool {
-                // SAFETY: OSTD checked the task's data and local_data types during construction.
-                // The current task keeps both alive throughout the callback.
-                let handler: &#handler_type = unsafe {
-                    &*data.cast::<alloc::sync::Arc<#handler_type>>()
-                };
-                let local: &<#handler_type as ::ostd::user::UserEventHandler>::LocalData = unsafe {
-                    &*local.cast::<<#handler_type as ::ostd::user::UserEventHandler>::LocalData>()
-                };
-                <#handler_type as ::ostd::user::UserEventHandler>::handle(
-                    handler, local, task, event, user_ctx,
-                )
-            }
+            #(#context_callbacks)*
 
             #[unsafe(no_mangle)]
             unsafe extern "Rust" fn __ostd_user_has_kernel_event(

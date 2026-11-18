@@ -85,12 +85,12 @@ fn calculate_si_code_and_si_status(wait_status: &WaitStatus) -> (i32, i32) {
 
     // TODO: Add supports for `CLD_DUMPED`.
     match wait_status {
-        WaitStatus::Zombie(process) => {
+        WaitStatus::Zombie(process, _) => {
             let exit_code = process.status().exit_code();
             parse_exit_code(exit_code)
         }
-        WaitStatus::Stop(_process, signum) => (CLD_STOPPED, signum.as_u8() as i32),
-        WaitStatus::Continue(_) => (CLD_CONTINUED, SIGCONT.as_u8() as i32),
+        WaitStatus::Stop(_, _, signum) => (CLD_STOPPED, signum.as_u8() as i32),
+        WaitStatus::Continue(_, _) => (CLD_CONTINUED, SIGCONT.as_u8() as i32),
         WaitStatus::TraceeExit(thread) => {
             let exit_code = thread.as_posix_thread().unwrap().exit_code();
             parse_exit_code(exit_code)

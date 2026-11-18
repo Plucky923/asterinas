@@ -151,7 +151,7 @@ pub(crate) fn kill_all<S: Signal + Clone>(signal: Option<S>, ctx: &Context) -> R
 
 fn kill_process(process: &Process, signal: Option<Box<dyn Signal>>, ctx: &Context) -> Result<()> {
     let signum = signal.as_ref().map(|signal| signal.num());
-    let target_main_thread = process.main_thread();
+    let target_main_thread = process.main_thread()?;
     check_signal_perm(target_main_thread.as_posix_thread().unwrap(), ctx, signum)?;
 
     if let Some(signal) = signal {
@@ -163,9 +163,9 @@ fn kill_process(process: &Process, signal: Option<Box<dyn Signal>>, ctx: &Contex
 
 // Reference: <https://elixir.bootlin.com/linux/v6.17/source/kernel/signal.c#L799>.
 fn check_signal_perm(target: &PosixThread, ctx: &Context, signum: Option<SigNum>) -> Result<()> {
-    let target_process = target.process();
+    let target_process = target.process_ref();
 
-    if Arc::ptr_eq(&target_process, &ctx.process) {
+    if Arc::ptr_eq(target_process, ctx.process) {
         return Ok(());
     }
 

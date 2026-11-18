@@ -12,6 +12,7 @@
 #include <linux/kernelet.h>
 #include <linux/math64.h>
 #include <linux/mm.h>
+#include <linux/objtool.h>
 #include <linux/preempt.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
@@ -24,6 +25,7 @@
 #include <linux/thread_info.h>
 #include <linux/uaccess.h>
 
+#include <asm/asm.h>
 #include <asm/cpufeature.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
@@ -33,17 +35,11 @@
 
 #include "endovisor.h"
 
-#define RFLAGS_USER \
-	(X86_EFLAGS_CF | X86_EFLAGS_PF | X86_EFLAGS_AF | X86_EFLAGS_ZF | \
-	 X86_EFLAGS_SF | X86_EFLAGS_TF | X86_EFLAGS_DF | X86_EFLAGS_OF | \
-	 X86_EFLAGS_AC | X86_EFLAGS_ID)
-
-static inline void restore_carrier_fpu(struct carrier *c)
+// Restores FPU state after the caller observes `TIF_NEED_FPU_LOAD`.
+static __cold void restore_carrier_fpu(struct carrier *c)
 {
-	if (unlikely(test_thread_flag(TIF_NEED_FPU_LOAD))) {
-		atomic64_inc(&c->sandbox->stats.fpu_restores);
-		kernelet_fpu_restore_carrier();
-	}
+	atomic64_inc(&c->sandbox->stats.fpu_restores);
+	kernelet_fpu_restore_carrier();
 }
 
 static inline void write_cpu_slot(u16 kernelet, u16 vcpu, u32 generation)
@@ -170,8 +166,7 @@ int carrier_attach(struct carrier *c)
 	}
 	fd_install(fd, file);
 
-	WRITE_ONCE(current->carrier_hooks, &c->hooks);
-	set_syscall_work(KERNELET);
+	kernelet_set_carrier_hooks(&c->hooks);
 	carrier_sched_attach(c);
 	cpu_slot_set_current(c);
 	return 0;
@@ -181,8 +176,7 @@ static void carrier_detach_hooks(struct carrier *c)
 {
 	if (READ_ONCE(current->carrier_hooks) != &c->hooks)
 		return;
-	clear_syscall_work(KERNELET);
-	WRITE_ONCE(current->carrier_hooks, NULL);
+	kernelet_set_carrier_hooks(NULL);
 	barrier();
 	carrier_sched_detach(c);
 	cpu_slot_clear_current();
@@ -581,16 +575,11 @@ static bool vcpu_await(struct carrier *c)
 // PR #3 Carrier Event Hooks (`on_syscall`, `on_exception`, `on_resume`, `on_kernel_fault`)
 // ------------------------------------------------------------------
 
-static void __noreturn enter_user_event(struct carrier *c, u64 raw_event)
+static noinline __cold void validate_event_stack(struct carrier *c, u64 event_rsp,
+						u64 gen)
 {
 	struct sandbox *sandbox = c->sandbox;
-	u64 event_rsp = READ_ONCE(c->urec->event_rsp);
-	u64 gen = (u64)atomic64_read(&sandbox->kstack_free_gen);
 	unsigned long usable = 0, top = 0;
-
-	if (likely(event_rsp == c->cached_event_rsp &&
-		   gen == c->cached_kstack_gen))
-		goto valid_stack;
 
 	// Order reading `kstack_free_gen` before reading `live_stacks_bitmap`
 	// (`kstack_free` clears the bit before bumping `kstack_free_gen`).
@@ -600,26 +589,46 @@ static void __noreturn enter_user_event(struct carrier *c, u64 raw_event)
 					     &usable, &top) ||
 		     event_rsp < usable + 4096UL || event_rsp > top)) {
 		sandbox_stop(sandbox, STOP_STACK_OVERFLOW, 0,
-			"invalid user_event_entry stack");
+			"invalid user event stack");
 		carrier_die(c);
 	}
 	c->cached_event_rsp = event_rsp;
 	c->cached_kstack_gen = gen;
+}
 
-valid_stack:
+static void __noreturn enter_user_event(struct carrier *c, unsigned long image_entry)
+{
+	struct sandbox *sandbox = c->sandbox;
+	u64 event_rsp = READ_ONCE(c->urec->event_rsp);
+	u64 gen = (u64)atomic64_read(&sandbox->kstack_free_gen);
+
+	if (unlikely(event_rsp != c->cached_event_rsp || gen != c->cached_kstack_gen))
+		validate_event_stack(c, event_rsp, gen);
+
 	WRITE_ONCE(c->vrec->irq_off, 1);
 	WRITE_ONCE(c->state, CARRIER_KERNEL);
-	restore_carrier_fpu(c);
-	enter_image(sandbox->user_event_entry, event_rsp, raw_event, 0);
+	if (unlikely(READ_ONCE(current_thread_info()->flags) & _TIF_NEED_FPU_LOAD))
+		restore_carrier_fpu(c);
+	enter_image(image_entry, event_rsp, (u64)(unsigned long)c->vrec, 0);
 	BUG();
 }
 
-static bool on_syscall(struct pt_regs *regs)
+// Establishes fixed user segments before vOSTD takes over the frame.
+// vOSTD's register setters and Task save/restore preserve these selectors.
+static void fix_user_segments(struct pt_regs *regs)
 {
-	struct carrier *c = current_carrier();
+	regs->cs = __USER_CS;
+	regs->ss = __USER_DS;
+}
+
+static __always_inline bool handle_user_syscall(struct pt_regs *regs,
+					       struct carrier_event_hooks *hooks,
+					       long nr, bool native64)
+{
+	struct carrier *c = carrier_of(hooks);
 	struct sandbox *sandbox;
 
-	if (unlikely(!c || READ_ONCE(c->state) != CARRIER_USER))
+	if (unlikely(READ_ONCE(c->state) != CARRIER_USER))
 		return false;
 	sandbox = c->sandbox;
 
@@ -628,7 +637,7 @@ static bool on_syscall(struct pt_regs *regs)
 		carrier_die(c);
 #endif
 
-	if (unlikely(regs->cs != __USER_CS || in_compat_syscall())) {
+	if (!native64 && unlikely(regs->cs != __USER_CS || in_compat_syscall())) {
 		c->exc_trap = X86_TRAP_GP;
 		c->exc_error = 0;
 		c->exc_addr = 0;
@@ -641,14 +650,30 @@ static bool on_syscall(struct pt_regs *regs)
 		     fatal_signal_pending(current)))
 		carrier_die(c);
 
-	// PR #3 syscall convention: place syscall number into `ax` and clear `orig_ax`.
-	regs->ax = regs->orig_ax;
+	// Linux's native 64-bit fast hook already supplies the fixed selectors.
+	if (!native64)
+		fix_user_segments(regs);
+
+	// The image takes the Linux-decoded syscall number in `ax`.
+	regs->ax = nr;
 	regs->orig_ax = -1;
 	c->from_syscall = true;
 	if (static_branch_unlikely(&endovisor_audit_key))
 		WRITE_ONCE(c->syscalls, c->syscalls + 1);
 
-	enter_user_event(c, USER_EVENT_SYSCALL);
+	enter_user_event(c, sandbox->user_syscall_entry);
+}
+
+static bool on_syscall(struct pt_regs *regs, struct carrier_event_hooks *hooks,
+		       long nr)
+{
+	return handle_user_syscall(regs, hooks, nr, false);
+}
+
+static bool on_syscall_64(struct pt_regs *regs, struct carrier_event_hooks *hooks,
+			  long nr)
+{
+	return handle_user_syscall(regs, hooks, nr, true);
 }
 
 static bool on_exception(struct pt_regs *regs, unsigned int trapnr,
@@ -716,7 +741,8 @@ static void on_resume(struct pt_regs *regs)
 		WRITE_ONCE(c->state, CARRIER_KERNEL);
 		cpu_slot_set_current(c);
 		watch_arm(c);
-		restore_carrier_fpu(c);
+		if (unlikely(READ_ONCE(current_thread_info()->flags) & _TIF_NEED_FPU_LOAD))
+			restore_carrier_fpu(c);
 
 		if (c->vcpu == 0)
 			enter_image(sandbox->entry_fn,
@@ -739,12 +765,14 @@ static void on_resume(struct pt_regs *regs)
 			WRITE_ONCE(c->urec->trap_num, c->exc_trap);
 			WRITE_ONCE(c->urec->error_code, c->exc_error);
 			WRITE_ONCE(c->urec->fault_addr, c->exc_addr);
+			fix_user_segments(c->user_regs);
 			c->from_syscall = false;
-			enter_user_event(c, USER_EVENT_EXCEPTION);
+			enter_user_event(c, sandbox->user_exception_entry);
 		}
 		if (READ_ONCE(c->vrec->pending)) {
+			fix_user_segments(c->user_regs);
 			c->from_syscall = false;
-			enter_user_event(c, USER_EVENT_KERNEL_EVENT);
+			enter_user_event(c, sandbox->user_kernel_event_entry);
 		}
 		return;
 	}
@@ -818,6 +846,7 @@ static bool on_kernel_fault(struct pt_regs *regs, unsigned int trapnr,
 const struct carrier_event_hooks carrier_hooks = {
 	.on_exit = on_exit,
 	.on_syscall = on_syscall,
+	.on_syscall_64 = on_syscall_64,
 	.on_resume = on_resume,
 	.on_exception = on_exception,
 	.on_kernel_fault = on_kernel_fault,
@@ -1142,7 +1171,8 @@ static u64 svc_dispatch(void *arg)
 	    READ_ONCE(sandbox->dying))
 		c->doomed = true;
 
-	restore_carrier_fpu(c);
+	if (unlikely(READ_ONCE(current_thread_info()->flags) & _TIF_NEED_FPU_LOAD))
+		restore_carrier_fpu(c);
 	watch_arm(c);
 	c->depth--;
 	if (c->depth == 0) {
@@ -1259,22 +1289,16 @@ void __noreturn do_user_run_on_linux(struct carrier *c)
 	struct sandbox *sandbox = c->sandbox;
 	struct pt_regs *regs = c->user_regs;
 	bool from_syscall = c->from_syscall;
-	bool bad_user_addr;
 
 	if (unlikely(READ_ONCE(sandbox->dying) ||
-		     fatal_signal_pending(current)))
+		     ((READ_ONCE(current_thread_info()->flags) & _TIF_SIGPENDING) &&
+		      fatal_signal_pending(current))))
 		carrier_die(c);
 
-	bad_user_addr = regs->ip >= TASK_SIZE_MAX ||
-			(((s64)regs->sp >> 47) != 0 && ((s64)regs->sp >> 47) != -1);
-
-	regs->flags = (regs->flags & RFLAGS_USER) | X86_EFLAGS_IF |
-		      X86_EFLAGS_FIXED;
-	regs->cs = __USER_CS;
-	regs->ss = __USER_DS;
 	regs->orig_ax = -1;
 
-	if (unlikely(bad_user_addr)) {
+	if (unlikely(regs->ip >= TASK_SIZE_MAX ||
+		     (((s64)regs->sp >> 47) != 0 && ((s64)regs->sp >> 47) != -1))) {
 		c->exc_trap = X86_TRAP_GP;
 		c->exc_error = 0;
 		c->exc_addr = 0;
@@ -1317,9 +1341,20 @@ static s32 svc_user_run(void *ctx)
 	struct carrier *c = current_carrier();
 
 	(void)ctx;
-	jump_user_run(c->linux_sp, c);
-	BUG();
+	// The Host owns the aligned `linux_sp`; no Image pointer selects it.
+	// Switch before calling Linux code and never resume this service frame.
+	// The new continuation has no caller beyond this user-return boundary.
+	asm volatile("movq %[linux_sp], %%rsp\n\t"
+		     UNWIND_HINT(UNWIND_HINT_TYPE_END_OF_STACK, 0, 0, 0)
+		     "call %c[run]\n\t"
+		     "ud2\n\t"
+		     : "+D" (c), ASM_CALL_CONSTRAINT
+		     : [linux_sp] "m" (c->linux_sp), [run] "i" (do_user_run_on_linux)
+		     : "rax", "rcx", "rdx", "rsi", "r8", "r9", "r10", "r11",
+		       "cc", "memory");
+	unreachable();
 }
+STACK_FRAME_NON_STANDARD(svc_user_run);
 
 static struct mmio_result svc_mmio_read(u32 dev, u32 offset, u32 width)
 {

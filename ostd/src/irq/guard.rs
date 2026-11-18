@@ -76,34 +76,14 @@ impl DisabledLocalIrqGuard {
         Self { was_enabled: false }
     }
 
-    /// Disables local virtual IRQs and returns `(guard, vcpu_record.guards)`
-    /// in a single `.text.kernelet_cpu_access` sequence.
+    /// Masks virtual IRQs for the handoff to the Host.
+    ///
+    /// The guard leaves IRQs masked on drop. The Host resumes delivery on user return.
     #[cfg(feature = "kernelet")]
     #[inline(always)]
-    pub(crate) fn disable_with_guards() -> (Self, u32) {
-        let (was_enabled, guards) = arch_irq::disable_local_save_with_guards();
-        (Self { was_enabled }, guards)
-    }
-
-    /// Checks for pending preemption and disables local virtual IRQs for user
-    /// return in a single `.text.kernelet_cpu_access` sequence on the fast path.
-    #[cfg(feature = "kernelet")]
-    #[inline(always)]
-    pub(crate) fn disable_for_user_return() -> (Self, u32) {
-        if let Some((was_enabled, guards)) =
-            arch_irq::try_disable_with_guards_if_no_preempt(crate::task::Task::preempt_info_offset())
-        {
-            return (Self { was_enabled }, guards);
-        }
-        Self::preempt_and_disable_slow()
-    }
-
-    #[cfg(feature = "kernelet")]
-    #[cold]
-    #[inline(never)]
-    fn preempt_and_disable_slow() -> (Self, u32) {
-        crate::task::scheduler::might_preempt();
-        Self::disable_with_guards()
+    pub(crate) fn disable_for_user_return(current_task: &crate::task::CurrentTask) -> Self {
+        arch_irq::disable_local_for_user_return(current_task);
+        Self { was_enabled: false }
     }
 }
 

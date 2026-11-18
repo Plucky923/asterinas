@@ -160,7 +160,10 @@ pub struct Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        self.pidfile_pollee.notify(IoEvents::HUP);
+        // A clone that fails before publication may still have exposed a pidfd.
+        if !self.status.is_reaped() {
+            self.pidfile_pollee.notify(IoEvents::HUP);
+        }
     }
 }
 
@@ -331,8 +334,13 @@ impl Process {
         &self.nice
     }
 
-    pub(crate) fn main_thread(&self) -> Arc<Thread> {
-        self.tasks.lock().main().as_thread().unwrap().clone()
+    pub(crate) fn main_thread(&self) -> Result<Arc<Thread>> {
+        let tasks = self.tasks.lock();
+        let main_task = tasks
+            .as_slice()
+            .first()
+            .ok_or_else(|| Error::with_message(Errno::ESRCH, "the process has no main thread"))?;
+        Ok(main_task.as_thread().unwrap().clone())
     }
 
     pub(crate) fn oom_score_adj(&self) -> &AtomicI16 {

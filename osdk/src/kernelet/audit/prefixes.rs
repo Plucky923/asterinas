@@ -49,7 +49,7 @@ pub(super) fn audit(
     virq_entry: u64,
     yield_entry: u64,
     exit_entry: u64,
-    user_event_entry: u64,
+    user_entries: [(&str, u64); 3],
     stub_start: u64,
     stub_end: u64,
     cpu_access_start: u64,
@@ -75,13 +75,15 @@ pub(super) fn audit(
         || symbol("__kernelet_stubs_end")?.value != stub_end
         || symbol("__kernelet_cpu_access_start")?.value != cpu_access_start
         || symbol("__kernelet_cpu_access_end")?.value != cpu_access_end
-        || symbols
-            .iter()
-            .zip(names)
-            .find(|(_, candidate)| candidate.as_str() == "user_event_entry")
-            .is_some_and(|(sym, _)| sym.value != user_event_entry)
     {
         return Err("audit item 11: a linked entry symbol disagrees with its entry table".into());
+    }
+    for (name, address) in user_entries {
+        if symbol(name)?.value != address {
+            return Err(format!(
+                "audit item 11: {name} disagrees with its entry table"
+            ));
+        }
     }
     for stub in [virq, yield_, exit] {
         if stub.value < stub_start

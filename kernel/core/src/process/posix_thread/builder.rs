@@ -33,7 +33,6 @@ pub(crate) struct PosixThreadBuilder {
     tid: Tid,
     thread_name: ThreadName,
     user_ctx: Box<UserContext>,
-    process: Weak<Process>,
     credentials: Credentials,
     vmar: VmarHandle,
 
@@ -64,7 +63,6 @@ impl PosixThreadBuilder {
             tid,
             thread_name,
             user_ctx,
-            process: Weak::new(),
             credentials,
             vmar,
             set_child_tid: 0,
@@ -80,11 +78,6 @@ impl PosixThreadBuilder {
             ns_proxy: None,
             default_timer_slack_ns: 50_000, // 50 usec default slack
         }
-    }
-
-    pub(crate) fn process(mut self, process: Weak<Process>) -> Self {
-        self.process = process;
-        self
     }
 
     pub(crate) fn cpu_affinity(mut self, cpu_affinity: CpuSet) -> Self {
@@ -155,12 +148,11 @@ impl PosixThreadBuilder {
         self
     }
 
-    pub(crate) fn build(self) -> Result<Arc<Task>> {
+    pub(crate) fn build(self, process: Arc<Process>) -> Result<Arc<Task>> {
         let stack = TaskOptions::prepare_stack()?;
         let Self {
             tid,
             user_ctx,
-            process,
             credentials,
             vmar,
             thread_name,
@@ -188,7 +180,6 @@ impl PosixThreadBuilder {
             .unwrap_or_else(|| Arc::new(ThreadFsInfo::new(ns_proxy.mnt_ns().new_path_resolver())));
 
         Ok(Arc::new_cyclic(|weak_task| {
-            let process_arc = process.upgrade();
             let posix_thread = {
                 let prof_clock = ProfClock::new();
                 let virtual_timer_manager = TimerManager::new(prof_clock.user_clock().clone());
@@ -227,7 +218,6 @@ impl PosixThreadBuilder {
             ));
 
             let thread_local = ThreadLocal::new(
-                process_arc,
                 set_child_tid,
                 clear_child_tid,
                 vmar,

@@ -47,7 +47,25 @@ pub(crate) trait SignalContext {
 }
 
 /// Handles a pending signal for the current process.
-pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
+///
+/// Returns whether signal, mask restoration, or syscall-restart work was considered.
+/// This work may have changed the thread's exit state.
+pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> bool {
+    let needs_restart = user_ctx.syscall_ret() == -(Errno::ERESTARTSYS as i32) as usize
+        && ctx.thread_local.orig_syscall_ret().is_some();
+    if !needs_restart && ctx.thread_local.sig_mask_saved().get().is_none() {
+        let pending =
+            ctx.posix_thread.sig_queues().pending_set() | ctx.process.sig_queues().pending_set();
+        if u64::from(pending) == 0 || !pending.intersects(!ctx.posix_thread.sig_mask()) {
+            return false;
+        }
+    }
+    handle_pending_signal_slow(user_ctx, ctx);
+    true
+}
+
+#[cold]
+fn handle_pending_signal_slow(user_ctx: &mut UserContext, ctx: &Context) {
     // FIXME: This function may handle or suppress only one signal per trap, delaying
     // other pending unmasked signals until the next trap. Consider a looped scan.
     //
@@ -234,7 +252,13 @@ impl Drop for RestoreSigMaskGuard<'_> {
 }
 
 fn dequeue_pending_signal(ctx: &Context) -> Option<(DequeuedSignal, SigAction)> {
-    if ctx.posix_thread.sig_queues().is_empty() && ctx.process.sig_queues().is_empty() {
+    let pending =
+        ctx.posix_thread.sig_queues().pending_set() | ctx.process.sig_queues().pending_set();
+    if u64::from(pending) == 0 {
+        return None;
+    }
+    let sig_mask = ctx.posix_thread.sig_mask();
+    if !pending.intersects(!sig_mask) {
         return None;
     }
 
@@ -243,7 +267,6 @@ fn dequeue_pending_signal(ctx: &Context) -> Option<(DequeuedSignal, SigAction)> 
     let sig_dispositions = ctx.process.sig_dispositions().lock();
     let sig_dispositions = sig_dispositions.lock();
 
-    let sig_mask = posix_thread.sig_mask();
     let (signal, sig_num, sig_action) = loop {
         let signal = ctx.dequeue_signal(&sig_mask)?;
         let sig_num = signal.num();

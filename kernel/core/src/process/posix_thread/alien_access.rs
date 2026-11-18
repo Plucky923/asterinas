@@ -17,7 +17,7 @@ impl PosixThread {
         accessor: &PosixThread,
         mode: AlienAccessMode,
     ) -> Result<()> {
-        if Weak::ptr_eq(accessor.weak_process(), self.weak_process()) {
+        if Arc::ptr_eq(accessor.process_ref(), self.process_ref()) {
             return Ok(());
         }
 

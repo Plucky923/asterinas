@@ -43,10 +43,7 @@ impl LsmAlienAccessHook for YamaLsm {
             YamaScope::Disabled => false,
             YamaScope::Relational => {
                 !accessor_has_cap_sys_ptrace
-                    && !is_ancestor_of(
-                        context.accessor().weak_process(),
-                        context.target().process(),
-                    )
+                    && !is_ancestor_of(context.accessor().process_ref(), context.target().process())
             }
             YamaScope::Capability => !accessor_has_cap_sys_ptrace,
             YamaScope::NoAttach => true,
@@ -127,12 +124,12 @@ define_atomic_version_of_integer_like_type!(YamaScope, try_from = true, {
 
 static YAMA_SCOPE: AtomicYamaScope = AtomicYamaScope(AtomicI32::new(YamaScope::Relational as i32));
 
-fn is_ancestor_of(ancestor: &Weak<Process>, descendant: Arc<Process>) -> bool {
+fn is_ancestor_of(ancestor: &Arc<Process>, descendant: Arc<Process>) -> bool {
     let mut current = descendant;
     loop {
         let parent_guard = current.parent().lock();
         let parent = parent_guard.process();
-        if parent.ptr_eq(ancestor) {
+        if core::ptr::eq(parent.as_ptr(), Arc::as_ptr(ancestor)) {
             return true;
         }
         let Some(parent) = parent.upgrade() else {
